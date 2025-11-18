@@ -36,6 +36,7 @@ pub const DEFAULT_HTTP_PORT: u16 = 8080;
 pub struct LocalModelBuilder {
     model_path: Option<PathBuf>,
     model_name: Option<String>,
+    hf_model_id: Option<String>,
     endpoint_id: Option<EndpointId>,
     context_length: Option<u32>,
     template_file: Option<PathBuf>,
@@ -68,6 +69,7 @@ impl Default for LocalModelBuilder {
             tls_key_path: Default::default(),
             model_path: Default::default(),
             model_name: Default::default(),
+            hf_model_id: Default::default(),
             endpoint_id: Default::default(),
             context_length: Default::default(),
             template_file: Default::default(),
@@ -96,6 +98,11 @@ impl LocalModelBuilder {
 
     pub fn model_name(&mut self, model_name: Option<String>) -> &mut Self {
         self.model_name = model_name;
+        self
+    }
+
+    pub fn hf_model_id(&mut self, hf_model_id: Option<String>) -> &mut Self {
+        self.hf_model_id = hf_model_id;
         self
     }
 
@@ -281,6 +288,11 @@ impl LocalModelBuilder {
 
         let mut card =
             ModelDeploymentCard::load_from_disk(&model_path, self.custom_template_path.as_deref())?;
+        
+        // Set the HF model ID if provided. This allows served_model_name to differ from the HF model ID.
+        // The frontend will use hf_model_id (if set) to download config files from HuggingFace.
+        card.hf_model_id = self.hf_model_id.take();
+        
         // The served model name defaults to the full model path.
         // This matches what vllm and sglang do.
         card.set_name(

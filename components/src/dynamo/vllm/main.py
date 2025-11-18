@@ -78,6 +78,9 @@ async def worker():
 
     # Download the model if necessary.
     # register_llm would do this for us, but we want it on disk before we start vllm.
+    # Save the original HF model ID before downloading
+    original_hf_model_id = config.model
+    
     # Ensure the original HF name (e.g. "Qwen/Qwen3-0.6B") is used as the served_model_name.
     if not config.served_model_name:
         config.served_model_name = config.engine_args.served_model_name = config.model
@@ -86,23 +89,23 @@ async def worker():
 
     # Route to appropriate initialization based on config flags
     if config.multimodal_processor:
-        await init_multimodal_processor(runtime, config)
+        await init_multimodal_processor(runtime, config, original_hf_model_id)
         logger.debug("init_multimodal_processor completed")
     elif config.multimodal_encode_worker:
-        await init_multimodal_encode_worker(runtime, config)
+        await init_multimodal_encode_worker(runtime, config, original_hf_model_id)
         logger.debug("init_multimodal_encode_worker completed")
     elif (
         config.multimodal_worker
         or config.multimodal_decode_worker
         or config.multimodal_encode_prefill_worker
     ):
-        await init_multimodal_worker(runtime, config)
+        await init_multimodal_worker(runtime, config, original_hf_model_id)
         logger.debug("init_multimodal_worker completed")
     elif config.is_prefill_worker:
-        await init_prefill(runtime, config)
+        await init_prefill(runtime, config, original_hf_model_id)
         logger.debug("init_prefill completed")
     else:
-        await init(runtime, config)
+        await init(runtime, config, original_hf_model_id)
         logger.debug("init completed")
 
     logger.debug("Worker function completed, exiting...")
@@ -313,6 +316,7 @@ async def register_vllm_model(
     engine_client: AsyncLLM,
     vllm_config,
     migration_limit: int,
+    hf_model_id: str = None,
 ):
     """
     Helper function to register a vLLM model with runtime configuration.
@@ -325,6 +329,7 @@ async def register_vllm_model(
         engine_client: vLLM engine client
         vllm_config: vLLM configuration
         migration_limit: Migration limit for the model
+        hf_model_id: Original HuggingFace model ID for downloading config (optional)
     """
     runtime_config = ModelRuntimeConfig()
 
@@ -346,20 +351,33 @@ async def register_vllm_model(
     data_parallel_size = getattr(vllm_config.parallel_config, "data_parallel_size", 1)
     runtime_config.data_parallel_size = data_parallel_size
 
-    await register_llm(
-        model_input,
-        model_type,
-        generate_endpoint,
-        config.model,
-        config.served_model_name,
-        kv_cache_block_size=config.engine_args.block_size,
-        migration_limit=migration_limit,
-        runtime_config=runtime_config,
-        custom_template_path=config.custom_jinja_template,
-    )
+    # Register all served model names
+    served_names = getattr(config, "served_model_names", None)
+    if served_names:
+        served_names = [name for name in served_names if name]
+    else:
+        served_names = [config.served_model_name] if config.served_model_name else []
+
+    if not served_names:
+        served_names = [hf_model_id] if hf_model_id else [config.model]
+
+    for served_name in served_names:
+        logging.info(f"Registering model with served name: {served_name}")
+        await register_llm(
+            model_input,
+            model_type,
+            generate_endpoint,
+            config.model,
+            served_name,
+            hf_model_id=hf_model_id,
+            kv_cache_block_size=config.engine_args.block_size,
+            migration_limit=migration_limit,
+            runtime_config=runtime_config,
+            custom_template_path=config.custom_jinja_template,
+        )
 
 
-async def init_prefill(runtime: DistributedRuntime, config: Config):
+async def init_prefill(runtime: DistributedRuntime, config: Config, hf_model_id: str = None):
     """
     Instantiate and serve
     """
@@ -430,6 +448,7 @@ async def init_prefill(runtime: DistributedRuntime, config: Config):
             engine_client,
             vllm_config,
             migration_limit=0,  # Prefill doesn't support migration
+            hf_model_id=hf_model_id,
         )
 
     health_check_payload = VllmPrefillHealthCheckPayload(
@@ -464,7 +483,7 @@ async def init_prefill(runtime: DistributedRuntime, config: Config):
         handler.cleanup()
 
 
-async def init(runtime: DistributedRuntime, config: Config):
+async def init(runtime: DistributedRuntime, config: Config, hf_model_id: str = None):
     """
     Instantiate and serve
     """
@@ -562,6 +581,7 @@ async def init(runtime: DistributedRuntime, config: Config):
             engine_client,
             vllm_config,
             migration_limit=config.migration_limit,
+            hf_model_id=hf_model_id,
         )
 
     health_check_payload = VllmHealthCheckPayload(
@@ -632,7 +652,7 @@ def get_engine_cache_info(engine: AsyncLLM):
         raise
 
 
-async def init_multimodal_processor(runtime: DistributedRuntime, config: Config):
+async def init_multimodal_processor(runtime: DistributedRuntime, config: Config, hf_model_id: str = None):
     """Initialize multimodal processor component"""
     component = runtime.namespace(config.namespace).component(config.component)
 
@@ -683,7 +703,7 @@ async def init_multimodal_processor(runtime: DistributedRuntime, config: Config)
         handler.cleanup()
 
 
-async def init_multimodal_encode_worker(runtime: DistributedRuntime, config: Config):
+async def init_multimodal_encode_worker(runtime: DistributedRuntime, config: Config, hf_model_id: str = None):
     """Initialize multimodal encode worker component"""
     component = runtime.namespace(config.namespace).component(config.component)
 
@@ -721,7 +741,7 @@ async def init_multimodal_encode_worker(runtime: DistributedRuntime, config: Con
         handler.cleanup()
 
 
-async def init_multimodal_worker(runtime: DistributedRuntime, config: Config):
+async def init_multimodal_worker(runtime: DistributedRuntime, config: Config, hf_model_id: str = None):
     """
     Initialize multimodal worker component.
 

@@ -167,6 +167,11 @@ pub struct ModelDeploymentCard {
     /// Human readable model name, e.g. "Meta Llama 3.1 8B Instruct"
     pub display_name: String,
 
+    /// Optional HuggingFace model ID for downloading config files.
+    /// If not set, display_name will be used for HF downloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hf_model_id: Option<String>,
+
     // Cache the Slugified display_name so we can share references to it
     slug: Slug,
 
@@ -395,7 +400,9 @@ impl ModelDeploymentCard {
         }
 
         let ignore_weights = true;
-        let local_path = crate::hub::from_hf(&self.display_name, ignore_weights).await?;
+        // Use hf_model_id if available, otherwise fall back to display_name
+        let model_id = self.hf_model_id.as_ref().unwrap_or(&self.display_name);
+        let local_path = crate::hub::from_hf(model_id, ignore_weights).await?;
 
         self.update_dir(&local_path);
         Ok(())
@@ -447,8 +454,12 @@ impl ModelDeploymentCard {
         if let Some(pf) = self.prompt_formatter.as_mut() {
             pf.update_dir(dir);
         }
+        // Only update chat_template_file if it's not already a valid local file
+        // (e.g., from a ConfigMap mount). This preserves custom templates.
         if let Some(ct) = self.chat_template_file.as_mut() {
+            if !ct.is_local() {
             ct.update_dir(dir);
+            }
         }
         if let Some(gc) = self.gen_config.as_mut() {
             gc.update_dir(dir);
@@ -525,6 +536,7 @@ impl ModelDeploymentCard {
         Ok(Self {
             slug: Slug::from_string(&display_name),
             display_name,
+            hf_model_id: None, // set later by the caller if needed
             model_info: Some(ModelInfoType::from_disk(local_path)?),
             tokenizer: Some(TokenizerKind::from_disk(local_path)?),
             gen_config: GenerationConfig::from_disk(local_path).ok(), // optional

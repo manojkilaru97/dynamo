@@ -44,6 +44,7 @@ class Config:
     # mirror vLLM
     model: str
     served_model_name: Optional[str]
+    served_model_names: Optional[list[str]] = None
 
     # rest vLLM args
     engine_args: AsyncEngineArgs
@@ -242,14 +243,24 @@ def parse_args() -> Config:
 
     config = Config()
     config.model = args.model
+    served_model_names: list[str] = []
     if args.served_model_name:
-        assert (
-            len(args.served_model_name) <= 1
-        ), "We do not support multiple model names."
-        config.served_model_name = args.served_model_name[0]
+        if isinstance(args.served_model_name, (list, tuple)):
+            for name in args.served_model_name:
+                if not name:
+                    continue
+                if name not in served_model_names:
+                    served_model_names.append(name)
+        else:
+            served_model_names.append(args.served_model_name)
+
+    if served_model_names:
+        config.served_model_name = served_model_names[0]
+        config.served_model_names = served_model_names
     else:
         # This becomes an `Option` on the Rust side
         config.served_model_name = None
+        config.served_model_names = None
 
     config.namespace = os.environ.get("DYN_NAMESPACE", "dynamo")
 

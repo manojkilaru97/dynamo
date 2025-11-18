@@ -235,7 +235,7 @@ fn lora_name_to_id(lora_name: &str) -> i32 {
 /// For LoRA mode, both `lora_name` and `base_model_path` must be provided together.
 /// Providing only one of them will result in an error.
 #[pyfunction]
-#[pyo3(signature = (model_input, model_type, endpoint, model_path, model_name=None, context_length=None, kv_cache_block_size=None, router_mode=None, migration_limit=0, runtime_config=None, user_data=None, custom_template_path=None, media_decoder=None, media_fetcher=None, lora_name=None, base_model_path=None))]
+#[pyo3(signature = (model_input, model_type, endpoint, model_path, model_name=None, hf_model_id=None, context_length=None, kv_cache_block_size=None, router_mode=None, migration_limit=0, runtime_config=None, user_data=None, custom_template_path=None, media_decoder=None, media_fetcher=None, lora_name=None, base_model_path=None))]
 #[allow(clippy::too_many_arguments)]
 fn register_llm<'p>(
     py: Python<'p>,
@@ -244,6 +244,7 @@ fn register_llm<'p>(
     endpoint: Endpoint,
     model_path: &str,
     model_name: Option<&str>,
+    hf_model_id: Option<&str>,
     context_length: Option<u32>,
     kv_cache_block_size: Option<u32>,
     router_mode: Option<RouterMode>,
@@ -282,6 +283,7 @@ fn register_llm<'p>(
 
     let inner_path = model_path.to_string();
     let model_name = model_name.map(|n| n.to_string());
+    let hf_model_id_str = hf_model_id.map(|s| s.to_string());
     let router_mode = router_mode.unwrap_or(RouterMode::RoundRobin);
     let router_config = RouterConfig::new(router_mode.into(), KvRouterConfig::default());
 
@@ -364,6 +366,7 @@ fn register_llm<'p>(
         builder
             .model_path(model_path)
             .model_name(model_name.clone())
+            .hf_model_id(hf_model_id_str.or(Some(source_path.clone())))
             .context_length(context_length)
             .kv_cache_block_size(kv_cache_block_size)
             .router_config(Some(router_config))
