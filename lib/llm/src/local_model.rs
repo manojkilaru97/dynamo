@@ -451,8 +451,11 @@ impl LocalModel {
         self.card.model_type = model_type;
         self.card.model_input = model_input;
 
-        // Compute model_suffix from lora_name if present
-        let model_suffix = lora_name.map(|name| Slug::slugify(name).to_string());
+        // Compute model_suffix: use lora_name if present, otherwise use model name
+        // This ensures unique keys when multiple model names are served from the same endpoint
+        let model_suffix = lora_name
+            .map(|name| Slug::slugify(name).to_string())
+            .or_else(|| Some(Slug::slugify(self.card.name()).to_string()));
 
         let suffix_for_log = model_suffix
             .as_ref()
@@ -484,18 +487,22 @@ impl LocalModel {
 
     /// Helper associated function to detach a model from an endpoint
     ///
-    /// For base models, pass `lora_name = None`.
-    /// For LoRA adapters, pass `lora_name = Some("adapter-name")`.
+    /// For base models, pass `model_name = Some("model-name")` and `lora_name = None`.
+    /// For LoRA adapters, pass `lora_name = Some("adapter-name")` (model_name is ignored).
     pub async fn detach_from_endpoint(
         endpoint: &Endpoint,
+        model_name: Option<&str>,
         lora_name: Option<&str>,
     ) -> anyhow::Result<()> {
         let drt = endpoint.drt();
         let instance_id = drt.connection_id();
         let endpoint_id = endpoint.id();
 
-        // Compute model_suffix from lora_name if present
-        let model_suffix = lora_name.map(|name| Slug::slugify(name).to_string());
+        // Compute model_suffix: use lora_name if present, otherwise use model name
+        // This matches the logic in attach() to ensure correct key lookup
+        let model_suffix = lora_name
+            .map(|name| Slug::slugify(name).to_string())
+            .or_else(|| model_name.map(|name| Slug::slugify(name).to_string()));
 
         let instance = DiscoveryInstance::Model {
             namespace: endpoint_id.namespace,

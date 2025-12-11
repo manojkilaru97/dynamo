@@ -405,26 +405,33 @@ fn register_llm<'p>(
 /// # Arguments
 ///
 /// * `endpoint` - The endpoint where the model is registered
+/// * `model_name` - The served model name (required for base models)
 /// * `lora_name` - Optional LoRA adapter name (if unregistering a LoRA deployment)
 ///
 /// # MDC Path Format
 ///
-/// - Base model: `v1/mdc/{namespace}/{component}/{endpoint}/{instance_id}`
+/// - Base model: `v1/mdc/{namespace}/{component}/{endpoint}/{instance_id}/{model_slug}`
 /// - LoRA model: `v1/mdc/{namespace}/{component}/{endpoint}/{instance_id}/{lora_slug}`
 #[pyfunction]
-#[pyo3(signature = (endpoint, lora_name=None))]
+#[pyo3(signature = (endpoint, model_name=None, lora_name=None))]
 fn unregister_llm<'p>(
     py: Python<'p>,
     endpoint: Endpoint,
+    model_name: Option<&str>,
     lora_name: Option<&str>,
 ) -> PyResult<Bound<'p, PyAny>> {
+    let model_name_owned = model_name.map(|s| s.to_string());
     let lora_name_owned = lora_name.map(|s| s.to_string());
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         // Unified detach method handles both base models and LoRA adapters
-        LocalModel::detach_from_endpoint(&endpoint.inner, lora_name_owned.as_deref())
-            .await
-            .map_err(to_pyerr)?;
+        LocalModel::detach_from_endpoint(
+            &endpoint.inner,
+            model_name_owned.as_deref(),
+            lora_name_owned.as_deref(),
+        )
+        .await
+        .map_err(to_pyerr)?;
         Ok(())
     })
 }

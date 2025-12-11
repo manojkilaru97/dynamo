@@ -1113,12 +1113,14 @@ async def register_llm(
 
 async def unregister_llm(
     endpoint: Endpoint,
+    model_name: Optional[str] = None,
     lora_name: Optional[str] = None,
 ) -> None:
     """
     Unregister a model from the discovery system.
 
-    If lora_name is provided, unregisters a LoRA adapter instead of a base model.
+    For base models, pass model_name (the served model name).
+    For LoRA adapters, pass lora_name (model_name is ignored).
     """
     ...
 
