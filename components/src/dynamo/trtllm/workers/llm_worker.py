@@ -444,6 +444,8 @@ async def init_llm_worker(
             shutdown_event=shutdown_event,
             encoder_cache_capacity_gb=config.multimodal_embedding_cache_capacity_gb,
             disable_request_abort=config.disable_request_abort,
+            additional_metrics=additional_metrics,
+            enable_thinking_default=config.dyn_enable_thinking_default,
         )
 
         # Register the model with runtime config
