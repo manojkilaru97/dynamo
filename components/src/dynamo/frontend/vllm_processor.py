@@ -602,6 +602,14 @@ class VllmProcessor:
                     token_count += len(engine_response["token_ids"])
 
                 if choices:
+                    for _c in choices:
+                        _fr = _c.get("finish_reason")
+                        _tc = _c.get("delta", {}).get("tool_calls")
+                        if _fr or _tc:
+                            logger.warning(
+                                "YIELD_DEBUG: finish_reason=%s has_tool_calls=%s choice_keys=%s",
+                                _fr, bool(_tc), list(_c.keys()),
+                            )
                     dynamo_out = {
                         "id": request_id,
                         "choices": choices,
