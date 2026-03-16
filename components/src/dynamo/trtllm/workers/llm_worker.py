@@ -109,6 +109,152 @@ def build_kv_connector_config(config: Config):
     return None
 
 
+def _log_config_info_from_engine_args(
+    metrics_collector: "MetricsCollector",
+    engine_args: dict,
+    config: "Config",
+) -> None:
+    """Log static configuration as Prometheus info gauges (called once at startup).
+
+    Extracts model, parallel, speculative, and cache config from engine_args dict
+    and calls metrics_collector.log_config_info(). Follows the same pattern as
+    vLLM's model_config_info / parallel_config_info and TRT-LLM's
+    OpenAIServer._log_config_info_metrics().
+    """
+    try:
+        # Disaggregation mode — distinguishes prefill vs decode workers in P/D mode
+        disagg_mode = (
+            config.disaggregation_mode.value
+            if hasattr(config.disaggregation_mode, "value")
+            else str(config.disaggregation_mode)
+        )
+
+        # Model config
+        model_config = {
+            "model": str(config.model),
+            "served_model_name": str(config.served_model_name or config.model),
+            "backend": str(engine_args.get("backend", "pytorch")),
+            "dtype": str(engine_args.get("dtype", "auto")),
+            "disaggregation_mode": disagg_mode,
+        }
+        # Quantization from quant_config if present
+        quant_config = engine_args.get("quant_config")
+        if quant_config is not None:
+            quant_algo = getattr(quant_config, "quant_algo", None) if not isinstance(quant_config, dict) else quant_config.get("quant_algo")
+            model_config["quantization"] = str(quant_algo) if quant_algo else "none"
+        else:
+            model_config["quantization"] = "none"
+        max_seq_len = engine_args.get("max_seq_len")
+        if max_seq_len is not None:
+            model_config["max_model_len"] = str(max_seq_len)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                model_config["gpu_type"] = torch.cuda.get_device_name(0)
+        except Exception:
+            pass
+
+        # Parallel config
+        tp_size = engine_args.get("tensor_parallel_size", 1) or 1
+        pp_size = engine_args.get("pipeline_parallel_size", 1) or 1
+        parallel_config = {
+            "tensor_parallel_size": str(tp_size),
+            "pipeline_parallel_size": str(pp_size),
+            "gpu_count": str(tp_size * pp_size),
+        }
+        ep_size = engine_args.get("expert_parallel_size")
+        if ep_size is not None:
+            parallel_config["expert_parallel_size"] = str(ep_size)
+        if engine_args.get("enable_attention_dp"):
+            parallel_config["enable_attention_dp"] = "true"
+
+        # Speculative decoding config
+        spec_config = engine_args.get("speculative_config")
+        logging.debug(
+            "Config info: speculative_config=%s (type=%s)",
+            spec_config, type(spec_config).__name__ if spec_config else "None",
+        )
+        speculative_config = None
+        if spec_config is not None:
+            if isinstance(spec_config, dict):
+                speculative_config = {"spec_enabled": "true"}
+                if "decoding_type" in spec_config:
+                    speculative_config["spec_method"] = str(spec_config["decoding_type"])
+                num_layers = spec_config.get("num_nextn_predict_layers")
+                if num_layers is not None:
+                    speculative_config["spec_num_tokens"] = str(num_layers)
+                draft_model = spec_config.get("speculative_model")
+                if draft_model is not None:
+                    speculative_config["spec_draft_model"] = str(draft_model)
+            else:
+                # Object-style config (from LLM args)
+                speculative_config = {"spec_enabled": "true"}
+                decoding_type = getattr(spec_config, "decoding_type", None)
+                if decoding_type is not None:
+                    speculative_config["spec_method"] = str(decoding_type)
+                num_layers = getattr(spec_config, "num_nextn_predict_layers", None)
+                if num_layers is not None:
+                    speculative_config["spec_num_tokens"] = str(num_layers)
+
+        # KV cache config
+        kv_cache_config = engine_args.get("kv_cache_config")
+        cache_config = None
+        if kv_cache_config is not None:
+            cache_config = {}
+            if isinstance(kv_cache_config, dict):
+                for field in ("free_gpu_memory_fraction", "enable_block_reuse"):
+                    if field in kv_cache_config:
+                        cache_config[field] = str(kv_cache_config[field])
+            else:
+                for field in ("free_gpu_memory_fraction", "enable_block_reuse",
+                              "enable_partial_reuse"):
+                    val = getattr(kv_cache_config, field, None)
+                    if val is not None:
+                        cache_config[field] = str(val)
+
+        # Runtime config: scheduler, batching, CUDA graphs, MoE, guided decoding
+        runtime_config = {
+            "max_batch_size": str(engine_args.get("max_batch_size", "")),
+            "max_num_tokens": str(engine_args.get("max_num_tokens", "")),
+        }
+        if engine_args.get("disable_overlap_scheduler") is not None:
+            runtime_config["disable_overlap_scheduler"] = str(engine_args["disable_overlap_scheduler"])
+        if engine_args.get("enable_chunked_prefill"):
+            runtime_config["enable_chunked_prefill"] = "true"
+        if engine_args.get("guided_decoding_backend"):
+            runtime_config["guided_decoding_backend"] = str(engine_args["guided_decoding_backend"])
+        # CUDA graph config
+        cuda_graph = engine_args.get("cuda_graph_config")
+        if cuda_graph is not None:
+            if isinstance(cuda_graph, dict):
+                runtime_config["cuda_graphs_enabled"] = str(cuda_graph.get("enable_padding", True))
+                batch_sizes = cuda_graph.get("batch_sizes")
+                if batch_sizes:
+                    runtime_config["cuda_graph_batch_sizes"] = str(len(batch_sizes))
+            else:
+                runtime_config["cuda_graphs_enabled"] = str(getattr(cuda_graph, "enable_padding", True))
+        # MoE config
+        moe_config = engine_args.get("moe_config")
+        if moe_config is not None:
+            if isinstance(moe_config, dict):
+                moe_backend = moe_config.get("backend")
+            else:
+                moe_backend = getattr(moe_config, "backend", None)
+            if moe_backend is not None:
+                runtime_config["moe_backend"] = str(moe_backend)
+
+        metrics_collector.log_config_info(
+            model_config=model_config,
+            parallel_config=parallel_config,
+            speculative_config=speculative_config,
+            cache_config=cache_config if cache_config else None,
+            runtime_config=runtime_config,
+        )
+        logging.info("Logged config info metrics (model, parallel, speculative, cache, runtime)")
+    except Exception as e:
+        logging.warning("Failed to log config info metrics: %s", e)
+
+
 async def init_llm_worker(
     runtime: DistributedRuntime,
     config: Config,
@@ -397,26 +543,64 @@ async def init_llm_worker(
         # Initialize TensorRT-LLM MetricsCollector and register with global REGISTRY
         # This enables exposing TRT-LLM's native Prometheus metrics (request latency, TTFT, TPOT, etc.)
         metrics_collector = None
+        additional_metrics = None
         if config.publish_events_and_metrics:
             try:
-                model_name_for_metrics = config.served_model_name or config.model
+                model_name_for_metrics = (
+                    config.served_model_name[0] if config.served_model_name else None
+                ) or config.model
                 metrics_collector = MetricsCollector(
                     {"model_name": model_name_for_metrics, "engine_type": "trtllm"}
                 )
                 logging.info("TensorRT-LLM MetricsCollector initialized")
 
-                # Register TRT-LLM metrics (TRT-LLM natively outputs trtllm_* metrics after traffic)
-                # Auto-label injection: hierarchy labels are added automatically
+                # Log static config info as Prometheus gauges (set once at startup)
+                # Mirrors vLLM's model_config_info / parallel_config_info pattern
+                _log_config_info_from_engine_args(
+                    metrics_collector, engine_args, config
+                )
+
+                # Prefix filter: all TRT-LLM metrics (engine + additional) use "trtllm_" prefix
+                _metric_prefixes = ["trtllm_"]
+
+                # Additional metrics (abort tracking, request types, KV transfer perf).
+                # Wrapped in try/except because AdditionalMetricsCollector depends on
+                # prometheus_names which may not be available in all packaging variants.
+                try:
+                    from dynamo.trtllm.metrics import AdditionalMetricsCollector
+
+                    disagg_mode_str = (
+                        config.disaggregation_mode.value
+                        if hasattr(config.disaggregation_mode, "value")
+                        else str(config.disaggregation_mode)
+                    )
+                    additional_metrics = AdditionalMetricsCollector(
+                        labels={
+                            "model_name": model_name_for_metrics,
+                            "disaggregation_mode": disagg_mode_str,
+                            "engine_type": "trtllm",
+                        },
+                    )
+                    logging.info(
+                        "Additional metrics initialized (disagg_mode=%s)",
+                        disagg_mode_str,
+                    )
+                except Exception as e:
+                    logging.warning("Failed to initialize additional metrics: %s", e)
+
+                # Single callback for all Python-side metrics (trtllm_ + additional)
                 register_engine_metrics_callback(
                     endpoint=endpoint,
                     registry=REGISTRY,
-                    metric_prefix_filters=["trtllm_"],
+                    metric_prefix_filters=_metric_prefixes,
                     namespace_name=config.namespace,
                     component_name=config.component,
                     endpoint_name="generate",
                     model_name=model_name_for_metrics,
                 )
-                logging.info("TensorRT-LLM Prometheus metrics registered")
+                logging.info(
+                    "Prometheus metrics registered (prefixes: %s)", _metric_prefixes
+                )
             except Exception as e:
                 logging.warning(
                     f"Failed to initialize TensorRT-LLM Prometheus metrics: {e}"
