@@ -80,6 +80,10 @@ class RequestHandlerConfig:
     # - False: Default thinking-off mode (e.g., GLM-4.7 style)
     # - None: No auto-generation, require explicit enable_thinking in request
     enable_thinking_default: Optional[bool] = None
+    # When True, the model's chat template already appends <think> to the prompt
+    # (e.g., GLM-4.7, GLM-4.5). The structural_tag should NOT include <think> as
+    # the begin tag to avoid a double <think> that causes model degeneration.
+    prompt_injects_thinking_tag: bool = False
 
 
 class HandlerBase(BaseGenerativeHandler):
@@ -119,6 +123,9 @@ class HandlerBase(BaseGenerativeHandler):
             self.enable_thinking_default = None
         else:
             self.enable_thinking_default = bool(_etd)
+        self.prompt_injects_thinking_tag = bool(
+            getattr(config, "prompt_injects_thinking_tag", False)
+        )
 
     def check_error(self, result: dict):
         """
@@ -923,9 +930,9 @@ class HandlerBase(BaseGenerativeHandler):
             xgrammar content dict, or None if no guided decoding is specified.
         """
         if json_schema is not None:
-            return {"type": "json_schema", "json_schema": {"name": "guided_json", "schema": json_schema}}
+            return {"type": "json_schema", "json_schema": json_schema}
         elif json_object:
-            return {"type": "json_schema", "json_schema": {"name": "json_object", "schema": {"type": "object"}}}
+            return {"type": "json_schema", "json_schema": {"type": "object"}}
         elif regex is not None:
             return {"type": "regex", "pattern": regex}
         elif grammar is not None:
@@ -934,7 +941,9 @@ class HandlerBase(BaseGenerativeHandler):
 
     @staticmethod
     def _generate_structural_tag_for_reasoning(
-        content: dict, enable_thinking: bool
+        content: dict,
+        enable_thinking: bool,
+        prompt_injects_thinking_tag: bool = False,
     ) -> dict:
         """
         Generate structural_tag for combining reasoning with guided decoding.
@@ -947,19 +956,31 @@ class HandlerBase(BaseGenerativeHandler):
             content: The xgrammar content dict (json_schema, regex, or grammar format).
             enable_thinking: If True, generate thinking-on mode (sequence format).
                            If False, generate thinking-off mode (triggered_tags format).
+            prompt_injects_thinking_tag: If True, the chat template already appended
+                           <think> to the prompt. The structural_tag begin tag is set
+                           to "" to avoid a double <think> that causes model degeneration.
 
         Returns:
             A structural_tag dict in xgrammar format.
         """
         if enable_thinking:
-            # Thinking-ON mode: Model generates <think>...</think> then JSON
-            # Format: sequence of [<think>any_text</think>, json_schema]
+            # Thinking-ON mode: Model generates <think>...</think> then JSON.
+            #
+            # When the chat template already injects <think> into the prompt
+            # (e.g., GLM-4.7, GLM-4.5), xgrammar must NOT constrain the model
+            # to output another <think> — that would create a double <think>
+            # sequence the model has never seen in training, causing degenerate
+            # output (repeating digits, garbage tokens).
+            #
+            # When the template does NOT inject <think>, xgrammar constrains
+            # the model to produce it as the first output tokens.
+            begin_tag = "" if prompt_injects_thinking_tag else "<think>"
             return {
                 "type": "sequence",
                 "elements": [
                     {
                         "type": "tag",
-                        "begin": "<think>",
+                        "begin": begin_tag,
                         "content": {"type": "any_text"},
                         "end": "</think>",
                     },
@@ -1045,7 +1066,9 @@ class HandlerBase(BaseGenerativeHandler):
                     # guided decoding. This allows <think>...</think> reasoning content
                     # to be free text while constraining the final output.
                     structural_tag = self._generate_structural_tag_for_reasoning(
-                        content, enable_thinking is True
+                        content,
+                        enable_thinking is True,
+                        prompt_injects_thinking_tag=self.prompt_injects_thinking_tag,
                     )
                     # When using structural_tag, clear other params to avoid conflict
                     # (xgrammar uses structural_tag exclusively)

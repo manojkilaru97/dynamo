@@ -32,6 +32,7 @@ class DynamoRuntimeConfig(ConfigBase):
     # - False: Default thinking-off mode (</think> at start, e.g., GLM-4.7)
     # - None: No auto-generation, require explicit enable_thinking in request
     dyn_enable_thinking_default: Optional[bool] = None
+    dyn_prompt_injects_thinking_tag: bool = False
     custom_jinja_template: Optional[str] = None
     endpoint_types: str
     dump_config_to: Optional[str] = None
@@ -157,6 +158,18 @@ class DynamoRuntimeArgGroup(ArgGroup):
                 "For GLM-4.7, set to 'false' to enable structural_tag generation for reasoning + JSON output."
             ),
             type=lambda x: None if x.lower() == "none" else x.lower() == "true",
+        )
+        add_argument(
+            g,
+            flag_name="--dyn-prompt-injects-thinking-tag",
+            env_var="DYN_PROMPT_INJECTS_THINKING_TAG",
+            default=False,
+            help=(
+                "Set to true when the model's chat template already appends <think> to the "
+                "prompt (e.g., GLM-4.7, GLM-4.5). Prevents the structural_tag from adding a "
+                "duplicate <think> that causes model degeneration with guided decoding."
+            ),
+            type=lambda x: x.lower() in ("true", "1", "yes"),
         )
         add_argument(
             g,
