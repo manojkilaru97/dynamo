@@ -15,12 +15,15 @@ use axum::response::sse::Event;
 use dynamo_async_openai::types::responses::{
     AssistantRole, FunctionToolCall, InputTokenDetails, Instructions, OutputContent, OutputItem,
     OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent, OutputTokenDetails,
-    Response, ResponseCompletedEvent, ResponseContentPartAddedEvent, ResponseContentPartDoneEvent,
-    ResponseCreatedEvent, ResponseFailedEvent, ResponseFunctionCallArgumentsDeltaEvent,
-    ResponseFunctionCallArgumentsDoneEvent, ResponseInProgressEvent, ResponseOutputItemAddedEvent,
-    ResponseOutputItemDoneEvent, ResponseStreamEvent, ResponseTextDeltaEvent,
-    ResponseTextDoneEvent, ResponseTextParam, ResponseUsage, ServiceTier, Status,
-    TextResponseFormatConfiguration, ToolChoiceOptions, ToolChoiceParam, Truncation,
+    ReasoningItem, Response, ResponseCompletedEvent, ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent, ResponseCreatedEvent, ResponseFailedEvent,
+    ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent,
+    ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent,
+    ResponseReasoningSummaryPartAddedEvent, ResponseReasoningSummaryPartDoneEvent,
+    ResponseReasoningSummaryTextDeltaEvent, ResponseReasoningSummaryTextDoneEvent,
+    ResponseStreamEvent, ResponseTextDeltaEvent, ResponseTextDoneEvent, ResponseTextParam,
+    ResponseUsage, ServiceTier, Status, Summary, SummaryPart, TextResponseFormatConfiguration,
+    ToolChoiceOptions, ToolChoiceParam, Truncation,
 };
 use uuid::Uuid;
 
@@ -41,6 +44,11 @@ pub struct ResponseStreamConverter {
     message_started: bool,
     message_output_index: u32,
     accumulated_text: String,
+    // Reasoning content tracking
+    reasoning_item_id: String,
+    reasoning_started: bool,
+    reasoning_output_index: u32,
+    accumulated_reasoning: String,
     // Function call tracking
     function_call_items: Vec<FunctionCallState>,
     // Output index counter
@@ -78,6 +86,10 @@ impl ResponseStreamConverter {
             message_started: false,
             message_output_index: 0,
             accumulated_text: String::new(),
+            reasoning_item_id: format!("rs_{}", Uuid::new_v4().simple()),
+            reasoning_started: false,
+            reasoning_output_index: 0,
+            accumulated_reasoning: String::new(),
             function_call_items: Vec::new(),
             next_output_index: 0,
             usage: None,
@@ -271,6 +283,59 @@ impl ResponseStreamConverter {
                 events.push(make_sse_event(&text_delta));
             }
 
+            // Handle reasoning_content deltas
+            if let Some(reasoning) = &delta.reasoning_content
+                && !reasoning.is_empty()
+            {
+                // Emit output_item.added + reasoning_summary_part.added on first reasoning chunk
+                if !self.reasoning_started {
+                    self.reasoning_started = true;
+                    self.reasoning_output_index = self.next_output_index;
+                    self.next_output_index += 1;
+
+                    let item_added = ResponseStreamEvent::ResponseOutputItemAdded(
+                        ResponseOutputItemAddedEvent {
+                            sequence_number: self.next_seq(),
+                            output_index: self.reasoning_output_index,
+                            item: OutputItem::Reasoning(ReasoningItem {
+                                id: self.reasoning_item_id.clone(),
+                                summary: vec![],
+                                content: None,
+                                encrypted_content: None,
+                                status: Some(OutputStatus::InProgress),
+                            }),
+                        },
+                    );
+                    events.push(make_sse_event(&item_added));
+
+                    let part_added = ResponseStreamEvent::ResponseReasoningSummaryPartAdded(
+                        ResponseReasoningSummaryPartAddedEvent {
+                            sequence_number: self.next_seq(),
+                            item_id: self.reasoning_item_id.clone(),
+                            output_index: self.reasoning_output_index,
+                            summary_index: 0,
+                            part: SummaryPart::SummaryText(Summary {
+                                text: String::new(),
+                            }),
+                        },
+                    );
+                    events.push(make_sse_event(&part_added));
+                }
+
+                // Emit reasoning summary text delta
+                self.accumulated_reasoning.push_str(reasoning);
+                let text_delta = ResponseStreamEvent::ResponseReasoningSummaryTextDelta(
+                    ResponseReasoningSummaryTextDeltaEvent {
+                        sequence_number: self.next_seq(),
+                        item_id: self.reasoning_item_id.clone(),
+                        output_index: self.reasoning_output_index,
+                        summary_index: 0,
+                        delta: reasoning.clone(),
+                    },
+                );
+                events.push(make_sse_event(&text_delta));
+            }
+
             // Handle tool call deltas
             if let Some(tool_calls) = &delta.tool_calls {
                 for tc in tool_calls {
@@ -392,6 +457,7 @@ impl ResponseStreamConverter {
                     }
                 }
             }
+
         }
 
         events
@@ -400,6 +466,49 @@ impl ResponseStreamConverter {
     /// Emit the final events when the stream ends: done events + completed.
     pub fn emit_end_events(&mut self) -> Vec<Result<Event, anyhow::Error>> {
         let mut events = Vec::new();
+
+        // Close reasoning item if it was started
+        if self.reasoning_started {
+            let text_done = ResponseStreamEvent::ResponseReasoningSummaryTextDone(
+                ResponseReasoningSummaryTextDoneEvent {
+                    sequence_number: self.next_seq(),
+                    item_id: self.reasoning_item_id.clone(),
+                    output_index: self.reasoning_output_index,
+                    summary_index: 0,
+                    text: self.accumulated_reasoning.clone(),
+                },
+            );
+            events.push(make_sse_event(&text_done));
+
+            let part_done = ResponseStreamEvent::ResponseReasoningSummaryPartDone(
+                ResponseReasoningSummaryPartDoneEvent {
+                    sequence_number: self.next_seq(),
+                    item_id: self.reasoning_item_id.clone(),
+                    output_index: self.reasoning_output_index,
+                    summary_index: 0,
+                    part: SummaryPart::SummaryText(Summary {
+                        text: self.accumulated_reasoning.clone(),
+                    }),
+                },
+            );
+            events.push(make_sse_event(&part_done));
+
+            let item_done =
+                ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
+                    sequence_number: self.next_seq(),
+                    output_index: self.reasoning_output_index,
+                    item: OutputItem::Reasoning(ReasoningItem {
+                        id: self.reasoning_item_id.clone(),
+                        summary: vec![SummaryPart::SummaryText(Summary {
+                            text: self.accumulated_reasoning.clone(),
+                        })],
+                        content: None,
+                        encrypted_content: None,
+                        status: Some(OutputStatus::Completed),
+                    }),
+                });
+            events.push(make_sse_event(&item_done));
+        }
 
         // Close text message if it was started
         if self.message_started {
@@ -488,7 +597,19 @@ impl ResponseStreamConverter {
         }
 
         // Build the final output vector from accumulated state
+        // Reasoning comes first (before message), matching non-streaming response ordering
         let mut output = Vec::new();
+        if self.reasoning_started {
+            output.push(OutputItem::Reasoning(ReasoningItem {
+                id: self.reasoning_item_id.clone(),
+                summary: vec![SummaryPart::SummaryText(Summary {
+                    text: self.accumulated_reasoning.clone(),
+                })],
+                content: None,
+                encrypted_content: None,
+                status: Some(OutputStatus::Completed),
+            }));
+        }
         if self.message_started {
             output.push(OutputItem::Message(OutputMessage {
                 id: Some(self.message_item_id.clone()),
@@ -906,6 +1027,144 @@ mod tests {
         assert!(
             tool_types.contains(&"response.output_item.done".to_string()),
             "output_item.done inline after text: {tool_types:?}"
+        );
+    }
+
+    fn reasoning_chunk(text: &str) -> NvCreateChatCompletionStreamResponse {
+        #[allow(deprecated)]
+        NvCreateChatCompletionStreamResponse {
+            id: "chat-1".into(),
+            choices: vec![ChatChoiceStream {
+                index: 0,
+                delta: ChatCompletionStreamResponseDelta {
+                    content: None,
+                    function_call: None,
+                    tool_calls: None,
+                    role: None,
+                    refusal: None,
+                    reasoning_content: Some(text.into()),
+                },
+                finish_reason: None,
+                stop_reason: None,
+                logprobs: None,
+            }],
+            created: 0,
+            model: "test".into(),
+            service_tier: None,
+            system_fingerprint: None,
+            object: "chat.completion.chunk".into(),
+            usage: None,
+            nvext: None,
+        }
+    }
+
+    /// Reasoning-only response emits correct event sequence.
+    #[test]
+    fn test_reasoning_only_response() {
+        let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
+        let _ = conv.emit_start_events();
+
+        let events1 = conv.process_chunk(&reasoning_chunk("Let me think"));
+        let types1 = event_types(&events1);
+        assert!(
+            types1.contains(&"response.output_item.added".to_string()),
+            "should emit output_item.added on first reasoning: {types1:?}"
+        );
+        assert!(
+            types1.contains(&"response.reasoning_summary_part.added".to_string()),
+            "should emit reasoning_summary_part.added: {types1:?}"
+        );
+        assert!(
+            types1.contains(&"response.reasoning_summary_text.delta".to_string()),
+            "should emit reasoning text delta: {types1:?}"
+        );
+
+        // Second chunk should only have delta (no added events)
+        let events2 = conv.process_chunk(&reasoning_chunk(" about this"));
+        let types2 = event_types(&events2);
+        assert_eq!(types2.len(), 1, "second chunk should have 1 event: {types2:?}");
+        assert_eq!(
+            types2[0], "response.reasoning_summary_text.delta",
+            "second chunk should be delta: {types2:?}"
+        );
+
+        let end_events = conv.emit_end_events();
+        let end_types = event_types(&end_events);
+        assert!(
+            end_types.contains(&"response.reasoning_summary_text.done".to_string()),
+            "end should have reasoning text done: {end_types:?}"
+        );
+        assert!(
+            end_types.contains(&"response.reasoning_summary_part.done".to_string()),
+            "end should have reasoning part done: {end_types:?}"
+        );
+        assert!(
+            end_types.contains(&"response.completed".to_string()),
+            "end should have completed: {end_types:?}"
+        );
+    }
+
+    /// Reasoning followed by text content: both emitted with correct output indices.
+    #[test]
+    fn test_reasoning_then_text() {
+        let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
+        let _ = conv.emit_start_events();
+
+        // Reasoning chunks
+        let _ = conv.process_chunk(&reasoning_chunk("thinking..."));
+        // Text chunks
+        let text_events = conv.process_chunk(&text_chunk("The answer is 42"));
+        let text_types = event_types(&text_events);
+        assert!(
+            text_types.contains(&"response.output_item.added".to_string()),
+            "text message should start: {text_types:?}"
+        );
+
+        let end_events = conv.emit_end_events();
+        let end_types = event_types(&end_events);
+        // Both reasoning and text should be closed
+        assert!(
+            end_types.contains(&"response.reasoning_summary_text.done".to_string()),
+            "reasoning closed: {end_types:?}"
+        );
+        assert!(
+            end_types.contains(&"response.output_text.done".to_string()),
+            "text closed: {end_types:?}"
+        );
+        assert!(
+            end_types.contains(&"response.completed".to_string()),
+            "completed present: {end_types:?}"
+        );
+    }
+
+    /// Reasoning + tool call: both tracked with separate output indices.
+    #[test]
+    fn test_reasoning_then_tool_call() {
+        let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
+        let _ = conv.emit_start_events();
+
+        let _ = conv.process_chunk(&reasoning_chunk("I should call get_weather"));
+        let tool_events = conv.process_chunk(&tool_call_chunk(
+            0,
+            Some("call-1"),
+            Some("get_weather"),
+            Some("{\"city\":\"SF\"}"),
+        ));
+        let tool_types = event_types(&tool_events);
+        assert!(
+            tool_types.contains(&"response.output_item.added".to_string()),
+            "tool call started: {tool_types:?}"
+        );
+
+        let end_events = conv.emit_end_events();
+        let end_types = event_types(&end_events);
+        assert!(
+            end_types.contains(&"response.reasoning_summary_text.done".to_string()),
+            "reasoning closed: {end_types:?}"
+        );
+        assert!(
+            end_types.contains(&"response.completed".to_string()),
+            "completed: {end_types:?}"
         );
     }
 }
