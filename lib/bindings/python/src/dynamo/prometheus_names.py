@@ -380,6 +380,20 @@ class trtllm_additional:
     # KV cache transfer speed per request in GB/s
     KV_TRANSFER_SPEED_GB_S = "trtllm_kv_transfer_speed_gb_s"
 
+    # --- Iteration-level gauges (updated every stats poll from get_stats_async) ---
+    # Requests actively being executed by the engine this iteration
+    NUM_REQUESTS_RUNNING = "trtllm_num_requests_running"
+    # Requests waiting in the scheduler queue
+    NUM_REQUESTS_WAITING = "trtllm_num_requests_waiting"
+    # Requests in context (prefill) phase this iteration
+    NUM_CONTEXT_REQUESTS = "trtllm_num_context_requests"
+    # Generation throughput (tokens/s) computed over the stats window
+    GEN_THROUGHPUT = "trtllm_gen_throughput"
+    # Cumulative prompt tokens processed by this worker
+    PROMPT_TOKENS_TOTAL = "trtllm_prompt_tokens_total"
+    # Cumulative generation tokens produced by this worker
+    GENERATION_TOKENS_TOTAL = "trtllm_generation_tokens_total"
+
 
 class work_handler:
     """Work handler Prometheus metric names"""

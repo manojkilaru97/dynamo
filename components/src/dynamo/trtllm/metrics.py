@@ -31,9 +31,10 @@ This module adds metrics that have no engine/runtime/frontend equivalent:
 """
 
 import logging
+import time
 from datetime import timedelta
 
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 from dynamo.prometheus_names import trtllm_additional as metric_names
 
@@ -142,6 +143,46 @@ class AdditionalMetricsCollector:
             buckets=KV_TRANSFER_SPEED_BUCKETS,
         )
 
+        # --- Iteration-level gauges (updated from get_stats_async polling loop) ---
+        # These mirror the core queue/throughput metrics in SGLang and vLLM.
+        # The `disaggregation_mode` label ("prefill", "decode", "prefill_and_decode")
+        # disambiguates workers in P/D disaggregated deployments so PromQL queries
+        # can filter correctly (e.g. sum where disaggregation_mode=~"decode|prefill_and_decode").
+        self.num_requests_running = Gauge(
+            metric_names.NUM_REQUESTS_RUNNING,
+            "Number of requests actively executing in the engine this iteration",
+            labelnames=self._labelnames,
+        )
+        self.num_requests_waiting = Gauge(
+            metric_names.NUM_REQUESTS_WAITING,
+            "Number of requests waiting in the scheduler queue",
+            labelnames=self._labelnames,
+        )
+        self.num_context_requests = Gauge(
+            metric_names.NUM_CONTEXT_REQUESTS,
+            "Number of requests in context (prefill) phase this iteration",
+            labelnames=self._labelnames,
+        )
+        self.gen_throughput = Gauge(
+            metric_names.GEN_THROUGHPUT,
+            "Generation throughput in tokens/s computed over the stats polling window",
+            labelnames=self._labelnames,
+        )
+        self.prompt_tokens_total = Counter(
+            metric_names.PROMPT_TOKENS_TOTAL,
+            "Cumulative prompt tokens processed by this worker",
+            labelnames=self._labelnames,
+        )
+        self.generation_tokens_total = Counter(
+            metric_names.GENERATION_TOKENS_TOTAL,
+            "Cumulative generation tokens produced by this worker",
+            labelnames=self._labelnames,
+        )
+
+        # Internal state for throughput and counter delta computation
+        self._last_throughput_ts: float = time.monotonic()
+        self._last_gen_tokens: int = 0
+
         logger.info("AdditionalMetricsCollector initialized")
 
     # --- Request helpers ---
@@ -165,6 +206,57 @@ class AdditionalMetricsCollector:
     def record_kv_transfer_success(self):
         """Increment the KV transfer success counter."""
         self.kv_transfer_success.labels(*self._labelvalues).inc()
+
+    def update_from_iteration_stats(self, stat: dict) -> None:
+        """Update iteration-level gauges and counters from a get_stats_async() result.
+
+        Called once per stats poll iteration alongside MetricsCollector.log_iteration_stats().
+        The stat dict mirrors the /metrics JSON schema from TRT-LLM's executor.
+
+        In P/D disaggregated deployments each worker only sees its own phase:
+        - prefill worker: numContextRequests is active, numGeneratedTokens is ~0
+        - decode worker: numActiveRequests drives gen_throughput, numContextRequests is ~0
+        Use the `disaggregation_mode` label to filter correctly in PromQL.
+
+        Args:
+            stat: Iteration stats dict from engine.llm.get_stats_async().
+        """
+        try:
+            lv = self._labelvalues
+
+            # Queue state
+            num_active = stat.get("numActiveRequests", 0)
+            num_queued = stat.get("numQueuedRequests", 0)
+            num_context = stat.get("numContextRequests", 0)
+            self.num_requests_running.labels(*lv).set(num_active)
+            self.num_requests_waiting.labels(*lv).set(num_queued)
+            self.num_context_requests.labels(*lv).set(num_context)
+
+            # Token counters — increment by delta since last poll
+            total_prompt = stat.get("numPromptTokens", 0)
+            total_gen = stat.get("numGeneratedTokens", 0)
+
+            # Counters can only go forward; guard against resets or missing fields
+            if total_prompt > 0:
+                self.prompt_tokens_total.labels(*lv).inc(max(0, total_prompt))
+            gen_delta = max(0, total_gen - self._last_gen_tokens)
+            if gen_delta > 0:
+                self.generation_tokens_total.labels(*lv).inc(gen_delta)
+
+            # Generation throughput: tokens/s over the wall-clock interval
+            now = time.monotonic()
+            elapsed = now - self._last_throughput_ts
+            if elapsed > 0 and gen_delta > 0:
+                self.gen_throughput.labels(*lv).set(gen_delta / elapsed)
+            elif elapsed > 0 and num_active == 0:
+                # No active requests — throughput is 0
+                self.gen_throughput.labels(*lv).set(0.0)
+
+            self._last_gen_tokens = total_gen
+            self._last_throughput_ts = now
+
+        except Exception as e:
+            logger.warning("update_from_iteration_stats failed: %s", e)
 
     def record_kv_transfer_perf(self, timing_metrics) -> bool:
         """Record KV transfer performance from RequestPerfMetrics.timing_metrics.
