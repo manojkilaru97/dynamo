@@ -33,6 +33,7 @@ class DynamoRuntimeConfig(ConfigBase):
     # - None: No auto-generation, require explicit enable_thinking in request
     dyn_enable_thinking_default: Optional[bool] = None
     dyn_prompt_injects_thinking_tag: bool = False
+    exclude_tools_when_tool_choice_none: bool = True
     custom_jinja_template: Optional[str] = None
     endpoint_types: str
     dump_config_to: Optional[str] = None
@@ -170,6 +171,15 @@ class DynamoRuntimeArgGroup(ArgGroup):
                 "duplicate <think> that causes model degeneration with guided decoding."
             ),
             type=lambda x: x.lower() in ("true", "1", "yes"),
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--exclude-tools-when-tool-choice-none",
+            env_var="DYN_EXCLUDE_TOOLS_WHEN_TOOL_CHOICE_NONE",
+            default=True,
+            help="Exclude tool definitions from the chat template when tool_choice=\'none\'. "
+                 "Prevents models from generating raw XML tool calls in the content field. "
+                 "See: https://github.com/ai-dynamo/dynamo/pull/7391",
         )
         add_argument(
             g,

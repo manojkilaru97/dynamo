@@ -83,7 +83,11 @@ class FrontendConfig(ConfigBase):
     event_plane: str
     chat_processor: str
     enable_anthropic_api: bool
+    strip_anthropic_preamble: bool
     debug_perf: bool
+    enable_streaming_tool_dispatch: bool
+    enable_streaming_reasoning_dispatch: bool
+    exclude_tools_when_tool_choice_none: bool
     preprocess_workers: int
 
     def validate(self) -> None:
@@ -526,6 +530,51 @@ class FrontendArgGroup(ArgGroup):
             help=(
                 "[EXPERIMENTAL] Enable Anthropic Messages API endpoint (/v1/messages). "
                 "This feature is experimental and may change."
+            ),
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--strip-anthropic-preamble",
+            env_var="DYN_STRIP_ANTHROPIC_PREAMBLE",
+            default=False,
+            help=(
+                "Strip the Claude Code billing preamble (x-anthropic-billing-header) "
+                "from the system prompt. Saves tokens and improves prompt caching."
+            ),
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--enable-streaming-tool-dispatch",
+            env_var="DYN_ENABLE_STREAMING_TOOL_DISPATCH",
+            default=False,
+            help=(
+                "[EXPERIMENTAL] Enable streaming tool call dispatch. Emits "
+                "'event: tool_call_dispatch' SSE events on /v1/chat/completions "
+                "for each complete tool call before finish_reason arrives. "
+                "Can be combined with --enable-streaming-reasoning-dispatch."
+            ),
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--enable-streaming-reasoning-dispatch",
+            env_var="DYN_ENABLE_STREAMING_REASONING_DISPATCH",
+            default=False,
+            help=(
+                "[EXPERIMENTAL] Enable streaming reasoning dispatch. Emits a "
+                "single 'event: reasoning_dispatch' SSE event on /v1/chat/completions "
+                "with the complete reasoning block once thinking ends. "
+                "Can be combined with --enable-streaming-tool-dispatch."
+            ),
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--exclude-tools-when-tool-choice-none",
+            env_var="DYN_EXCLUDE_TOOLS_WHEN_TOOL_CHOICE_NONE",
+            default=True,
+            help=(
+                "Exclude tool definitions from the chat template when "
+                "tool_choice='none'. Prevents models from generating raw XML "
+                "tool calls in the content field."
             ),
         )
         add_argument(
