@@ -305,8 +305,9 @@ class Publisher:
         component_gauges: LLMBackendMetrics,
         zmq_endpoint: Optional[str] = None,
         enable_local_indexer: bool = False,
-        metrics_collector=None,
-    ):
+        metrics_collector: Any = None,
+        additional_metrics: Any = None,
+    ) -> None:
         self.endpoint = endpoint
         self.engine = engine
         self.worker_id = worker_id
@@ -316,6 +317,7 @@ class Publisher:
         self.component_gauges = component_gauges
         self.enable_local_indexer = enable_local_indexer
         self.metrics_collector = metrics_collector
+        self.additional_metrics = additional_metrics
         self.attention_dp_size = engine.get_attention_dp_size()
 
         # The first few kv events from the model engine are always "created" type events.
@@ -494,6 +496,13 @@ class Publisher:
                     self.metrics_collector.log_iteration_stats(stat)
                 except Exception as e:
                     logging.warning(f"Failed to log iteration stats: {e}")
+
+            # Update additional iteration-level gauges (queue depths, token counters,
+            # gen_throughput). These are the metrics needed for SGLang/vLLM parity.
+            # In P/D disaggregated mode the disaggregation_mode label on each metric
+            # identifies whether this is a prefill or decode worker.
+            if self.additional_metrics is not None:
+                self.additional_metrics.update_from_iteration_stats(stat)
 
         await self._polling_loop(
             lambda: self.engine.llm.get_stats_async(timeout=_STATS_TIMEOUT_SEC),
@@ -776,8 +785,9 @@ async def get_publisher(
     component_gauges: LLMBackendMetrics,
     zmq_endpoint: Optional[str] = None,
     enable_local_indexer: bool = False,
-    metrics_collector=None,
-):
+    metrics_collector: Any = None,
+    additional_metrics: Any = None,
+) -> AsyncGenerator[Publisher, None]:
     publisher = Publisher(
         endpoint,
         engine,
@@ -788,6 +798,7 @@ async def get_publisher(
         zmq_endpoint=zmq_endpoint,
         enable_local_indexer=enable_local_indexer,
         metrics_collector=metrics_collector,
+        additional_metrics=additional_metrics,
     )
     try:
         publisher.initialize()

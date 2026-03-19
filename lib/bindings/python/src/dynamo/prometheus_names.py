@@ -274,6 +274,75 @@ class task_tracker:
     # Total number of rejected tasks
     TASKS_REJECTED_TOTAL = "tasks_rejected_total"
 
+class tokio_perf:
+    """Tokio runtime metrics"""
+
+    WORKER_MEAN_POLL_TIME_NS = "worker_mean_poll_time_ns"
+    GLOBAL_QUEUE_DEPTH = "global_queue_depth"
+    BUDGET_FORCED_YIELD_TOTAL = "budget_forced_yield_total"
+    WORKER_BUSY_RATIO = "worker_busy_ratio"
+    WORKER_PARK_COUNT_TOTAL = "worker_park_count_total"
+    WORKER_LOCAL_QUEUE_DEPTH = "worker_local_queue_depth"
+    WORKER_STEAL_COUNT_TOTAL = "worker_steal_count_total"
+    WORKER_OVERFLOW_COUNT_TOTAL = "worker_overflow_count_total"
+    BLOCKING_THREADS = "blocking_threads"
+    BLOCKING_IDLE_THREADS = "blocking_idle_threads"
+    BLOCKING_QUEUE_DEPTH = "blocking_queue_depth"
+    ALIVE_TASKS = "alive_tasks"
+
+
+class transport:
+    """Transport-specific metrics (TCP / NATS)"""
+
+    # NOTE: Nested classes added manually because the codegen does not yet
+    # handle Rust submodules (see TODO in prometheus_parser.rs).
+    # Re-running gen-python-prometheus-names will overwrite this file and
+    # lose these classes until the codegen is updated.
+
+    class tcp:
+        POOL_ACTIVE = "tcp_pool_active"
+        POOL_IDLE = "tcp_pool_idle"
+        BYTES_SENT_TOTAL = "tcp_bytes_sent_total"
+        BYTES_RECEIVED_TOTAL = "tcp_bytes_received_total"
+        ERRORS_TOTAL = "tcp_errors_total"
+        SERVER_QUEUE_DEPTH = "tcp_server_queue_depth"
+
+    class nats:
+        ERRORS_TOTAL = "nats_errors_total"
+
+
+class trtllm_additional:
+    """Additional TRT-LLM worker metrics beyond what the engine natively provides."""
+
+    # Total number of aborted/cancelled requests
+    NUM_ABORTED_REQUESTS_TOTAL = "trtllm_num_aborted_requests_total"
+    # Total number of requests containing image content
+    REQUEST_TYPE_IMAGE_TOTAL = "trtllm_request_type_image_total"
+    # Total number of requests using guided/structured decoding
+    REQUEST_TYPE_STRUCTURED_OUTPUT_TOTAL = "trtllm_request_type_structured_output_total"
+    # Total number of successful KV cache transfers
+    KV_TRANSFER_SUCCESS_TOTAL = "trtllm_kv_transfer_success_total"
+    # KV cache transfer latency per request in seconds
+    KV_TRANSFER_LATENCY_SECONDS = "trtllm_kv_transfer_latency_seconds"
+    # KV cache transfer size per request in bytes
+    KV_TRANSFER_BYTES = "trtllm_kv_transfer_bytes"
+    # KV cache transfer speed per request in GB/s
+    KV_TRANSFER_SPEED_GB_S = "trtllm_kv_transfer_speed_gb_s"
+
+    # --- Iteration-level gauges (updated every stats poll from get_stats_async) ---
+    # Requests actively being executed by the engine this iteration
+    NUM_REQUESTS_RUNNING = "trtllm_num_requests_running"
+    # Requests waiting in the scheduler queue
+    NUM_REQUESTS_WAITING = "trtllm_num_requests_waiting"
+    # Requests in context (prefill) phase this iteration
+    NUM_CONTEXT_REQUESTS = "trtllm_num_context_requests"
+    # Generation throughput (tokens/s) computed over the stats window
+    GEN_THROUGHPUT = "trtllm_gen_throughput"
+    # Cumulative prompt tokens processed by this worker
+    PROMPT_TOKENS_TOTAL = "trtllm_prompt_tokens_total"
+    # Cumulative generation tokens produced by this worker
+    GENERATION_TOKENS_TOTAL = "trtllm_generation_tokens_total"
+
 
 class work_handler:
     """Work handler Prometheus metric names"""
