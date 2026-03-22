@@ -14,12 +14,14 @@ fn work_handler_metric_name(suffix: &str) -> String {
     format!("{}_{}", name_prefix::WORK_HANDLER, suffix)
 }
 
-/// Network transit: frontend send to backend receive (wall-clock, cross-process).
+/// Egress latency: frontend serialization-start to worker handle_payload entry (wall-clock).
+/// Includes request serialization + codec encoding + network transit. The timestamp is
+/// embedded in the serialized bytes so it cannot be deferred to post-encoding.
 pub static WORK_HANDLER_NETWORK_TRANSIT_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     Histogram::with_opts(
         HistogramOpts::new(
             work_handler_metric_name(work_handler::NETWORK_TRANSIT_SECONDS),
-            "Frontend-to-backend network transit time (cross-process wall-clock, seconds)",
+            "Frontend serialization-start to worker receive: serialize + network transit (seconds)",
         )
         .buckets(vec![
             0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,

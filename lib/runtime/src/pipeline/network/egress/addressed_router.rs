@@ -21,8 +21,12 @@ use crate::protocols::maybe_error::MaybeError;
 use anyhow::{Error, Result};
 use serde::Deserialize;
 use serde::Serialize;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_stream::{StreamExt, StreamNotifyClose, wrappers::ReceiverStream};
 use tracing::Instrument;
+
+use crate::metrics::request_plane::REQUEST_PLANE_SEND_SECONDS;
+use crate::metrics::request_plane::REQUEST_PLANE_SERIALIZE_SECONDS;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +48,12 @@ struct RequestControlMessage {
     request_type: RequestType,
     response_type: ResponseType,
     connection_info: ConnectionInfo,
+    /// Unix epoch nanoseconds stamped at the start of serialization (co-located with
+    /// serialize_start). Read by the worker to compute egress latency (serialization +
+    /// network transit). Cannot be stamped after serialization because the value is
+    /// baked into the encoded bytes.
+    #[serde(default)]
+    sent_at_unix_ns: u64,
 }
 
 pub struct AddressedRequest<T> {
@@ -125,11 +135,24 @@ where
         // used to issue the request on the
         // todo -- this object should be automatically created by the register call, and achieved by to the two into_parts()
         // calls. all the information here is provided by the [`StreamOptions`] object and/or the dataplane object
+        // Stamp both timers at the same instant: the start of the serialization + send path.
+        // sent_at_unix_ns is embedded in the wire message so the worker can compute network
+        // transit as (worker_recv_time - sent_at_unix_ns). Because the timestamp is baked into
+        // the serialized bytes, it cannot be re-stamped after encoding. Both serialize_seconds
+        // and work_handler_network_transit_seconds therefore start from this same boundary,
+        // which means network_transit_seconds includes serialization overhead (~sub-ms).
+        let serialize_start = std::time::Instant::now();
+        let sent_at_unix_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
         let control_message = RequestControlMessage {
             id: engine_ctx.id().to_string(),
             request_type: RequestType::SingleIn,
             response_type: ResponseType::ManyOut,
             connection_info,
+            sent_at_unix_ns,
         };
 
         // next build the two part message where we package the connection info and the request into
@@ -167,11 +190,15 @@ where
         let mut headers = std::collections::HashMap::new();
         inject_trace_headers_into_map(&mut headers);
 
+        REQUEST_PLANE_SERIALIZE_SECONDS.observe(serialize_start.elapsed().as_secs_f64());
+
         // Send request (works for all transport types)
+        let send_start = std::time::Instant::now();
         let _response = self
             .req_client
             .send_request(address, buffer, headers)
             .await?;
+        REQUEST_PLANE_SEND_SECONDS.observe(send_start.elapsed().as_secs_f64());
 
         tracing::trace!(request_id, "awaiting transport handshake");
         let response_stream = response_stream_provider

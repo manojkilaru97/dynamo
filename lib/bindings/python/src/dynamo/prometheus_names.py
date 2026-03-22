@@ -260,8 +260,10 @@ class name_prefix:
 class request_plane:
     """Request plane metrics at AddressedPushRouter"""
 
-    # Time from generate() entry to send_request() (serialization + encoding)
-    QUEUE_SECONDS = "queue_seconds"
+    # Time from generate() entry to send_request(): JSON serialization of
+    # RequestControlMessage + request body + TwoPartMessage encoding + trace headers.
+    # Pure CPU work; no network I/O.
+    SERIALIZE_SECONDS = "serialize_seconds"
     # Time for send_request() to complete (frontend view: network + queue + ack)
     SEND_SECONDS = "send_seconds"
     # Time from send_request() to first response item (transport roundtrip TTFT)

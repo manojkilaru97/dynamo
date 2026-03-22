@@ -551,8 +551,10 @@ pub mod kvindexer {
 
 /// Request plane metrics at AddressedPushRouter
 pub mod request_plane {
-    /// Time from generate() entry to send_request() (serialization + encoding)
-    pub const QUEUE_SECONDS: &str = "queue_seconds";
+    /// Time from generate() entry to send_request(): JSON serialization of
+    /// RequestControlMessage + request body + TwoPartMessage encoding + trace headers.
+    /// Pure CPU work; no network I/O.
+    pub const SERIALIZE_SECONDS: &str = "serialize_seconds";
     /// Time for send_request() to complete (frontend view: network + queue + ack)
     pub const SEND_SECONDS: &str = "send_seconds";
     /// Time from send_request() to first response item (transport roundtrip TTFT)

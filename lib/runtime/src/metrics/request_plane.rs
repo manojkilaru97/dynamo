@@ -14,18 +14,18 @@ fn request_plane_metric_name(suffix: &str) -> String {
     format!("{}_{}", name_prefix::REQUEST_PLANE, suffix)
 }
 
-/// Time from generate() entry to send_request() (serialization + encoding + control message).
-pub static REQUEST_PLANE_QUEUE_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+/// JSON serialization of request + control message + TwoPartMessage encoding before send_request().
+pub static REQUEST_PLANE_SERIALIZE_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     Histogram::with_opts(
         HistogramOpts::new(
-            request_plane_metric_name(request_plane::QUEUE_SECONDS),
-            "Time from generate() entry to send_request() (seconds)",
+            request_plane_metric_name(request_plane::SERIALIZE_SECONDS),
+            "Time to serialize and encode request before send_request() (seconds)",
         )
         .buckets(vec![
             0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
         ]),
     )
-    .expect("request_plane_queue_seconds histogram")
+    .expect("request_plane_serialize_seconds histogram")
 });
 
 /// Time for send_request() to complete (frontend view: network + queue + ack).
@@ -77,8 +77,8 @@ static PROMETHEUS_REGISTERED: OnceCell<Result<(), String>> = OnceCell::new();
 pub fn ensure_request_plane_metrics_registered(registry: &MetricsRegistry) {
     let _ = METRICS_REGISTERED.get_or_init(|| {
         registry.add_metric_or_warn(
-            Box::new(REQUEST_PLANE_QUEUE_SECONDS.clone()),
-            "request_plane_queue_seconds",
+            Box::new(REQUEST_PLANE_SERIALIZE_SECONDS.clone()),
+            "request_plane_serialize_seconds",
         );
         registry.add_metric_or_warn(
             Box::new(REQUEST_PLANE_SEND_SECONDS.clone()),
@@ -103,7 +103,7 @@ pub fn ensure_request_plane_metrics_registered_prometheus(
     PROMETHEUS_REGISTERED
         .get_or_init(|| {
             (|| -> Result<(), prometheus::Error> {
-                registry.register(Box::new(REQUEST_PLANE_QUEUE_SECONDS.clone()))?;
+                registry.register(Box::new(REQUEST_PLANE_SERIALIZE_SECONDS.clone()))?;
                 registry.register(Box::new(REQUEST_PLANE_SEND_SECONDS.clone()))?;
                 registry.register(Box::new(REQUEST_PLANE_ROUNDTRIP_TTFT_SECONDS.clone()))?;
                 registry.register(Box::new(REQUEST_PLANE_INFLIGHT.clone()))?;

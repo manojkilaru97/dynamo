@@ -21,6 +21,7 @@ use crate::endpoint_type::EndpointType;
 use crate::kv_router::metrics::{
     RoutingOverheadMetrics, register_router_queue_metrics, register_worker_load_metrics,
 };
+use dynamo_runtime::metrics::request_plane::ensure_request_plane_metrics_registered_prometheus;
 use crate::request_template::RequestTemplate;
 use anyhow::Result;
 use axum_server::tls_rustls::RustlsConfig;
@@ -452,6 +453,12 @@ impl HttpServiceConfigBuilder {
         // These are updated by KvScheduler on enqueue/update/free
         if let Err(e) = register_router_queue_metrics(&registry) {
             tracing::warn!("Failed to register router queue metrics: {}", e);
+        }
+
+        // Register request-plane metrics (queue/send/roundtrip latency histograms).
+        // These are observed by AddressedPushRouter on every outbound request.
+        if let Err(e) = ensure_request_plane_metrics_registered_prometheus(&registry) {
+            tracing::warn!("Failed to register request plane metrics: {}", e);
         }
 
         if let Some(ref discovery) = config.drt_discovery {
