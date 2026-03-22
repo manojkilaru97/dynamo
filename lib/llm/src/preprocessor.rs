@@ -227,9 +227,17 @@ impl OpenAIPreprocessor {
         tracker: Option<&RequestTracker>,
     ) -> Result<(PreprocessedRequest, HashMap<String, String>)> {
         let mut builder = self.builder(request)?;
+        let template_start = Instant::now();
         let formatted_prompt = self
             .apply_template(request)
             .with_context(|| "Failed to apply prompt template")?;
+        // Observe only when the Jinja template was actually rendered (chat requests).
+        // Completions/raw-prompt requests return None and are not counted.
+        if formatted_prompt.is_some() {
+            dynamo_runtime::metrics::frontend_perf::TEMPLATE_SECONDS
+                .observe(template_start.elapsed().as_secs_f64());
+        }
+
         let annotations = self
             .gather_tokens(request, &mut builder, formatted_prompt.clone(), tracker)
             .with_context(|| "Failed to gather tokens")?;

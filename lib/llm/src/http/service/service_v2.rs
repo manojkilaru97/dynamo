@@ -21,6 +21,7 @@ use crate::endpoint_type::EndpointType;
 use crate::kv_router::metrics::{
     RoutingOverheadMetrics, register_router_queue_metrics, register_worker_load_metrics,
 };
+use dynamo_runtime::metrics::frontend_perf::ensure_frontend_perf_metrics_registered_prometheus;
 use dynamo_runtime::metrics::request_plane::ensure_request_plane_metrics_registered_prometheus;
 use crate::request_template::RequestTemplate;
 use anyhow::Result;
@@ -435,7 +436,13 @@ impl HttpServiceConfigBuilder {
             tracing::warn!("Failed to register router queue metrics: {}", e);
         }
 
-        // Register request-plane metrics (queue/send/roundtrip latency histograms).
+        // Register frontend pipeline perf metrics (template_seconds, tokenize_seconds, etc.).
+        // template_seconds is observed in preprocessor.rs on every chat request.
+        if let Err(e) = ensure_frontend_perf_metrics_registered_prometheus(&registry) {
+            tracing::warn!("Failed to register frontend perf metrics: {}", e);
+        }
+
+        // Register request-plane metrics (serialize/send/roundtrip latency histograms).
         // These are observed by AddressedPushRouter on every outbound request.
         if let Err(e) = ensure_request_plane_metrics_registered_prometheus(&registry) {
             tracing::warn!("Failed to register request plane metrics: {}", e);
