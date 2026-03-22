@@ -274,6 +274,11 @@ struct RequestControlMessage {
     request_type: RequestType,
     response_type: ResponseType,
     connection_info: ConnectionInfo,
+    /// Unix epoch nanoseconds stamped at the start of serialization on the frontend.
+    /// Used by the worker to compute egress latency (serialization + network transit).
+    /// Zero when received from an older frontend that does not populate this field.
+    #[serde(default)]
+    sent_at_unix_ns: u64,
 }
 
 pub struct Ingress<Req: PipelineIO, Resp: PipelineIO> {

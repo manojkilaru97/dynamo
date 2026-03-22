@@ -7,6 +7,8 @@
 //! with automatic label injection and hierarchical naming support.
 
 pub mod prometheus_names;
+pub mod request_plane;
+pub mod work_handler_perf;
 
 use parking_lot::Mutex;
 use std::collections::HashSet;

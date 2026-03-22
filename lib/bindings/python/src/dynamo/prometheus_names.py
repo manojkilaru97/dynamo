@@ -204,6 +204,31 @@ class name_prefix:
     FRONTEND = "dynamo_frontend"
     # Prefix for KV router metrics (used with router_id label)
     ROUTER = "dynamo_router"
+    # Prefix for tokio runtime metrics
+    TOKIO = "dynamo_tokio"
+    # Prefix for standalone KV indexer metrics
+    KVINDEXER = "dynamo_kvindexer"
+    # Prefix for request-plane metrics at AddressedPushRouter
+    REQUEST_PLANE = "dynamo_request_plane"
+    # Prefix for transport-layer metrics (TCP / NATS)
+    TRANSPORT = "dynamo_transport"
+    # Prefix for work-handler transport breakdown metrics (backend side)
+    WORK_HANDLER = "dynamo_work_handler"
+
+
+class request_plane:
+    """Request plane metrics at AddressedPushRouter"""
+
+    # Time from generate() entry to send_request(): JSON serialization of
+    # RequestControlMessage + request body + TwoPartMessage encoding + trace headers.
+    # Pure CPU work; no network I/O.
+    SERIALIZE_SECONDS = "serialize_seconds"
+    # Time for send_request() to complete (frontend view: network + queue + ack)
+    SEND_SECONDS = "send_seconds"
+    # Time from send_request() to first response item (transport roundtrip TTFT)
+    ROUNDTRIP_TTFT_SECONDS = "roundtrip_ttft_seconds"
+    # Currently in-flight requests (gauge)
+    INFLIGHT_REQUESTS = "inflight_requests"
 
 
 class router_request:

@@ -4,11 +4,16 @@
 use super::*;
 
 use crate::metrics::prometheus_names::work_handler;
+use crate::metrics::work_handler_perf::{
+    WORK_HANDLER_NETWORK_TRANSIT_SECONDS, WORK_HANDLER_TIME_TO_FIRST_RESPONSE_SECONDS,
+    ensure_work_handler_perf_metrics_registered,
+};
+use crate::metrics::MetricsHierarchy;
 use crate::protocols::maybe_error::MaybeError;
 use prometheus::{Histogram, IntCounter, IntCounterVec, IntGauge};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::Instrument;
 use tracing::info_span;
 
@@ -86,6 +91,10 @@ impl WorkHandlerMetrics {
             &[work_handler::ERROR_TYPE_LABEL],
             metrics_labels,
         )?;
+
+        // Register network transit + time-to-first-response histograms with the endpoint's
+        // DRT MetricsRegistry so they appear in the worker's /metrics scrape.
+        ensure_work_handler_perf_metrics_registered(endpoint.get_metrics_registry());
 
         Ok(Self::new(
             request_counter,
@@ -194,6 +203,18 @@ where
             }
         };
 
+        // Observe network transit: wall-clock delta from FE send to worker receive.
+        // Only valid when the sender populated sent_at_unix_ns (non-zero).
+        if control_msg.sent_at_unix_ns > 0 {
+            let recv_unix_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let transit_secs =
+                recv_unix_ns.saturating_sub(control_msg.sent_at_unix_ns) as f64 / 1e9;
+            WORK_HANDLER_NETWORK_TRANSIT_SECONDS.observe(transit_secs);
+        }
+
         // extend request with context
         tracing::trace!("received control message: {:?}", control_msg);
         tracing::trace!("received request: {:?}", request);
@@ -238,6 +259,8 @@ where
             Ok(stream) => {
                 tracing::trace!("Successfully generated response stream; sending prologue");
                 let _result = publisher.send_prologue(None).await;
+                WORK_HANDLER_TIME_TO_FIRST_RESPONSE_SECONDS
+                    .observe(start_time.elapsed().as_secs_f64());
                 stream
             }
             Err(e) => {
