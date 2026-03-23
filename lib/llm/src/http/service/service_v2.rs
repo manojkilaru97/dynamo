@@ -491,6 +491,15 @@ impl HttpServiceConfigBuilder {
         router = router.layer(
             TraceLayer::new_for_http()
                 .make_span_with(make_request_span)
+                .on_request(
+                    |request: &axum::http::Request<Body>, _span: &tracing::Span| {
+                        tracing::info!(
+                            method = %request.method(),
+                            uri = %request.uri(),
+                            "request received"
+                        );
+                    },
+                )
                 .on_response(
                     |response: &Response<Body>, latency: Duration, _span: &tracing::Span| {
                         let status = response.status();
@@ -509,7 +518,7 @@ impl HttpServiceConfigBuilder {
                                 "request completed with client request error"
                             );
                         } else {
-                            tracing::debug!(
+                            tracing::info!(
                                 status = %status.as_u16(),
                                 latency_ms = %latency_ms,
                                 "request completed"
