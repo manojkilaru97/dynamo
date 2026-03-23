@@ -239,6 +239,11 @@ pub struct ModelDeploymentCard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lora: Option<LoraInfo>,
 
+    /// Additional names this model responds to (aliases).
+    /// Requests using any of these names will be routed to this worker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+
     /// User-defined metadata for custom worker behavior
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_data: Option<serde_json::Value>,
@@ -432,6 +437,11 @@ impl ModelDeploymentCard {
 
     pub fn source_path(&self) -> &str {
         self.source_path.as_ref().unwrap_or(&self.display_name)
+    }
+
+    /// Set additional names (aliases) this model responds to.
+    pub fn set_aliases(&mut self, aliases: Vec<String>) {
+        self.aliases = aliases;
     }
 
     /// Build an in-memory ModelDeploymentCard from a folder containing config.json,

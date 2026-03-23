@@ -132,7 +132,10 @@ def _log_config_info_from_engine_args(
         # Model config
         model_config = {
             "model": str(config.model),
-            "served_model_name": str(config.served_model_name or config.model),
+            "served_model_name": str(
+                (config.served_model_name[0] if config.served_model_name else None)
+                or config.model
+            ),
             "backend": str(engine_args.get("backend", "pytorch")),
             "dtype": str(engine_args.get("dtype", "auto")),
             "disaggregation_mode": disagg_mode,
@@ -271,6 +274,17 @@ async def init_llm_worker(
         shutdown_event: Event to signal shutdown.
         shutdown_endpoints: Optional list to populate with endpoints for graceful shutdown.
     """
+
+    # Normalize served_model_name: handles string (from env var) and list (from CLI nargs).
+    if isinstance(config.served_model_name, str):
+        names = [
+            n.strip()
+            for n in config.served_model_name.replace(",", " ").split()
+            if n.strip()
+        ]
+        config.served_model_name = names if names else None
+    elif isinstance(config.served_model_name, (list, tuple)):
+        config.served_model_name = list(config.served_model_name) or None
 
     encode_client = None
     if config.encode_endpoint:
@@ -475,8 +489,9 @@ async def init_llm_worker(
         config.dump_config_to, {"engine_args": engine_args, "dynamo_args": config}
     )
 
-    # Prepare model name for metrics
-    model_name_for_metrics = config.served_model_name or config.model
+    # Prepare model name for metrics (use primary name only)
+    _primary_served_name = config.served_model_name[0] if config.served_model_name else None
+    model_name_for_metrics = _primary_served_name or config.model
 
     # Construct Prometheus gauges directly; passed through to the engine and publisher
     # via explicit parameters (no module-level global).
@@ -640,16 +655,21 @@ async def init_llm_worker(
         # Encode workers do NOT register - they're internal workers only
         # Prefill and decode workers register - frontend detects their role via ModelType
         if config.disaggregation_mode != DisaggregationMode.ENCODE:
+            _primary_name = (
+                config.served_model_name[0] if config.served_model_name else None
+            )
+            _aliases = config.served_model_name[1:] if config.served_model_name else []
             await register_model(
                 model_input,
                 model_type,
                 endpoint,
                 config.model,
-                config.served_model_name,
+                _primary_name,
                 context_length=config.max_seq_len,
                 kv_cache_block_size=config.kv_block_size,
                 runtime_config=runtime_config,
                 custom_template_path=config.custom_jinja_template,
+                model_aliases=_aliases if _aliases else None,
             )
 
         # Get health check payload (checks env var and falls back to TensorRT-LLM default)
@@ -659,7 +679,9 @@ async def init_llm_worker(
             # Initialize and pass in the publisher to the request handler to
             # publish events and metrics.
             # Use model as fallback if served_model_name is not provided
-            model_name_for_metrics = config.served_model_name or config.model
+            model_name_for_metrics = (
+                config.served_model_name[0] if config.served_model_name else None
+            ) or config.model
             metrics_labels = [
                 (
                     prometheus_names.labels.MODEL,

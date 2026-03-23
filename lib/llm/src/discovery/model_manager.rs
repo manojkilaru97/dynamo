@@ -137,6 +137,18 @@ impl ModelManager {
         model.add_worker_set(namespace.to_string(), Arc::new(worker_set))
     }
 
+    /// Add an already-Arc-wrapped WorkerSet to a Model. Creates the Model if it doesn't exist.
+    /// Used to register the same WorkerSet under multiple model names (aliases).
+    pub fn add_worker_set_arc(
+        &self,
+        model_name: &str,
+        namespace: &str,
+        worker_set: Arc<WorkerSet>,
+    ) -> Result<(), ModelManagerError> {
+        let model = self.get_or_create_model(model_name);
+        model.add_worker_set(namespace.to_string(), worker_set)
+    }
+
     /// Remove a WorkerSet from a Model. Removes the Model if it becomes empty.
     pub fn remove_worker_set(&self, model_name: &str, namespace: &str) -> Option<Arc<WorkerSet>> {
         let model = self.models.get(model_name)?;

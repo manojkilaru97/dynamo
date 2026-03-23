@@ -3,7 +3,8 @@
 
 """Dynamo TRT-LLM backend configuration ArgGroup."""
 
-from typing import Optional
+import argparse
+from typing import List, Optional
 
 from tensorrt_llm.llmapi import BuildConfig
 
@@ -41,7 +42,11 @@ class DynamoTrtllmArgGroup(ArgGroup):
             flag_name="--served-model-name",
             env_var="DYN_TRTLLM_SERVED_MODEL_NAME",
             default=None,
-            help="Name to serve the model under. Defaults to deriving it from model path.",
+            help="Name(s) to serve the model under. Accepts one or more names. "
+            "The first name is the primary; additional names are aliases. "
+            "Defaults to deriving it from model path.",
+            nargs="+",
+            arg_type=None,
         )
         add_argument(
             g,
@@ -444,7 +449,7 @@ class DynamoTrtllmConfig(ConfigBase):
     """Configuration for Dynamo TRT-LLM backend-specific options."""
 
     model: str
-    served_model_name: Optional[str] = None
+    served_model_name: Optional[List[str]] = None
 
     tensor_parallel_size: int
     pipeline_parallel_size: int
