@@ -701,6 +701,7 @@ impl ModelDeploymentCard {
             model_type: Default::default(),  // set later
             model_input: Default::default(), // set later
             lora: None,
+            aliases: Vec::new(),
             user_data: None,
             runtime_config: ModelRuntimeConfig::default(),
             media_decoder: None,
