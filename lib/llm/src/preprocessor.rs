@@ -1250,9 +1250,9 @@ impl
             h.set_request(std::sync::Arc::new(request.clone()));
         }
 
-        // For non-streaming requests (stream=false), enable usage by default
-        // This ensures compliance with OpenAI API spec where non-streaming responses
-        // always include usage statistics
+        // Enable usage tracking for all requests (streaming and non-streaming).
+        // For streaming this emits a final usage-only SSE chunk; for non-streaming
+        // the usage field is included in the response object.
         request.enable_usage_for_nonstreaming(original_stream_flag);
 
         // Set stream=true for internal processing (after audit capture)
@@ -1366,9 +1366,9 @@ impl
         // Preserve original streaming flag
         let original_stream_flag = request.inner.stream.unwrap_or(false);
 
-        // For non-streaming requests (stream=false), enable usage by default
-        // This ensures compliance with OpenAI API spec where non-streaming responses
-        // always include usage statistics
+        // Enable usage tracking for all requests (streaming and non-streaming).
+        // For streaming this emits a final usage-only SSE chunk; for non-streaming
+        // the usage field is included in the response object.
         request.enable_usage_for_nonstreaming(original_stream_flag);
 
         request.inner.stream = Some(true);
