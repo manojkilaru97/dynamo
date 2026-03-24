@@ -42,6 +42,9 @@ pub mod logging {
     /// Enable span event logging (create/close events)
     pub const DYN_LOGGING_SPAN_EVENTS: &str = "DYN_LOGGING_SPAN_EVENTS";
 
+    /// Enable OTEL payload logging for LLM request/response data (set to "1" to enable)
+    pub const DYNAMO_LOG_PAYLOADS: &str = "DYNAMO_LOG_PAYLOADS";
+
     /// OTLP (OpenTelemetry Protocol) tracing and logging configuration
     pub mod otlp {
         /// Enable OTLP export for traces and logs (set to "1" to enable)
