@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt::Display,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -506,14 +506,62 @@ async fn completions_single(
     if streaming {
         // For streaming, we'll drop the http_queue_guard on the first token
         let mut http_queue_guard = Some(http_queue_guard);
+
+        // Payload log accumulators for streaming completions.
+        let log_payloads = log_payloads_enabled();
+        let mut payload_text_bufs: HashMap<u32, String> = HashMap::new();
+        let request_id_for_log = request_id.clone();
+        let model_for_log = model.clone();
+
         let stream = stream
             .map(move |response| {
+                // Accumulate text content for payload logging before response is consumed.
+                let mut is_final = false;
+                if log_payloads {
+                    if let Some(data) = &response.data {
+                        // data.inner is CreateCompletionResponse (NvCreateCompletionResponse
+                        // wraps it with #[serde(flatten)] but no Deref)
+                        for choice in &data.inner.choices {
+                            let buf = payload_text_bufs.entry(choice.index).or_default();
+                            if buf.len() < MAX_PAYLOAD_ACCUMULATE_BYTES {
+                                buf.push_str(&choice.text);
+                            }
+                            if choice.finish_reason.is_some() {
+                                is_final = true;
+                            }
+                        }
+                    }
+                }
+
                 // Calls observe_response() on each token
-                process_response_using_event_converter_and_observe_metrics(
+                let sse_result = process_response_using_event_converter_and_observe_metrics(
                     EventConverter::from(response),
                     &mut response_collector,
                     &mut http_queue_guard,
-                )
+                );
+
+                // Emit assembled payload log on the final chunk.
+                if is_final {
+                    let choices_json: Vec<serde_json::Value> = payload_text_bufs
+                        .iter()
+                        .map(|(idx, text)| serde_json::json!({ "index": idx, "text": text }))
+                        .collect();
+                    if let Ok(payload) =
+                        serde_json::to_string(&serde_json::json!({ "choices": choices_json }))
+                    {
+                        tracing::info!(
+                            target: PAYLOAD_LOG_TARGET,
+                            request_id = %request_id_for_log,
+                            model = %model_for_log,
+                            endpoint = "completions",
+                            streaming = true,
+                            payload_type = "response",
+                            payload = %payload,
+                        );
+                    }
+                }
+
+                sse_result
             })
             .filter_map(|result| {
                 use futures::future;
@@ -1003,6 +1051,150 @@ pub(super) async fn check_for_backend_error(
     }
 }
 
+/// Serialize `payload` and wrap it as an SSE event with the given name.
+fn make_dispatch_event(
+    event_name: &str,
+    payload: &impl serde::Serialize,
+) -> Option<Result<Event, axum::Error>> {
+    match serde_json::to_string(payload) {
+        Ok(json) => Some(Ok(Event::default().event(event_name).data(json))),
+        Err(e) => {
+            tracing::warn!("streaming_{event_name}: failed to serialize: {e}");
+            None
+        }
+    }
+}
+
+/// Emits early `event: tool_call_dispatch` SSE events for any complete tool calls found in a
+/// streaming response chunk, when `DYN_ENABLE_STREAMING_TOOL_DISPATCH` is enabled.
+///
+/// Dynamo backends emit each tool call as a single complete chunk (id + name + arguments
+/// all present), so we can dispatch immediately upon seeing the chunk rather than waiting
+/// for `finish_reason="tool_calls"` to arrive. Each event payload includes `choice_index`
+/// for correct disambiguation when `n > 1`.
+fn streaming_tool_dispatch_events(
+    response: &crate::types::Annotated<NvCreateChatCompletionStreamResponse>,
+    dispatched_ids: &mut HashSet<String>,
+) -> Vec<Result<Event, axum::Error>> {
+    let Some(data) = &response.data else {
+        return vec![];
+    };
+
+    let mut events = vec![];
+    for choice in &data.choices {
+        let Some(tool_calls) = &choice.delta.tool_calls else {
+            continue;
+        };
+        for chunk in tool_calls {
+            // Only dispatch when the tool call is fully formed (id + name + arguments)
+            let has_name_and_args = chunk
+                .function
+                .as_ref()
+                .is_some_and(|f| f.name.is_some() && f.arguments.is_some());
+
+            if let (true, Some(id)) = (has_name_and_args, &chunk.id) {
+                // Skip already-dispatched tool calls (dedup guard, matches
+                // the stopped/done flags in Anthropic/Responses converters).
+                if !dispatched_ids.insert(id.clone()) {
+                    continue;
+                }
+                let payload = serde_json::json!({
+                    "choice_index": choice.index,
+                    "tool_call": chunk,
+                });
+                events.extend(make_dispatch_event("tool_call_dispatch", &payload));
+            }
+        }
+    }
+    events
+}
+
+/// Accumulates reasoning tokens and emits a single `event: reasoning_dispatch` SSE event
+/// when the complete reasoning block has been decoded (i.e. when `reasoning_content`
+/// transitions from `Some(token)` to `None`), matching the UX of `tool_call_dispatch`.
+///
+/// The buffer is maintained across chunks by the caller (captured in the flat_map closure).
+/// Flushing also occurs when `finish_reason` is set, to handle max_tokens during reasoning.
+fn accumulate_reasoning_dispatch(
+    response: &crate::types::Annotated<NvCreateChatCompletionStreamResponse>,
+    buffers: &mut HashMap<u32, String>,
+) -> Vec<Result<Event, axum::Error>> {
+    let Some(data) = &response.data else {
+        return vec![];
+    };
+
+    let mut events = vec![];
+    for choice in &data.choices {
+        let buffer = buffers.entry(choice.index).or_default();
+        let has_reasoning = choice
+            .delta
+            .reasoning_content
+            .as_ref()
+            .is_some_and(|r| !r.is_empty());
+
+        if has_reasoning {
+            buffer.push_str(choice.delta.reasoning_content.as_ref().unwrap());
+        }
+
+        // Emit when reasoning transitions to None OR when the stream ends (finish_reason).
+        if !buffer.is_empty() && (!has_reasoning || choice.finish_reason.is_some()) {
+            let payload = serde_json::json!({
+                "index": choice.index,
+                "reasoning_content": buffer.as_str(),
+            });
+            events.extend(make_dispatch_event("reasoning_dispatch", &payload));
+            buffer.clear();
+        }
+    }
+    events
+}
+
+/// Maximum bytes to accumulate per choice for streaming payload logs.
+/// Prevents unbounded memory growth for very long completions.
+const MAX_PAYLOAD_ACCUMULATE_BYTES: usize = 256 * 1024;
+
+/// Accumulates chat completion content and reasoning tokens for payload logging.
+///
+/// Borrows the response chunk before it is consumed by `EventConverter`.
+/// Returns `true` when any choice carries a `finish_reason` (stream ending).
+/// Only intended to be called when `log_payloads_enabled()` is true.
+fn accumulate_payload_chat(
+    response: &Annotated<NvCreateChatCompletionStreamResponse>,
+    content_bufs: &mut HashMap<u32, String>,
+    reasoning_bufs: &mut HashMap<u32, String>,
+) -> bool {
+    let Some(data) = &response.data else {
+        return false;
+    };
+    let mut is_final = false;
+    // Note: for n > 1, is_final fires on the first choice to finish; subsequent choices
+    // may still have content arriving. This is acceptable for the n = 1 common case.
+    for choice in &data.choices {
+        if let Some(dynamo_async_openai::types::ChatCompletionMessageContent::Text(s)) =
+            &choice.delta.content
+        {
+            if !s.is_empty() {
+                let buf = content_bufs.entry(choice.index).or_default();
+                if buf.len() < MAX_PAYLOAD_ACCUMULATE_BYTES {
+                    buf.push_str(s);
+                }
+            }
+        }
+        if let Some(reasoning) = &choice.delta.reasoning_content {
+            if !reasoning.is_empty() {
+                let buf = reasoning_bufs.entry(choice.index).or_default();
+                if buf.len() < MAX_PAYLOAD_ACCUMULATE_BYTES {
+                    buf.push_str(reasoning);
+                }
+            }
+        }
+        if choice.finish_reason.is_some() {
+            is_final = true;
+        }
+    }
+    is_final
+}
+
 /// OpenAI Chat Completions Request Handler
 ///
 /// This method will handle the incoming request for the /v1/chat/completions endpoint. The endpoint is a "source"
@@ -1151,21 +1343,101 @@ async fn chat_completions(
         stream_handle.arm(); // allows the system to detect client disconnects and cancel the LLM generation
 
         let mut http_queue_guard = Some(http_queue_guard);
-        let stream = stream
-            .map(move |response| {
-                // Calls observe_response() on each token
-                // EventConverter will detect `event: "error"` and convert to SSE error events
-                process_response_using_event_converter_and_observe_metrics(
-                    EventConverter::from(response),
-                    &mut response_collector,
-                    &mut http_queue_guard,
+        let tool_dispatch_enabled = state.streaming_tool_dispatch_enabled();
+        let reasoning_dispatch_enabled = state.streaming_reasoning_dispatch_enabled();
+        let mut reasoning_buffer: HashMap<u32, String> = HashMap::new();
+        let mut dispatched_tool_ids: HashSet<String> = HashSet::new();
+
+        // Payload log accumulators for streaming responses.
+        // Only allocated/used when payload logging is enabled; gated to avoid overhead.
+        let log_payloads = log_payloads_enabled();
+        let mut payload_content_bufs: HashMap<u32, String> = HashMap::new();
+        let mut payload_reasoning_bufs: HashMap<u32, String> = HashMap::new();
+        let request_id_for_log = request_id.clone();
+        let model_for_log = model.clone();
+
+        // flat_map lets us optionally prepend extra SSE events before each regular chunk:
+        //   - `event: tool_call_dispatch`  — complete tool call detected early (tool dispatch)
+        //   - `event: reasoning_dispatch`  — complete reasoning block (emitted once)
+        // When both flags are off the flat_map is equivalent to the original map + filter_map.
+        let stream = stream.flat_map(move |response| {
+            // Extract side-channel events before the response is consumed by EventConverter.
+            let mut events: Vec<Result<Event, axum::Error>> = vec![];
+            if tool_dispatch_enabled {
+                events.extend(streaming_tool_dispatch_events(
+                    &response,
+                    &mut dispatched_tool_ids,
+                ));
+            }
+            if reasoning_dispatch_enabled {
+                events.extend(accumulate_reasoning_dispatch(
+                    &response,
+                    &mut reasoning_buffer,
+                ));
+            }
+
+            // Accumulate content for payload logging before response is consumed.
+            // Only fires on cleanly-finished responses (finish_reason set); client-disconnected
+            // streams are silently skipped since monitor_for_disconnects cancels the stream.
+            let is_final = if log_payloads {
+                accumulate_payload_chat(
+                    &response,
+                    &mut payload_content_bufs,
+                    &mut payload_reasoning_bufs,
                 )
-            })
-            .filter_map(|result| {
-                use futures::future;
-                // Transpose Result<Option<T>> -> Option<Result<T>>
-                future::ready(result.transpose())
-            });
+            } else {
+                false
+            };
+
+            // Convert to SSE event (this consumes the response).
+            // EventConverter will detect `event: "error"` and convert to SSE error events.
+            let sse_result = process_response_using_event_converter_and_observe_metrics(
+                EventConverter::from(response),
+                &mut response_collector,
+                &mut http_queue_guard,
+            );
+
+            // Emit assembled payload log on the final chunk.
+            if is_final {
+                let choices_json: Vec<serde_json::Value> = payload_content_bufs
+                    .iter()
+                    .map(|(idx, content)| {
+                        let reasoning =
+                            payload_reasoning_bufs.get(idx).map(String::as_str).unwrap_or("");
+                        let mut msg = serde_json::json!({
+                            "role": "assistant",
+                            "content": content,
+                        });
+                        if !reasoning.is_empty() {
+                            msg["reasoning_content"] =
+                                serde_json::Value::String(reasoning.to_owned());
+                        }
+                        serde_json::json!({ "index": idx, "message": msg })
+                    })
+                    .collect();
+                if let Ok(payload) =
+                    serde_json::to_string(&serde_json::json!({ "choices": choices_json }))
+                {
+                    tracing::info!(
+                        target: PAYLOAD_LOG_TARGET,
+                        request_id = %request_id_for_log,
+                        model = %model_for_log,
+                        endpoint = "chat_completions",
+                        streaming = true,
+                        payload_type = "response",
+                        payload = %payload,
+                    );
+                }
+            }
+
+            // Side-channel events come first, then the regular data event.
+            match sse_result {
+                Ok(Some(ev)) => events.push(Ok(ev)),
+                Ok(None) => {}
+                Err(e) => events.push(Err(e)),
+            }
+            stream::iter(events)
+        });
         let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
 
         let mut sse_stream = Sse::new(stream);

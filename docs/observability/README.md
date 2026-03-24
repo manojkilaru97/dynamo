@@ -40,7 +40,8 @@ For detailed setup instructions and configuration, see [Prometheus + Grafana Set
 | [Operator Metrics (Kubernetes)](../kubernetes/observability/operator-metrics.md) | Operator controller and webhook metrics for Kubernetes | N/A (configured via Helm) |
 | [Health Checks](health-checks.md) | Component health monitoring and readiness probes | `DYN_SYSTEM_PORT`†, `DYN_SYSTEM_STARTING_HEALTH_STATUS`, `DYN_SYSTEM_HEALTH_PATH`, `DYN_SYSTEM_LIVE_PATH`, `DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS` |
 | [Tracing](tracing.md) | Distributed tracing with OpenTelemetry and Tempo | `DYN_LOGGING_JSONL`†, `OTEL_EXPORT_ENABLED`†, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`†, `OTEL_SERVICE_NAME`† |
-| [Logging](logging.md) | Structured logging configuration | `DYN_LOGGING_JSONL`†, `DYN_LOG`, `DYN_LOG_USE_LOCAL_TZ`, `DYN_LOGGING_CONFIG_PATH`, `OTEL_SERVICE_NAME`†, `OTEL_EXPORT_ENABLED`†, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`† |
+| [Logging](logging.md) | Structured logging and OTLP log export to Loki | `DYN_LOGGING_JSONL`†, `DYN_LOG`, `DYN_LOG_USE_LOCAL_TZ`, `DYN_LOGGING_CONFIG_PATH`, `OTEL_SERVICE_NAME`†, `OTEL_EXPORT_ENABLED`†, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`†, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`† |
+| [Payload Logging and KV Transfer Tracing](payload-logging.md) | LLM request/response payload export via OTEL Logs; KV cache transfer span instrumentation for disaggregated serving | `DYNAMO_LOG_PAYLOADS`, `OTEL_EXPORT_ENABLED`†, `DYNAMO_KV_TRANSFER_TIMEOUT_S` |
 
 **Variables marked with † are shared across multiple observability systems.**
 
