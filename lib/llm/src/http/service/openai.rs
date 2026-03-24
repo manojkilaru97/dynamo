@@ -24,6 +24,8 @@ use axum::{
 use base64::Engine as _;
 use bytes::Bytes;
 use dynamo_runtime::config::environment_names::llm as env_llm;
+use dynamo_runtime::config::environment_names::logging as env_logging;
+use dynamo_runtime::config::env_is_truthy;
 use dynamo_runtime::{
     pipeline::{AsyncEngineContextProvider, Context},
     protocols::annotated::AnnotationsProvider,
@@ -77,6 +79,16 @@ pub(super) fn get_body_limit() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .map(|mb| mb * 1024 * 1024)
         .unwrap_or(45 * 1024 * 1024)
+}
+
+/// Tracing target used for payload log records exported to OTEL.
+/// Suppressed from console output; visible only in the OTEL log pipeline.
+const PAYLOAD_LOG_TARGET: &str = "dynamo_payload";
+
+/// Returns true if OTEL payload logging is enabled via `DYNAMO_LOG_PAYLOADS`.
+fn log_payloads_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_is_truthy(env_logging::DYNAMO_LOG_PAYLOADS))
 }
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
@@ -431,6 +443,21 @@ async fn completions_single(
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
+    // Log request payload to OTEL (suppressed from console)
+    if log_payloads_enabled() {
+        if let Ok(payload) = serde_json::to_string(request.content()) {
+            tracing::info!(
+                target: PAYLOAD_LOG_TARGET,
+                request_id = %request_id,
+                model = %model,
+                endpoint = "completions",
+                streaming = streaming,
+                payload_type = "request",
+                payload = %payload,
+            );
+        }
+    }
+
     // todo - error handling should be more robust
     let (engine, parsing_options) = state
         .manager()
@@ -529,6 +556,21 @@ async fn completions_single(
                 inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                 err_response
             })?;
+
+        // Log response payload to OTEL for non-streaming requests (suppressed from console)
+        if log_payloads_enabled() {
+            if let Ok(payload) = serde_json::to_string(&response) {
+                tracing::info!(
+                    target: PAYLOAD_LOG_TARGET,
+                    request_id = %request_id,
+                    model = %model,
+                    endpoint = "completions",
+                    streaming = false,
+                    payload_type = "response",
+                    payload = %payload,
+                );
+            }
+        }
 
         inflight_guard.mark_ok();
         // If the engine context was killed (client disconnect), the response was
@@ -1041,6 +1083,21 @@ async fn chat_completions(
     // Create HTTP queue guard after template resolution so labels are correct
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
+    // Log request payload to OTEL (suppressed from console)
+    if log_payloads_enabled() {
+        if let Ok(payload) = serde_json::to_string(request.content()) {
+            tracing::info!(
+                target: PAYLOAD_LOG_TARGET,
+                request_id = %request_id,
+                model = %model,
+                endpoint = "chat_completions",
+                streaming = streaming,
+                payload_type = "request",
+                payload = %payload,
+            );
+        }
+    }
+
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
     let (engine, parsing_options) = state
@@ -1155,6 +1212,21 @@ async fn chat_completions(
                     inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                     err_response
                 })?;
+
+        // Log response payload to OTEL for non-streaming requests (suppressed from console)
+        if log_payloads_enabled() {
+            if let Ok(payload) = serde_json::to_string(&response) {
+                tracing::info!(
+                    target: PAYLOAD_LOG_TARGET,
+                    request_id = %request_id,
+                    model = %model,
+                    endpoint = "chat_completions",
+                    streaming = false,
+                    payload_type = "response",
+                    payload = %payload,
+                );
+            }
+        }
 
         inflight_guard.mark_ok();
         // If the engine context was killed (client disconnect), the response was
