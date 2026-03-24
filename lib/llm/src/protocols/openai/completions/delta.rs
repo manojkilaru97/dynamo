@@ -16,29 +16,24 @@ use crate::{
 };
 
 impl NvCreateCompletionRequest {
-    /// Enables usage tracking for non-streaming requests to comply with OpenAI API specification.
+    /// Enables usage tracking for all requests (both streaming and non-streaming).
     ///
-    /// According to OpenAI API spec, non-streaming completion responses (stream=false)
-    /// must always include usage statistics. This method ensures `stream_options.include_usage`
-    /// is set to `true` for non-streaming requests.
-    ///
-    /// Reference: https://platform.openai.com/docs/api-reference/completions/create
+    /// Usage statistics are always emitted so clients can track token consumption regardless
+    /// of streaming mode. For streaming requests this produces a final usage-only SSE chunk
+    /// at the end of the stream; for non-streaming requests the usage field is included in
+    /// the single response object.
     ///
     /// # Arguments
     /// * `original_stream_flag` - The original value of the `stream` field before any internal processing
-    pub fn enable_usage_for_nonstreaming(&mut self, original_stream_flag: bool) {
-        if !original_stream_flag {
-            // For non-streaming requests (stream=false), enable usage by default
-            if self.inner.stream_options.is_none() {
-                self.inner.stream_options =
-                    Some(dynamo_async_openai::types::ChatCompletionStreamOptions {
-                        include_usage: true,
-                        continuous_usage_stats: false,
-                    });
-            } else if let Some(ref mut opts) = self.inner.stream_options {
-                // If stream_options exists, ensure include_usage is true for non-streaming
-                opts.include_usage = true;
-            }
+    pub fn enable_usage_for_nonstreaming(&mut self, _original_stream_flag: bool) {
+        if self.inner.stream_options.is_none() {
+            self.inner.stream_options =
+                Some(dynamo_async_openai::types::ChatCompletionStreamOptions {
+                    include_usage: true,
+                    continuous_usage_stats: false,
+                });
+        } else if let Some(ref mut opts) = self.inner.stream_options {
+            opts.include_usage = true;
         }
     }
 
