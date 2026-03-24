@@ -1009,6 +1009,12 @@ class HandlerBase(BaseGenerativeHandler):
             if value is not None
         }
 
+        # When n > 1, TRT-LLM requires best_of >= n. If the client didn't set best_of
+        # explicitly, default it to n so SamplingParams.__post_init__ validation passes.
+        n = overrides.get("n")
+        if n is not None and n > 1 and overrides.get("best_of") is None:
+            overrides["best_of"] = n
+
         # Convert guided_decoding dict (from Rust serialization) to GuidedDecodingParams.
         # Explicit field mapping avoids breakage if either side adds fields the other
         # doesn't know about (e.g. Rust's "backend"/"choice" vs TRT-LLM's fields).
