@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, ReadHalf, WriteHalf};
@@ -134,7 +135,15 @@ impl TcpClient {
 
         // forwards the bytes send from this stream to the transport layer; hold the alive_rx half of the oneshot channel
 
-        let writer_task = tokio::spawn(handle_writer(framed_writer, bytes_rx, alive_rx, context));
+        let network_failed = Arc::new(AtomicBool::new(false));
+
+        let writer_task = tokio::spawn(handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            context,
+            Arc::clone(&network_failed),
+        ));
 
         let subject = info.subject.clone();
         tokio::spawn(async move {
@@ -211,6 +220,7 @@ impl TcpClient {
         let stream_sender = StreamSender {
             tx: bytes_tx,
             prologue,
+            network_failed,
         };
 
         Ok(stream_sender)
@@ -301,6 +311,7 @@ async fn handle_writer(
     mut bytes_rx: tokio::sync::mpsc::Receiver<TwoPartMessage>,
     alive_rx: tokio::sync::oneshot::Receiver<()>,
     context: Arc<dyn AsyncEngineContext>,
+    network_failed: Arc<AtomicBool>,
 ) -> Result<FramedWrite<tokio::io::WriteHalf<tokio::net::TcpStream>, TwoPartCodec>> {
     // Only send sentinel for normal channel closure
     let mut send_sentinel = true;
@@ -337,6 +348,7 @@ async fn handle_writer(
                 "failed to send message to network; possible disconnect: {:?}",
                 e
             );
+            network_failed.store(true, Ordering::Relaxed);
             send_sentinel = false;
             break;
         }
@@ -474,7 +486,7 @@ mod tests {
         // Close the sender to trigger normal termination
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
 
         assert!(result.is_ok());
 
@@ -504,7 +516,7 @@ mod tests {
         // Close the sender immediately to trigger normal termination
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
 
         assert!(result.is_ok());
 
@@ -541,7 +553,7 @@ mod tests {
         // Kill the context
         controller.kill();
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
 
         assert!(result.is_ok());
 
@@ -579,7 +591,7 @@ mod tests {
         // Stop the context
         controller.stop();
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
 
         assert!(result.is_ok());
 
@@ -624,7 +636,7 @@ mod tests {
         // Close the sender to trigger normal termination
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
 
         assert!(result.is_ok());
 
@@ -655,7 +667,7 @@ mod tests {
         // Close the sender to trigger normal termination
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
 
         assert!(result.is_ok());
 
@@ -683,7 +695,7 @@ mod tests {
         // Close the sender
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
 
         assert!(result.is_ok());
 
@@ -729,7 +741,7 @@ mod tests {
         // Close the sender
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
 
         assert!(result.is_ok());
 

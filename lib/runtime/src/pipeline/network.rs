@@ -15,6 +15,7 @@ pub mod manager;
 pub mod tcp;
 
 use crate::SystemHealth;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
@@ -146,9 +147,18 @@ pub trait ResponseService {
 pub struct StreamSender {
     tx: tokio::sync::mpsc::Sender<TwoPartMessage>,
     prologue: Option<ResponseStreamPrologue>,
+    /// Set by handle_writer when a TCP write fails (iptables RST, peer disconnect).
+    /// Allows push_handler to distinguish network failures from client cancellations.
+    network_failed: Arc<AtomicBool>,
 }
 
 impl StreamSender {
+    /// Returns true if handle_writer recorded a TCP write failure (network drop).
+    /// Use this to distinguish network failures from clean client cancellations.
+    pub fn network_failed(&self) -> bool {
+        self.network_failed.load(Ordering::Relaxed)
+    }
+
     pub async fn send(&self, data: Bytes) -> Result<()> {
         Ok(self.tx.send(TwoPartMessage::from_data(data)).await?)
     }
