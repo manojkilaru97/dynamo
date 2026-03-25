@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Error, Result};
 use futures::{stream, stream::StreamExt};
+use std::time::Duration;
 
 use crate::{
     http::service::metrics::Metrics, model_card::ModelDeploymentCard, preprocessor::BackendOutput,
@@ -33,10 +34,19 @@ fn is_migratable(err: &(dyn StdError + 'static)) -> bool {
     error::match_error_chain(err, MIGRATABLE, NON_MIGRATABLE)
 }
 
+/// Backoff between migration retry attempts.
+///
+/// When kube-proxy reloads iptables during k8s scale-up, all workers' TCP
+/// connections are RST'd simultaneously for ~1-2s. Without backoff, migration
+/// exhausts its retry limit before iptables finishes reloading. This value
+/// matches STREAM_RETRY_BACKOFF in etcd/lease.rs (same root cause).
+const MIGRATION_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
 pub struct Migration {
     migration_limit: u32,
     model_name: Arc<String>,
     metrics: Arc<Metrics>,
+    retry_backoff: Duration,
 }
 
 impl Migration {
@@ -46,6 +56,7 @@ impl Migration {
             migration_limit,
             model_name: Arc::new(model_name),
             metrics,
+            retry_backoff: MIGRATION_RETRY_BACKOFF,
         })
     }
 
@@ -82,6 +93,7 @@ impl
             self.migration_limit,
             self.model_name.clone(),
             self.metrics.clone(),
+            self.retry_backoff,
         )
         .await?;
         let response_stream = stream::unfold(retry_manager, move |mut retry_manager| async move {
@@ -103,6 +115,7 @@ struct RetryManager {
     retries_left: u32,
     model_name: Arc<String>,
     metrics: Arc<Metrics>,
+    retry_backoff: Duration,
 }
 
 impl RetryManager {
@@ -113,6 +126,7 @@ impl RetryManager {
         retries_left: u32,
         model_name: Arc<String>,
         metrics: Arc<Metrics>,
+        retry_backoff: Duration,
     ) -> Result<Self> {
         let mut slf = Self {
             context,
@@ -122,6 +136,7 @@ impl RetryManager {
             retries_left: retries_left + 1, // +1 to account for the initial attempt
             model_name,
             metrics,
+            retry_backoff,
         };
         slf.new_stream().await?;
         Ok(slf)
@@ -158,8 +173,25 @@ impl RetryManager {
 
     async fn new_stream(&mut self) -> Result<()> {
         let mut response_stream: Option<Result<ManyOut<Annotated<BackendOutput>>>> = None;
+        let mut attempt: u32 = 0;
         while self.retries_left > 0 {
             self.retries_left -= 1;
+
+            // Sleep before retries (not the initial attempt) to let transient network
+            // disruptions resolve. The primary case is kube-proxy iptables reload during
+            // k8s scale-up: all workers' TCP connections are RST'd simultaneously for
+            // ~1-2s. Without backoff, migration exhausts retries before iptables finishes
+            // reloading. See also STREAM_RETRY_BACKOFF in etcd/lease.rs (same event).
+            if attempt > 0 && !self.retry_backoff.is_zero() {
+                tracing::debug!(
+                    attempt,
+                    backoff_ms = self.retry_backoff.as_millis(),
+                    "Migration retry backoff before next worker attempt"
+                );
+                tokio::time::sleep(self.retry_backoff).await;
+            }
+            attempt += 1;
+
             let request = Context::with_id(self.request.clone(), self.context.id().to_string());
             self.context.link_child(request.context());
             if self.context.is_stopped() || self.context.is_killed() {
@@ -564,6 +596,7 @@ mod tests {
             0,
             Arc::new(TEST_MODEL.to_string()),
             metrics.clone(),
+            Duration::ZERO, // no backoff in tests
         )
         .await
         .expect("Failed to build RetryManager");
@@ -614,6 +647,7 @@ mod tests {
             3,
             Arc::new(TEST_MODEL.to_string()),
             metrics.clone(),
+            Duration::ZERO, // no backoff in tests
         )
         .await
         .expect("Failed to build RetryManager");
@@ -665,6 +699,7 @@ mod tests {
             3,
             Arc::new(TEST_MODEL.to_string()),
             metrics.clone(),
+            Duration::ZERO, // no backoff in tests
         )
         .await
         .expect("Failed to build RetryManager");
@@ -717,6 +752,7 @@ mod tests {
             3,
             Arc::new(TEST_MODEL.to_string()),
             metrics.clone(),
+            Duration::ZERO, // no backoff in tests
         )
         .await;
 
@@ -756,6 +792,7 @@ mod tests {
             3,
             Arc::new(TEST_MODEL.to_string()),
             metrics.clone(),
+            Duration::ZERO, // no backoff in tests
         ) // 3 retries
         .await
         .expect("Failed to build RetryManager");
@@ -814,6 +851,7 @@ mod tests {
             3,
             Arc::new(TEST_MODEL.to_string()),
             metrics.clone(),
+            Duration::ZERO, // no backoff in tests
         ) // 3 retries
         .await
         .expect("Failed to build RetryManager");
@@ -877,6 +915,7 @@ mod tests {
             3,
             Arc::new(TEST_MODEL.to_string()),
             metrics.clone(),
+            Duration::ZERO, // no backoff in tests
         )
         .await;
 
