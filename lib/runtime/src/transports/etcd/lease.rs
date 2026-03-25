@@ -112,16 +112,28 @@ async fn new_keep_alive_stream(
             anyhow::bail!("Unable to maintain lease - deadline exceeded while establishing keep-alive stream");
         }
 
+        // Log which channel generation we are about to use.
+        // If generation stays constant across retries → same Arc<ChannelInner>, no new DNS.
+        // If generation increments → reconnect() was called and stored a new channel.
+        let gen = connector.generation();
+        tracing::debug!(
+            lease_id,
+            generation = gen,
+            consecutive_failures,
+            "keep-alive stream attempt (channel generation {})", gen
+        );
+
         let mut lease_client = connector.get_client().lease_client();
         match lease_client.keep_alive(lease_id as i64).await {
             Ok((sender, receiver)) => {
-                tracing::debug!(lease_id, "Established keep-alive stream");
+                tracing::debug!(lease_id, generation = gen, "Established keep-alive stream");
                 return Ok(Some((sender, receiver)));
             }
             Err(e) => {
                 consecutive_failures += 1;
                 tracing::warn!(
                     lease_id,
+                    generation = gen,
                     error = %e,
                     attempt = consecutive_failures,
                     "Failed to establish keep-alive stream"
@@ -132,8 +144,9 @@ async fn new_keep_alive_stream(
                     // actually moved. Ask the connector for a fresh channel.
                     tracing::warn!(
                         lease_id,
-                        "Keep-alive stream failed {} times; reconnecting to etcd",
-                        consecutive_failures
+                        generation = gen,
+                        "Keep-alive stream failed {} times on generation {}; triggering reconnect",
+                        consecutive_failures, gen
                     );
                     consecutive_failures = 0;
                     tokio::select! {
@@ -141,7 +154,16 @@ async fn new_keep_alive_stream(
                         reconnect_result = connector.reconnect(*deadline) => {
                             match reconnect_result {
                                 Err(e) => return Err(e),
-                                _ => continue,
+                                _ => {
+                                    tracing::debug!(
+                                        lease_id,
+                                        old_generation = gen,
+                                        new_generation = connector.generation(),
+                                        "reconnect complete; next attempt will use generation {}",
+                                        connector.generation()
+                                    );
+                                    continue;
+                                }
                             }
                         }
                         _ = token.cancelled() => {
@@ -154,6 +176,13 @@ async fn new_keep_alive_stream(
                     // This avoids DNS re-resolution on a new lazy channel.
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     let backoff = std::cmp::min(STREAM_RETRY_BACKOFF, remaining / 2);
+                    tracing::debug!(
+                        lease_id,
+                        generation = gen,
+                        backoff_ms = backoff.as_millis(),
+                        "retrying keep-alive on same channel (generation {}), backoff {:?}",
+                        gen, backoff
+                    );
                     tokio::select! {
                         biased;
                         _ = token.cancelled() => {
