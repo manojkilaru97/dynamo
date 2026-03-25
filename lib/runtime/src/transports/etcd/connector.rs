@@ -78,8 +78,8 @@ impl Connector {
     /// shares the same ChannelInner (no new DNS lookup per call).  The generation
     /// counter lets callers detect when reconnect() has swapped in a new channel.
     pub fn get_client(&self) -> etcd_client::Client {
-        let gen = self.generation.load(Ordering::Relaxed);
-        tracing::trace!(generation = gen, "get_client: returning client (generation {})", gen);
+        let cur_gen = self.generation.load(Ordering::Relaxed);
+        tracing::trace!(generation = cur_gen, "get_client: returning client (generation {})", cur_gen);
         self.client.read().clone()
     }
 

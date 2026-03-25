@@ -115,25 +115,25 @@ async fn new_keep_alive_stream(
         // Log which channel generation we are about to use.
         // If generation stays constant across retries → same Arc<ChannelInner>, no new DNS.
         // If generation increments → reconnect() was called and stored a new channel.
-        let gen = connector.generation();
+        let cur_gen = connector.generation();
         tracing::debug!(
             lease_id,
-            generation = gen,
+            generation = cur_gen,
             consecutive_failures,
-            "keep-alive stream attempt (channel generation {})", gen
+            "keep-alive stream attempt (channel generation {})", cur_gen
         );
 
         let mut lease_client = connector.get_client().lease_client();
         match lease_client.keep_alive(lease_id as i64).await {
             Ok((sender, receiver)) => {
-                tracing::debug!(lease_id, generation = gen, "Established keep-alive stream");
+                tracing::debug!(lease_id, generation = cur_gen, "Established keep-alive stream");
                 return Ok(Some((sender, receiver)));
             }
             Err(e) => {
                 consecutive_failures += 1;
                 tracing::warn!(
                     lease_id,
-                    generation = gen,
+                    generation = cur_gen,
                     error = %e,
                     attempt = consecutive_failures,
                     "Failed to establish keep-alive stream"
@@ -144,9 +144,9 @@ async fn new_keep_alive_stream(
                     // actually moved. Ask the connector for a fresh channel.
                     tracing::warn!(
                         lease_id,
-                        generation = gen,
+                        generation = cur_gen,
                         "Keep-alive stream failed {} times on generation {}; triggering reconnect",
-                        consecutive_failures, gen
+                        consecutive_failures, cur_gen
                     );
                     consecutive_failures = 0;
                     tokio::select! {
@@ -157,7 +157,7 @@ async fn new_keep_alive_stream(
                                 _ => {
                                     tracing::debug!(
                                         lease_id,
-                                        old_generation = gen,
+                                        old_generation = cur_gen,
                                         new_generation = connector.generation(),
                                         "reconnect complete; next attempt will use generation {}",
                                         connector.generation()
@@ -178,10 +178,10 @@ async fn new_keep_alive_stream(
                     let backoff = std::cmp::min(STREAM_RETRY_BACKOFF, remaining / 2);
                     tracing::debug!(
                         lease_id,
-                        generation = gen,
+                        generation = cur_gen,
                         backoff_ms = backoff.as_millis(),
                         "retrying keep-alive on same channel (generation {}), backoff {:?}",
-                        gen, backoff
+                        cur_gen, backoff
                     );
                     tokio::select! {
                         biased;
