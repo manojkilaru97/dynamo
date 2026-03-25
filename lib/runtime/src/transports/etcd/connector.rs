@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use etcd_client::ConnectOptions;
 use parking_lot::RwLock;
-use std::{sync::Arc, time::Duration};
+use std::{sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
 use tokio::{sync::Mutex, time::sleep};
 
 /// Manages ETCD client connections with reconnection support
@@ -18,6 +18,10 @@ pub struct Connector {
     /// Tracks the current backoff duration and last successful connect time
     /// The Mutex ensures only one reconnect operation runs at a time
     backoff_state: Mutex<BackoffState>,
+    /// Monotonically increasing generation counter. Incremented on every successful
+    /// reconnect so callers can tell whether they hold a client from a new channel.
+    /// Generation 0 = the client created in Connector::new().
+    generation: AtomicU64,
 }
 
 impl Connector {
@@ -34,27 +38,54 @@ impl Connector {
             etcd_urls,
             connect_options,
             backoff_state: Mutex::new(BackoffState::default()),
+            generation: AtomicU64::new(0),
         }))
     }
 
-    /// Connect to ETCD cluster
+    /// Connect to ETCD cluster.
+    ///
+    /// DEBUG NOTE: We log the wall-clock time consumed by `Client::connect().await`.
+    /// A duration near-zero (~<5ms) indicates a *lazy* tonic channel — DNS has not yet
+    /// been resolved and the first RPC will trigger it.  A duration >50ms indicates an
+    /// *eager* connection where DNS + TCP handshake completed inside this call.
+    /// This tells us whether `get_client()` after a `reconnect()` is DNS-safe.
     async fn connect(
         etcd_urls: &[String],
         connect_options: &Option<ConnectOptions>,
     ) -> Result<etcd_client::Client> {
-        etcd_client::Client::connect(etcd_urls.to_vec(), connect_options.clone())
+        let t0 = std::time::Instant::now();
+        let result = etcd_client::Client::connect(etcd_urls.to_vec(), connect_options.clone())
             .await
             .with_context(|| {
                 format!(
                     "Unable to connect to etcd server at {}. Check etcd server status",
                     etcd_urls.join(", ")
                 )
-            })
+            });
+        let elapsed = t0.elapsed();
+        tracing::debug!(
+            elapsed_ms = elapsed.as_millis(),
+            // <5ms → lazy (DNS not yet resolved); >50ms → eager (DNS+TCP done here)
+            lazy_hint = elapsed.as_millis() < 5,
+            "etcd Client::connect() returned"
+        );
+        result
     }
 
-    /// Get a clone of the current ETCD client
+    /// Get a clone of the current ETCD client.
+    ///
+    /// Returns a cheap clone — the underlying tonic Channel is Arc-wrapped so this
+    /// shares the same ChannelInner (no new DNS lookup per call).  The generation
+    /// counter lets callers detect when reconnect() has swapped in a new channel.
     pub fn get_client(&self) -> etcd_client::Client {
+        let gen = self.generation.load(Ordering::Relaxed);
+        tracing::trace!(generation = gen, "get_client: returning client (generation {})", gen);
         self.client.read().clone()
+    }
+
+    /// Current channel generation (0 = initial, increments on each successful reconnect).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// Reconnect to ETCD cluster with retry logic
@@ -81,7 +112,11 @@ impl Connector {
 
             match Self::connect(&self.etcd_urls, &self.connect_options).await {
                 Ok(new_client) => {
-                    tracing::info!("Successfully reconnected to ETCD cluster");
+                    let new_gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::info!(
+                        generation = new_gen,
+                        "Successfully reconnected to ETCD cluster (generation {})", new_gen
+                    );
                     // Update the client behind the lock
                     let mut client_guard = self.client.write();
                     *client_guard = new_client;
