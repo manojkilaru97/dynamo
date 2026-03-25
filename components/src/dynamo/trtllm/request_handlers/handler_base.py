@@ -84,6 +84,10 @@ class RequestHandlerConfig:
     # (e.g., GLM-4.7, GLM-4.5). The structural_tag should NOT include <think> as
     # the begin tag to avoid a double <think> that causes model degeneration.
     prompt_injects_thinking_tag: bool = False
+    # When True, the engine uses speculative decoding (e.g. MTP). Requests with
+    # logprobs enabled will be rejected early because TRT-LLM's speculative
+    # sampler does not support return_log_probs.
+    is_speculative_decoding: bool = False
 
 
 class HandlerBase(BaseGenerativeHandler):
@@ -125,6 +129,9 @@ class HandlerBase(BaseGenerativeHandler):
             self.enable_thinking_default = bool(_etd)
         self.prompt_injects_thinking_tag = bool(
             getattr(config, "prompt_injects_thinking_tag", False)
+        )
+        self.is_speculative_decoding = bool(
+            getattr(config, "is_speculative_decoding", False)
         )
 
     def check_error(self, result: dict):
@@ -700,6 +707,18 @@ class HandlerBase(BaseGenerativeHandler):
 
             # Handle logprobs
             if logprobs_value is not None:
+                if self.is_speculative_decoding:
+                    logging.warning(
+                        "Request %s rejected: logprobs not supported with speculative decoding",
+                        request_id,
+                    )
+                    yield {
+                        "finish_reason": {
+                            "error": "logprobs not supported with speculative decoding (e.g. MTP)"
+                        },
+                        "token_ids": [],
+                    }
+                    return
                 if hasattr(sampling_params, "logprobs"):
                     setattr(
                         sampling_params, "logprobs", max(1, int(logprobs_value))

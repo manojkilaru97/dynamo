@@ -1532,6 +1532,13 @@ pub fn validate_chat_completion_unsupported_fields(
         ));
     }
 
+    if inner.logprobs == Some(true) || inner.top_logprobs.is_some() {
+        return Err(ErrorMessage::not_implemented_error(
+            VALIDATION_PREFIX.to_string()
+                + "`logprobs` is not supported.",
+        ));
+    }
+
     Ok(())
 }
 
