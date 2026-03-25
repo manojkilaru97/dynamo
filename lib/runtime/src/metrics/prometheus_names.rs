@@ -366,6 +366,11 @@ pub mod work_handler {
 
         /// Final message publishing error
         pub const PUBLISH_FINAL: &str = "publish_final";
+
+        /// TCP write failure mid-stream (iptables RST, peer disconnect).
+        /// Indicates an in-flight request was dropped due to a network failure,
+        /// not a client cancellation. Alert on sustained rates of this error.
+        pub const NETWORK_DROP: &str = "network_drop";
     }
 }
 

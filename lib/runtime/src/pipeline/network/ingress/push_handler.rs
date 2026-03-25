@@ -311,27 +311,41 @@ where
             }
             if (publisher.send(resp_bytes.into()).await).is_err() {
                 send_complete_final = false;
-                if context.is_stopped() {
-                    // Say there are 2 threads accessing `context`, the sequence can be either:
-                    // 1. context.stop_generating (other) -> publisher.send failure (this)
-                    //    -> context.is_stopped (this)
-                    // 2. publisher.send failure (this) -> context.stop_generating (other)
-                    //    -> context.is_stopped (this)
-                    // Case 1 can happen when client closed the connection after receiving the
-                    // complete response from frontend. Hence, send failure can be expected in this
-                    // case.
-                    tracing::warn!("Failed to publish response for stream {}", context.id());
+                if publisher.network_failed() {
+                    // TCP write failed (iptables RST, peer disconnect). The response is lost.
+                    // context.is_stopped() may also be true here if a ControlMessage::Stop
+                    // raced in on the read half at the same time — making this look like a
+                    // clean cancellation when it was actually a network drop.
+                    tracing::error!(
+                        "Failed to publish response for stream {} (network failure, request dropped)",
+                        context.id()
+                    );
+                    context.stop_generating();
+                    if let Some(m) = self.metrics() {
+                        m.error_counter
+                            .with_label_values(&[work_handler::error_types::NETWORK_DROP])
+                            .inc();
+                    }
+                } else if context.is_stopped() {
+                    // Channel closed because the context was stopped — client cancelled cleanly.
+                    tracing::warn!(
+                        "Failed to publish response for stream {} (client cancelled)",
+                        context.id()
+                    );
+                    if let Some(m) = self.metrics() {
+                        m.error_counter
+                            .with_label_values(&[work_handler::error_types::PUBLISH_RESPONSE])
+                            .inc();
+                    }
                 } else {
-                    // Otherwise, this is an error.
+                    // Channel closed for an unexpected reason.
                     tracing::error!("Failed to publish response for stream {}", context.id());
                     context.stop_generating();
-                }
-                // Account errors in all cases, including cancellation. Therefore this metric can be
-                // inflated.
-                if let Some(m) = self.metrics() {
-                    m.error_counter
-                        .with_label_values(&[work_handler::error_types::PUBLISH_RESPONSE])
-                        .inc();
+                    if let Some(m) = self.metrics() {
+                        m.error_counter
+                            .with_label_values(&[work_handler::error_types::PUBLISH_RESPONSE])
+                            .inc();
+                    }
                 }
                 break;
             }
