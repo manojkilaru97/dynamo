@@ -87,34 +87,86 @@ async fn new_keep_alive_stream(
     deadline: &Instant,
     token: &CancellationToken,
 ) -> anyhow::Result<Option<(LeaseKeeper, LeaseKeepAliveStream)>> {
+    // Number of consecutive stream-open failures before we give up on the
+    // current channel and ask the connector for a fresh one.
+    //
+    // Background: connector.reconnect() creates a *new lazy tonic channel*
+    // that has not yet resolved DNS. The very next keep_alive() call on that
+    // channel triggers a fresh DNS lookup. Under CoreDNS overload (e.g.
+    // simultaneous scale-up of many instances) that lookup fails, so we
+    // immediately call reconnect() again — a tight loop that burns through
+    // the lease TTL deadline in seconds.
+    //
+    // The existing channel's TCP connection is already established and does
+    // not require DNS for additional streams. We therefore retry on the
+    // current channel first (with backoff), and only reconnect after
+    // MAX_STREAM_RETRIES consecutive failures to handle the case where etcd
+    // itself has restarted.
+    const MAX_STREAM_RETRIES: u32 = 5;
+    const STREAM_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+    let mut consecutive_failures: u32 = 0;
+
     loop {
+        if Instant::now() >= *deadline {
+            anyhow::bail!("Unable to maintain lease - deadline exceeded while establishing keep-alive stream");
+        }
+
         let mut lease_client = connector.get_client().lease_client();
         match lease_client.keep_alive(lease_id as i64).await {
             Ok((sender, receiver)) => {
                 tracing::debug!(lease_id, "Established keep-alive stream");
-                return Ok(Some((sender, receiver))); // success
+                return Ok(Some((sender, receiver)));
             }
             Err(e) => {
-                tracing::warn!(lease_id, error = %e, "Failed to establish keep-alive stream");
+                consecutive_failures += 1;
+                tracing::warn!(
+                    lease_id,
+                    error = %e,
+                    attempt = consecutive_failures,
+                    "Failed to establish keep-alive stream"
+                );
 
-                // Try to reconnect with the deadline, but also check for cancellation
-                tokio::select! {
-                    biased;
-
-                    reconnect_result = connector.reconnect(*deadline) => {
-                        match reconnect_result {
-                            Err(e) => return Err(e), // cannot reconnect
-                            _ => continue, // retry
+                if consecutive_failures >= MAX_STREAM_RETRIES {
+                    // Enough retries on the existing channel — etcd may have
+                    // actually moved. Ask the connector for a fresh channel.
+                    tracing::warn!(
+                        lease_id,
+                        "Keep-alive stream failed {} times; reconnecting to etcd",
+                        consecutive_failures
+                    );
+                    consecutive_failures = 0;
+                    tokio::select! {
+                        biased;
+                        reconnect_result = connector.reconnect(*deadline) => {
+                            match reconnect_result {
+                                Err(e) => return Err(e),
+                                _ => continue,
+                            }
+                        }
+                        _ = token.cancelled() => {
+                            tracing::debug!(lease_id, "Cancellation token triggered during reconnection");
+                            return Ok(None);
                         }
                     }
-
-                    _ = token.cancelled() => {
-                        tracing::debug!(lease_id, "Cancellation token triggered during reconnection");
-                        return Ok(None); // cancelled
+                } else {
+                    // Retry on the existing channel after a short backoff.
+                    // This avoids DNS re-resolution on a new lazy channel.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let backoff = std::cmp::min(STREAM_RETRY_BACKOFF, remaining / 2);
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => {
+                            tracing::debug!(lease_id, "Cancellation token triggered during retry backoff");
+                            return Ok(None);
+                        }
+                        _ = tokio::time::sleep(backoff) => {
+                            continue;
+                        }
                     }
                 }
             }
-        };
+        }
     }
 }
 
