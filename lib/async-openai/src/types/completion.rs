@@ -17,7 +17,7 @@ use utoipa::ToSchema;
 
 use crate::error::OpenAIError;
 
-use super::{ChatCompletionStreamOptions, Choice, CompletionUsage, Prompt, Stop};
+use super::{ChatCompletionStreamOptions, Choice, CompletionUsage, Prompt, ResponseFormat, Stop};
 
 /// Custom deserializer for the echo parameter that only accepts booleans.
 /// Rejects integers and strings with clear error messages.
@@ -203,6 +203,18 @@ pub struct CreateCompletionRequest {
     /// Determinism is not guaranteed, and you should refer to the `system_fingerprint` response parameter to monitor changes in the backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
+
+    /// An object specifying the format that the model must output.
+    ///
+    /// Setting to `{ "type": "json_object" }` enables JSON mode.
+    /// Setting to `{ "type": "json_schema", "json_schema": {...} }` enables Structured Outputs
+    /// which guarantees the model will match your supplied JSON schema.
+    ///
+    /// Note: `response_format` is an extension not in the OpenAI Completions spec.
+    /// Use `extra_body.guided_json` / `guided_regex` / `guided_grammar` / `guided_choice`
+    /// for other structured decoding modes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
 }
 
 #[derive(ToSchema, Debug, Deserialize, Clone, PartialEq, Serialize)]

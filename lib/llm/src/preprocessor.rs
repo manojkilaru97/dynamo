@@ -53,6 +53,7 @@ use crate::protocols::{
         chat_completions::{
             NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse, jail::JailedStream,
         },
+        common_ext::CommonExtProvider,
         completions::{NvCreateCompletionRequest, NvCreateCompletionResponse},
         embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse},
         nvext::NvExtProvider,
@@ -1397,6 +1398,23 @@ impl
             .await?;
 
         let mut common_request = builder.build()?;
+
+        // Thinking-off support: if enable_thinking=false, append the </think> token
+        // so the model immediately produces the final answer without a reasoning trace.
+        // This mirrors Chat Completions' chat_template_args.enable_thinking=false behavior
+        // but for the raw-prompt Completions API.
+        if request.get_enable_thinking() == Some(false) && common_request.prompt_embeds.is_none() {
+            use crate::protocols::TokenIdType;
+            // Tokenize "</think>" to get the correct token ID(s) for this model
+            if let Ok(think_encoding) = self.tokenizer.encode("</think>") {
+                let think_ids: Vec<TokenIdType> = think_encoding
+                    .token_ids()
+                    .iter()
+                    .map(|&id| id as TokenIdType)
+                    .collect();
+                common_request.token_ids.extend(think_ids);
+            }
+        }
 
         // Attach the timing tracker to the request so downstream components can record metrics
         common_request.tracker = tracker;
