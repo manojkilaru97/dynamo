@@ -3028,23 +3028,24 @@ mod tests {
 
     #[test]
     fn test_completions_unsupported_fields_rejected() {
-        // Test that known unsupported fields are rejected and all shown in error message
+        // Test that known unsupported fields are rejected and shown in error message.
+        // Note: response_format is now a supported field and should NOT appear here.
         let json = r#"{
             "model": "test-model",
             "prompt": "Hello",
-            "add_special_tokens": true,
-            "response_format": {"type": "json_object"}
+            "add_special_tokens": true
         }"#;
 
         let request: NvCreateCompletionRequest = serde_json::from_str(json).unwrap();
 
-        // Verify both unsupported fields were captured
+        // Verify unsupported field was captured
         assert!(
             request
                 .unsupported_fields
                 .contains_key("add_special_tokens")
         );
-        assert!(request.unsupported_fields.contains_key("response_format"));
+        // response_format is now supported — it should NOT be in unsupported_fields
+        assert!(!request.unsupported_fields.contains_key("response_format"));
 
         let result = validate_completion_fields_generic(&request);
         assert!(result.is_err());
@@ -3052,10 +3053,29 @@ mod tests {
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
             let msg = &error_response.1.message;
             assert!(msg.contains("Unsupported parameter"));
-            // Verify both fields appear in error message
+            // Verify field appears in error message
             assert!(msg.contains("add_special_tokens"));
-            assert!(msg.contains("response_format"));
         }
+    }
+
+    #[test]
+    fn test_completions_response_format_is_supported() {
+        // Test that response_format is accepted as a supported field (not rejected)
+        let json = r#"{
+            "model": "test-model",
+            "prompt": "Hello",
+            "response_format": {"type": "json_object"}
+        }"#;
+
+        let request: NvCreateCompletionRequest = serde_json::from_str(json).unwrap();
+
+        // response_format should be parsed into the inner field, not unsupported_fields
+        assert!(!request.unsupported_fields.contains_key("response_format"));
+        assert!(request.inner.response_format.is_some());
+
+        // And validation should pass (no unsupported fields)
+        let result = validate_completion_fields_generic(&request);
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

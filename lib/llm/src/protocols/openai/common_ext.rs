@@ -89,6 +89,17 @@ pub struct CommonExt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
     pub skip_special_tokens: Option<bool>,
+
+    /// Controls thinking mode for the Completions API.
+    ///
+    /// When `false`, the server appends `</think>` to the prompt to immediately close
+    /// the reasoning block. Default: `None` (uses model/server default, typically thinking-on).
+    ///
+    /// Note: For Chat Completions API, use `extra_body.chat_template_kwargs.enable_thinking`
+    /// instead. This field only affects `/v1/completions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub enable_thinking: Option<bool>,
 }
 
 impl CommonExt {
@@ -222,6 +233,7 @@ mod tests {
             guided_whitespace_pattern: None,
             guided_structural_tag: None,
             skip_special_tokens: None,
+            enable_thinking: None,
         };
         assert!(common_ext.validate().is_ok());
     }

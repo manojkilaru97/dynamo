@@ -183,9 +183,29 @@ impl CommonExtProvider for NvCreateCompletionRequest {
         Some(&self.common)
     }
 
-    /// Guided Decoding Options
+    /// Guided JSON options — in priority order:
+    /// 1. Explicit `extra_body.guided_json`
+    /// 2. OpenAI `response_format.json_schema` or `response_format.json_object`
     fn get_guided_json(&self) -> Option<serde_json::Value> {
-        self.common.guided_json.clone()
+        if let Some(value) = self.common.guided_json.clone() {
+            return Some(value);
+        }
+        // Map OpenAI response_format to guided_json (mirrors chat_completions.rs behavior)
+        if let Some(response_format) = self.inner.response_format.as_ref() {
+            use dynamo_async_openai::types::ResponseFormat;
+            match response_format {
+                ResponseFormat::Text => {}
+                ResponseFormat::JsonObject => {
+                    return Some(serde_json::json!({"type": "object"}));
+                }
+                ResponseFormat::JsonSchema { json_schema } => {
+                    if let Some(schema) = json_schema.schema.clone() {
+                        return Some(schema);
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn get_guided_regex(&self) -> Option<String> {
@@ -210,6 +230,12 @@ impl CommonExtProvider for NvCreateCompletionRequest {
 
     fn get_guided_structural_tag(&self) -> Option<serde_json::Value> {
         self.common.guided_structural_tag.clone()
+    }
+
+    /// Returns the enable_thinking setting from CommonExt.
+    /// Used by the completions preprocessor to inject </think> for thinking-off mode.
+    fn get_enable_thinking(&self) -> Option<bool> {
+        self.common.enable_thinking
     }
 
     fn get_top_k(&self) -> Option<i32> {
