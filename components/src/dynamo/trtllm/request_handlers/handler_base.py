@@ -939,6 +939,7 @@ class HandlerBase(BaseGenerativeHandler):
         regex: Optional[str] = None,
         grammar: Optional[str] = None,
         json_object: bool = False,
+        choice: Optional[list] = None,
     ) -> Optional[dict]:
         """
         Build xgrammar content dict for structural_tag from guided decoding params.
@@ -956,6 +957,9 @@ class HandlerBase(BaseGenerativeHandler):
             return {"type": "regex", "pattern": regex}
         elif grammar is not None:
             return {"type": "grammar", "grammar": grammar}
+        elif choice is not None:
+            pattern = "|".join(re.escape(str(c)) for c in choice)
+            return {"type": "regex", "pattern": pattern}
         return None
 
     @staticmethod
@@ -1059,35 +1063,10 @@ class HandlerBase(BaseGenerativeHandler):
             json_object = guided_decoding.get("json_object", False)
             enable_thinking = guided_decoding.get("enable_thinking")
 
-            # Auto-detect thinking mode from the completions API prompt suffix when
-            # enable_thinking is not set explicitly in the request.
-            #
-            # For the completions API, the user manually constructs the prompt and
-            # encodes the thinking mode via the last token in the prompt:
-            #   <think>   -> thinking-on  -> sequence structural_tag
-            #                (model generates: reasoning ... </think> {constrained})
-            #   </think>  -> thinking-off -> triggered_tags structural_tag
-            #                (</think> is the last prompt token; xgrammar fires
-            #                 the constraint immediately on the first generated token)
-            #
-            # Without this, a </think>-suffixed prompt falls back to
-            # enable_thinking_default=True which uses sequence mode and waits for
-            # </think> in the *generated* output. Since </think> is already in the
-            # prompt, the trigger never fires and the model generates unconstrained
-            # output (markdown fences, extra text, etc.).
-            #
-            # This mirrors how chat completions works: the chat template explicitly
-            # appends <think> or </think> to the prompt, so the thinking mode is
-            # always unambiguous. Here we achieve the same by inspecting the prompt.
-            if enable_thinking is None:
-                prompt = request.get("prompt", "")
-                if isinstance(prompt, str):
-                    prompt_stripped = prompt.rstrip()
-                    if prompt_stripped.endswith("</think>"):
-                        enable_thinking = False   # triggered_tags: fires on </think> in prompt
-                    elif prompt_stripped.endswith("<think>"):
-                        enable_thinking = True    # sequence: begin="", any_text, end="</think>"
-            # Fall back to server-level default for prompts without a thinking suffix
+            # For completions API: prompt-suffix auto-detection of thinking mode is
+            # performed in Rust (completions.rs get_enable_thinking) while the
+            # prompt string is still available. By this point the prompt has been
+            # tokenized and only token_ids remain — request.get("prompt") is empty.
             if enable_thinking is None:
                 enable_thinking = self.enable_thinking_default
 
@@ -1100,12 +1079,12 @@ class HandlerBase(BaseGenerativeHandler):
                 or regex is not None
                 or grammar is not None
                 or json_object
+                or choice is not None
             )
 
             if (
                 has_guided_decoding
                 and structural_tag is None
-                and enable_thinking is True
             ):
                 # Build xgrammar content from guided decoding params
                 content = self._build_xgrammar_content(
@@ -1113,6 +1092,7 @@ class HandlerBase(BaseGenerativeHandler):
                     regex=regex,
                     grammar=grammar,
                     json_object=json_object,
+                    choice=choice,
                 )
                 if content is not None:
                     # Generate mode-aware structural_tag for combining reasoning with
@@ -1129,6 +1109,7 @@ class HandlerBase(BaseGenerativeHandler):
                     regex = None
                     grammar = None
                     json_object = False
+                    choice = None
                     logging.debug(
                         f"Generated structural_tag for reasoning mode "
                         f"(enable_thinking={enable_thinking}): {structural_tag}"

@@ -235,7 +235,33 @@ impl CommonExtProvider for NvCreateCompletionRequest {
     /// Returns the enable_thinking setting from CommonExt.
     /// Used by the completions preprocessor to inject </think> for thinking-off mode.
     fn get_enable_thinking(&self) -> Option<bool> {
-        self.common.enable_thinking
+        // Explicit per-request value takes priority
+        if let Some(v) = self.common.enable_thinking {
+            return Some(v);
+        }
+        // Auto-detect thinking mode from the prompt suffix when guided decoding is active.
+        // For the completions API, the user encodes thinking mode via the last token:
+        //   <think>   -> thinking-on  -> sequence structural_tag (any_text, </think>, JSON)
+        //   </think>  -> thinking-off -> triggered_tags (fires constraint on </think> in prompt)
+        //
+        // This detection is done here in Rust, while the prompt string is still available.
+        // By the time the Python handler receives the request, it has been tokenized to
+        // token_ids and the original prompt text is no longer accessible.
+        let has_guided = self.common.guided_json.is_some()
+            || self.common.guided_regex.is_some()
+            || self.common.guided_grammar.is_some()
+            || self.common.guided_choice.is_some()
+            || self.inner.response_format.is_some();
+        if has_guided {
+            let prompt_str = prompt_to_string(&self.inner.prompt);
+            let trimmed = prompt_str.trim_end();
+            if trimmed.ends_with("</think>") {
+                return Some(false); // triggered_tags: fires on </think> in prompt tokens
+            } else if trimmed.ends_with("<think>") {
+                return Some(true); // sequence: begin="", any_text, end="</think>"
+            }
+        }
+        None
     }
 
     fn get_top_k(&self) -> Option<i32> {
