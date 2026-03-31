@@ -1399,50 +1399,6 @@ impl
 
         let mut common_request = builder.build()?;
 
-        // Thinking-off support: if enable_thinking=false, append the </think> token
-        // so the model immediately produces the final answer without a reasoning trace.
-        // This mirrors Chat Completions' chat_template_args.enable_thinking=false behavior
-        // but for the raw-prompt Completions API.
-        if request.get_enable_thinking() == Some(false) && common_request.prompt_embeds.is_none() {
-            use crate::protocols::TokenIdType;
-            // Tokenize "</think>" to get the correct token ID(s) for this model
-            if let Ok(think_encoding) = self.tokenizer.encode("</think>") {
-                let think_ids: Vec<TokenIdType> = think_encoding
-                    .token_ids()
-                    .iter()
-                    .map(|&id| id as TokenIdType)
-                    .collect();
-                // Guard: only append </think> if the prompt does NOT already end with it.
-                // When enable_thinking=false is auto-detected from a </think>-suffixed
-                // completions prompt, appending again creates </think></think> which
-                // confuses the model and breaks xgrammar guided-decoding constraints.
-                let already_ends = !think_ids.is_empty()
-                    && common_request.token_ids.ends_with(&think_ids);
-                if already_ends {
-                    tracing::debug!(
-                        "completions preprocess: </think> already at end of prompt \
-                         (token_ids len={}), skipping append",
-                        common_request.token_ids.len()
-                    );
-                } else {
-                    common_request.token_ids.extend_from_slice(&think_ids);
-                    tracing::debug!(
-                        "completions preprocess: appended </think> (ids={:?}), \
-                         prompt len now={}",
-                        think_ids,
-                        common_request.token_ids.len()
-                    );
-                }
-                // Debug: log last 8 token IDs of the final prompt to confirm
-                // no accidental double think-tag injection.
-                let tail_start = common_request.token_ids.len().saturating_sub(8);
-                tracing::debug!(
-                    "completions preprocess: final prompt tail token_ids={:?}",
-                    &common_request.token_ids[tail_start..]
-                );
-            }
-        }
-
         // Attach the timing tracker to the request so downstream components can record metrics
         common_request.tracker = tracker;
 
