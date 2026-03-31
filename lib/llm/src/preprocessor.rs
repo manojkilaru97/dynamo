@@ -1412,7 +1412,34 @@ impl
                     .iter()
                     .map(|&id| id as TokenIdType)
                     .collect();
-                common_request.token_ids.extend(think_ids);
+                // Guard: only append </think> if the prompt does NOT already end with it.
+                // When enable_thinking=false is auto-detected from a </think>-suffixed
+                // completions prompt, appending again creates </think></think> which
+                // confuses the model and breaks xgrammar guided-decoding constraints.
+                let already_ends = !think_ids.is_empty()
+                    && common_request.token_ids.ends_with(&think_ids);
+                if already_ends {
+                    tracing::debug!(
+                        "completions preprocess: </think> already at end of prompt \
+                         (token_ids len={}), skipping append",
+                        common_request.token_ids.len()
+                    );
+                } else {
+                    common_request.token_ids.extend_from_slice(&think_ids);
+                    tracing::debug!(
+                        "completions preprocess: appended </think> (ids={:?}), \
+                         prompt len now={}",
+                        think_ids,
+                        common_request.token_ids.len()
+                    );
+                }
+                // Debug: log last 8 token IDs of the final prompt to confirm
+                // no accidental double think-tag injection.
+                let tail_start = common_request.token_ids.len().saturating_sub(8);
+                tracing::debug!(
+                    "completions preprocess: final prompt tail token_ids={:?}",
+                    &common_request.token_ids[tail_start..]
+                );
             }
         }
 

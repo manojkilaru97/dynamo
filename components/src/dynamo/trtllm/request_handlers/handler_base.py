@@ -1074,6 +1074,14 @@ class HandlerBase(BaseGenerativeHandler):
             # 1. Any guided decoding is specified (json, regex, grammar, json_object)
             # 2. structural_tag is NOT already provided (user didn't override)
             # 3. enable_thinking is set (from request or server default)
+            # For thinking-off: GuidedDecodingParams has no choice field.
+            # Convert choice list to regex alternation so xgrammar enforces it
+            # via direct regex constraint (no structural_tag). For thinking-on
+            # the regex is wrapped in a structural_tag sequence below.
+            if choice is not None and regex is None:
+                regex = "|".join(re.escape(str(c)) for c in choice)
+                choice = None
+
             has_guided_decoding = (
                 json_schema is not None
                 or regex is not None
@@ -1085,6 +1093,7 @@ class HandlerBase(BaseGenerativeHandler):
             if (
                 has_guided_decoding
                 and structural_tag is None
+                and enable_thinking is True
             ):
                 # Build xgrammar content from guided decoding params
                 content = self._build_xgrammar_content(
