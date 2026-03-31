@@ -1059,7 +1059,35 @@ class HandlerBase(BaseGenerativeHandler):
             json_object = guided_decoding.get("json_object", False)
             enable_thinking = guided_decoding.get("enable_thinking")
 
-            # Fall back to server-level default if request didn't specify
+            # Auto-detect thinking mode from the completions API prompt suffix when
+            # enable_thinking is not set explicitly in the request.
+            #
+            # For the completions API, the user manually constructs the prompt and
+            # encodes the thinking mode via the last token in the prompt:
+            #   <think>   -> thinking-on  -> sequence structural_tag
+            #                (model generates: reasoning ... </think> {constrained})
+            #   </think>  -> thinking-off -> triggered_tags structural_tag
+            #                (</think> is the last prompt token; xgrammar fires
+            #                 the constraint immediately on the first generated token)
+            #
+            # Without this, a </think>-suffixed prompt falls back to
+            # enable_thinking_default=True which uses sequence mode and waits for
+            # </think> in the *generated* output. Since </think> is already in the
+            # prompt, the trigger never fires and the model generates unconstrained
+            # output (markdown fences, extra text, etc.).
+            #
+            # This mirrors how chat completions works: the chat template explicitly
+            # appends <think> or </think> to the prompt, so the thinking mode is
+            # always unambiguous. Here we achieve the same by inspecting the prompt.
+            if enable_thinking is None:
+                prompt = request.get("prompt", "")
+                if isinstance(prompt, str):
+                    prompt_stripped = prompt.rstrip()
+                    if prompt_stripped.endswith("</think>"):
+                        enable_thinking = False   # triggered_tags: fires on </think> in prompt
+                    elif prompt_stripped.endswith("<think>"):
+                        enable_thinking = True    # sequence: begin="", any_text, end="</think>"
+            # Fall back to server-level default for prompts without a thinking suffix
             if enable_thinking is None:
                 enable_thinking = self.enable_thinking_default
 
