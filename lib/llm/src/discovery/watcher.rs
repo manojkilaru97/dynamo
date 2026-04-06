@@ -330,6 +330,7 @@ impl ModelWatcher {
                     if alias != &model_name {
                         self.manager.remove_worker_set(alias, &ws_key);
                         self.manager.remove_model_if_empty(alias);
+                        self.manager.unregister_alias(alias);
                     }
                 }
             }
@@ -351,6 +352,7 @@ impl ModelWatcher {
         for alias in &card.aliases {
             if alias != &model_name {
                 let _ = self.manager.remove_model(alias);
+                self.manager.unregister_alias(alias);
             }
         }
 
@@ -777,6 +779,7 @@ impl ModelWatcher {
                             );
                             self.manager
                                 .add_worker_set_arc(alias, &ws_key, ws_arc.clone())?;
+                            self.manager.register_alias(alias, card.name());
                         }
                     }
                 }
