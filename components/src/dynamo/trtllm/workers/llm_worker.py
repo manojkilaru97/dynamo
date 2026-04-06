@@ -650,6 +650,7 @@ async def init_llm_worker(
             enable_thinking_default=config.dyn_enable_thinking_default,
             prompt_injects_thinking_tag=config.dyn_prompt_injects_thinking_tag,
             is_speculative_decoding=engine_args.get("speculative_config") is not None,
+            context_length=config.max_seq_len,
         )
 
         # Register the model with runtime config
