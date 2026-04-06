@@ -88,6 +88,9 @@ class RequestHandlerConfig:
     # logprobs enabled will be rejected early because TRT-LLM's speculative
     # sampler does not support return_log_probs.
     is_speculative_decoding: bool = False
+    # Max sequence length the engine supports; used to compute a dynamic
+    # default for max_tokens when the client does not specify it.
+    context_length: Optional[int] = None
 
 
 class HandlerBase(BaseGenerativeHandler):
@@ -133,6 +136,7 @@ class HandlerBase(BaseGenerativeHandler):
         self.is_speculative_decoding = bool(
             getattr(config, "is_speculative_decoding", False)
         )
+        self.context_length: Optional[int] = config.context_length
 
     def check_error(self, result: dict):
         """
@@ -732,9 +736,14 @@ class HandlerBase(BaseGenerativeHandler):
                         sampling_params, "prompt_logprobs", int(prompt_logprobs_value)
                     )
 
-        max_tokens = request["stop_conditions"]["max_tokens"]
+        max_tokens = request["stop_conditions"].get("max_tokens")
         if max_tokens:
             sampling_params.max_tokens = max_tokens
+        elif self.context_length is not None:
+            # OpenAI spec: when max_tokens is omitted, default to
+            # max_context_length - prompt_token_length (same as vLLM handler).
+            input_length = len(request.get("token_ids", []))
+            sampling_params.max_tokens = max(1, self.context_length - input_length)
 
         ignore_eos = request["stop_conditions"].get("ignore_eos")
         if ignore_eos:
