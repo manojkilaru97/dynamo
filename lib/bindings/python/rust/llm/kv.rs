@@ -755,7 +755,7 @@ impl KvRouter {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (token_ids, model, stop_conditions=None, sampling_options=None, output_options=None, router_config_override=None, worker_id=None, dp_rank=None, extra_args=None, block_mm_infos=None, multi_modal_data=None, mm_routing_info=None))]
+    #[pyo3(signature = (token_ids, model, stop_conditions=None, sampling_options=None, output_options=None, router_config_override=None, worker_id=None, dp_rank=None, extra_args=None, block_mm_infos=None, multi_modal_data=None, mm_routing_info=None, cache_salt=None))]
     fn generate<'p>(
         &self,
         py: Python<'p>,
@@ -771,6 +771,7 @@ impl KvRouter {
         block_mm_infos: Option<PyObject>,
         multi_modal_data: Option<PyObject>,
         mm_routing_info: Option<PyObject>,
+        cache_salt: Option<String>,
     ) -> PyResult<Bound<'p, PyAny>> {
         // Depythonize the options with defaults
         let stop_conditions: StopConditions = if let Some(obj) = stop_conditions {
@@ -836,6 +837,7 @@ impl KvRouter {
         request_builder
             .model(model)
             .token_ids(token_ids)
+            .cache_salt(cache_salt)
             .stop_conditions(stop_conditions)
             .sampling_options(sampling_options)
             .output_options(output_options)

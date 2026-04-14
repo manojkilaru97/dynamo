@@ -125,16 +125,60 @@ def build_sampling_params(
     sampling_params = SamplingParams(**default_sampling_params)
     sampling_params.detokenize = False
 
+    tool_choice = request.get("request_for_sampling", {}).get("tool_choice")
+    model_name = str(request.get("model") or request.get("served_model_name") or "")
+    is_minimax_m2 = "minimax" in model_name.lower()
+    forced_tool_choice = tool_choice == "required" or (
+        isinstance(tool_choice, dict)
+        and bool(tool_choice.get("function", {}).get("name"))
+    )
+
     # Handle guided_decoding - convert to StructuredOutputsParams
     guided_decoding = request["sampling_options"].get("guided_decoding")
     if guided_decoding is not None and isinstance(guided_decoding, dict):
+        json_object = guided_decoding.get("json_object")
+        if json_object is False:
+            json_object = None
         sampling_params.structured_outputs = StructuredOutputsParams(
             json=guided_decoding.get("json"),
             regex=guided_decoding.get("regex"),
             choice=guided_decoding.get("choice"),
             grammar=guided_decoding.get("grammar"),
+            json_object=json_object,
+            disable_fallback=guided_decoding.get("disable_fallback", False),
+            disable_any_whitespace=guided_decoding.get(
+                "disable_any_whitespace", False
+            ),
+            disable_additional_properties=guided_decoding.get(
+                "disable_additional_properties", False
+            ),
             whitespace_pattern=guided_decoding.get("whitespace_pattern"),
+            structural_tag=guided_decoding.get("structural_tag"),
         )
+        if sampling_params.structured_outputs is not None:
+            if guided_decoding.get("structural_tag") is not None:
+                # Reasoning-aware handoff is expressed via structural_tag and is
+                # currently implemented by xgrammar. Routing these requests to
+                # LMFE silently disables the intended handoff semantics.
+                sampling_params.structured_outputs._backend = "xgrammar"
+                sampling_params.structured_outputs._backend_was_auto = True
+            elif is_minimax_m2 and guided_decoding.get("grammar") is not None:
+                # MiniMax native grammar requests can stay in reasoning forever
+                # on the default xgrammar path. The guidance backend already
+                # handles the same grammar forms correctly for MiniMax in the
+                # legacy guided_grammar path, so use that backend explicitly.
+                sampling_params.structured_outputs._backend = "guidance"
+                sampling_params.structured_outputs._backend_was_auto = True
+            elif (
+                guided_decoding.get("regex") is not None
+                or (guided_decoding.get("json") is not None and forced_tool_choice)
+            ):
+                # Regex and forced-tool JSON still prefer LMFE for cleaner
+                # termination. Plain MiniMax structured JSON now stays on the
+                # reasoning-aware structural_tag + xgrammar path above.
+                sampling_params.structured_outputs._backend = "lm-format-enforcer"
+                sampling_params.structured_outputs._backend_was_auto = True
+        sampling_params.skip_reading_prefix_cache = True
 
     # Apply remaining sampling_options
     for key, value in request["sampling_options"].items():
@@ -1058,6 +1102,8 @@ class BaseWorkerHandler(ABC):
         )
         if mm_uuids is not None:
             prompt_kwargs["multi_modal_uuids"] = mm_uuids
+        if request.get("cache_salt") is not None:
+            prompt_kwargs["cache_salt"] = request["cache_salt"]
 
         prompt = TokensPrompt(**prompt_kwargs)
         return prompt, embedding_sequence_length, None

@@ -154,6 +154,18 @@ pub struct OpenAIPreprocessor {
 }
 
 impl OpenAIPreprocessor {
+    fn has_structured_decoding_request(request: &NvCreateChatCompletionRequest) -> bool {
+        request.structured_outputs.is_some()
+            || request.inner.response_format.is_some()
+            || request.get_guided_json().is_some()
+            || request.get_guided_regex().is_some()
+            || request.get_guided_grammar().is_some()
+            || request.get_guided_choice().is_some()
+            || request.get_guided_json_object().is_some()
+            || request.get_guided_whitespace_pattern().is_some()
+            || request.get_guided_structural_tag().is_some()
+    }
+
     pub fn new(mdc: ModelDeploymentCard) -> Result<Arc<Self>> {
         let formatter = PromptFormatter::from_mdc(&mdc)?;
         let tokenizer = mdc.tokenizer()?;
@@ -673,12 +685,14 @@ impl OpenAIPreprocessor {
             self.runtime_config.reasoning_parser.as_deref(),
             request.chat_template_args.as_ref(),
         );
+        let has_structured_decoding = Self::has_structured_decoding_request(request);
         let should_parse_reasoning = self.runtime_config.reasoning_parser.is_some() && !is_disabled;
 
         tracing::debug!(
             reasoning_parser = ?self.runtime_config.reasoning_parser,
             chat_template_args = ?request.chat_template_args,
             is_disabled_by_request = is_disabled,
+            has_structured_decoding = has_structured_decoding,
             should_parse_reasoning = should_parse_reasoning,
             "Reasoning parser decision for postprocessing"
         );
@@ -726,6 +740,12 @@ impl OpenAIPreprocessor {
 
         // Apply jail conditionally
         let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> = if should_jail {
+            tracing::warn!(
+                tool_choice = ?request.inner.tool_choice,
+                has_tools,
+                tool_call_parser = ?self.tool_call_parser,
+                "Applying tool calling jail to stream"
+            );
             Box::pin(Self::apply_tool_calling_jail(
                 self.tool_call_parser.clone(),
                 request.inner.tool_choice.clone(),
@@ -1613,12 +1633,7 @@ mod tests {
                 false,
                 "glm45 + enable_thinking=true → enabled",
             ),
-            (
-                Some("glm45"),
-                None,
-                false,
-                "glm45 + no args → enabled",
-            ),
+            (Some("glm45"), None, false, "glm45 + no args → enabled"),
             (
                 Some("glm45"),
                 Some(&empty_args),

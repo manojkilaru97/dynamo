@@ -132,8 +132,13 @@ impl<T: OpenAISamplingOptionsProvider + CommonExtProvider> SamplingOptionsProvid
         let guided_regex = self.get_guided_regex();
         let guided_grammar = self.get_guided_grammar();
         let guided_choice = self.get_guided_choice();
+        let guided_json_object = self.get_guided_json_object();
         let guided_whitespace_pattern = self.get_guided_whitespace_pattern();
         let guided_structural_tag = self.get_guided_structural_tag();
+        let guided_disable_fallback = self.get_guided_disable_fallback();
+        let guided_disable_any_whitespace = self.get_guided_disable_any_whitespace();
+        let guided_disable_additional_properties =
+            self.get_guided_disable_additional_properties();
         let enable_thinking = self.get_enable_thinking();
 
         let guided_decoding = match common::GuidedDecodingOptions::from_optional(
@@ -141,9 +146,13 @@ impl<T: OpenAISamplingOptionsProvider + CommonExtProvider> SamplingOptionsProvid
             guided_regex,
             guided_choice,
             guided_grammar,
+            guided_json_object,
             guided_decoding_backend,
             guided_whitespace_pattern,
             guided_structural_tag,
+            guided_disable_fallback,
+            guided_disable_any_whitespace,
+            guided_disable_additional_properties,
             enable_thinking,
         ) {
             Ok(options) => options,
@@ -167,6 +176,7 @@ impl<T: OpenAISamplingOptionsProvider + CommonExtProvider> SamplingOptionsProvid
             seed,
             use_beam_search: None,
             length_penalty: None,
+            skip_reading_prefix_cache: guided_decoding.as_ref().map(|_| true),
             guided_decoding,
             include_stop_str_in_output,
         })

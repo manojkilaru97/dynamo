@@ -69,6 +69,12 @@ shutdown_endpoints: list = []
 CHECKPOINT_SLEEP_MODE_LEVEL = 1
 
 
+def _vllm_reasoning_parser_name(name: str | None) -> str | None:
+    if name == "minimax_append_think":
+        return "minimax_m2_append_think"
+    return name
+
+
 def build_headless_namespace(config: Config) -> argparse.Namespace:
     """Build an argparse Namespace from engine_args for vLLM's run_headless().
 
@@ -459,6 +465,20 @@ def setup_vllm_engine(config, stat_logger=None):
     # Taken from build_async_engine_client_from_engine_args()
     usage_context = UsageContext.OPENAI_API_SERVER
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+    vllm_reasoning_parser = _vllm_reasoning_parser_name(config.dyn_reasoning_parser)
+    logger.warning(
+        "DYN_REASONING_DEBUG config.dyn_reasoning_parser=%r before_structured_outputs_reasoning_parser=%r",
+        config.dyn_reasoning_parser,
+        vllm_config.structured_outputs_config.reasoning_parser,
+    )
+    if vllm_reasoning_parser:
+        vllm_config.structured_outputs_config.reasoning_parser = (
+            vllm_reasoning_parser
+        )
+    logger.warning(
+        "DYN_REASONING_DEBUG after_structured_outputs_reasoning_parser=%r",
+        vllm_config.structured_outputs_config.reasoning_parser,
+    )
 
     # Set up consolidator endpoints if KVBM (DynamoConnector) is enabled
     consolidator_endpoints = None

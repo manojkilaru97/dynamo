@@ -53,7 +53,8 @@ pub async fn completion_response_stream(
 > {
     // create the context for the request
     // [WIP] from request id.
-    let request_id = get_or_create_request_id(request.inner.user.as_deref());
+    let request_id =
+        get_or_create_request_id(request.request_id.as_deref().or(request.inner.user.as_deref()));
     let streaming = request.inner.stream.unwrap_or(false);
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone(),
@@ -193,14 +194,12 @@ pub fn grpc_monitor_for_disconnects<T>(
 fn get_or_create_request_id(primary: Option<&str>) -> String {
     // Try to get the request ID from the primary source
     if let Some(primary) = primary
-        && let Ok(uuid) = uuid::Uuid::parse_str(primary)
+        && !primary.trim().is_empty()
     {
-        return uuid.to_string();
+        return primary.to_string();
     }
 
-    // Try to parse the request ID as a UUID, or generate a new one if missing/invalid
-    let uuid = uuid::Uuid::new_v4();
-    uuid.to_string()
+    uuid::Uuid::new_v4().to_string()
 }
 
 impl TryFrom<inference::ModelInferRequest> for NvCreateCompletionRequest {
@@ -330,6 +329,8 @@ impl TryFrom<inference::ModelInferRequest> for NvCreateCompletionRequest {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         })
     }

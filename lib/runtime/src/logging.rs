@@ -900,8 +900,8 @@ fn setup_logging() {
 #[cfg(not(feature = "tokio-console"))]
 fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
     // Suppress payload logs from console output - they are exported to OTEL only
-    let fmt_filter_layer = filters(load_config())
-        .add_directive("dynamo_payload=off".parse().unwrap());
+    let fmt_filter_layer =
+        filters(load_config()).add_directive("dynamo_payload=off".parse().unwrap());
     let trace_filter_layer = filters(load_config());
     let otel_filter_layer = filters(load_config());
 

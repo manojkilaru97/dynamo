@@ -39,6 +39,21 @@ def _make_handler() -> _TestWorkerHandler:
     return handler
 
 
+def test_build_prompt_from_request_preserves_cache_salt():
+    handler = _make_handler()
+
+    prompt, embedding_sequence_length, error = handler._build_prompt_from_request(
+        {"token_ids": [1, 2, 3], "cache_salt": "req-123"},
+        "req-123",
+        None,
+    )
+
+    assert error is None
+    assert embedding_sequence_length is None
+    assert prompt["prompt_token_ids"] == [1, 2, 3]
+    assert prompt["cache_salt"] == "req-123"
+
+
 @pytest.mark.asyncio
 async def test_wake_up_before_sleep_is_noop():
     handler = _make_handler()

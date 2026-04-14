@@ -109,7 +109,9 @@ async fn new_keep_alive_stream(
 
     loop {
         if Instant::now() >= *deadline {
-            anyhow::bail!("Unable to maintain lease - deadline exceeded while establishing keep-alive stream");
+            anyhow::bail!(
+                "Unable to maintain lease - deadline exceeded while establishing keep-alive stream"
+            );
         }
 
         // Log which channel generation we are about to use.
@@ -120,13 +122,18 @@ async fn new_keep_alive_stream(
             lease_id,
             generation = cur_gen,
             consecutive_failures,
-            "keep-alive stream attempt (channel generation {})", cur_gen
+            "keep-alive stream attempt (channel generation {})",
+            cur_gen
         );
 
         let mut lease_client = connector.get_client().lease_client();
         match lease_client.keep_alive(lease_id as i64).await {
             Ok((sender, receiver)) => {
-                tracing::debug!(lease_id, generation = cur_gen, "Established keep-alive stream");
+                tracing::debug!(
+                    lease_id,
+                    generation = cur_gen,
+                    "Established keep-alive stream"
+                );
                 return Ok(Some((sender, receiver)));
             }
             Err(e) => {
@@ -146,7 +153,8 @@ async fn new_keep_alive_stream(
                         lease_id,
                         generation = cur_gen,
                         "Keep-alive stream failed {} times on generation {}; triggering reconnect",
-                        consecutive_failures, cur_gen
+                        consecutive_failures,
+                        cur_gen
                     );
                     consecutive_failures = 0;
                     tokio::select! {
@@ -181,7 +189,8 @@ async fn new_keep_alive_stream(
                         generation = cur_gen,
                         backoff_ms = backoff.as_millis(),
                         "retrying keep-alive on same channel (generation {}), backoff {:?}",
-                        cur_gen, backoff
+                        cur_gen,
+                        backoff
                     );
                     tokio::select! {
                         biased;

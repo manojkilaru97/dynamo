@@ -5,6 +5,43 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
 
+/// OpenAI-compatible structured output parameters.
+///
+/// Mirrors vLLM's `StructuredOutputsParams` so Dynamo's OpenAI frontend can
+/// accept the same request shape and pass it through to the worker bridge.
+#[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone, Default)]
+pub struct StructuredOutputsParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<serde_json::Value>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<Vec<String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_object: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_fallback: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_any_whitespace: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_additional_properties: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whitespace_pattern: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_tag: Option<serde_json::Value>,
+}
+
 /// Common extensions for OpenAI API requests that are not part of the standard OpenAI spec
 /// but are commonly needed across different request types.
 #[derive(ToSchema, Serialize, Deserialize, Builder, Validate, Debug, Clone, Default)]
@@ -100,6 +137,12 @@ pub struct CommonExt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
     pub enable_thinking: Option<bool>,
+
+    /// Compatibility field accepted from legacy tool tests.
+    /// Dynamo currently ignores this for MiniMax chat requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub reasoning_budget: Option<u32>,
 }
 
 impl CommonExt {
@@ -118,10 +161,14 @@ pub trait CommonExtProvider {
     fn get_guided_regex(&self) -> Option<String>;
     fn get_guided_grammar(&self) -> Option<String>;
     fn get_guided_choice(&self) -> Option<Vec<String>>;
+    fn get_guided_json_object(&self) -> Option<bool>;
     fn get_guided_decoding_backend(&self) -> Option<String>;
     #[allow(unused)] // Not used
     fn get_guided_whitespace_pattern(&self) -> Option<String>;
     fn get_guided_structural_tag(&self) -> Option<serde_json::Value>;
+    fn get_guided_disable_fallback(&self) -> Option<bool>;
+    fn get_guided_disable_any_whitespace(&self) -> Option<bool>;
+    fn get_guided_disable_additional_properties(&self) -> Option<bool>;
 
     /// Other sampling Options
     fn get_top_k(&self) -> Option<i32>;
@@ -159,6 +206,7 @@ mod tests {
         assert_eq!(common_ext.guided_decoding_backend, None);
         assert_eq!(common_ext.include_stop_str_in_output, None);
         assert_eq!(common_ext.skip_special_tokens, None);
+        assert_eq!(common_ext.reasoning_budget, None);
     }
 
     #[test]
@@ -175,6 +223,7 @@ mod tests {
             .guided_choice(vec!["choice1".to_string(), "choice2".to_string()])
             .guided_decoding_backend("backend".to_string())
             .skip_special_tokens(false)
+            .reasoning_budget(2048)
             .build()
             .unwrap();
 
@@ -198,6 +247,7 @@ mod tests {
             Some("backend".to_string())
         );
         assert_eq!(common_ext.skip_special_tokens, Some(false));
+        assert_eq!(common_ext.reasoning_budget, Some(2048));
     }
 
     #[test]
@@ -234,6 +284,7 @@ mod tests {
             guided_structural_tag: None,
             skip_special_tokens: None,
             enable_thinking: None,
+            reasoning_budget: None,
         };
         assert!(common_ext.validate().is_ok());
     }
@@ -298,6 +349,7 @@ mod tests {
         // Test with false value
         let common_ext = CommonExt::builder()
             .skip_special_tokens(false)
+            .reasoning_budget(1024)
             .build()
             .unwrap();
 
@@ -305,10 +357,12 @@ mod tests {
         let deserialized: CommonExt = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.skip_special_tokens, Some(false));
+        assert_eq!(deserialized.reasoning_budget, Some(1024));
 
         // Test that None is not serialized (skip_serializing_if = "Option::is_none")
         let common_ext = CommonExt::builder().build().unwrap();
         let json = serde_json::to_string(&common_ext).unwrap();
         assert!(!json.contains("skip_special_tokens"));
+        assert!(!json.contains("reasoning_budget"));
     }
 }

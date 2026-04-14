@@ -21,8 +21,6 @@ use crate::endpoint_type::EndpointType;
 use crate::kv_router::metrics::{
     RoutingOverheadMetrics, register_router_queue_metrics, register_worker_load_metrics,
 };
-use dynamo_runtime::metrics::frontend_perf::ensure_frontend_perf_metrics_registered_prometheus;
-use dynamo_runtime::metrics::request_plane::ensure_request_plane_metrics_registered_prometheus;
 use crate::request_template::RequestTemplate;
 use anyhow::Result;
 use axum_server::tls_rustls::RustlsConfig;
@@ -31,6 +29,8 @@ use dynamo_runtime::config::env_is_truthy;
 use dynamo_runtime::config::environment_names::llm as env_llm;
 use dynamo_runtime::discovery::Discovery;
 use dynamo_runtime::logging::make_request_span;
+use dynamo_runtime::metrics::frontend_perf::ensure_frontend_perf_metrics_registered_prometheus;
+use dynamo_runtime::metrics::request_plane::ensure_request_plane_metrics_registered_prometheus;
 use std::net::SocketAddr;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;

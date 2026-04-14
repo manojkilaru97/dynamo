@@ -124,6 +124,12 @@ pub struct PreprocessedRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_embeds: Option<String>,
 
+    /// Optional salt forwarded to the backend prompt object to isolate
+    /// vLLM prefix-cache reuse for requests that must not share cached state.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_salt: Option<String>,
+
     // Multimodal data
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Option::is_none")]

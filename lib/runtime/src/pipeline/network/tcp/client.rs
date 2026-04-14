@@ -486,7 +486,14 @@ mod tests {
         // Close the sender to trigger normal termination
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -516,7 +523,14 @@ mod tests {
         // Close the sender immediately to trigger normal termination
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -553,7 +567,14 @@ mod tests {
         // Kill the context
         controller.kill();
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -591,7 +612,14 @@ mod tests {
         // Stop the context
         controller.stop();
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -636,7 +664,14 @@ mod tests {
         // Close the sender to trigger normal termination
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -667,7 +702,14 @@ mod tests {
         // Close the sender to trigger normal termination
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -695,7 +737,14 @@ mod tests {
         // Close the sender
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -741,7 +790,14 @@ mod tests {
         // Close the sender
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller, Arc::new(AtomicBool::new(false))).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
 
         assert!(result.is_ok());
 

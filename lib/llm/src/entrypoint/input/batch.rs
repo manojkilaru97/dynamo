@@ -230,6 +230,8 @@ async fn evaluate(
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,
+        structured_outputs: None,
+        request_id: None,
         unsupported_fields: Default::default(),
     };
     let mut stream = engine.generate(Context::new(req)).await?;

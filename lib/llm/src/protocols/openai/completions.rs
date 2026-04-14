@@ -13,7 +13,7 @@ use super::{
     ContentProvider, OpenAIOutputOptionsProvider, OpenAISamplingOptionsProvider,
     OpenAIStopConditionsProvider,
     common::{self, OutputOptionsProvider, SamplingOptionsProvider, StopConditionsProvider},
-    common_ext::{CommonExt, CommonExtProvider},
+    common_ext::{CommonExt, CommonExtProvider, StructuredOutputsParams},
     nvext::{NvExt, NvExtProvider},
     validate,
 };
@@ -38,6 +38,14 @@ pub struct NvCreateCompletionRequest {
     // metadata - passthrough parameter without restrictions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+
+    /// OpenAI-compatible structured outputs parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_outputs: Option<StructuredOutputsParams>,
+
+    /// Optional caller-provided request identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 
     /// Catch-all for unsupported fields - checked during validation
     #[serde(flatten, default, skip_serializing)]
@@ -190,14 +198,17 @@ impl CommonExtProvider for NvCreateCompletionRequest {
         if let Some(value) = self.common.guided_json.clone() {
             return Some(value);
         }
+        if let Some(structured_outputs) = self.structured_outputs.as_ref()
+            && let Some(schema) = structured_outputs.json.clone()
+        {
+            return Some(schema);
+        }
         // Map OpenAI response_format to guided_json (mirrors chat_completions.rs behavior)
         if let Some(response_format) = self.inner.response_format.as_ref() {
             use dynamo_async_openai::types::ResponseFormat;
             match response_format {
                 ResponseFormat::Text => {}
-                ResponseFormat::JsonObject => {
-                    return Some(serde_json::json!({"type": "object"}));
-                }
+                ResponseFormat::JsonObject => {}
                 ResponseFormat::JsonSchema { json_schema } => {
                     if let Some(schema) = json_schema.schema.clone() {
                         return Some(schema);
@@ -209,15 +220,42 @@ impl CommonExtProvider for NvCreateCompletionRequest {
     }
 
     fn get_guided_regex(&self) -> Option<String> {
-        self.common.guided_regex.clone()
+        self.common.guided_regex.clone().or_else(|| {
+            self.structured_outputs
+                .as_ref()
+                .and_then(|params| params.regex.clone())
+        })
     }
 
     fn get_guided_grammar(&self) -> Option<String> {
-        self.common.guided_grammar.clone()
+        self.common.guided_grammar.clone().or_else(|| {
+            self.structured_outputs
+                .as_ref()
+                .and_then(|params| params.grammar.clone())
+        })
     }
 
     fn get_guided_choice(&self) -> Option<Vec<String>> {
-        self.common.guided_choice.clone()
+        self.common.guided_choice.clone().or_else(|| {
+            self.structured_outputs
+                .as_ref()
+                .and_then(|params| params.choice.clone())
+        })
+    }
+
+    fn get_guided_json_object(&self) -> Option<bool> {
+        self.structured_outputs
+            .as_ref()
+            .and_then(|params| params.json_object)
+            .or_else(|| {
+                self.inner.response_format.as_ref().and_then(|response_format| {
+                    use dynamo_async_openai::types::ResponseFormat;
+                    match response_format {
+                        ResponseFormat::JsonObject => Some(true),
+                        _ => None,
+                    }
+                })
+            })
     }
 
     fn get_guided_decoding_backend(&self) -> Option<String> {
@@ -225,11 +263,37 @@ impl CommonExtProvider for NvCreateCompletionRequest {
     }
 
     fn get_guided_whitespace_pattern(&self) -> Option<String> {
-        self.common.guided_whitespace_pattern.clone()
+        self.common.guided_whitespace_pattern.clone().or_else(|| {
+            self.structured_outputs
+                .as_ref()
+                .and_then(|params| params.whitespace_pattern.clone())
+        })
     }
 
     fn get_guided_structural_tag(&self) -> Option<serde_json::Value> {
-        self.common.guided_structural_tag.clone()
+        self.common.guided_structural_tag.clone().or_else(|| {
+            self.structured_outputs
+                .as_ref()
+                .and_then(|params| params.structural_tag.clone())
+        })
+    }
+
+    fn get_guided_disable_fallback(&self) -> Option<bool> {
+        self.structured_outputs
+            .as_ref()
+            .and_then(|params| params.disable_fallback)
+    }
+
+    fn get_guided_disable_any_whitespace(&self) -> Option<bool> {
+        self.structured_outputs
+            .as_ref()
+            .and_then(|params| params.disable_any_whitespace)
+    }
+
+    fn get_guided_disable_additional_properties(&self) -> Option<bool> {
+        self.structured_outputs
+            .as_ref()
+            .and_then(|params| params.disable_additional_properties)
     }
 
     /// Auto-detects thinking mode from the prompt suffix when guided decoding is active.
@@ -471,6 +535,7 @@ impl OpenAIOutputOptionsProvider for NvCreateCompletionRequest {
 impl ValidateRequest for NvCreateCompletionRequest {
     fn validate(&self) -> Result<(), anyhow::Error> {
         validate::validate_no_unsupported_fields(&self.unsupported_fields)?;
+        validate::validate_structured_outputs(&self.structured_outputs)?;
         validate::validate_model(&self.inner.model)?;
 
         // Validate prompt and prompt_embeds together (checks presence, format, and content)
