@@ -233,6 +233,109 @@ fn get_arguments_config(
     HashMap::new()
 }
 
+fn extract_types_from_schema(schema: &Value) -> Vec<String> {
+    let mut types = Vec::new();
+
+    if let Some(type_str) = schema.get("type").and_then(|t| t.as_str()) {
+        types.push(type_str.to_lowercase());
+    } else if let Some(type_arr) = schema.get("type").and_then(|t| t.as_array()) {
+        for ty in type_arr {
+            if let Some(type_str) = ty.as_str() {
+                types.push(type_str.to_lowercase());
+            }
+        }
+    }
+
+    if let Some(enum_values) = schema.get("enum").and_then(|v| v.as_array()) {
+        for value in enum_values {
+            let inferred = match value {
+                Value::Null => Some("null"),
+                Value::Bool(_) => Some("boolean"),
+                Value::Number(n) if n.is_i64() || n.is_u64() => Some("integer"),
+                Value::Number(_) => Some("number"),
+                Value::String(_) => Some("string"),
+                Value::Array(_) => Some("array"),
+                Value::Object(_) => Some("object"),
+            };
+            if let Some(kind) = inferred {
+                types.push(kind.to_string());
+            }
+        }
+    }
+
+    for choice_field in ["anyOf", "oneOf", "allOf"] {
+        if let Some(choices) = schema.get(choice_field).and_then(|v| v.as_array()) {
+            for choice in choices {
+                types.extend(extract_types_from_schema(choice));
+            }
+        }
+    }
+
+    if types.is_empty() {
+        return vec!["string".to_string()];
+    }
+
+    types.sort();
+    types.dedup();
+    types
+}
+
+fn parse_expected_json_container(raw: &str, expected_kind: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    let mut candidates = vec![trimmed.to_string()];
+
+    if trimmed.len() >= 2 {
+        let first = trimmed.chars().next().unwrap_or_default();
+        let last = trimmed.chars().last().unwrap_or_default();
+        if (first == '"' || first == '\'') && first == last {
+            candidates.push(trimmed[1..trimmed.len() - 1].trim().to_string());
+        }
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+        match (&parsed, expected_kind) {
+            (Value::Object(_), "object") | (Value::Array(_), "array") => return Some(parsed),
+            (Value::String(nested), _) => candidates.push(nested.trim().to_string()),
+            _ => {}
+        }
+    }
+
+    let mut idx = 0;
+    while idx < candidates.len() {
+        let candidate = candidates[idx].clone();
+        let unescaped = candidate
+            .replace("\\\"", "\"")
+            .replace("\\'", "'")
+            .replace("\\n", "\n");
+        if !candidates.contains(&unescaped) {
+            candidates.push(unescaped);
+        }
+        idx += 1;
+    }
+
+    for candidate in candidates {
+        let bytes = candidate.as_bytes();
+        if bytes.is_empty() {
+            continue;
+        }
+        let starts_like_container = matches!(bytes[0], b'{' | b'[');
+        let ends_like_container = matches!(bytes[bytes.len() - 1], b'}' | b']');
+        if !starts_like_container || !ends_like_container {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<Value>(&candidate) {
+            match (&parsed, expected_kind) {
+                (Value::Object(_), "object") | (Value::Array(_), "array") => {
+                    return Some(parsed);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    None
+}
+
 /// Convert parameter value based on its type in the schema.
 /// This matches the behavior of the Python implementation.
 /// Converts a string parameter value from XML into a typed JSON Value.
@@ -341,147 +444,71 @@ fn convert_param_value(
         return Value::String(param_value);
     }
 
-    // Get the type from schema
-    let param_type = param_config
+    let param_types = param_config
         .get(param_name)
-        .and_then(|v| v.get("type"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("string")
-        .to_lowercase();
+        .map(extract_types_from_schema)
+        .unwrap_or_else(|| vec!["string".to_string()]);
 
-    // The follow `match` block follows this rough pattern for each block:
-    // 1. Match `param_type` against predefined string representations of each type,
-    // 2. Parse the string value and convert it to the appropriate Rust JSON Value type.
-    // Each branch handles a category of type aliases (e.g., "int"/"integer"/"int32" all map to i64).
-    // If parsing fails, we log a warning and fall back to returning the value as a string.
-    match param_type.as_str() {
-        // String types: Return value as-is (already HTML-unescaped above)
-        "string" | "str" | "text" | "varchar" | "char" | "enum" => Value::String(param_value),
-
-        // Integer types: Parse as i64, fall back to string on error.
-        // Matches: "int", "integer", "int32", "uint", "unsigned", "long", "short", etc.
-        t if t.starts_with("int")
-            || t.starts_with("uint")
-            || t.starts_with("long")
-            || t.starts_with("short")
-            || t.starts_with("unsigned") =>
-        {
-            match param_value.parse::<i64>() {
-                Ok(int_val) => Value::Number(int_val.into()),
-                Err(_) => {
-                    tracing::warn!(
-                        "Parsed value '{}' of parameter '{}' is not an integer in tool '{}', degenerating to string.",
-                        param_value,
-                        param_name,
-                        func_name
-                    );
-                    Value::String(param_value)
-                }
-            }
+    for param_type in [
+        "integer", "int", "number", "float", "boolean", "bool", "object", "array", "string",
+        "str", "text",
+    ] {
+        if !param_types.iter().any(|t| t == param_type) {
+            continue;
         }
 
-        // Float/Number types: Parse as f64.
-        // Matches: "number", "num", "float", "float32", "float64", "double", etc.
-        // Note: Whole numbers (e.g., 42.0) are stored as integers for better JSON compatibility.
-        t if t.starts_with("num") || t.starts_with("float") => {
-            match param_value.parse::<f64>() {
-                Ok(float_val) => {
-                    // Return int if it's a whole number, otherwise float.
+        match param_type {
+            "string" | "str" | "text" => return Value::String(param_value.clone()),
+            "integer" | "int" => {
+                if let Ok(int_val) = param_value.parse::<i64>() {
+                    return Value::Number(int_val.into());
+                }
+            }
+            "number" | "float" => {
+                if let Ok(float_val) = param_value.parse::<f64>() {
                     if float_val.fract() == 0.0 && float_val.is_finite() {
-                        Value::Number((float_val as i64).into())
-                    } else if let Some(num) = serde_json::Number::from_f64(float_val) {
-                        Value::Number(num)
-                    } else {
-                        tracing::warn!(
-                            "Parsed value '{}' of parameter '{}' is not a valid float in tool '{}', degenerating to string.",
-                            param_value,
-                            param_name,
-                            func_name
-                        );
-                        Value::String(param_value)
+                        return Value::Number((float_val as i64).into());
+                    }
+                    if let Some(num) = serde_json::Number::from_f64(float_val) {
+                        return Value::Number(num);
                     }
                 }
-                Err(_) => {
-                    tracing::warn!(
-                        "Parsed value '{}' of parameter '{}' is not a float in tool '{}', degenerating to string.",
-                        param_value,
-                        param_name,
-                        func_name
-                    );
-                    Value::String(param_value)
+            }
+            "boolean" | "bool" => {
+                let lower_val = param_value.to_lowercase();
+                if lower_val == "true" {
+                    return Value::Bool(true);
+                }
+                if lower_val == "false" {
+                    return Value::Bool(false);
                 }
             }
-        }
-
-        // Boolean types: Only "true" or "false" (case-insensitive) are valid.
-        // Any other value defaults to false with a warning.
-        "boolean" | "bool" | "binary" => {
-            let lower_val = param_value.to_lowercase();
-            if lower_val != "true" && lower_val != "false" {
-                tracing::warn!(
-                    "Parsed value '{}' of parameter '{}' is not a boolean (`true` or `false`) in tool '{}', degenerating to false.",
-                    param_value,
-                    param_name,
-                    func_name
-                );
+            "object" => {
+                if let Some(json_val) = parse_expected_json_container(&param_value, "object") {
+                    return json_val;
+                }
             }
-            Value::Bool(lower_val == "true")
-        }
-
-        // Complex types (objects/arrays): Try JSON parsing, then fall back to Python-style
-        // `ast.literal_eval` (or our own barebones version of it for the purposes of this
-        // parser).
-        // Matches: "object", "array", "arr", "dict", "dictionary", "list", etc.
-        // This handles both JSON syntax ({"a": 1}) and Python syntax ({'a': 1}).
-        t if t == "object"
-            || t == "array"
-            || t == "arr"
-            || t.starts_with("dict")
-            || t.starts_with("list") =>
-        {
-            // Try JSON parsing first (standard JSON with double quotes).
-            if let Ok(json_val) = serde_json::from_str::<Value>(&param_value) {
-                return json_val;
+            "array" => {
+                if let Some(json_val) = parse_expected_json_container(&param_value, "array") {
+                    return json_val;
+                }
             }
-
-            tracing::warn!(
-                "Parsed value '{}' of parameter '{}' cannot be parsed with json.loads in tool '{}', will try other methods to parse it.",
-                param_value,
-                param_name,
-                func_name
-            );
-
-            // Try `ast.literal_eval` equivalent (handles Python-style single quotes, etc.).
-            if let Ok(json_val) = try_literal_eval(&param_value) {
-                return json_val;
-            }
-
-            tracing::warn!(
-                "Parsed value '{}' of parameter '{}' cannot be converted via Python `ast.literal_eval()` in tool '{}', degenerating to string.",
-                param_value,
-                param_name,
-                func_name
-            );
-            Value::String(param_value)
-        }
-
-        // Unknown/custom types: Attempt best-effort parsing via `literal_eval`.
-        // This allows for flexible type names while still trying to parse structured data
-        _ => {
-            // Unknown type, try `literal_eval`.
-            if let Ok(json_val) = try_literal_eval(&param_value) {
-                return json_val;
-            }
-
-            tracing::warn!(
-                "Parsed value '{}' of parameter '{}' cannot be converted via Python `ast.literal_eval()` in tool '{}', degenerating to string.",
-                param_value,
-                param_name,
-                func_name
-            );
-            Value::String(param_value)
+            _ => {}
         }
     }
+
+    if let Ok(json_val) = try_literal_eval(&param_value) {
+        return json_val;
+    }
+
+    tracing::warn!(
+        "Parsed value '{}' of parameter '{}' could not be converted using schema types {:?} in tool '{}', degenerating to string.",
+        param_value,
+        param_name,
+        param_types,
+        func_name
+    );
+    Value::String(param_value)
 }
 
 /// Try to parse a value similar to Python's ast.literal_eval.

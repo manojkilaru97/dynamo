@@ -565,6 +565,8 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
             nvext: resp.nvext,
             chat_template_args,
             media_io_kwargs: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         })
     }

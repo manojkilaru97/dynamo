@@ -3,12 +3,12 @@
 
 use super::*;
 
+use crate::metrics::MetricsHierarchy;
 use crate::metrics::prometheus_names::work_handler;
 use crate::metrics::work_handler_perf::{
     WORK_HANDLER_NETWORK_TRANSIT_SECONDS, WORK_HANDLER_TIME_TO_FIRST_RESPONSE_SECONDS,
     ensure_work_handler_perf_metrics_registered,
 };
-use crate::metrics::MetricsHierarchy;
 use crate::protocols::maybe_error::MaybeError;
 use prometheus::{Histogram, IntCounter, IntCounterVec, IntGauge};
 use serde::{Deserialize, Serialize};

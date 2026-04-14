@@ -372,6 +372,26 @@ impl ChoiceJailState {
 
     /// Finalize any remaining content when stream ends
     async fn finalize(&mut self, jail_stream: &JailedStream) -> Option<ChoiceEmission> {
+        if self.is_jailed && self.accumulated_content.is_empty() {
+            if let Some(pending_reasoning) = self.pending_reasoning_content.take()
+                && !pending_reasoning.is_empty()
+            {
+                let final_choice = create_choice_stream(
+                    self.index,
+                    Some(Role::Assistant),
+                    &pending_reasoning,
+                    None,
+                    self.stream_finish_reason,
+                    None,
+                    None,
+                );
+                self.end_jail();
+                return Some(ChoiceEmission::Content(final_choice));
+            }
+            self.end_jail();
+            return None;
+        }
+
         if self.is_jailed && !self.accumulated_content.is_empty() {
             // Create a dummy choice for the method call
             #[allow(deprecated)]
@@ -433,6 +453,14 @@ impl ChoiceJailStateCollection {
     /// Create a new empty collection
     fn new() -> Self {
         Self { states: Vec::new() }
+    }
+
+    /// Get an existing state for a choice index, if present.
+    fn get_state(&self, index: u32) -> Option<&ChoiceJailState> {
+        self.states
+            .binary_search_by_key(&index, |s| s.index)
+            .ok()
+            .map(|pos| &self.states[pos])
     }
 
     /// Get or create state for a choice index
@@ -532,16 +560,140 @@ impl JailedStream {
 
                     // Process each choice independently using the new architecture
                     for choice in &chat_response.choices {
-                        if let Some(ref content) = choice.delta.content {
-                            // Jailing only applies to text content
-                            let text_content = match content {
-                                dynamo_async_openai::types::ChatCompletionMessageContent::Text(text) => Some(text.as_str()),
-                                dynamo_async_openai::types::ChatCompletionMessageContent::Parts(_) => None,
-                            };
+                        let starts_jailed = matches!(self.jail_mode, JailMode::Immediate { .. });
+                        let text_content = match choice.delta.content.as_ref() {
+                            Some(dynamo_async_openai::types::ChatCompletionMessageContent::Text(
+                                text,
+                            )) => Some(text.as_str()),
+                            Some(dynamo_async_openai::types::ChatCompletionMessageContent::Parts(_)) => {
+                                None
+                            }
+                            None => None,
+                        };
+                        let reasoning_text = choice.delta.reasoning_content.as_deref();
+                        let jail_input = text_content
+                            .map(|text| (text, false))
+                            .or_else(|| {
+                                if starts_jailed {
+                                    reasoning_text.map(|text| (text, true))
+                                } else {
+                                    None
+                                }
+                            });
 
-                            if let Some(text) = text_content {
-                                let starts_jailed = matches!(self.jail_mode, JailMode::Immediate { .. });
-                                let choice_state = choice_states.get_or_create_state(choice.index, starts_jailed);
+                        if let Some((text, text_came_from_reasoning)) = jail_input {
+                            let choice_state =
+                                choice_states.get_or_create_state(choice.index, starts_jailed);
+                            let mut jail_text = text;
+
+                            if starts_jailed && text_came_from_reasoning {
+                                if !choice_state.accumulated_content.is_empty() {
+                                    jail_text = text;
+                                } else if let Some((reasoning_prefix, normalized)) =
+                                    self.split_immediate_tool_json_from_content(text)
+                                {
+                                    if !reasoning_prefix.is_empty() {
+                                        let pending = choice_state
+                                            .pending_reasoning_content
+                                            .get_or_insert_with(String::new);
+                                        pending.push_str(reasoning_prefix);
+                                    }
+                                    jail_text = normalized;
+                                } else {
+                                    if let Some(reasoning_content) = &choice.delta.reasoning_content {
+                                        let pending = choice_state
+                                            .pending_reasoning_content
+                                            .get_or_insert_with(String::new);
+                                        pending.push_str(reasoning_content);
+                                    }
+                                    choice_state.stream_finish_reason = choice.finish_reason;
+                                    continue;
+                                }
+                            } else if starts_jailed && choice_state.accumulated_content.is_empty() {
+                                if let Some((reasoning_prefix, normalized)) =
+                                    self.split_immediate_tool_json_from_content(text)
+                                {
+                                    if !reasoning_prefix.is_empty() {
+                                        let pending = choice_state
+                                            .pending_reasoning_content
+                                            .get_or_insert_with(String::new);
+                                        pending.push_str(reasoning_prefix);
+                                    }
+                                    jail_text = normalized;
+                                } else if !self.looks_like_immediate_tool_json_prefix(text) {
+                                    let reasoning_only = text
+                                        .rfind("</think>")
+                                        .map(|idx| &text[..idx])
+                                        .unwrap_or(text);
+                                    if !reasoning_only.is_empty() {
+                                        let pending = choice_state
+                                            .pending_reasoning_content
+                                            .get_or_insert_with(String::new);
+                                        pending.push_str(reasoning_only);
+                                    }
+                                    choice_state.stream_finish_reason = choice.finish_reason;
+                                    continue;
+                                }
+                            } else if starts_jailed {
+                                if let Some((reasoning_prefix, normalized)) =
+                                    self.split_immediate_tool_json_from_content(text)
+                                {
+                                    if !reasoning_prefix.is_empty() {
+                                        let pending = choice_state
+                                            .pending_reasoning_content
+                                            .get_or_insert_with(String::new);
+                                        pending.push_str(reasoning_prefix);
+                                    }
+                                    jail_text = normalized;
+                                }
+                            }
+
+                            if let Some(reasoning_content) = &choice.delta.reasoning_content
+                                && !text_came_from_reasoning
+                            {
+                                let pending = choice_state
+                                    .pending_reasoning_content
+                                    .get_or_insert_with(String::new);
+                                pending.push_str(reasoning_content);
+                            }
+
+                            // Store metadata when any choice becomes jailed (first time only)
+                            if !choice_state.is_jailed && self.should_start_jail(jail_text)
+                                && last_annotated_id.is_none() {
+                                    last_annotated_id = response.id.clone();
+                                    last_annotated_event = response.event.clone();
+                                    last_annotated_comment = response.comment.clone();
+                                }
+
+                            // Track actual stream finish reason in the choice state
+                            choice_state.stream_finish_reason = choice.finish_reason;
+
+                            // Process this choice and get emissions
+                            let mut emissions = choice_state
+                                .process_content(choice, jail_text, &self)
+                                .await;
+                            if !emissions.is_empty()
+                                && let Some(reasoning) = choice_state.pending_reasoning_content.take()
+                                && let Some(first) = emissions.first_mut()
+                            {
+                                first.choice_mut().delta.reasoning_content = Some(reasoning);
+                            }
+                            all_emissions.extend(emissions);
+                        } else {
+                            // Handle choices without content (e.g., final chunks with finish_reason)
+                            // Only filter out if this choice was ever jailed and lacks role
+                            // (to avoid aggregator issues with deltas missing role after unjail)
+                            let was_ever_jailed = choice_states.get_state(choice.index).is_some_and(
+                                |choice_state| {
+                                    !choice_state.accumulated_content.is_empty()
+                                        || choice_state.is_jailed
+                                },
+                            );
+
+                            if was_ever_jailed {
+                                let choice_state =
+                                    choice_states.get_or_create_state(choice.index, starts_jailed);
+                                choice_state.stream_finish_reason = choice.finish_reason;
 
                                 if let Some(reasoning_content) = &choice.delta.reasoning_content {
                                     let pending = choice_state
@@ -550,34 +702,19 @@ impl JailedStream {
                                     pending.push_str(reasoning_content);
                                 }
 
-                                // Store metadata when any choice becomes jailed (first time only)
-                                if !choice_state.is_jailed && self.should_start_jail(text)
-                                    && last_annotated_id.is_none() {
-                                        last_annotated_id = response.id.clone();
-                                        last_annotated_event = response.event.clone();
-                                        last_annotated_comment = response.comment.clone();
-                                    }
-
-                                // Track actual stream finish reason in the choice state
-                                choice_state.stream_finish_reason = choice.finish_reason;
-
-                                // Process this choice and get emissions
-                                let mut emissions = choice_state.process_content(choice, text, &self).await;
-                                if !emissions.is_empty()
-                                    && let Some(reasoning) = choice_state.pending_reasoning_content.take()
-                                    && let Some(first) = emissions.first_mut()
+                                // If the backend closes with an empty finish chunk after we have
+                                // been buffering content, flush immediately so the client sees the
+                                // terminal tool/content chunk before the subsequent usage chunk.
+                                if choice.finish_reason.is_some()
+                                    && choice_state.is_jailed
+                                    && !choice_state.accumulated_content.is_empty()
                                 {
-                                    first.choice_mut().delta.reasoning_content = Some(reasoning);
+                                    if let Some(emission) = choice_state.finalize(&self).await {
+                                        all_emissions.push(emission);
+                                    }
+                                    continue;
                                 }
-                                all_emissions.extend(emissions);
                             }
-                            // For multimodal content, pass through unchanged (no jailing)
-                        } else {
-                            // Handle choices without content (e.g., final chunks with finish_reason)
-                            // Only filter out if this choice was ever jailed and lacks role
-                            // (to avoid aggregator issues with deltas missing role after unjail)
-                            let choice_state = choice_states.get_or_create_state(choice.index, false);
-                            let was_ever_jailed = !choice_state.accumulated_content.is_empty() || choice_state.is_jailed;
 
                             let should_emit = choice.delta.role.is_some()
                                 || choice.delta.tool_calls.is_some()
@@ -752,6 +889,211 @@ impl JailedStream {
         sequence_match || tool_call_match
     }
 
+    fn strip_immediate_tool_control_prefix<'a>(&self, content: &'a str) -> &'a str {
+        let mut trimmed = content.trim_start();
+        loop {
+            let Some(after_lt) = trimmed.strip_prefix('<') else {
+                return trimmed;
+            };
+            let Some(end_idx) = after_lt.find('>') else {
+                return trimmed;
+            };
+            let marker = after_lt[..end_idx].trim();
+            let is_control_marker = marker.starts_with('/')
+                || marker.chars().all(|ch| {
+                    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.')
+                });
+            if !is_control_marker {
+                return trimmed;
+            }
+            trimmed = after_lt[end_idx + 1..].trim_start();
+        }
+    }
+
+    fn split_immediate_tool_json_from_content<'a>(
+        &self,
+        content: &'a str,
+    ) -> Option<(&'a str, &'a str)> {
+        if let JailMode::Immediate { format } = &self.jail_mode
+            && let Some((_value, _json, start, end)) =
+                self.recover_tool_choice_json_suffix(content, format)
+            && start > 0
+        {
+            return Some((&content[..start], &content[start..end]));
+        }
+
+        if let Some(idx) = content.rfind("</think>") {
+            let suffix = content[idx + "</think>".len()..].trim_start();
+            if self.looks_like_immediate_tool_json_prefix(suffix) {
+                return Some((&content[..idx], suffix));
+            }
+        }
+
+        let normalized = self.strip_immediate_tool_control_prefix(content);
+        if normalized.len() != content.len()
+            && self.looks_like_immediate_tool_json_prefix(content)
+        {
+            return Some(("", normalized));
+        }
+
+        None
+    }
+
+    fn looks_like_immediate_tool_json_prefix(&self, content: &str) -> bool {
+        let trimmed = self.strip_immediate_tool_control_prefix(content);
+        match &self.jail_mode {
+            JailMode::Immediate {
+                format: ToolChoiceFormat::SingleObject { .. },
+            } => trimmed.starts_with('{'),
+            JailMode::Immediate {
+                format: ToolChoiceFormat::ArrayOfTools,
+            } => trimmed.starts_with('['),
+            JailMode::MarkerBased => false,
+        }
+    }
+
+    fn recover_tool_choice_json_suffix(
+        &self,
+        content: &str,
+        format: &ToolChoiceFormat,
+    ) -> Option<(serde_json::Value, String, usize, usize)> {
+        let mut best_match: Option<(serde_json::Value, String, usize, usize)> = None;
+
+        for (start, ch) in content.char_indices() {
+            let candidate_starts_json = match format {
+                ToolChoiceFormat::SingleObject { .. } => ch == '{',
+                ToolChoiceFormat::ArrayOfTools => ch == '[',
+            };
+            if !candidate_starts_json {
+                continue;
+            }
+
+            let candidate = &content[start..];
+            let mut stream =
+                serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+            let Some(Ok(value)) = stream.next() else {
+                continue;
+            };
+            let consumed = stream.byte_offset();
+            let parsed_slice = &candidate[..consumed];
+
+            if !self.tool_choice_value_matches_schema(&value, format) {
+                continue;
+            }
+
+            best_match = Some((value, parsed_slice.to_string(), start, start + consumed));
+        }
+
+        best_match
+    }
+
+    fn parse_tool_choice_json_candidate(
+        &self,
+        content: &str,
+        format: &ToolChoiceFormat,
+    ) -> Option<(serde_json::Value, String, usize, usize)> {
+        let expected_open = match format {
+            ToolChoiceFormat::SingleObject { .. } => '{',
+            ToolChoiceFormat::ArrayOfTools => '[',
+        };
+        let trimmed = self.strip_immediate_tool_control_prefix(content);
+        let trimmed_prefix_len = content.len() - trimmed.len();
+
+        if trimmed.starts_with(expected_open) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if self.tool_choice_value_matches_schema(&parsed, format) {
+                    return Some((
+                        parsed,
+                        trimmed.to_string(),
+                        trimmed_prefix_len,
+                        trimmed_prefix_len + trimmed.len(),
+                    ));
+                }
+            }
+        }
+
+        self.recover_tool_choice_json_suffix(content, format)
+    }
+
+    fn tool_choice_value_matches_schema(
+        &self,
+        value: &serde_json::Value,
+        format: &ToolChoiceFormat,
+    ) -> bool {
+        match format {
+            ToolChoiceFormat::SingleObject { tool_name } => {
+                value.is_object() && self.named_tool_arguments_match_schema(tool_name, value)
+            }
+            ToolChoiceFormat::ArrayOfTools => value
+                .as_array()
+                .is_some_and(|arr| !arr.is_empty() && arr.iter().all(|entry| self.required_tool_entry_matches_schema(entry))),
+        }
+    }
+
+    fn named_tool_arguments_match_schema(
+        &self,
+        tool_name: &str,
+        value: &serde_json::Value,
+    ) -> bool {
+        let Some(arguments) = value.as_object() else {
+            return false;
+        };
+        let Some(schema) = self
+            .tool_definitions
+            .as_ref()
+            .and_then(|tools| tools.iter().find(|tool| tool.name == tool_name))
+            .and_then(|tool| tool.parameters.as_ref())
+        else {
+            return true;
+        };
+
+        self.object_matches_parameter_schema(arguments, schema)
+    }
+
+    fn required_tool_entry_matches_schema(&self, value: &serde_json::Value) -> bool {
+        let Some(entry) = value.as_object() else {
+            return false;
+        };
+        let Some(tool_name) = entry.get("name").and_then(|name| name.as_str()) else {
+            return false;
+        };
+        let Some(parameters) = entry.get("parameters") else {
+            return false;
+        };
+
+        self.named_tool_arguments_match_schema(tool_name, parameters)
+    }
+
+    fn object_matches_parameter_schema(
+        &self,
+        value: &serde_json::Map<String, serde_json::Value>,
+        schema: &serde_json::Value,
+    ) -> bool {
+        let Some(schema_obj) = schema.as_object() else {
+            return true;
+        };
+
+        let required: Vec<&str> = schema_obj
+            .get("required")
+            .and_then(|required| required.as_array())
+            .map(|required| required.iter().filter_map(|entry| entry.as_str()).collect())
+            .unwrap_or_default();
+
+        if required.iter().any(|key| !value.contains_key(*key)) {
+            return false;
+        }
+
+        let Some(properties) = schema_obj.get("properties").and_then(|props| props.as_object()) else {
+            return true;
+        };
+
+        if value.is_empty() {
+            return required.is_empty();
+        }
+
+        value.keys().any(|key| properties.contains_key(key))
+    }
+
     /// Check if accumulated content should end jail
     async fn should_end_jail(&self, accumulated_content: &str) -> (bool, usize) {
         match &self.jail_mode {
@@ -797,30 +1139,12 @@ impl JailedStream {
                 }
             }
             JailMode::Immediate { format } => {
-                // For tool_choice, check if we have valid complete JSON
-                match format {
-                    ToolChoiceFormat::SingleObject { .. } => {
-                        // Expect single object: {"location": "Paris", "unit": "celsius"}
-                        if let Ok(value) =
-                            serde_json::from_str::<serde_json::Value>(accumulated_content)
-                            && value.is_object()
-                        {
-                            return (true, accumulated_content.len());
-                        }
-                        (false, accumulated_content.len())
-                    }
-                    ToolChoiceFormat::ArrayOfTools => {
-                        // Expect array: [{"name":"search","parameters":{...}}, ...]
-                        if let Ok(value) =
-                            serde_json::from_str::<serde_json::Value>(accumulated_content)
-                            && let Some(arr) = value.as_array()
-                            && !arr.is_empty()
-                        {
-                            return (true, accumulated_content.len());
-                        }
-                        (false, accumulated_content.len())
-                    }
+                if let Some((_value, _json, _start, end)) =
+                    self.parse_tool_choice_json_candidate(accumulated_content, format)
+                {
+                    return (true, end);
                 }
+                (false, accumulated_content.len())
             }
         }
     }
@@ -887,15 +1211,25 @@ impl JailedStream {
             JailMode::Immediate { format } => {
                 // tool_choice mode: parse JSON and convert to tool calls
                 match self.parse_tool_choice_json(accumulated_content, format) {
-                    Ok(tool_call_chunks) if !tool_call_chunks.is_empty() => create_choice_stream(
-                        choice_index,
-                        Some(Role::Assistant),
-                        "",
-                        Some(tool_call_chunks),
-                        base_choice.finish_reason,
-                        None,
-                        base_choice.logprobs.clone(),
-                    ),
+                    Ok(tool_call_chunks) if !tool_call_chunks.is_empty() => {
+                        let mut choice = create_choice_stream(
+                            choice_index,
+                            Some(Role::Assistant),
+                            "",
+                            Some(tool_call_chunks),
+                            base_choice.finish_reason,
+                            None,
+                            base_choice.logprobs.clone(),
+                        );
+                        if let Some((_value, _json, start, _end)) =
+                            self.parse_tool_choice_json_candidate(accumulated_content, format)
+                            && start > 0
+                        {
+                            choice.delta.reasoning_content =
+                                Some(accumulated_content[..start].to_string());
+                        }
+                        choice
+                    }
                     Ok(_) | Err(_) => {
                         // Parsing failed, return as content
                         create_choice_stream(
@@ -936,7 +1270,42 @@ impl JailedStream {
         json_content: &str,
         format: &ToolChoiceFormat,
     ) -> anyhow::Result<Vec<ChatCompletionMessageToolCallChunk>> {
-        let parsed = serde_json::from_str::<serde_json::Value>(json_content)?;
+        let Some((parsed, parsed_json, _start, _end)) =
+            self.parse_tool_choice_json_candidate(json_content, format)
+        else {
+            let parsed = serde_json::from_str::<serde_json::Value>(json_content)?;
+            return match format {
+                ToolChoiceFormat::SingleObject { tool_name } => {
+                    if self.tool_choice_value_matches_schema(&parsed, format) {
+                        Ok(vec![Self::create_tool_call_chunk(
+                            0,
+                            tool_name.clone(),
+                            json_content.to_string(),
+                        )])
+                    } else {
+                        Ok(vec![])
+                    }
+                }
+                ToolChoiceFormat::ArrayOfTools => {
+                    if self.tool_choice_value_matches_schema(&parsed, format) {
+                        let array = parsed.as_array().expect("validated as array");
+                        let chunks: Vec<ChatCompletionMessageToolCallChunk> = array
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, entry)| {
+                                let name = entry.get("name")?.as_str()?.to_string();
+                                let parameters = entry.get("parameters")?;
+                                let args = serde_json::to_string(parameters).ok()?;
+                                Some(Self::create_tool_call_chunk(idx as u32, name, args))
+                            })
+                            .collect();
+                        Ok(chunks)
+                    } else {
+                        Ok(vec![])
+                    }
+                }
+            };
+        };
 
         match format {
             ToolChoiceFormat::SingleObject { tool_name } => {
@@ -945,7 +1314,7 @@ impl JailedStream {
                     Ok(vec![Self::create_tool_call_chunk(
                         0,
                         tool_name.clone(),
-                        json_content.to_string(),
+                        parsed_json,
                     )])
                 } else {
                     Ok(vec![])

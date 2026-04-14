@@ -1341,6 +1341,29 @@ impl<T> From<crate::types::Annotated<T>> for EventConverter<T> {
     }
 }
 
+fn prune_null_object_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|_, field| !field.is_null());
+            for field in map.values_mut() {
+                prune_null_object_fields(field);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                prune_null_object_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn serialize_sse_payload<T: Serialize>(data: &T) -> Result<String, axum::Error> {
+    let mut value = serde_json::to_value(data).map_err(axum::Error::new)?;
+    prune_null_object_fields(&mut value);
+    serde_json::to_string(&value).map_err(axum::Error::new)
+}
+
 /// Process streaming response with event conversion for SSE
 ///
 /// This function handles metrics collection, http_queue_guard management, and converts
@@ -1395,7 +1418,7 @@ pub fn process_response_using_event_converter_and_observe_metrics<T: Serialize>(
     let mut event = Event::default();
 
     if let Some(ref data) = annotated.data {
-        event = event.json_data(data)?;
+        event = event.data(serialize_sse_payload(data)?);
     }
 
     if let Some(ref msg) = annotated.event {
@@ -1495,6 +1518,35 @@ async fn handler_metrics(State(state): State<Arc<MetricsHandlerState>>) -> impl 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn extract_sse_data_json(event: &axum::response::sse::Event) -> serde_json::Value {
+        let debug = format!("{:?}", event);
+        let data_marker = "data: ";
+        let after_data = debug
+            .find(data_marker)
+            .map(|p| p + data_marker.len())
+            .expect("no 'data: ' in Event debug output");
+        let rest = &debug[after_data..];
+        let json_start = rest.find('{').expect("no JSON object after data:");
+
+        let mut depth = 0i32;
+        let mut json_end = 0;
+        for (i, b) in rest[json_start..].bytes().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        json_end = json_start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        serde_json::from_str(&rest[json_start..json_end]).expect("failed to parse SSE data JSON")
+    }
 
     #[test]
     fn test_round_to_sig_figs() {
@@ -2282,5 +2334,65 @@ mod tests {
             ])
             .get();
         assert_eq!(success_count, 1);
+    }
+
+    #[test]
+    fn test_serialize_sse_payload_prunes_null_object_fields() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": null,
+                    "content": "hello",
+                    "tool_calls": null,
+                    "reasoning_content": null
+                },
+                "finish_reason": null
+            }]
+        });
+
+        let serialized = serialize_sse_payload(&payload).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        let delta = &parsed["choices"][0]["delta"];
+
+        assert_eq!(delta["content"], "hello");
+        assert!(delta.get("tool_calls").is_none());
+        assert!(delta.get("reasoning_content").is_none());
+        assert!(delta.get("role").is_none());
+        assert!(parsed["choices"][0].get("finish_reason").is_none());
+    }
+
+    #[test]
+    fn test_event_converter_omits_null_fields_from_sse_output() {
+        let annotated = crate::types::Annotated::<serde_json::Value> {
+            id: None,
+            data: Some(serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": "weather",
+                        "tool_calls": null
+                    }
+                }]
+            })),
+            event: None,
+            comment: None,
+            error: None,
+        };
+
+        let mut collector = Arc::new(Metrics::new()).create_response_collector("test-model");
+        let mut http_queue_guard = None;
+        let event = process_response_using_event_converter_and_observe_metrics(
+            EventConverter::from(annotated),
+            &mut collector,
+            &mut http_queue_guard,
+        )
+        .unwrap()
+        .expect("expected SSE event");
+
+        let parsed = extract_sse_data_json(&event);
+        let delta = &parsed["choices"][0]["delta"];
+        assert_eq!(delta["content"], "weather");
+        assert!(delta.get("tool_calls").is_none());
     }
 }

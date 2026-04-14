@@ -4,7 +4,13 @@
 use anyhow::{Context, Result};
 use etcd_client::ConnectOptions;
 use parking_lot::RwLock;
-use std::{sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{sync::Mutex, time::sleep};
 
 /// Manages ETCD client connections with reconnection support
@@ -79,7 +85,11 @@ impl Connector {
     /// counter lets callers detect when reconnect() has swapped in a new channel.
     pub fn get_client(&self) -> etcd_client::Client {
         let cur_gen = self.generation.load(Ordering::Relaxed);
-        tracing::trace!(generation = cur_gen, "get_client: returning client (generation {})", cur_gen);
+        tracing::trace!(
+            generation = cur_gen,
+            "get_client: returning client (generation {})",
+            cur_gen
+        );
         self.client.read().clone()
     }
 
@@ -115,7 +125,8 @@ impl Connector {
                     let new_gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
                     tracing::info!(
                         generation = new_gen,
-                        "Successfully reconnected to ETCD cluster (generation {})", new_gen
+                        "Successfully reconnected to ETCD cluster (generation {})",
+                        new_gen
                     );
                     // Update the client behind the lock
                     let mut client_guard = self.client.write();

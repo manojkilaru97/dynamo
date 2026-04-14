@@ -457,7 +457,6 @@ impl ResponseStreamConverter {
                     }
                 }
             }
-
         }
 
         events
@@ -1082,7 +1081,11 @@ mod tests {
         // Second chunk should only have delta (no added events)
         let events2 = conv.process_chunk(&reasoning_chunk(" about this"));
         let types2 = event_types(&events2);
-        assert_eq!(types2.len(), 1, "second chunk should have 1 event: {types2:?}");
+        assert_eq!(
+            types2.len(),
+            1,
+            "second chunk should have 1 event: {types2:?}"
+        );
         assert_eq!(
             types2[0], "response.reasoning_summary_text.delta",
             "second chunk should be delta: {types2:?}"

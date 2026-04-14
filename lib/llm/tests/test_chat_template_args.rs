@@ -61,6 +61,19 @@ fn test_chat_template_args() {
     );
 }
 
+#[test]
+fn test_reasoning_budget_compat_field() {
+    let json_with_reasoning_budget = r#"{
+        "model": "test-model",
+        "messages": [],
+        "reasoning_budget": 4096
+    }"#;
+
+    let request: NvCreateChatCompletionRequest =
+        serde_json::from_str(json_with_reasoning_budget).unwrap();
+    assert_eq!(request.common.reasoning_budget, Some(4096));
+}
+
 // TODO: Add template rendering test that verifies chat_template_args/chat_template_kwargs
 // values are actually passed to the Jinja template context during rendering.
 // This would require setting up PromptFormatter with ChatTemplate/ContextMixins.

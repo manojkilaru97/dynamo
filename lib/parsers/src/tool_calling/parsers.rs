@@ -3172,4 +3172,46 @@ weather forecasting
         assert!(args["items"].is_array());
         assert_eq!(args["items"], serde_json::json!([1, 2, 3, 4, 5]));
     }
+
+    #[tokio::test]
+    async fn test_minimax_m2_anyof_object_parameter() {
+        let input = r#"<minimax:tool_call>
+<invoke name="get_weather">
+<parameter name="location">{\"city\": \"Paris\"}</parameter>
+</invoke>
+</minimax:tool_call>"#;
+        let tools = vec![ToolDefinition {
+            name: "get_weather".to_string(),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "required": ["location"],
+                "properties": {
+                    "location": {
+                        "anyOf": [
+                            {
+                                "type": "object",
+                                "properties": { "city": { "type": "string" } },
+                                "required": ["city"]
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "lat": { "type": "number" },
+                                    "lon": { "type": "number" }
+                                },
+                                "required": ["lat", "lon"]
+                            }
+                        ]
+                    }
+                }
+            })),
+        }];
+        let (result, _) = detect_and_parse_tool_call(input, Some("minimax_m2"), Some(&tools))
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "get_weather");
+        assert_eq!(args["location"], serde_json::json!({"city": "Paris"}));
+    }
 }

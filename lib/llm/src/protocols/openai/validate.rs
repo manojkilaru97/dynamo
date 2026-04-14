@@ -111,6 +111,41 @@ pub fn validate_no_unsupported_fields(
     Ok(())
 }
 
+/// Validates OpenAI-compatible structured_outputs payloads.
+pub fn validate_structured_outputs(
+    structured_outputs: &Option<crate::protocols::openai::common_ext::StructuredOutputsParams>,
+) -> Result<(), anyhow::Error> {
+    let Some(params) = structured_outputs else {
+        return Ok(());
+    };
+
+    let count = [
+        params.json.is_some(),
+        params.regex.is_some(),
+        params.choice.is_some(),
+        params.grammar.is_some(),
+        params.json_object.is_some(),
+        params.structural_tag.is_some(),
+    ]
+    .iter()
+    .filter(|&&v| v)
+    .count();
+
+    if count > 1 {
+        anyhow::bail!(
+            "Only one structured_outputs constraint may be set at a time (`json`, `regex`, `choice`, `grammar`, `json_object`, or `structural_tag`)"
+        );
+    }
+
+    if count == 0 {
+        anyhow::bail!(
+            "structured_outputs requires one constraint (`json`, `regex`, `choice`, `grammar`, `json_object`, or `structural_tag`)"
+        );
+    }
+
+    Ok(())
+}
+
 /// Validates response_format for chat completions.
 ///
 /// Dynamo currently supports translating:

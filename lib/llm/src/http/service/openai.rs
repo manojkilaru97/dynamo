@@ -13,7 +13,7 @@ use axum::{
     body::Body,
     extract::State,
     http::Request,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -23,9 +23,9 @@ use axum::{
 };
 use base64::Engine as _;
 use bytes::Bytes;
+use dynamo_runtime::config::env_is_truthy;
 use dynamo_runtime::config::environment_names::llm as env_llm;
 use dynamo_runtime::config::environment_names::logging as env_logging;
-use dynamo_runtime::config::env_is_truthy;
 use dynamo_runtime::{
     pipeline::{AsyncEngineContextProvider, Context},
     protocols::annotated::AnnotationsProvider,
@@ -64,6 +64,7 @@ use dynamo_runtime::logging::get_distributed_tracing_context;
 use tracing::Instrument;
 
 pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Dynamo Annotation for the request ID
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
@@ -313,25 +314,24 @@ pub(super) fn get_or_create_request_id(primary: Option<&str>, headers: &HeaderMa
 
     // Try to get the request ID from the primary source
     if let Some(primary) = primary
-        && let Ok(uuid) = uuid::Uuid::parse_str(primary)
+        && !primary.trim().is_empty()
     {
-        return uuid.to_string();
+        return primary.to_string();
     }
 
     // Try to get the request ID header as a string slice
     let request_id_opt = headers
         .get(DYNAMO_REQUEST_ID_HEADER)
+        .or_else(|| headers.get(REQUEST_ID_HEADER))
         .and_then(|h| h.to_str().ok());
 
-    // Try to parse the request ID as a UUID, or generate a new one if missing/invalid
-    let uuid = match request_id_opt {
-        Some(request_id) => {
-            uuid::Uuid::parse_str(request_id).unwrap_or_else(|_| uuid::Uuid::new_v4())
-        }
-        None => uuid::Uuid::new_v4(),
-    };
+    if let Some(request_id) = request_id_opt
+        && !request_id.trim().is_empty()
+    {
+        return request_id.to_string();
+    }
 
-    uuid.to_string()
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// OpenAI Completions Request Handler
@@ -436,13 +436,16 @@ async fn completions_single(
     let metrics_model = state.manager().resolve_canonical_name(&model);
 
     // Create inflight_guard early to ensure all errors are counted
-    let mut inflight_guard =
-        state
-            .metrics_clone()
-            .create_inflight_guard(&metrics_model, Endpoint::Completions, streaming);
+    let mut inflight_guard = state.metrics_clone().create_inflight_guard(
+        &metrics_model,
+        Endpoint::Completions,
+        streaming,
+    );
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metrics_model);
+    let http_queue_guard = state
+        .metrics_clone()
+        .create_http_queue_guard(&metrics_model);
 
     // Log request payload to OTEL (suppressed from console)
     if log_payloads_enabled() {
@@ -469,7 +472,9 @@ async fn completions_single(
             err_response
         })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
+    let mut response_collector = state
+        .metrics_clone()
+        .create_response_collector(&metrics_model);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -577,7 +582,13 @@ async fn completions_single(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+
+        Ok(response)
     } else {
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
@@ -649,13 +660,16 @@ async fn completions_batch(
     let metrics_model = state.manager().resolve_canonical_name(&model);
 
     // Create inflight_guard early to ensure all errors are counted
-    let mut inflight_guard =
-        state
-            .metrics_clone()
-            .create_inflight_guard(&metrics_model, Endpoint::Completions, streaming);
+    let mut inflight_guard = state.metrics_clone().create_inflight_guard(
+        &metrics_model,
+        Endpoint::Completions,
+        streaming,
+    );
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metrics_model);
+    let http_queue_guard = state
+        .metrics_clone()
+        .create_http_queue_guard(&metrics_model);
 
     let (engine, parsing_options) = state
         .manager()
@@ -666,7 +680,9 @@ async fn completions_batch(
             err_response
         })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
+    let mut response_collector = state
+        .metrics_clone()
+        .create_response_collector(&metrics_model);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -765,7 +781,13 @@ async fn completions_batch(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+
+        Ok(response)
     } else {
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
@@ -826,13 +848,16 @@ async fn embeddings(
     let metrics_model = state.manager().resolve_canonical_name(model);
 
     // Create inflight_guard early to ensure all errors are counted
-    let mut inflight =
-        state
-            .metrics_clone()
-            .create_inflight_guard(&metrics_model, Endpoint::Embeddings, streaming);
+    let mut inflight = state.metrics_clone().create_inflight_guard(
+        &metrics_model,
+        Endpoint::Embeddings,
+        streaming,
+    );
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metrics_model);
+    let http_queue_guard = state
+        .metrics_clone()
+        .create_http_queue_guard(&metrics_model);
 
     // todo - error handling should be more robust
     let engine = state.manager().get_embeddings_engine(model).map_err(|_| {
@@ -841,7 +866,9 @@ async fn embeddings(
         err_response
     })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
+    let mut response_collector = state
+        .metrics_clone()
+        .create_response_collector(&metrics_model);
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
@@ -1244,10 +1271,11 @@ async fn chat_completions(
     tracing::trace!("Received chat completions request: {:?}", request.content());
 
     // Create inflight_guard early to ensure all errors (including validation) are counted
-    let mut inflight_guard =
-        state
-            .metrics_clone()
-            .create_inflight_guard(&metrics_model, Endpoint::ChatCompletions, streaming);
+    let mut inflight_guard = state.metrics_clone().create_inflight_guard(
+        &metrics_model,
+        Endpoint::ChatCompletions,
+        streaming,
+    );
 
     // Handle unsupported fields - if Some(resp) is returned by
     // validate_chat_completion_unsupported_fields,
@@ -1305,7 +1333,9 @@ async fn chat_completions(
             err_response
         })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
+    let mut response_collector = state
+        .metrics_clone()
+        .create_response_collector(&metrics_model);
 
     let annotations = request.annotations();
 
@@ -1406,8 +1436,10 @@ async fn chat_completions(
                 let choices_json: Vec<serde_json::Value> = payload_content_bufs
                     .iter()
                     .map(|(idx, content)| {
-                        let reasoning =
-                            payload_reasoning_bufs.get(idx).map(String::as_str).unwrap_or("");
+                        let reasoning = payload_reasoning_bufs
+                            .get(idx)
+                            .map(String::as_str)
+                            .unwrap_or("");
                         let mut msg = serde_json::json!({
                             "role": "assistant",
                             "content": content,
@@ -1450,7 +1482,13 @@ async fn chat_completions(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+
+        Ok(response)
     } else {
         // Check first event for backend errors before aggregating (non-streaming only)
         let stream_with_check =
@@ -1538,8 +1576,7 @@ pub fn validate_chat_completion_unsupported_fields(
 
     if inner.logprobs == Some(true) || inner.top_logprobs.is_some() {
         return Err(ErrorMessage::not_implemented_error(
-            VALIDATION_PREFIX.to_string()
-                + "`logprobs` is not supported.",
+            VALIDATION_PREFIX.to_string() + "`logprobs` is not supported.",
         ));
     }
 
@@ -1710,7 +1747,9 @@ async fn responses(
     let streaming = request.inner.stream.unwrap_or(false);
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metrics_model);
+    let http_queue_guard = state
+        .metrics_clone()
+        .create_http_queue_guard(&metrics_model);
     let mut inflight_guard =
         state
             .metrics_clone()
@@ -1782,7 +1821,9 @@ async fn responses(
             err_response
         })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&metrics_model);
+    let mut response_collector = state
+        .metrics_clone()
+        .create_response_collector(&metrics_model);
 
     tracing::trace!("Issuing generate call for responses");
 
@@ -1879,7 +1920,13 @@ async fn responses(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+
+        Ok(response)
     } else {
         // Non-streaming path: aggregate stream into single response
 
@@ -2587,6 +2634,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -2619,6 +2668,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -2656,6 +2707,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
 
@@ -2680,6 +2733,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -2703,6 +2758,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -2726,6 +2783,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -2751,6 +2810,8 @@ mod tests {
                 .unwrap(),
             nvext: None,
             metadata: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -2774,6 +2835,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -2805,6 +2868,8 @@ mod tests {
                 "session": {"id": "session-1", "timestamp": 1640995200}
             })
             .into(),
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
 
@@ -2835,6 +2900,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
 
@@ -2865,6 +2932,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -2894,6 +2963,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -2923,6 +2994,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -2954,6 +3027,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -2983,6 +3058,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
+            request_id: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
