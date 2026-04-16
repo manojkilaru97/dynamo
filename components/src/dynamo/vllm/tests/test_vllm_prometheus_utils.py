@@ -50,10 +50,12 @@ vllm:time_to_first_token_seconds_count{model_name="meta-llama/Llama-3.1-8B"} 165
                 exclude_prefixes=["python_", "process_"],
             )
 
-        # Should only contain vllm: metrics
-        assert "vllm:request_success_total" in result
-        assert "vllm:time_to_first_token_seconds" in result
-        assert "# HELP vllm:request_success_total" in result
+        # Should only contain normalized vLLM metrics
+        assert "request_success_total" in result
+        assert "time_to_first_token_seconds" in result
+        assert "# HELP request_success_total" in result
+        assert "vllm:request_success_total" not in result
+        assert "vllm:time_to_first_token_seconds" not in result
 
         # Should not contain excluded metrics
         assert "python_gc_objects_collected_total" not in result
