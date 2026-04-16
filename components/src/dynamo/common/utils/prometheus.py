@@ -184,6 +184,28 @@ def _compile_include_pattern(metric_prefixes: tuple[str, ...]) -> Pattern:
     return re.compile(rf"^(# (HELP|TYPE) )?({prefixes_regex})")
 
 
+def _normalize_metric_line(line: str) -> str:
+    """Normalize backend metric names for exported Prometheus text.
+
+    Keep Dynamo-native metric names as-is and strip only the backend-specific
+    ``vllm:`` prefix from the Prometheus metric token itself. This preserves a
+    backend-agnostic schema on Dynamo's `/metrics` surface while still allowing
+    internal filtering on raw metric names before normalization.
+    """
+    if line.startswith("# HELP ") or line.startswith("# TYPE "):
+        directive, metric_name, rest = line.split(" ", 3)[1:]
+        if metric_name.startswith("vllm:"):
+            metric_name = metric_name[len("vllm:") :]
+        return f"# {directive} {metric_name} {rest}"
+
+    metric_name, sep, remainder = line.partition("{")
+    if not sep:
+        metric_name, sep, remainder = line.partition(" ")
+    if metric_name.startswith("vllm:"):
+        metric_name = metric_name[len("vllm:") :]
+    return f"{metric_name}{sep}{remainder}" if sep else metric_name
+
+
 def get_prometheus_expfmt(
     registry,
     metric_prefix_filters: Optional[list[str]] = None,
@@ -283,13 +305,18 @@ def get_prometheus_expfmt(
                 if include_pattern and not include_pattern.match(line):
                     continue
 
-                lines.append(line)
+                lines.append(_normalize_metric_line(line))
 
             result = "\n".join(lines)
             if result and not result.endswith("\n"):
                 result += "\n"
             return result
         else:
+            metrics_text = "\n".join(
+                _normalize_metric_line(line)
+                for line in metrics_text.split("\n")
+                if line.strip()
+            )
             # Ensure metrics_text ends with newline
             if metrics_text and not metrics_text.endswith("\n"):
                 metrics_text += "\n"

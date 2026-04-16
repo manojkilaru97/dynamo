@@ -121,8 +121,9 @@ class TestPrometheusExpositionFormatInjection:
             inject_custom_labels=labels_to_inject,
         )
 
-        # Verify vllm metric is present with injected labels
-        assert "vllm:requests" in expfmt
+        # Verify vllm metric is present with injected labels using normalized name
+        assert "requests_total" in expfmt or "requests " in expfmt
+        assert "vllm:requests" not in expfmt
         assert f'{prometheus_names.labels.NAMESPACE}="prod"' in expfmt
         assert f'{prometheus_names.labels.MODEL}="llama-3-70b"' in expfmt
 
@@ -268,4 +269,5 @@ class TestPrometheusExpositionFormatInjection:
         assert f'{prometheus_names.labels.ENDPOINT}="generate"' in expfmt
 
         # Verify metric is present
-        assert "vllm:requests" in expfmt
+        assert "requests_total" in expfmt or "requests " in expfmt
+        assert "vllm:requests" not in expfmt

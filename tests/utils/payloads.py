@@ -1012,17 +1012,20 @@ class VLLMMetricsPayload(MetricsPayload):
         """vLLM-specific metric checks"""
         checks = [
             MetricCheck(
-                # Check: Minimum count of unique vllm:* metrics
-                name="vllm:*",
-                pattern=lambda name: r"^vllm:\w+",
+                # Check: Minimum count of unique normalized backend metrics
+                name="backend_metrics_normalized",
+                pattern=lambda name: r"^(?!python_|process_|http_|dynamo_)[a-z]\w+",
                 validator=lambda value: (
                     len(set(value)) >= 56
                 ),  # 80% of typical ~70 vllm metrics (excluding _bucket) as of 2026-02-05 (but will grow)
                 error_msg=lambda name, value: (
-                    f"Expected at least 56 unique vllm:* metrics, but found only {len(set(value))}"
+                    "Expected at least 56 unique normalized backend metrics, "
+                    f"but found only {len(set(value))}"
                 ),
                 success_msg=lambda name, value: (
-                    f"SUCCESS: Found {len(set(value))} unique vllm:* metrics (minimum required: 56)"
+                    "SUCCESS: Found "
+                    f"{len(set(value))} unique normalized backend metrics "
+                    "(minimum required: 56)"
                 ),
                 multiline=True,
             )
@@ -1039,22 +1042,25 @@ class VLLMMetricsPayload(MetricsPayload):
         for label_name in required_labels:
             checks.append(
                 MetricCheck(
-                    name=f"vllm:* with {label_name}",
+                    name=f"backend_metrics_normalized with {label_name}",
                     pattern=cast(
                         Callable[[str], str],
-                        lambda name, lbl=label_name: rf'vllm:\w+\{{[^}}]*{lbl}="[^"]+"',
+                        lambda name, lbl=label_name: (
+                            rf'^(?!python_|process_|http_|dynamo_)[a-z]\w+\{{[^}}]*{lbl}="[^"]+"'
+                        ),
                     ),
                     validator=lambda value: len(value) > 0,
                     error_msg=cast(
                         Callable[[str, Any], str],
                         lambda name, value, lbl=label_name: (
-                            f"vLLM metrics missing label: {lbl}"
+                            f"Normalized backend metrics missing label: {lbl}"
                         ),
                     ),
                     success_msg=cast(
                         Callable[[str, Any], str],
                         lambda name, value, lbl=label_name: (
-                            f"SUCCESS: vLLM metrics include {lbl} label (found {len(value)} metrics)"
+                            "SUCCESS: Normalized backend metrics include "
+                            f"{lbl} label (found {len(value)} metrics)"
                         ),
                     ),
                     multiline=True,
