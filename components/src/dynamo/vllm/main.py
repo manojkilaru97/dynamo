@@ -466,19 +466,10 @@ def setup_vllm_engine(config, stat_logger=None):
     usage_context = UsageContext.OPENAI_API_SERVER
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
     vllm_reasoning_parser = _vllm_reasoning_parser_name(config.dyn_reasoning_parser)
-    logger.warning(
-        "DYN_REASONING_DEBUG config.dyn_reasoning_parser=%r before_structured_outputs_reasoning_parser=%r",
-        config.dyn_reasoning_parser,
-        vllm_config.structured_outputs_config.reasoning_parser,
-    )
     if vllm_reasoning_parser:
         vllm_config.structured_outputs_config.reasoning_parser = (
             vllm_reasoning_parser
         )
-    logger.warning(
-        "DYN_REASONING_DEBUG after_structured_outputs_reasoning_parser=%r",
-        vllm_config.structured_outputs_config.reasoning_parser,
-    )
 
     # Set up consolidator endpoints if KVBM (DynamoConnector) is enabled
     consolidator_endpoints = None

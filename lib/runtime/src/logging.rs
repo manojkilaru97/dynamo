@@ -27,7 +27,7 @@
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 use figment::{
     Figment,
@@ -72,11 +72,14 @@ use uuid::Uuid;
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry::{global, trace::Tracer};
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
 
+use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{Key, KeyValue};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::error;
 use tracing_subscriber::layer::SubscriberExt;
@@ -102,6 +105,8 @@ const DEFAULT_OTEL_SERVICE_NAME: &str = "dynamo";
 
 /// Once instance to ensure the logger is only initialized once
 static INIT: Once = Once::new();
+static PAYLOAD_LOGGER: OnceLock<SdkLogger> = OnceLock::new();
+static PAYLOAD_LOGGER_PROVIDER: OnceLock<SdkLoggerProvider> = OnceLock::new();
 
 #[derive(Serialize, Deserialize, Debug)]
 struct LoggingConfig {
@@ -904,6 +909,7 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
         filters(load_config()).add_directive("dynamo_payload=off".parse().unwrap());
     let trace_filter_layer = filters(load_config());
     let otel_filter_layer = filters(load_config());
+    let otel_logs_filter_layer = filters(load_config());
 
     if jsonl_logging_enabled() {
         let span_events = if span_events_enabled() {
@@ -921,29 +927,49 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
         // Create OpenTelemetry tracer - conditionally export to OTLP based on env var
         let service_name = get_service_name();
 
-        // Build tracer provider - with or without OTLP export
-        let (tracer_provider, endpoint_opt) = if otlp_exporter_enabled() {
-            // Export enabled: create OTLP exporter with batch processor
-            let endpoint = std::env::var(env_logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
-                .unwrap_or_else(|_| DEFAULT_OTLP_ENDPOINT.to_string());
+        // Build tracer and logger providers - with or without OTLP export
+        let (tracer_provider, logger_provider_opt, endpoint_opt) = if otlp_exporter_enabled() {
+            // Export enabled: create OTLP exporters with batch processors
+            let traces_endpoint =
+                std::env::var(env_logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+                    .unwrap_or_else(|_| DEFAULT_OTLP_ENDPOINT.to_string());
+            let logs_endpoint = std::env::var(env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT)
+                .unwrap_or_else(|_| traces_endpoint.clone());
 
-            // Initialize OTLP exporter using gRPC (Tonic)
-            let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
-                .with_tonic()
-                .with_endpoint(&endpoint)
-                .build()?;
-
-            // Create tracer provider with batch exporter and service name
-            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_batch_exporter(otlp_exporter)
-                .with_resource(
-                    opentelemetry_sdk::Resource::builder_empty()
-                        .with_service_name(service_name.clone())
-                        .build(),
-                )
+            let resource = opentelemetry_sdk::Resource::builder_empty()
+                .with_service_name(service_name.clone())
                 .build();
 
-            (provider, Some(endpoint))
+            // Initialize OTLP span exporter using gRPC (Tonic)
+            let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(&traces_endpoint)
+                .build()?;
+
+            let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_batch_exporter(span_exporter)
+                .with_resource(resource.clone())
+                .build();
+
+            // Initialize OTLP log exporter using gRPC (Tonic)
+            let log_exporter = opentelemetry_otlp::LogExporter::builder()
+                .with_tonic()
+                .with_endpoint(&logs_endpoint)
+                .build()?;
+
+            let logger_provider = SdkLoggerProvider::builder()
+                .with_batch_exporter(log_exporter)
+                .with_resource(resource)
+                .build();
+
+            let _ = PAYLOAD_LOGGER_PROVIDER.set(logger_provider.clone());
+            let _ = PAYLOAD_LOGGER.set(logger_provider.logger("dynamo.payload"));
+
+            (
+                tracer_provider,
+                Some(logger_provider),
+                Some(traces_endpoint),
+            )
         } else {
             // No export - traces generated locally only (for logging/trace IDs)
             let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
@@ -954,11 +980,14 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .build();
 
-            (provider, None)
+            (provider, None, None)
         };
 
         // Get a tracer from the provider
         let tracer = tracer_provider.tracer(service_name.clone());
+        let otel_logs_layer = logger_provider_opt
+            .as_ref()
+            .map(|lp| OpenTelemetryTracingBridge::new(lp).with_filter(otel_logs_filter_layer));
 
         tracing_subscriber::registry()
             .with(
@@ -966,6 +995,7 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
                     .with_tracer(tracer)
                     .with_filter(otel_filter_layer),
             )
+            .with(otel_logs_layer)
             .with(DistributedTraceIdLayer.with_filter(trace_filter_layer))
             .with(l)
             .init();
@@ -975,7 +1005,7 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(
                 endpoint = %endpoint,
                 service = %service_name,
-                "OpenTelemetry OTLP export enabled"
+                "OpenTelemetry OTLP export enabled (traces and logs)"
             );
         } else {
             tracing::info!(
@@ -990,7 +1020,87 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
             .with_writer(std::io::stderr)
             .with_filter(fmt_filter_layer);
 
-        tracing_subscriber::registry().with(l).init();
+        let service_name = get_service_name();
+
+        let (tracer_provider, logger_provider_opt, endpoint_opt) = if otlp_exporter_enabled() {
+            let traces_endpoint =
+                std::env::var(env_logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+                    .unwrap_or_else(|_| DEFAULT_OTLP_ENDPOINT.to_string());
+            let logs_endpoint = std::env::var(env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT)
+                .unwrap_or_else(|_| traces_endpoint.clone());
+
+            let resource = opentelemetry_sdk::Resource::builder_empty()
+                .with_service_name(service_name.clone())
+                .build();
+
+            let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(&traces_endpoint)
+                .build()?;
+
+            let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_batch_exporter(span_exporter)
+                .with_resource(resource.clone())
+                .build();
+
+            let log_exporter = opentelemetry_otlp::LogExporter::builder()
+                .with_tonic()
+                .with_endpoint(&logs_endpoint)
+                .build()?;
+
+            let logger_provider = SdkLoggerProvider::builder()
+                .with_batch_exporter(log_exporter)
+                .with_resource(resource)
+                .build();
+
+            let _ = PAYLOAD_LOGGER_PROVIDER.set(logger_provider.clone());
+            let _ = PAYLOAD_LOGGER.set(logger_provider.logger("dynamo.payload"));
+
+            (
+                tracer_provider,
+                Some(logger_provider),
+                Some(traces_endpoint),
+            )
+        } else {
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_resource(
+                    opentelemetry_sdk::Resource::builder_empty()
+                        .with_service_name(service_name.clone())
+                        .build(),
+                )
+                .build();
+
+            (provider, None, None)
+        };
+
+        let tracer = tracer_provider.tracer(service_name.clone());
+        let otel_logs_layer = logger_provider_opt
+            .as_ref()
+            .map(|lp| OpenTelemetryTracingBridge::new(lp).with_filter(otel_logs_filter_layer));
+
+        tracing_subscriber::registry()
+            .with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(tracer)
+                    .with_filter(otel_filter_layer),
+            )
+            .with(otel_logs_layer)
+            .with(DistributedTraceIdLayer.with_filter(trace_filter_layer))
+            .with(l)
+            .init();
+
+        if let Some(endpoint) = endpoint_opt {
+            tracing::info!(
+                endpoint = %endpoint,
+                service = %service_name,
+                "OpenTelemetry OTLP export enabled (traces and logs)"
+            );
+        } else {
+            tracing::info!(
+                service = %service_name,
+                "OpenTelemetry OTLP export disabled, traces local only"
+            );
+        }
     }
 
     Ok(())
@@ -1042,6 +1152,68 @@ pub fn log_message(level: &str, message: &str, module: &str, file: &str, line: u
             .line(Some(line))
             .build(),
     );
+}
+
+fn json_value_to_any_value(value: serde_json::Value) -> AnyValue {
+    match value {
+        serde_json::Value::Null => AnyValue::String("null".into()),
+        serde_json::Value::Bool(v) => AnyValue::Boolean(v),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                AnyValue::Int(i)
+            } else if let Some(u) = n.as_u64() {
+                match i64::try_from(u) {
+                    Ok(v) => AnyValue::Int(v),
+                    Err(_) => AnyValue::String(u.to_string().into()),
+                }
+            } else if let Some(f) = n.as_f64() {
+                AnyValue::Double(f)
+            } else {
+                AnyValue::String(n.to_string().into())
+            }
+        }
+        serde_json::Value::String(s) => AnyValue::String(s.into()),
+        serde_json::Value::Array(items) => AnyValue::ListAny(Box::new(
+            items.into_iter().map(json_value_to_any_value).collect(),
+        )),
+        serde_json::Value::Object(map) => AnyValue::Map(Box::new(
+            map.into_iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, value)| (Key::new(key), json_value_to_any_value(value)))
+                .collect(),
+        )),
+    }
+}
+
+/// Emit a structured OTEL log record for canonical request/response payload logging.
+///
+/// This bypasses tracing's scalar-only field model so nested `payload` and `headers`
+/// survive as structured objects in OTLP export instead of JSON strings.
+pub fn emit_payload_log(body: &'static str, target: &'static str, fields: serde_json::Value) {
+    let Some(logger) = PAYLOAD_LOGGER.get() else {
+        return;
+    };
+
+    let mut record = logger.create_log_record();
+    record.set_event_name(body);
+    record.set_target(target);
+    record.set_timestamp(std::time::SystemTime::now());
+    record.set_observed_timestamp(std::time::SystemTime::now());
+    record.set_severity_text("INFO");
+    record.set_severity_number(Severity::Info);
+    record.set_body(AnyValue::String(body.into()));
+
+    if let serde_json::Value::Object(map) = fields {
+        record.add_attributes(
+            map.into_iter()
+                .map(|(key, value)| (Key::new(key), json_value_to_any_value(value))),
+        );
+    }
+
+    logger.emit(record);
+    if let Some(provider) = PAYLOAD_LOGGER_PROVIDER.get() {
+        let _ = provider.force_flush();
+    }
 }
 
 fn load_config() -> LoggingConfig {
