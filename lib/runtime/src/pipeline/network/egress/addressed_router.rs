@@ -108,6 +108,14 @@ where
         let engine_ctx = context.context();
         let engine_ctx_ = engine_ctx.clone();
 
+        if engine_ctx.is_stopped() || engine_ctx.is_killed() {
+            tracing::debug!(request_id, "Request cancelled before backend dispatch");
+            return Ok(ResponseStream::new(
+                Box::pin(tokio_stream::empty()),
+                engine_ctx,
+            ));
+        }
+
         // registration options for the data plane in a singe in / many out configuration
         let options = StreamOptions::builder()
             .context(engine_ctx.clone())
@@ -201,10 +209,26 @@ where
         REQUEST_PLANE_SEND_SECONDS.observe(send_start.elapsed().as_secs_f64());
 
         tracing::trace!(request_id, "awaiting transport handshake");
-        let response_stream = response_stream_provider
-            .await
-            .map_err(|_| PipelineError::DetachedStreamReceiver)?
-            .map_err(PipelineError::ConnectionFailed)?;
+        let response_stream = tokio::select! {
+            res = response_stream_provider => {
+                res.map_err(|_| PipelineError::DetachedStreamReceiver)?
+                    .map_err(PipelineError::ConnectionFailed)?
+            }
+            _ = engine_ctx.stopped() => {
+                tracing::debug!(request_id, "Request cancelled while awaiting backend handshake");
+                return Ok(ResponseStream::new(
+                    Box::pin(tokio_stream::empty()),
+                    engine_ctx,
+                ));
+            }
+            _ = engine_ctx.killed() => {
+                tracing::debug!(request_id, "Request killed while awaiting backend handshake");
+                return Ok(ResponseStream::new(
+                    Box::pin(tokio_stream::empty()),
+                    engine_ctx,
+                ));
+            }
+        };
 
         // TODO: Detect end-of-stream using Server-Sent Events (SSE)
         let mut is_complete_final = false;

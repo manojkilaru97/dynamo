@@ -328,6 +328,7 @@ def _maybe_wrap_guided_decoding_for_minimax_reasoning(
     wrapped.pop("regex", None)
     wrapped.pop("grammar", None)
     wrapped.pop("choice", None)
+    wrapped["_dynamo_structural_content_type"] = content["type"]
     wrapped["structural_tag"] = json.dumps(
         {
             "type": "sequence",
@@ -344,6 +345,11 @@ def _maybe_wrap_guided_decoding_for_minimax_reasoning(
             ],
         },
         ensure_ascii=False,
+    )
+    logger.info(
+        "Wrapped MiniMax guided decoding for reasoning handoff: source=%s content_type=%s",
+        source,
+        content["type"],
     )
     return wrapped
 

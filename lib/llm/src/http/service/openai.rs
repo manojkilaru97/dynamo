@@ -32,7 +32,7 @@ use dynamo_runtime::{
     protocols::annotated::AnnotationsProvider,
 };
 use futures::{StreamExt, stream};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use super::{
     RouteDoc,
@@ -114,12 +114,14 @@ fn header_map_to_json(headers: &HeaderMap) -> serde_json::Value {
 }
 
 fn error_response_payload(response: &ErrorResponse) -> serde_json::Value {
-    serde_json::json!({
-        "error": {
-            "message": response.1.message.clone(),
-            "type": response.1.error_type.clone(),
-            "code": response.1.code,
-        }
+    serde_json::to_value(&*response.1).unwrap_or_else(|_| {
+        serde_json::json!({
+            "error": {
+                "message": response.1.message.clone(),
+                "type": response.1.error_type.clone(),
+                "code": response.1.code,
+            }
+        })
     })
 }
 
@@ -185,12 +187,28 @@ fn log_payloads_enabled() -> bool {
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Deserialize, Debug)]
 pub(crate) struct ErrorMessage {
     message: String,
     #[serde(rename = "type")]
     error_type: String,
     code: u16,
+}
+
+impl Serialize for ErrorMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serde_json::json!({
+            "error": {
+                "message": self.message,
+                "type": self.error_type,
+                "code": self.code,
+            }
+        })
+        .serialize(serializer)
+    }
 }
 
 fn map_error_code_to_error_type(code: StatusCode) -> String {
@@ -227,6 +245,18 @@ fn extract_error_type_from_response(response: &ErrorResponse) -> ErrorType {
 }
 
 impl ErrorMessage {
+    fn bad_request_from_message<T: Into<String>>(message: T) -> ErrorResponse {
+        let code = StatusCode::BAD_REQUEST;
+        (
+            code,
+            Json(ErrorMessage {
+                message: message.into(),
+                error_type: map_error_code_to_error_type(code),
+                code: code.as_u16(),
+            }),
+        )
+    }
+
     /// Not Found Error
     pub fn model_not_found() -> ErrorResponse {
         let code = StatusCode::NOT_FOUND;
@@ -296,6 +326,11 @@ impl ErrorMessage {
     /// If successful, it will return the [`HttpError`] as an [`ErrorMessage::internal_server_error`]
     /// with the details of the error.
     pub fn from_anyhow(err: anyhow::Error, alt_msg: &str) -> ErrorResponse {
+        let err_string = format!("{err:#}");
+        if let Some(response) = map_backend_validation_error(&err_string) {
+            return response;
+        }
+
         // First check for PipelineError::ServiceOverloaded
         if let Some(pipeline_err) =
             err.downcast_ref::<dynamo_runtime::pipeline::error::PipelineError>()
@@ -364,6 +399,22 @@ impl From<HttpError> for ErrorMessage {
             code: err.code,
         }
     }
+}
+
+fn map_backend_validation_error(error: &str) -> Option<ErrorResponse> {
+    let trimmed = error.trim();
+
+    if trimmed.contains("VLLMValidationError:")
+        || trimmed.contains("Failed to convert the grammar from GBNF to Lark:")
+    {
+        let detail = trimmed
+            .split_once(": ")
+            .map(|(_, rhs)| rhs.to_string())
+            .unwrap_or_else(|| trimmed.to_string());
+        return Some(ErrorMessage::bad_request_from_message(detail));
+    }
+
+    None
 }
 
 // Problem: Currently we are using JSON from axum as the request validator. Whenever there is an invalid JSON, it will return a 422.
@@ -1249,7 +1300,10 @@ pub(super) async fn check_for_backend_error(
 }
 
 fn normalize_backend_error(error_msg: String, status_code: StatusCode) -> (String, StatusCode) {
-    if status_code == StatusCode::INTERNAL_SERVER_ERROR && error_msg.contains("Grammar error:") {
+    if status_code == StatusCode::INTERNAL_SERVER_ERROR
+        && (error_msg.contains("Grammar error:")
+            || error_msg.contains("Failed to convert the grammar from GBNF to Lark:"))
+    {
         return (error_msg, StatusCode::BAD_REQUEST);
     }
 
@@ -1755,6 +1809,16 @@ pub fn validate_chat_completion_fields_generic(
         }));
     }
 
+    if let Some(top_p) = request.inner.top_p
+        && !(0.0 < top_p && top_p <= 1.0)
+    {
+        return Err(ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: VALIDATION_PREFIX.to_string()
+                + &format!("`top_p` must be in (0, 1], got {top_p}."),
+        }));
+    }
+
     request.validate().map_err(|e| {
         ErrorMessage::from_http_error(HttpError {
             code: 400,
@@ -1795,7 +1859,9 @@ pub fn validate_completion_fields_generic(
 }
 
 fn map_stream_parse_error_to_response(context: &str, error: &str) -> ErrorResponse {
-    if error.contains("Grammar error:") {
+    if error.contains("Grammar error:")
+        || error.contains("Failed to convert the grammar from GBNF to Lark:")
+    {
         return ErrorMessage::from_http_error(HttpError {
             code: 400,
             message: error.to_string(),

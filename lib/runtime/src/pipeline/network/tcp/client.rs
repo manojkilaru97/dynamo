@@ -285,6 +285,11 @@ async fn handle_reader(
                         tracing::warn!(
                             "tcp stream read error, closing connection: {e:?}"
                         );
+                        if let Some(counter) = &cancellation_counter && !cancellation_counted {
+                            counter.inc();
+                            cancellation_counted = true;
+                        }
+                        context.kill();
                         break;
                     }
                     None => {
@@ -293,7 +298,9 @@ async fn handle_reader(
                         // dropped the connection
                         if let Some(counter) = &cancellation_counter && !cancellation_counted {
                             counter.inc();
+                            cancellation_counted = true;
                         }
+                        context.stop();
                         break;
                     }
                 }
