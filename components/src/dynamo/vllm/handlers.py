@@ -157,11 +157,26 @@ def build_sampling_params(
         )
         if sampling_params.structured_outputs is not None:
             if guided_decoding.get("structural_tag") is not None:
-                # Reasoning-aware handoff is expressed via structural_tag and is
-                # currently implemented by xgrammar. Routing these requests to
-                # LMFE silently disables the intended handoff semantics.
-                sampling_params.structured_outputs._backend = "xgrammar"
+                structural_content_type = guided_decoding.get(
+                    "_dynamo_structural_content_type"
+                )
+                if is_minimax_m2 and structural_content_type == "json_schema":
+                    # MiniMax json-schema requests can stay in reasoning forever
+                    # on the structural_tag + xgrammar path. Guidance already
+                    # supports structural_tag, including json-schema tags, so
+                    # prefer it for this narrow MiniMax path.
+                    sampling_params.structured_outputs._backend = "guidance"
+                else:
+                    # Reasoning-aware handoff is expressed via structural_tag and is
+                    # currently implemented by xgrammar. Routing these requests to
+                    # LMFE silently disables the intended handoff semantics.
+                    sampling_params.structured_outputs._backend = "xgrammar"
                 sampling_params.structured_outputs._backend_was_auto = True
+                logger.info(
+                    "MiniMax structured backend selected: backend=%s structural_content_type=%s",
+                    sampling_params.structured_outputs._backend,
+                    structural_content_type,
+                )
             elif is_minimax_m2 and guided_decoding.get("grammar") is not None:
                 # MiniMax native grammar requests can stay in reasoning forever
                 # on the default xgrammar path. The guidance backend already
