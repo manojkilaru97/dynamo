@@ -23,6 +23,7 @@ use axum::{
 };
 use base64::Engine as _;
 use bytes::Bytes;
+use dynamo_async_openai::types::ChatCompletionToolChoiceOption;
 use dynamo_runtime::config::env_is_truthy;
 use dynamo_runtime::config::environment_names::llm as env_llm;
 use dynamo_runtime::config::environment_names::logging as env_logging;
@@ -60,7 +61,7 @@ use crate::protocols::openai::{
 };
 use crate::request_template::RequestTemplate;
 use crate::types::Annotated;
-use dynamo_runtime::logging::get_distributed_tracing_context;
+use dynamo_runtime::logging::{emit_payload_log, get_distributed_tracing_context};
 use tracing::Instrument;
 
 pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
@@ -85,6 +86,96 @@ pub(super) fn get_body_limit() -> usize {
 /// Tracing target used for payload log records exported to OTEL.
 /// Suppressed from console output; visible only in the OTEL log pipeline.
 const PAYLOAD_LOG_TARGET: &str = "dynamo_payload";
+const MAX_PAYLOAD_ACCUMULATE_BYTES: usize = 256 * 1024;
+
+fn header_map_to_json(headers: &HeaderMap) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (name, value) in headers {
+        let key = name.as_str().to_string();
+        let value = value.to_str().unwrap_or_default().to_string();
+        if let Some(existing) = out.remove(&key) {
+            let updated = match existing {
+                serde_json::Value::String(first) => serde_json::Value::Array(vec![
+                    serde_json::Value::String(first),
+                    serde_json::Value::String(value),
+                ]),
+                serde_json::Value::Array(mut items) => {
+                    items.push(serde_json::Value::String(value));
+                    serde_json::Value::Array(items)
+                }
+                other => other,
+            };
+            out.insert(key, updated);
+        } else {
+            out.insert(key, serde_json::Value::String(value));
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+fn error_response_payload(response: &ErrorResponse) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": response.1.message.clone(),
+            "type": response.1.error_type.clone(),
+            "code": response.1.code,
+        }
+    })
+}
+
+fn emit_openai_request_log(
+    request_id: &str,
+    model: &str,
+    endpoint: &'static str,
+    streaming: bool,
+    headers: serde_json::Value,
+    payload: serde_json::Value,
+) {
+    if !log_payloads_enabled() {
+        return;
+    }
+
+    emit_payload_log(
+        "openai.request",
+        PAYLOAD_LOG_TARGET,
+        serde_json::json!({
+            "rid": request_id,
+            "request_id": request_id,
+            "model": model,
+            "endpoint": endpoint,
+            "streaming": streaming,
+            "headers": headers,
+            "payload": payload,
+        }),
+    );
+}
+
+fn emit_openai_response_log(
+    request_id: &str,
+    model: &str,
+    endpoint: &'static str,
+    streaming: bool,
+    status_code: u16,
+    payload: serde_json::Value,
+) {
+    if !log_payloads_enabled() {
+        return;
+    }
+
+    emit_payload_log(
+        "openai.response",
+        PAYLOAD_LOG_TARGET,
+        serde_json::json!({
+            "rid": request_id,
+            "request_id": request_id,
+            "model": model,
+            "endpoint": endpoint,
+            "streaming": streaming,
+            "status_code": status_code,
+            "payload": payload,
+        }),
+    );
+}
 
 /// Returns true if OTEL payload logging is enabled via `DYNAMO_LOG_PAYLOADS`.
 fn log_payloads_enabled() -> bool {
@@ -350,17 +441,28 @@ async fn handler_completions(
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
+    let request_id = get_or_create_request_id(request.inner.user.as_deref(), &headers);
+    let streaming = request.inner.stream.unwrap_or(false);
+    let raw_model = request.inner.model.clone();
+
+    emit_openai_request_log(
+        &request_id,
+        &raw_model,
+        "completions",
+        streaming,
+        header_map_to_json(&headers),
+        serde_json::to_value(&request).unwrap_or(serde_json::Value::Null),
+    );
+
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
     // create the context for the request
-    let request_id = get_or_create_request_id(request.inner.user.as_deref(), &headers);
-    let streaming = request.inner.stream.unwrap_or(false);
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone(),
         endpoint: Endpoint::Completions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = Context::with_id(request, request_id);
+    let request = Context::with_id(request, request_id.clone());
     let context = request.context();
 
     // create the connection handles
@@ -373,18 +475,40 @@ async fn handler_completions(
 
     // possibly long running task
     // if this returns a streaming response, the stream handle will be armed and captured by the response stream
-    let response = tokio::spawn(completions(state, request, stream_handle).in_current_span())
-        .await
-        .map_err(|e| {
-            ErrorMessage::internal_server_error(&format!(
-                "Failed to await chat completions task: {:?}",
-                e,
-            ))
-        })?;
+    let response =
+        match tokio::spawn(completions(state, request, stream_handle).in_current_span()).await {
+            Ok(response) => response,
+            Err(e) => {
+                let err_response = ErrorMessage::internal_server_error(&format!(
+                    "Failed to await chat completions task: {:?}",
+                    e,
+                ));
+                emit_openai_response_log(
+                    &request_id,
+                    &raw_model,
+                    "completions",
+                    streaming,
+                    err_response.0.as_u16(),
+                    error_response_payload(&err_response),
+                );
+                return Err(err_response);
+            }
+        };
 
     // if we got here, then we will return a response and the potentially long running task has completed successfully
     // without need to be cancelled.
     connection_handle.disarm();
+
+    if let Err(err_response) = &response {
+        emit_openai_response_log(
+            &request_id,
+            &raw_model,
+            "completions",
+            streaming,
+            err_response.0.as_u16(),
+            error_response_payload(err_response),
+        );
+    }
 
     response
 }
@@ -446,21 +570,6 @@ async fn completions_single(
     let http_queue_guard = state
         .metrics_clone()
         .create_http_queue_guard(&metrics_model);
-
-    // Log request payload to OTEL (suppressed from console)
-    if log_payloads_enabled() {
-        if let Ok(payload) = serde_json::to_string(request.content()) {
-            tracing::info!(
-                target: PAYLOAD_LOG_TARGET,
-                request_id = %request_id,
-                model = %model,
-                endpoint = "completions",
-                streaming = streaming,
-                payload_type = "request",
-                payload = %payload,
-            );
-        }
-    }
 
     // todo - error handling should be more robust
     let (engine, parsing_options) = state
@@ -552,19 +661,14 @@ async fn completions_single(
                         .iter()
                         .map(|(idx, text)| serde_json::json!({ "index": idx, "text": text }))
                         .collect();
-                    if let Ok(payload) =
-                        serde_json::to_string(&serde_json::json!({ "choices": choices_json }))
-                    {
-                        tracing::info!(
-                            target: PAYLOAD_LOG_TARGET,
-                            request_id = %request_id_for_log,
-                            model = %model_for_log,
-                            endpoint = "completions",
-                            streaming = true,
-                            payload_type = "response",
-                            payload = %payload,
-                        );
-                    }
+                    emit_openai_response_log(
+                        &request_id_for_log,
+                        &model_for_log,
+                        "completions",
+                        true,
+                        StatusCode::OK.as_u16(),
+                        serde_json::json!({ "choices": choices_json }),
+                    );
                 }
 
                 sse_result
@@ -617,20 +721,14 @@ async fn completions_single(
                 err_response
             })?;
 
-        // Log response payload to OTEL for non-streaming requests (suppressed from console)
-        if log_payloads_enabled() {
-            if let Ok(payload) = serde_json::to_string(&response) {
-                tracing::info!(
-                    target: PAYLOAD_LOG_TARGET,
-                    request_id = %request_id,
-                    model = %model,
-                    endpoint = "completions",
-                    streaming = false,
-                    payload_type = "response",
-                    payload = %payload,
-                );
-            }
-        }
+        emit_openai_response_log(
+            &request_id,
+            &model,
+            "completions",
+            false,
+            StatusCode::OK.as_u16(),
+            serde_json::to_value(&response).unwrap_or(serde_json::Value::Null),
+        );
 
         inflight_guard.mark_ok();
         // If the engine context was killed (client disconnect), the response was
@@ -836,7 +934,7 @@ async fn embeddings(
     check_ready(&state)?;
 
     let request_id = get_or_create_request_id(request.inner.user.as_deref(), &headers);
-    let request = Context::with_id(request, request_id);
+    let request = Context::with_id(request, request_id.clone());
     let request_id = request.id().to_string();
 
     // Embeddings are typically not streamed, so we default to non-streaming
@@ -911,22 +1009,66 @@ async fn embeddings(
 async fn handler_chat_completions(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(mut request): Json<NvCreateChatCompletionRequest>,
+    body: Bytes,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
+    let payload_value = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
+    let payload_obj = payload_value.as_object();
+    let request_id = get_or_create_request_id(
+        payload_obj
+            .and_then(|obj| obj.get("user"))
+            .and_then(serde_json::Value::as_str),
+        &headers,
+    );
+    let streaming = payload_obj
+        .and_then(|obj| obj.get("stream"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let raw_model = payload_obj
+        .and_then(|obj| obj.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    emit_openai_request_log(
+        &request_id,
+        &raw_model,
+        "chat_completions",
+        streaming,
+        header_map_to_json(&headers),
+        payload_value.clone(),
+    );
+
+    let mut request: NvCreateChatCompletionRequest =
+        serde_json::from_slice(&body).map_err(|e| {
+            let err_response = ErrorMessage::from_http_error(HttpError {
+                code: 400,
+                message: format!(
+                    "Failed to deserialize the JSON body into the target type: {e}"
+                ),
+            });
+            emit_openai_response_log(
+                &request_id,
+                &raw_model,
+                "chat_completions",
+                streaming,
+                err_response.0.as_u16(),
+                error_response_payload(&err_response),
+            );
+            err_response
+        })?;
+
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
     // create the context for the request
-    let request_id = get_or_create_request_id(request.inner.user.as_deref(), &headers);
-    let streaming = request.inner.stream.unwrap_or(false);
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone(),
         endpoint: Endpoint::ChatCompletions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = Context::with_id(request, request_id);
+    let request = Context::with_id(request, request_id.clone());
     let context = request.context();
 
     // create the connection handles
@@ -937,19 +1079,43 @@ async fn handler_chat_completions(
     )
     .await;
 
-    let response =
-        tokio::spawn(chat_completions(state, template, request, stream_handle).in_current_span())
-            .await
-            .map_err(|e| {
-                ErrorMessage::internal_server_error(&format!(
-                    "Failed to await chat completions task: {:?}",
-                    e,
-                ))
-            })?;
+    let response = match tokio::spawn(
+        chat_completions(state, template, request, stream_handle).in_current_span(),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            let err_response = ErrorMessage::internal_server_error(&format!(
+                "Failed to await chat completions task: {:?}",
+                e,
+            ));
+            emit_openai_response_log(
+                &request_id,
+                &raw_model,
+                "chat_completions",
+                streaming,
+                err_response.0.as_u16(),
+                error_response_payload(&err_response),
+            );
+            return Err(err_response);
+        }
+    };
 
     // if we got here, then we will return a response and the potentially long running task has completed successfully
     // without need to be cancelled.
     connection_handle.disarm();
+
+    if let Err(err_response) = &response {
+        emit_openai_response_log(
+            &request_id,
+            &raw_model,
+            "chat_completions",
+            streaming,
+            err_response.0.as_u16(),
+            error_response_payload(err_response),
+        );
+    }
 
     response
 }
@@ -1062,6 +1228,7 @@ pub(super) async fn check_for_backend_error(
     if let Some(first_event) = stream.next().await {
         // Check if it's an error event
         if let Some((error_msg, status_code)) = extract_backend_error_if_present(&first_event) {
+            let (error_msg, status_code) = normalize_backend_error(error_msg, status_code);
             return Err((
                 status_code,
                 Json(ErrorMessage {
@@ -1079,6 +1246,14 @@ pub(super) async fn check_for_backend_error(
         // Empty stream - this shouldn't happen but handle gracefully
         Ok(futures::stream::iter(vec![]).chain(stream))
     }
+}
+
+fn normalize_backend_error(error_msg: String, status_code: StatusCode) -> (String, StatusCode) {
+    if status_code == StatusCode::INTERNAL_SERVER_ERROR && error_msg.contains("Grammar error:") {
+        return (error_msg, StatusCode::BAD_REQUEST);
+    }
+
+    (error_msg, status_code)
 }
 
 /// Serialize `payload` and wrap it as an SSE event with the given name.
@@ -1179,50 +1354,20 @@ fn accumulate_reasoning_dispatch(
     events
 }
 
-/// Maximum bytes to accumulate per choice for streaming payload logs.
-/// Prevents unbounded memory growth for very long completions.
-const MAX_PAYLOAD_ACCUMULATE_BYTES: usize = 256 * 1024;
-
-/// Accumulates chat completion content and reasoning tokens for payload logging.
-///
-/// Borrows the response chunk before it is consumed by `EventConverter`.
-/// Returns `true` when any choice carries a `finish_reason` (stream ending).
-/// Only intended to be called when `log_payloads_enabled()` is true.
-fn accumulate_payload_chat(
+/// Returns `true` when any streaming chat choice carries a `finish_reason`.
+fn is_final_chat_payload_chunk(
     response: &Annotated<NvCreateChatCompletionStreamResponse>,
-    content_bufs: &mut HashMap<u32, String>,
-    reasoning_bufs: &mut HashMap<u32, String>,
+    expect_usage_chunk: bool,
 ) -> bool {
     let Some(data) = &response.data else {
         return false;
     };
-    let mut is_final = false;
-    // Note: for n > 1, is_final fires on the first choice to finish; subsequent choices
-    // may still have content arriving. This is acceptable for the n = 1 common case.
-    for choice in &data.choices {
-        if let Some(dynamo_async_openai::types::ChatCompletionMessageContent::Text(s)) =
-            &choice.delta.content
-        {
-            if !s.is_empty() {
-                let buf = content_bufs.entry(choice.index).or_default();
-                if buf.len() < MAX_PAYLOAD_ACCUMULATE_BYTES {
-                    buf.push_str(s);
-                }
-            }
-        }
-        if let Some(reasoning) = &choice.delta.reasoning_content {
-            if !reasoning.is_empty() {
-                let buf = reasoning_bufs.entry(choice.index).or_default();
-                if buf.len() < MAX_PAYLOAD_ACCUMULATE_BYTES {
-                    buf.push_str(reasoning);
-                }
-            }
-        }
-        if choice.finish_reason.is_some() {
-            is_final = true;
-        }
+
+    if expect_usage_chunk {
+        return data.usage.is_some();
     }
-    is_final
+
+    data.choices.iter().any(|choice| choice.finish_reason.is_some())
 }
 
 /// OpenAI Chat Completions Request Handler
@@ -1307,21 +1452,6 @@ async fn chat_completions(
     // Create HTTP queue guard after template resolution so labels are correct
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
-    // Log request payload to OTEL (suppressed from console)
-    if log_payloads_enabled() {
-        if let Ok(payload) = serde_json::to_string(request.content()) {
-            tracing::info!(
-                target: PAYLOAD_LOG_TARGET,
-                request_id = %request_id,
-                model = %model,
-                endpoint = "chat_completions",
-                streaming = streaming,
-                payload_type = "request",
-                payload = %payload,
-            );
-        }
-    }
-
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
     let (engine, parsing_options) = state
@@ -1336,6 +1466,12 @@ async fn chat_completions(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metrics_model);
+
+    // The preprocessor forces usage emission for chat-completion streams so clients always get
+    // a final usage-only chunk. Match the actual emitted stream contract here rather than the
+    // raw incoming request shape, otherwise payload logging will finalize one chunk too early and
+    // drop `usage` from the logged response.
+    let expect_usage_chunk = true;
 
     let annotations = request.annotations();
 
@@ -1382,11 +1518,9 @@ async fn chat_completions(
         let mut reasoning_buffer: HashMap<u32, String> = HashMap::new();
         let mut dispatched_tool_ids: HashSet<String> = HashSet::new();
 
-        // Payload log accumulators for streaming responses.
-        // Only allocated/used when payload logging is enabled; gated to avoid overhead.
         let log_payloads = log_payloads_enabled();
-        let mut payload_content_bufs: HashMap<u32, String> = HashMap::new();
-        let mut payload_reasoning_bufs: HashMap<u32, String> = HashMap::new();
+        let parsing_options_for_log = parsing_options.clone();
+        let mut payload_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> = Vec::new();
         let request_id_for_log = request_id.clone();
         let model_for_log = model.clone();
 
@@ -1410,15 +1544,9 @@ async fn chat_completions(
                 ));
             }
 
-            // Accumulate content for payload logging before response is consumed.
-            // Only fires on cleanly-finished responses (finish_reason set); client-disconnected
-            // streams are silently skipped since monitor_for_disconnects cancels the stream.
             let is_final = if log_payloads {
-                accumulate_payload_chat(
-                    &response,
-                    &mut payload_content_bufs,
-                    &mut payload_reasoning_bufs,
-                )
+                payload_chunks.push(response.clone());
+                is_final_chat_payload_chunk(&response, expect_usage_chunk)
             } else {
                 false
             };
@@ -1431,39 +1559,31 @@ async fn chat_completions(
                 &mut http_queue_guard,
             );
 
-            // Emit assembled payload log on the final chunk.
             if is_final {
-                let choices_json: Vec<serde_json::Value> = payload_content_bufs
-                    .iter()
-                    .map(|(idx, content)| {
-                        let reasoning = payload_reasoning_bufs
-                            .get(idx)
-                            .map(String::as_str)
-                            .unwrap_or("");
-                        let mut msg = serde_json::json!({
-                            "role": "assistant",
-                            "content": content,
-                        });
-                        if !reasoning.is_empty() {
-                            msg["reasoning_content"] =
-                                serde_json::Value::String(reasoning.to_owned());
-                        }
-                        serde_json::json!({ "index": idx, "message": msg })
-                    })
-                    .collect();
-                if let Ok(payload) =
-                    serde_json::to_string(&serde_json::json!({ "choices": choices_json }))
-                {
-                    tracing::info!(
-                        target: PAYLOAD_LOG_TARGET,
-                        request_id = %request_id_for_log,
-                        model = %model_for_log,
-                        endpoint = "chat_completions",
-                        streaming = true,
-                        payload_type = "response",
-                        payload = %payload,
-                    );
-                }
+                let response_chunks = std::mem::take(&mut payload_chunks);
+                let request_id_for_log = request_id_for_log.clone();
+                let model_for_log = model_for_log.clone();
+                let parsing_options_for_log = parsing_options_for_log.clone();
+                tokio::spawn(async move {
+                    let stream = stream::iter(response_chunks);
+                    if let Ok(final_response) =
+                        NvCreateChatCompletionResponse::from_annotated_stream(
+                            stream,
+                            parsing_options_for_log,
+                        )
+                        .await
+                    {
+                        emit_openai_response_log(
+                            &request_id_for_log,
+                            &model_for_log,
+                            "chat_completions",
+                            true,
+                            StatusCode::OK.as_u16(),
+                            serde_json::to_value(&final_response)
+                                .unwrap_or(serde_json::Value::Null),
+                        );
+                    }
+                });
             }
 
             // Side-channel events come first, then the regular data event.
@@ -1519,28 +1639,22 @@ async fn chat_completions(
                         "Failed to parse chat completion response: {:?}",
                         e
                     );
-                    let err_response = ErrorMessage::internal_server_error(&format!(
-                        "Failed to parse chat completion response: {}",
-                        e
-                    ));
+                    let err_response = map_stream_parse_error_to_response(
+                        "Failed to parse chat completion response",
+                        &e.to_string(),
+                    );
                     inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                     err_response
                 })?;
 
-        // Log response payload to OTEL for non-streaming requests (suppressed from console)
-        if log_payloads_enabled() {
-            if let Ok(payload) = serde_json::to_string(&response) {
-                tracing::info!(
-                    target: PAYLOAD_LOG_TARGET,
-                    request_id = %request_id,
-                    model = %model,
-                    endpoint = "chat_completions",
-                    streaming = false,
-                    payload_type = "response",
-                    payload = %payload,
-                );
-            }
-        }
+        emit_openai_response_log(
+            &request_id,
+            &model,
+            "chat_completions",
+            false,
+            StatusCode::OK.as_u16(),
+            serde_json::to_value(&response).unwrap_or(serde_json::Value::Null),
+        );
 
         inflight_guard.mark_ok();
         // If the engine context was killed (client disconnect), the response was
@@ -1623,6 +1737,24 @@ pub fn validate_chat_completion_stream_options(
 pub fn validate_chat_completion_fields_generic(
     request: &NvCreateChatCompletionRequest,
 ) -> Result<(), ErrorResponse> {
+    if request
+        .inner
+        .tool_choice
+        .as_ref()
+        .is_some_and(|choice| !matches!(choice, ChatCompletionToolChoiceOption::None))
+        && !request
+            .inner
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err(ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: VALIDATION_PREFIX.to_string()
+                + "When using `tool_choice`, `tools` must be set.",
+        }));
+    }
+
     request.validate().map_err(|e| {
         ErrorMessage::from_http_error(HttpError {
             code: 400,
@@ -1662,6 +1794,17 @@ pub fn validate_completion_fields_generic(
     })
 }
 
+fn map_stream_parse_error_to_response(context: &str, error: &str) -> ErrorResponse {
+    if error.contains("Grammar error:") {
+        return ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: error.to_string(),
+        });
+    }
+
+    ErrorMessage::internal_server_error(&format!("{context}: {error}"))
+}
+
 /// OpenAI Responses Request Handler
 ///
 /// This method will handle the incoming request for the /v1/responses endpoint.
@@ -1683,7 +1826,7 @@ async fn handler_responses(
         endpoint: Endpoint::Responses.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = Context::with_id(request, request_id);
+    let request = Context::with_id(request, request_id.clone());
     let context = request.context();
 
     // create the connection handles
@@ -2172,7 +2315,7 @@ async fn images(
     check_ready(&state)?;
 
     let request_id = get_or_create_request_id(request.inner.user.as_deref(), &headers);
-    let request = Context::with_id(request, request_id);
+    let request = Context::with_id(request, request_id.clone());
     let request_id = request.id().to_string();
 
     // Images are typically not streamed, so we default to non-streaming
@@ -2265,7 +2408,7 @@ async fn videos(
     check_ready(&state)?;
 
     let request_id = get_or_create_request_id(request.user.as_deref(), &headers);
-    let request = Context::with_id(request, request_id);
+    let request = Context::with_id(request, request_id.clone());
     let request_id = request.id().to_string();
 
     // Videos are typically not streamed, so we default to non-streaming
@@ -2336,7 +2479,7 @@ async fn video_stream(
     check_ready(&state)?;
 
     let request_id = get_or_create_request_id(request.user.as_deref(), &headers);
-    let request = Context::with_id(request, request_id);
+    let request = Context::with_id(request, request_id.clone());
     let model = request.model.clone();
 
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
