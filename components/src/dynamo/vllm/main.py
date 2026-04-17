@@ -597,6 +597,7 @@ async def register_vllm_model(
         custom_template_path=config.custom_jinja_template,
         media_decoder=media_decoder,
         media_fetcher=media_fetcher,
+        model_aliases=config.served_model_aliases or None,
     )
 
 

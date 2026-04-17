@@ -45,6 +45,7 @@ class Config(DynamoRuntimeConfig, DynamoVllmConfig):
     # mirror vLLM
     model: str
     served_model_name: Optional[str] = None
+    served_model_aliases: list[str] = []
 
     # rest vLLM args
     engine_args: AsyncEngineArgs
@@ -134,11 +135,11 @@ def update_dynamo_config_with_engine(
 
     if getattr(engine_config, "served_model_name", None) is not None:
         served = engine_config.served_model_name
-        if len(served) > 1:
-            raise ValueError("We do not support multiple model names.")
         dynamo_config.served_model_name = served[0]
+        dynamo_config.served_model_aliases = served[1:]
     else:
         dynamo_config.served_model_name = None
+        dynamo_config.served_model_aliases = []
 
     # Capture user-provided --endpoint before defaults overwrite it
     user_endpoint = dynamo_config.endpoint
