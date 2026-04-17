@@ -207,6 +207,26 @@ def test_endpoint_invalid_format_raises(mock_vllm_cli):
         parse_args()
 
 
+def test_multiple_served_model_names_are_split_into_primary_and_aliases(mock_vllm_cli):
+    """Multiple --served-model-name values should preserve the first as canonical and the rest as aliases."""
+    mock_vllm_cli(
+        "--model",
+        "Qwen/Qwen3-0.6B",
+        "--served-model-name",
+        "primary/model",
+        "stg/primary/model",
+        "private/ollama/primary/model",
+    )
+
+    config = parse_args()
+
+    assert config.served_model_name == "primary/model"
+    assert config.served_model_aliases == [
+        "stg/primary/model",
+        "private/ollama/primary/model",
+    ]
+
+
 # --connector removal tests
 
 

@@ -195,6 +195,7 @@ class OmniConfig(DynamoRuntimeConfig):
     # mirror vLLM
     model: str
     served_model_name: Optional[str] = None
+    served_model_aliases: list[str] = []
 
     # vLLM-Omni engine args
     engine_args: AsyncOmniEngineArgs
@@ -269,9 +270,8 @@ def parse_omni_args() -> OmniConfig:
 
     if getattr(engine_args, "served_model_name", None) is not None:
         served = engine_args.served_model_name
-        if len(served) > 1:
-            raise ValueError("We do not support multiple model names.")
         config.served_model_name = served[0]
+        config.served_model_aliases = served[1:]
 
     config.engine_args = engine_args
     config.validate()

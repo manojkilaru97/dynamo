@@ -76,6 +76,7 @@ async def init_omni(
         config.model,
         config.served_model_name,
         kv_cache_block_size=config.engine_args.block_size,
+        model_aliases=config.served_model_aliases or None,
     )
 
     logger.info("Starting to serve Omni worker endpoint...")

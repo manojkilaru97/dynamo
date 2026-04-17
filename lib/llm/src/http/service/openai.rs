@@ -784,7 +784,7 @@ async fn completions(
 #[tracing::instrument(skip_all)]
 async fn completions_single(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
 ) -> Result<Response, ErrorResponse> {
     let request_id = request.id().to_string();
@@ -794,8 +794,15 @@ async fn completions_single(
 
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
-    let model = request.inner.model.clone();
-    let metrics_model = state.manager().resolve_canonical_name(&model);
+    let requested_model = request.inner.model.clone();
+    let model = state.manager().resolve_canonical_name(&requested_model);
+    request.inner.model = model.clone();
+    let metrics_model = model.clone();
+    tracing::info!(
+        requested_model = %requested_model,
+        canonical_model = %model,
+        "Resolved chat request model"
+    );
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -943,7 +950,8 @@ async fn completions_single(
             );
         });
 
-        let response = NvCreateCompletionResponse::from_annotated_stream(stream, parsing_options)
+        let mut response =
+            NvCreateCompletionResponse::from_annotated_stream(stream, parsing_options)
             .await
             .map_err(|e| {
                 tracing::error!(
@@ -958,6 +966,7 @@ async fn completions_single(
                 inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                 err_response
             })?;
+        response.inner.model = model.clone();
 
         emit_openai_response_log(
             &request_id,
@@ -982,7 +991,7 @@ async fn completions_single(
 #[tracing::instrument(skip_all)]
 async fn completions_batch(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
     batch_size: usize,
     n: u8,
@@ -992,8 +1001,9 @@ async fn completions_batch(
 
     let request_id = request.id().to_string();
     let streaming = request.inner.stream.unwrap_or(false);
-    let model = request.inner.model.clone();
-    let metrics_model = state.manager().resolve_canonical_name(&model);
+    let model = state.manager().resolve_canonical_name(&request.inner.model);
+    request.inner.model = model.clone();
+    let metrics_model = model.clone();
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -1136,7 +1146,8 @@ async fn completions_batch(
             );
         });
 
-        let response = NvCreateCompletionResponse::from_annotated_stream(stream, parsing_options)
+        let mut response =
+            NvCreateCompletionResponse::from_annotated_stream(stream, parsing_options)
             .await
             .map_err(|e| {
                 tracing::error!(
@@ -1151,6 +1162,7 @@ async fn completions_batch(
                 inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                 err_response
             })?;
+        response.inner.model = model.clone();
 
         inflight_guard.mark_ok();
         // If the engine context was killed (client disconnect), the response was
@@ -1172,7 +1184,7 @@ async fn embeddings(
     check_ready(&state)?;
 
     let request_id = get_or_create_request_id(request.inner.user.as_deref(), &headers);
-    let request = Context::with_id(request, request_id.clone());
+    let mut request = Context::with_id(request, request_id.clone());
     let request_id = request.id().to_string();
 
     // Embeddings are typically not streamed, so we default to non-streaming
@@ -1180,8 +1192,9 @@ async fn embeddings(
 
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
-    let model = &request.inner.model;
-    let metrics_model = state.manager().resolve_canonical_name(model);
+    let model = state.manager().resolve_canonical_name(&request.inner.model);
+    request.inner.model = model.clone();
+    let metrics_model = model.clone();
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight = state.metrics_clone().create_inflight_guard(
@@ -1196,7 +1209,7 @@ async fn embeddings(
         .create_http_queue_guard(&metrics_model);
 
     // todo - error handling should be more robust
-    let engine = state.manager().get_embeddings_engine(model).map_err(|_| {
+    let engine = state.manager().get_embeddings_engine(&model).map_err(|_| {
         let err_response = ErrorMessage::model_not_found();
         inflight.mark_error(extract_error_type_from_response(&err_response));
         err_response
@@ -1652,8 +1665,15 @@ async fn chat_completions(
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
     // todo - determine the proper error code for when a request model is not present
-    let model = request.inner.model.clone();
-    let metrics_model = state.manager().resolve_canonical_name(&model);
+    let requested_model = request.inner.model.clone();
+    let model = state.manager().resolve_canonical_name(&requested_model);
+    request.inner.model = model.clone();
+    let metrics_model = model.clone();
+    tracing::info!(
+        requested_model = %requested_model,
+        canonical_model = %model,
+        "Resolved chat request model"
+    );
 
     tracing::trace!("Received chat completions request: {:?}", request.content());
 
@@ -1770,7 +1790,11 @@ async fn chat_completions(
         //   - `event: tool_call_dispatch`  — complete tool call detected early (tool dispatch)
         //   - `event: reasoning_dispatch`  — complete reasoning block (emitted once)
         // When both flags are off the flat_map is equivalent to the original map + filter_map.
-        let stream = stream.flat_map(move |response| {
+        let stream = stream.flat_map(move |mut response| {
+            if let Some(data) = response.data.as_mut() {
+                data.model = model_for_log.clone();
+            }
+
             // Extract side-channel events before the response is consumed by EventConverter.
             let mut events: Vec<Result<Event, axum::Error>> = vec![];
             if tool_dispatch_enabled {
@@ -1872,7 +1896,7 @@ async fn chat_completions(
             );
         });
 
-        let response =
+        let mut response =
             NvCreateChatCompletionResponse::from_annotated_stream(stream, parsing_options.clone())
                 .await
                 .map_err(|e| {
@@ -1888,6 +1912,7 @@ async fn chat_completions(
                     inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                     err_response
                 })?;
+        response.model = model.clone();
 
         emit_openai_response_log(
             &request_id,
@@ -2197,8 +2222,11 @@ async fn responses(
     apply_responses_max_output_len_cap(&mut request);
     tracing::trace!("Received responses request: {:?}", request.inner);
 
-    let model = request.inner.model.clone().unwrap_or_default();
-    let metrics_model = state.manager().resolve_canonical_name(&model);
+    let model = state
+        .manager()
+        .resolve_canonical_name(request.inner.model.as_deref().unwrap_or_default());
+    request.inner.model = Some(model.clone());
+    let metrics_model = model.clone();
     let streaming = request.inner.stream.unwrap_or(false);
     let request_id = request.id().to_string();
 
