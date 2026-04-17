@@ -53,8 +53,12 @@ pub async fn completion_response_stream(
 > {
     // create the context for the request
     // [WIP] from request id.
-    let request_id =
-        get_or_create_request_id(request.request_id.as_deref().or(request.inner.user.as_deref()));
+    let request_id = get_or_create_request_id(
+        request
+            .request_id
+            .as_deref()
+            .or(request.inner.user.as_deref()),
+    );
     let streaming = request.inner.stream.unwrap_or(false);
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone(),

@@ -264,6 +264,9 @@ pub mod llm {
     /// HTTP body size limit in MB
     pub const DYN_HTTP_BODY_LIMIT_MB: &str = "DYN_HTTP_BODY_LIMIT_MB";
 
+    /// Maximum generated output tokens allowed per request before silent capping.
+    pub const DYN_MAX_OUTPUT_LEN: &str = "DYN_MAX_OUTPUT_LEN";
+
     pub const DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: &str =
         "DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS";
 

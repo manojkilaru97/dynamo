@@ -137,8 +137,7 @@ impl<T: OpenAISamplingOptionsProvider + CommonExtProvider> SamplingOptionsProvid
         let guided_structural_tag = self.get_guided_structural_tag();
         let guided_disable_fallback = self.get_guided_disable_fallback();
         let guided_disable_any_whitespace = self.get_guided_disable_any_whitespace();
-        let guided_disable_additional_properties =
-            self.get_guided_disable_additional_properties();
+        let guided_disable_additional_properties = self.get_guided_disable_additional_properties();
         let enable_thinking = self.get_enable_thinking();
 
         let guided_decoding = match common::GuidedDecodingOptions::from_optional(

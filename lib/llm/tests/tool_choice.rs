@@ -3,9 +3,9 @@
 
 use dynamo_async_openai::types::{
     ChatCompletionMessageContent, ChatCompletionNamedToolChoice, ChatCompletionRequestMessage,
-    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-    ChatCompletionTool, ChatCompletionToolChoiceOption, ChatCompletionToolType,
-    CreateChatCompletionRequest, FunctionName, FunctionObject,
+    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionToolType, CreateChatCompletionRequest,
+    FunctionName, FunctionObject,
 };
 use dynamo_llm::protocols::common;
 use dynamo_llm::protocols::common::llm_backend::BackendOutput;
@@ -909,17 +909,15 @@ async fn test_named_tool_choice_waits_for_complete_top_level_object() {
         ))
         .expect("nested-object second chunk generation");
 
-    let input_stream = stream::iter(
-        vec![raw_response_1, raw_response_2]
-            .into_iter()
-            .map(|response| Annotated {
-                data: Some(response),
-                id: None,
-                event: None,
-                comment: None,
-                error: None,
-            }),
-    );
+    let input_stream = stream::iter(vec![raw_response_1, raw_response_2].into_iter().map(
+        |response| Annotated {
+            data: Some(response),
+            id: None,
+            event: None,
+            comment: None,
+            error: None,
+        },
+    ));
     let jail = JailedStream::builder()
         .tool_choice_named("search_documents".to_string())
         .tool_definitions(default_parser_tool_definitions())
@@ -1131,7 +1129,11 @@ async fn test_tool_choice_parse_failure_returns_as_content() {
         .expect("choice generation");
 
     let responses = apply_jail_transformation_streaming(vec![raw_response], tool_choice).await;
-    assert_eq!(responses.len(), 1, "parse failure should still emit fallback content");
+    assert_eq!(
+        responses.len(),
+        1,
+        "parse failure should still emit fallback content"
+    );
     let delta = &responses[0].choices[0].delta;
 
     // Jail stream behavior: if parsing fails, return accumulated content as-is

@@ -450,8 +450,8 @@ fn convert_param_value(
         .unwrap_or_else(|| vec!["string".to_string()]);
 
     for param_type in [
-        "integer", "int", "number", "float", "boolean", "bool", "object", "array", "string",
-        "str", "text",
+        "integer", "int", "number", "float", "boolean", "bool", "object", "array", "string", "str",
+        "text",
     ] {
         if !param_types.iter().any(|t| t == param_type) {
             continue;

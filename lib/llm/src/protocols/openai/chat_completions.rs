@@ -255,13 +255,16 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
             .as_ref()
             .and_then(|params| params.json_object)
             .or_else(|| {
-                self.inner.response_format.as_ref().and_then(|response_format| {
-                    use dynamo_async_openai::types::ResponseFormat;
-                    match response_format {
-                        ResponseFormat::JsonObject => Some(true),
-                        _ => None,
-                    }
-                })
+                self.inner
+                    .response_format
+                    .as_ref()
+                    .and_then(|response_format| {
+                        use dynamo_async_openai::types::ResponseFormat;
+                        match response_format {
+                            ResponseFormat::JsonObject => Some(true),
+                            _ => None,
+                        }
+                    })
             })
     }
 
@@ -296,7 +299,11 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
                         dynamo_async_openai::types::ChatCompletionToolChoiceOption::Named(_)
                             | dynamo_async_openai::types::ChatCompletionToolChoiceOption::Required
                     )
-                ) && self.inner.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+                ) && self
+                    .inner
+                    .tools
+                    .as_ref()
+                    .is_some_and(|tools| !tools.is_empty())
                 {
                     Some(true)
                 } else {
@@ -402,8 +409,14 @@ impl OpenAIOutputOptionsProvider for NvCreateChatCompletionRequest {
                 Some(top_logprobs) => Some(top_logprobs as u32),
                 None => Some(1_u32),
             },
-            Some(false) => None,
-            None => None,
+            Some(false) => match self.inner.top_logprobs {
+                Some(top_logprobs) if top_logprobs > 0 => Some(top_logprobs as u32),
+                _ => None,
+            },
+            None => match self.inner.top_logprobs {
+                Some(top_logprobs) if top_logprobs > 0 => Some(top_logprobs as u32),
+                _ => None,
+            },
         }
     }
 
@@ -417,6 +430,47 @@ impl OpenAIOutputOptionsProvider for NvCreateChatCompletionRequest {
 
     fn get_formatted_prompt(&self) -> Option<bool> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_request(logprobs: Option<bool>, top_logprobs: Option<u8>) -> NvCreateChatCompletionRequest {
+        NvCreateChatCompletionRequest {
+            inner: CreateChatCompletionRequest {
+                model: "test-model".to_string(),
+                messages: vec![ChatCompletionRequestMessage::User(
+                    ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Text("Hello".to_string()),
+                        name: None,
+                    },
+                )],
+                logprobs,
+                top_logprobs,
+                ..Default::default()
+            },
+            common: Default::default(),
+            nvext: None,
+            chat_template_args: None,
+            media_io_kwargs: None,
+            structured_outputs: None,
+            request_id: None,
+            unsupported_fields: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_get_logprobs_implicit_top_logprobs_without_flag() {
+        let request = make_request(None, Some(3));
+        assert_eq!(request.get_logprobs(), Some(3));
+    }
+
+    #[test]
+    fn test_get_logprobs_implicit_top_logprobs_with_false_flag() {
+        let request = make_request(Some(false), Some(4));
+        assert_eq!(request.get_logprobs(), Some(4));
     }
 }
 
