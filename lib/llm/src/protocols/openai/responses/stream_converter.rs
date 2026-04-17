@@ -165,6 +165,49 @@ impl ResponseStreamConverter {
         }
     }
 
+    pub fn completed_response(&self) -> Response {
+        let mut output = Vec::new();
+        if self.reasoning_started {
+            output.push(OutputItem::Reasoning(ReasoningItem {
+                id: self.reasoning_item_id.clone(),
+                summary: vec![SummaryPart::SummaryText(Summary {
+                    text: self.accumulated_reasoning.clone(),
+                })],
+                content: None,
+                encrypted_content: None,
+                status: Some(OutputStatus::Completed),
+            }));
+        }
+        if self.message_started {
+            output.push(OutputItem::Message(OutputMessage {
+                id: Some(self.message_item_id.clone()),
+                content: vec![OutputMessageContent::OutputText(OutputTextContent {
+                    text: self.accumulated_text.clone(),
+                    annotations: vec![],
+                    logprobs: Some(vec![]),
+                })],
+                role: AssistantRole::Assistant,
+                status: Some(OutputStatus::Completed),
+            }));
+        }
+        for fc in &self.function_call_items {
+            if fc.started {
+                output.push(OutputItem::FunctionCall(FunctionToolCall {
+                    id: Some(fc.item_id.clone()),
+                    call_id: fc.call_id.clone(),
+                    name: fc.name.clone(),
+                    arguments: fc.accumulated_args.clone(),
+                    status: Some(OutputStatus::Completed),
+                }));
+            }
+        }
+        self.make_response(Status::Completed, output)
+    }
+
+    pub fn failed_response(&self) -> Response {
+        self.make_response(Status::Failed, vec![])
+    }
+
     /// Emit the initial lifecycle events: created + in_progress.
     pub fn emit_start_events(&mut self) -> Vec<Result<Event, anyhow::Error>> {
         let mut events = Vec::with_capacity(2);
@@ -545,46 +588,10 @@ impl ResponseStreamConverter {
 
         // Build the final output vector from accumulated state
         // Reasoning comes first (before message), matching non-streaming response ordering
-        let mut output = Vec::new();
-        if self.reasoning_started {
-            output.push(OutputItem::Reasoning(ReasoningItem {
-                id: self.reasoning_item_id.clone(),
-                summary: vec![SummaryPart::SummaryText(Summary {
-                    text: self.accumulated_reasoning.clone(),
-                })],
-                content: None,
-                encrypted_content: None,
-                status: Some(OutputStatus::Completed),
-            }));
-        }
-        if self.message_started {
-            output.push(OutputItem::Message(OutputMessage {
-                id: Some(self.message_item_id.clone()),
-                content: vec![OutputMessageContent::OutputText(OutputTextContent {
-                    text: self.accumulated_text.clone(),
-                    annotations: vec![],
-                    logprobs: Some(vec![]),
-                })],
-                role: AssistantRole::Assistant,
-                status: Some(OutputStatus::Completed),
-            }));
-        }
-        for fc in &self.function_call_items {
-            if fc.started {
-                output.push(OutputItem::FunctionCall(FunctionToolCall {
-                    id: Some(fc.item_id.clone()),
-                    call_id: fc.call_id.clone(),
-                    name: fc.name.clone(),
-                    arguments: fc.accumulated_args.clone(),
-                    status: Some(OutputStatus::Completed),
-                }));
-            }
-        }
-
         // Emit response.completed
         let completed = ResponseStreamEvent::ResponseCompleted(ResponseCompletedEvent {
             sequence_number: self.next_seq(),
-            response: self.make_response(Status::Completed, output),
+            response: self.completed_response(),
         });
         events.push(make_sse_event(&completed));
 
@@ -597,7 +604,7 @@ impl ResponseStreamConverter {
 
         let failed = ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
             sequence_number: self.next_seq(),
-            response: self.make_response(Status::Failed, vec![]),
+            response: self.failed_response(),
         });
         events.push(make_sse_event(&failed));
 

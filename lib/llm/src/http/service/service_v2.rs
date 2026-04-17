@@ -138,6 +138,10 @@ impl State {
         self.manager.clone()
     }
 
+    pub fn endpoint_enabled(&self, endpoint_type: EndpointType) -> bool {
+        self.flags.get(&endpoint_type)
+    }
+
     pub fn discovery(&self) -> Arc<dyn Discovery> {
         self.discovery_client.clone()
     }
@@ -370,6 +374,8 @@ static HTTP_SVC_MODELS_PATH_ENV: &str = "DYN_HTTP_SVC_MODELS_PATH";
 static HTTP_SVC_HEALTH_PATH_ENV: &str = "DYN_HTTP_SVC_HEALTH_PATH";
 /// Environment variable to set the live endpoint path (default: `/live`)
 static HTTP_SVC_LIVE_PATH_ENV: &str = "DYN_HTTP_SVC_LIVE_PATH";
+/// Environment variable to set the ready endpoint path (default: `/ready`)
+static HTTP_SVC_READY_PATH_ENV: &str = "DYN_HTTP_SVC_READY_PATH";
 /// Environment variable to set the chat completions endpoint path (default: `/v1/chat/completions`)
 static HTTP_SVC_CHAT_PATH_ENV: &str = "DYN_HTTP_SVC_CHAT_PATH";
 /// Environment variable to set the completions endpoint path (default: `/v1/completions`)
@@ -468,6 +474,7 @@ impl HttpServiceConfigBuilder {
             super::openai::list_models_router(state.clone(), var(HTTP_SVC_MODELS_PATH_ENV).ok()),
             super::health::health_check_router(state.clone(), var(HTTP_SVC_HEALTH_PATH_ENV).ok()),
             super::health::live_check_router(state.clone(), var(HTTP_SVC_LIVE_PATH_ENV).ok()),
+            super::health::ready_check_router(state.clone(), var(HTTP_SVC_READY_PATH_ENV).ok()),
             super::busy_threshold::busy_threshold_router(state.clone(), None),
         ];
 
@@ -657,6 +664,42 @@ mod tests {
         assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
 
         // Clean up
+        handle.abort();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_ready_endpoint_returns_503_when_enabled_route_has_no_models() {
+        let service = HttpService::builder()
+            .enable_chat_endpoints(true)
+            .enable_embeddings_endpoints(false)
+            .enable_responses_endpoints(false)
+            .build()
+            .unwrap();
+        let port = service.port;
+
+        let cancel_token = CancellationToken::new();
+        let handle = tokio::spawn(async move {
+            service.run(cancel_token).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let client = reqwest::Client::new();
+        let ready_resp = client
+            .get(format!("http://localhost:{}/ready", port))
+            .send()
+            .await
+            .expect("ready request failed");
+        assert_eq!(ready_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+        let health_resp = client
+            .get(format!("http://localhost:{}/health", port))
+            .send()
+            .await
+            .expect("health request failed");
+        assert_eq!(health_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
         handle.abort();
     }
 }
