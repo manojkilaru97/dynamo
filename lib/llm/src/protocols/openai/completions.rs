@@ -248,13 +248,16 @@ impl CommonExtProvider for NvCreateCompletionRequest {
             .as_ref()
             .and_then(|params| params.json_object)
             .or_else(|| {
-                self.inner.response_format.as_ref().and_then(|response_format| {
-                    use dynamo_async_openai::types::ResponseFormat;
-                    match response_format {
-                        ResponseFormat::JsonObject => Some(true),
-                        _ => None,
-                    }
-                })
+                self.inner
+                    .response_format
+                    .as_ref()
+                    .and_then(|response_format| {
+                        use dynamo_async_openai::types::ResponseFormat;
+                        match response_format {
+                            ResponseFormat::JsonObject => Some(true),
+                            _ => None,
+                        }
+                    })
             })
     }
 

@@ -900,9 +900,9 @@ impl JailedStream {
             };
             let marker = after_lt[..end_idx].trim();
             let is_control_marker = marker.starts_with('/')
-                || marker.chars().all(|ch| {
-                    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.')
-                });
+                || marker
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.'));
             if !is_control_marker {
                 return trimmed;
             }
@@ -930,8 +930,7 @@ impl JailedStream {
         }
 
         let normalized = self.strip_immediate_tool_control_prefix(content);
-        if normalized.len() != content.len()
-            && self.looks_like_immediate_tool_json_prefix(content)
+        if normalized.len() != content.len() && self.looks_like_immediate_tool_json_prefix(content)
         {
             return Some(("", normalized));
         }
@@ -1024,9 +1023,12 @@ impl JailedStream {
             ToolChoiceFormat::SingleObject { tool_name } => {
                 value.is_object() && self.named_tool_arguments_match_schema(tool_name, value)
             }
-            ToolChoiceFormat::ArrayOfTools => value
-                .as_array()
-                .is_some_and(|arr| !arr.is_empty() && arr.iter().all(|entry| self.required_tool_entry_matches_schema(entry))),
+            ToolChoiceFormat::ArrayOfTools => value.as_array().is_some_and(|arr| {
+                !arr.is_empty()
+                    && arr
+                        .iter()
+                        .all(|entry| self.required_tool_entry_matches_schema(entry))
+            }),
         }
     }
 
@@ -1083,7 +1085,10 @@ impl JailedStream {
             return false;
         }
 
-        let Some(properties) = schema_obj.get("properties").and_then(|props| props.as_object()) else {
+        let Some(properties) = schema_obj
+            .get("properties")
+            .and_then(|props| props.as_object())
+        else {
             return true;
         };
 

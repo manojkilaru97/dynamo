@@ -88,6 +88,79 @@ pub(super) fn get_body_limit() -> usize {
 const PAYLOAD_LOG_TARGET: &str = "dynamo_payload";
 const MAX_PAYLOAD_ACCUMULATE_BYTES: usize = 256 * 1024;
 
+fn configured_max_output_len() -> Option<u32> {
+    std::env::var(env_llm::DYN_MAX_OUTPUT_LEN)
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn cap_output_len_field(field_name: &str, value: &mut Option<u32>, cap: u32) {
+    if let Some(current) = *value {
+        if current > cap {
+            tracing::info!(
+                field_name,
+                requested = current,
+                capped = cap,
+                "capped request output length to server policy",
+            );
+            *value = Some(cap);
+        }
+    }
+}
+
+fn apply_chat_max_output_len_cap(request: &mut NvCreateChatCompletionRequest) {
+    apply_chat_max_output_len_cap_with(request, configured_max_output_len());
+}
+
+fn apply_chat_max_output_len_cap_with(
+    request: &mut NvCreateChatCompletionRequest,
+    cap: Option<u32>,
+) {
+    let Some(cap) = cap else {
+        return;
+    };
+
+    if request.inner.max_completion_tokens.is_some() {
+        cap_output_len_field(
+            "max_completion_tokens",
+            &mut request.inner.max_completion_tokens,
+            cap,
+        );
+    } else {
+        cap_output_len_field("max_tokens", &mut request.inner.max_tokens, cap);
+    }
+}
+
+fn apply_completion_max_output_len_cap(request: &mut NvCreateCompletionRequest) {
+    apply_completion_max_output_len_cap_with(request, configured_max_output_len());
+}
+
+fn apply_completion_max_output_len_cap_with(
+    request: &mut NvCreateCompletionRequest,
+    cap: Option<u32>,
+) {
+    let Some(cap) = cap else {
+        return;
+    };
+    cap_output_len_field("max_tokens", &mut request.inner.max_tokens, cap);
+}
+
+fn apply_responses_max_output_len_cap(request: &mut NvCreateResponse) {
+    apply_responses_max_output_len_cap_with(request, configured_max_output_len());
+}
+
+fn apply_responses_max_output_len_cap_with(request: &mut NvCreateResponse, cap: Option<u32>) {
+    let Some(cap) = cap else {
+        return;
+    };
+    cap_output_len_field(
+        "max_output_tokens",
+        &mut request.inner.max_output_tokens,
+        cap,
+    );
+}
+
 fn header_map_to_json(headers: &HeaderMap) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     for (name, value) in headers {
@@ -567,13 +640,15 @@ async fn handler_completions(
 #[tracing::instrument(skip_all)]
 async fn completions(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
 ) -> Result<Response, ErrorResponse> {
     use crate::protocols::openai::completions::get_prompt_batch_size;
 
     // return a 503 if the service is not ready
     check_ready(&state)?;
+
+    apply_completion_max_output_len_cap(&mut request);
 
     // Validate stream_options is only used when streaming (NVBug 5662680)
     validate_completion_stream_options(&request)?;
@@ -1459,6 +1534,7 @@ async fn chat_completions(
             request.inner.max_completion_tokens = Some(template.max_completion_tokens);
         }
     }
+    apply_chat_max_output_len_cap(&mut request);
 
     // Capture the resolved model after template application for metrics and engine lookup
     // todo - make the protocols be optional for model name
@@ -1742,12 +1818,6 @@ pub fn validate_chat_completion_unsupported_fields(
         ));
     }
 
-    if inner.logprobs == Some(true) || inner.top_logprobs.is_some() {
-        return Err(ErrorMessage::not_implemented_error(
-            VALIDATION_PREFIX.to_string() + "`logprobs` is not supported.",
-        ));
-    }
-
     Ok(())
 }
 
@@ -1949,6 +2019,7 @@ async fn responses(
     } else if request.inner.max_output_tokens.is_none() {
         request.inner.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
     }
+    apply_responses_max_output_len_cap(&mut request);
     tracing::trace!("Received responses request: {:?}", request.inner);
 
     let model = request.inner.model.clone().unwrap_or_default();
@@ -2704,6 +2775,72 @@ mod tests {
         ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
         CreateCompletionRequest,
     };
+
+    #[test]
+    fn test_apply_chat_max_output_len_cap_prefers_max_completion_tokens() {
+        let mut request = NvCreateChatCompletionRequest {
+            inner: CreateChatCompletionRequest {
+                model: "test-model".to_string(),
+                messages: vec![ChatCompletionRequestMessage::User(
+                    ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Text("Hello".to_string()),
+                        name: None,
+                    },
+                )],
+                max_completion_tokens: Some(2048),
+                max_tokens: Some(4096),
+                ..Default::default()
+            },
+            common: Default::default(),
+            nvext: None,
+            chat_template_args: None,
+            media_io_kwargs: None,
+            structured_outputs: None,
+            request_id: None,
+            unsupported_fields: Default::default(),
+        };
+
+        apply_chat_max_output_len_cap_with(&mut request, Some(1024));
+        assert_eq!(request.inner.max_completion_tokens, Some(1024));
+        assert_eq!(request.inner.max_tokens, Some(4096));
+    }
+
+    #[test]
+    fn test_apply_completion_max_output_len_cap() {
+        let mut request = NvCreateCompletionRequest {
+            inner: CreateCompletionRequest {
+                model: "test-model".to_string(),
+                prompt: "Hello".to_string().into(),
+                max_tokens: Some(8192),
+                ..Default::default()
+            },
+            common: Default::default(),
+            nvext: None,
+            request_id: None,
+            unsupported_fields: Default::default(),
+        };
+
+        apply_completion_max_output_len_cap_with(&mut request, Some(2048));
+        assert_eq!(request.inner.max_tokens, Some(2048));
+    }
+
+    #[test]
+    fn test_apply_responses_max_output_len_cap() {
+        let mut request = NvCreateResponse {
+            inner: CreateResponse {
+                model: Some("test-model".to_string()),
+                input: Input::Text("Hello".to_string()),
+                max_output_tokens: Some(5000),
+                ..Default::default()
+            },
+            common: Default::default(),
+            nvext: None,
+            request_id: None,
+        };
+
+        apply_responses_max_output_len_cap_with(&mut request, Some(1024));
+        assert_eq!(request.inner.max_output_tokens, Some(1024));
+    }
 
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
 
