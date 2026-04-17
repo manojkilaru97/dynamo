@@ -305,6 +305,7 @@ fn generate_summary_for_path(path: &str) -> String {
         "/v1/models" => "List available models".to_string(),
         "/health" => "Health check".to_string(),
         "/live" => "Liveness check".to_string(),
+        "/ready" => "Readiness check".to_string(),
         "/metrics" => "Prometheus metrics".to_string(),
         "/openapi.json" => "OpenAPI specification".to_string(),
         "/docs" => "API documentation".to_string(),
@@ -344,6 +345,10 @@ fn generate_description_for_path(path: &str) -> String {
         }
         "/live" => {
             "Returns the liveness status of the service. Used for liveness probes."
+                .to_string()
+        }
+        "/ready" => {
+            "Returns the readiness status of the service. Used for readiness probes."
                 .to_string()
         }
         "/metrics" => {

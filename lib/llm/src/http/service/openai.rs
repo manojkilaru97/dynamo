@@ -86,6 +86,7 @@ pub(super) fn get_body_limit() -> usize {
 /// Tracing target used for payload log records exported to OTEL.
 /// Suppressed from console output; visible only in the OTEL log pipeline.
 const PAYLOAD_LOG_TARGET: &str = "dynamo_payload";
+const PAYLOAD_LOG_FALLBACK_TARGET: &str = "dynamo_llm::http::service::service_v2";
 const MAX_PAYLOAD_ACCUMULATE_BYTES: usize = 256 * 1024;
 
 fn configured_max_output_len() -> Option<u32> {
@@ -223,6 +224,24 @@ fn emit_openai_request_log(
             "payload": payload,
         }),
     );
+
+    if endpoint == "responses" {
+        tracing::warn!(
+            request_id = request_id,
+            "responses request payload logger invoked"
+        );
+        tracing::info!(
+            target: PAYLOAD_LOG_FALLBACK_TARGET,
+            rid = request_id,
+            request_id = request_id,
+            model = model,
+            endpoint = endpoint,
+            streaming = streaming,
+            headers_json = %headers,
+            payload_json = %payload,
+            "openai.request"
+        );
+    }
 }
 
 fn emit_openai_response_log(
@@ -250,12 +269,105 @@ fn emit_openai_response_log(
             "payload": payload,
         }),
     );
+
+    if endpoint == "responses" {
+        tracing::warn!(
+            request_id = request_id,
+            status_code = status_code,
+            "responses response payload logger invoked"
+        );
+        tracing::info!(
+            target: PAYLOAD_LOG_FALLBACK_TARGET,
+            rid = request_id,
+            request_id = request_id,
+            model = model,
+            endpoint = endpoint,
+            streaming = streaming,
+            status_code = status_code,
+            payload_json = %payload,
+            "openai.response"
+        );
+    }
 }
 
 /// Returns true if OTEL payload logging is enabled via `DYNAMO_LOG_PAYLOADS`.
 fn log_payloads_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| env_is_truthy(env_logging::DYNAMO_LOG_PAYLOADS))
+    env_is_truthy(env_logging::DYNAMO_LOG_PAYLOADS)
+}
+
+fn normalize_responses_reasoning(value: &mut serde_json::Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    let Some(reasoning) = root.get_mut("reasoning") else {
+        return;
+    };
+    let Some(reasoning_obj) = reasoning.as_object_mut() else {
+        return;
+    };
+
+    let effort_is_none = reasoning_obj
+        .get("effort")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("none"));
+
+    if !effort_is_none {
+        return;
+    }
+
+    // The Responses API tests use effort=none to mean "disable reasoning".
+    // The upstream typed model does not accept "none", so normalize it to
+    // omission rather than inventing a non-spec internal enum value.
+    reasoning_obj.remove("effort");
+    if reasoning_obj.is_empty() {
+        root.remove("reasoning");
+    }
+}
+
+fn normalize_responses_tools(value: &mut serde_json::Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    let Some(tools) = root.get_mut("tools").and_then(|value| value.as_array_mut()) else {
+        return;
+    };
+
+    for tool in tools {
+        let Some(tool_obj) = tool.as_object_mut() else {
+            continue;
+        };
+        let is_function = tool_obj
+            .get("type")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == "function");
+        if !is_function {
+            continue;
+        }
+        let Some(function_value) = tool_obj.remove("function") else {
+            continue;
+        };
+        let Some(function_obj) = function_value.as_object() else {
+            tool_obj.insert("function".to_string(), function_value);
+            continue;
+        };
+
+        for key in ["name", "description", "parameters", "strict"] {
+            if let Some(existing) = tool_obj.get(key) {
+                if !existing.is_null() {
+                    continue;
+                }
+            }
+            if let Some(nested) = function_obj.get(key) {
+                tool_obj.insert(key.to_string(), nested.clone());
+            }
+        }
+    }
+}
+
+fn normalize_responses_request_json(mut value: serde_json::Value) -> serde_json::Value {
+    normalize_responses_reasoning(&mut value);
+    normalize_responses_tools(&mut value);
+    value
 }
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
@@ -1947,16 +2059,59 @@ fn map_stream_parse_error_to_response(context: &str, error: &str) -> ErrorRespon
 async fn handler_responses(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(mut request): Json<NvCreateResponse>,
+    body: Bytes,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
+    let request_json =
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
+    let payload_obj = request_json.as_object();
+    let request_id = get_or_create_request_id(
+        payload_obj
+            .and_then(|obj| obj.get("request_id"))
+            .and_then(serde_json::Value::as_str),
+        &headers,
+    );
+    let streaming = payload_obj
+        .and_then(|obj| obj.get("stream"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let raw_model = payload_obj
+        .and_then(|obj| obj.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    emit_openai_request_log(
+        &request_id,
+        &raw_model,
+        "responses",
+        streaming,
+        header_map_to_json(&headers),
+        request_json.clone(),
+    );
+
+    let normalized_request_json = normalize_responses_request_json(request_json);
+    let mut request: NvCreateResponse =
+        serde_json::from_value(normalized_request_json).map_err(|err| {
+            let err_response = ErrorMessage::bad_request_from_message(format!(
+                "Failed to deserialize the JSON body into the target type: {err}"
+            ));
+            emit_openai_response_log(
+                &request_id,
+                &raw_model,
+                "responses",
+                streaming,
+                err_response.0.as_u16(),
+                error_response_payload(&err_response),
+            );
+            err_response
+        })?;
+
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
     // create the context for the request
-    let request_id = get_or_create_request_id(None, &headers);
-    let streaming = request.inner.stream.unwrap_or(false);
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone().unwrap_or_default(),
         endpoint: Endpoint::Responses.to_string(),
@@ -1977,15 +2132,35 @@ async fn handler_responses(
         tokio::spawn(responses(state, template, request, stream_handle).in_current_span())
             .await
             .map_err(|e| {
-                ErrorMessage::internal_server_error(&format!(
+                let err_response = ErrorMessage::internal_server_error(&format!(
                     "Failed to await responses task: {:?}",
                     e,
-                ))
+                ));
+                emit_openai_response_log(
+                    &request_id,
+                    &raw_model,
+                    "responses",
+                    streaming,
+                    err_response.0.as_u16(),
+                    error_response_payload(&err_response),
+                );
+                err_response
             })?;
 
     // if we got here, then we will return a response and the potentially long running task has completed successfully
     // without need to be cancelled.
     connection_handle.disarm();
+
+    if let Err(err_response) = &response {
+        emit_openai_response_log(
+            &request_id,
+            &raw_model,
+            "responses",
+            streaming,
+            err_response.0.as_u16(),
+            error_response_payload(err_response),
+        );
+    }
 
     response
 }
@@ -2025,6 +2200,7 @@ async fn responses(
     let model = request.inner.model.clone().unwrap_or_default();
     let metrics_model = state.manager().resolve_canonical_name(&model);
     let streaming = request.inner.stream.unwrap_or(false);
+    let request_id = request.id().to_string();
 
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state
@@ -2060,7 +2236,6 @@ async fn responses(
         include: request.inner.include.clone(),
         truncation: request.inner.truncation,
     };
-    let request_id = request.id().to_string();
     let (orig_request, context) = request.into_parts();
 
     let mut chat_request: NvCreateChatCompletionRequest =
@@ -2136,6 +2311,8 @@ async fn responses(
         // synchronous -- no .await while lock is held. Avoids async lock overhead per token.
         let converter = std::sync::Arc::new(std::sync::Mutex::new(converter));
         let converter_end = converter.clone();
+        let request_id_for_log = request_id.clone();
+        let model_for_log = model.clone();
 
         // Track whether the backend sent an error event during the stream.
         // Shared between event_stream (writer) and done_stream (reader).
@@ -2179,8 +2356,25 @@ async fn responses(
         let done_stream = stream::once(async move {
             let mut conv = converter_end.lock().expect("converter lock poisoned");
             let end_events = if saw_error_end.load(Ordering::Acquire) {
+                emit_openai_response_log(
+                    &request_id_for_log,
+                    &model_for_log,
+                    "responses",
+                    true,
+                    StatusCode::OK.as_u16(),
+                    serde_json::to_value(conv.failed_response()).unwrap_or(serde_json::Value::Null),
+                );
                 conv.emit_error_events()
             } else {
+                emit_openai_response_log(
+                    &request_id_for_log,
+                    &model_for_log,
+                    "responses",
+                    true,
+                    StatusCode::OK.as_u16(),
+                    serde_json::to_value(conv.completed_response())
+                        .unwrap_or(serde_json::Value::Null),
+                );
                 conv.emit_end_events()
             };
             stream::iter(end_events)
@@ -2263,6 +2457,15 @@ async fn responses(
             inflight_guard.mark_error(ErrorType::Cancelled);
         }
 
+        emit_openai_response_log(
+            &request_id,
+            &model,
+            "responses",
+            false,
+            StatusCode::OK.as_u16(),
+            serde_json::to_value(&response).unwrap_or(serde_json::Value::Null),
+        );
+
         Ok(Json(response).into_response())
     }
 }
@@ -2299,11 +2502,18 @@ pub fn validate_response_unsupported_fields(
 
 // todo - abstract this to the top level lib.rs to be reused
 // todo - move the service_observer to its own state/arc
-fn check_ready(_state: &Arc<service_v2::State>) -> Result<(), ErrorResponse> {
-    // if state.service_observer.stage() != ServiceStage::Ready {
-    //     return Err(ErrorMessage::service_unavailable());
-    // }
-    Ok(())
+fn check_ready(state: &Arc<service_v2::State>) -> Result<(), ErrorResponse> {
+    super::health::check_frontend_ready(state).map_err(|message| {
+        let code = StatusCode::SERVICE_UNAVAILABLE;
+        (
+            code,
+            Json(ErrorMessage {
+                message,
+                error_type: map_error_code_to_error_type(code),
+                code: code.as_u16(),
+            }),
+        )
+    })
 }
 
 /// openai compatible format
