@@ -691,14 +691,20 @@ mod tests {
             .send()
             .await
             .expect("ready request failed");
-        assert_eq!(ready_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            ready_resp.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
 
         let health_resp = client
             .get(format!("http://localhost:{}/health", port))
             .send()
             .await
             .expect("health request failed");
-        assert_eq!(health_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            health_resp.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
 
         handle.abort();
     }

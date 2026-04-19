@@ -28,7 +28,9 @@ const DEFAULT_SYSTEM_LIVE_PATH: &str = "/live";
 /// This is the wait time before sending canary health checks when no activity is detected
 pub const DEFAULT_CANARY_WAIT_TIME_SECS: u64 = 10;
 /// Default timeout for individual health check requests
-pub const DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS: u64 = 3;
+pub const DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Default grace window after the last full health check success before fencing
+pub const DEFAULT_HEALTH_CHECK_SUCCESS_TTL_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerConfig {
@@ -177,6 +179,12 @@ pub struct RuntimeConfig {
     #[builder(default = "DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS")]
     #[builder_field_attr(serde(skip_serializing_if = "Option::is_none"))]
     pub health_check_request_timeout_secs: u64,
+
+    /// How long a worker can go without a fully successful health check before it becomes not ready
+    /// Set this at runtime with environment variable DYN_HEALTH_CHECK_SUCCESS_TTL
+    #[builder(default = "DEFAULT_HEALTH_CHECK_SUCCESS_TTL_SECS")]
+    #[builder_field_attr(serde(skip_serializing_if = "Option::is_none"))]
+    pub health_check_success_ttl_secs: u64,
 }
 
 impl fmt::Display for RuntimeConfig {
@@ -208,6 +216,11 @@ impl fmt::Display for RuntimeConfig {
             f,
             ", health_check_request_timeout_secs={}",
             self.health_check_request_timeout_secs
+        )?;
+        write!(
+            f,
+            ", health_check_success_ttl_secs={}",
+            self.health_check_success_ttl_secs
         )?;
 
         Ok(())
@@ -279,6 +292,7 @@ impl RuntimeConfig {
                         let mapped_key = match k.as_str() {
                             "ENABLED" => "health_check_enabled",
                             "REQUEST_TIMEOUT" => "health_check_request_timeout_secs",
+                            "SUCCESS_TTL" => "health_check_success_ttl_secs",
                             _ => k.as_str(),
                         };
                         Some(mapped_key.into())
@@ -361,6 +375,7 @@ impl RuntimeConfig {
             health_check_enabled: false,
             canary_wait_time_secs: DEFAULT_CANARY_WAIT_TIME_SECS,
             health_check_request_timeout_secs: DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS,
+            health_check_success_ttl_secs: DEFAULT_HEALTH_CHECK_SUCCESS_TTL_SECS,
         }
     }
 
@@ -397,6 +412,7 @@ impl Default for RuntimeConfig {
             health_check_enabled: false,
             canary_wait_time_secs: DEFAULT_CANARY_WAIT_TIME_SECS,
             health_check_request_timeout_secs: DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS,
+            health_check_success_ttl_secs: DEFAULT_HEALTH_CHECK_SUCCESS_TTL_SECS,
         }
     }
 }

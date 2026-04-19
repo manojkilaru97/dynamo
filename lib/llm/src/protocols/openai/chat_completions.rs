@@ -437,7 +437,10 @@ impl OpenAIOutputOptionsProvider for NvCreateChatCompletionRequest {
 mod tests {
     use super::*;
 
-    fn make_request(logprobs: Option<bool>, top_logprobs: Option<u8>) -> NvCreateChatCompletionRequest {
+    fn make_request(
+        logprobs: Option<bool>,
+        top_logprobs: Option<u8>,
+    ) -> NvCreateChatCompletionRequest {
         NvCreateChatCompletionRequest {
             inner: CreateChatCompletionRequest {
                 model: "test-model".to_string(),

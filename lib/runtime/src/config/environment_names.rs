@@ -107,6 +107,15 @@ pub mod runtime {
         /// Wait time in seconds for canary deployments
         pub const DYN_CANARY_WAIT_TIME: &str = "DYN_CANARY_WAIT_TIME";
     }
+
+    /// Active health-check configuration
+    pub mod health_check {
+        /// Request timeout in seconds for active health checks
+        pub const DYN_HEALTH_CHECK_REQUEST_TIMEOUT: &str = "DYN_HEALTH_CHECK_REQUEST_TIMEOUT";
+
+        /// Grace window after the last successful health check before the endpoint is fenced
+        pub const DYN_HEALTH_CHECK_SUCCESS_TTL: &str = "DYN_HEALTH_CHECK_SUCCESS_TTL";
+    }
 }
 
 /// Worker lifecycle environment variables

@@ -260,6 +260,7 @@ impl DistributedRuntime {
                 request_timeout: std::time::Duration::from_secs(
                     config.health_check_request_timeout_secs,
                 ),
+                success_ttl: std::time::Duration::from_secs(config.health_check_success_ttl_secs),
             };
 
             // Start the health check manager (spawns per-endpoint monitoring tasks)
@@ -270,9 +271,10 @@ impl DistributedRuntime {
             .await
             {
                 Ok(()) => tracing::info!(
-                    "Health check manager started (canary_wait_time: {}s, request_timeout: {}s)",
+                    "Health check manager started (canary_wait_time: {}s, request_timeout: {}s, success_ttl: {}s)",
                     config.canary_wait_time_secs,
-                    config.health_check_request_timeout_secs
+                    config.health_check_request_timeout_secs,
+                    config.health_check_success_ttl_secs
                 ),
                 Err(e) => tracing::error!("Health check manager failed to start: {}", e),
             }
