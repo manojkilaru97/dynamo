@@ -689,6 +689,15 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         results
     }
 
+    pub fn active_requests(&self) -> HashMap<WorkerWithDpRank, usize> {
+        let table = self.workers.read();
+        let mut results = HashMap::with_capacity(table.slots.len());
+        for (worker, lock) in &table.slots {
+            results.insert(*worker, lock.read().active_requests());
+        }
+        results
+    }
+
     pub fn get_active_lora_counts(&self) -> HashMap<String, usize> {
         let mut counts: HashMap<String, usize> = HashMap::new();
         for entry in self.request_to_lora.iter() {

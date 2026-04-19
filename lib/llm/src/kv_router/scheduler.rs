@@ -25,6 +25,8 @@ use dynamo_runtime::traits::DistributedRuntimeProvider;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+
+const ROUTER_QUEUE_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
@@ -127,6 +129,10 @@ impl KvScheduler {
             slots.clone(),
             workers_with_configs.clone(),
             kv_router_config.router_queue_threshold,
+            kv_router_config.router_max_pending_per_worker,
+            kv_router_config
+                .router_max_queue_wait_ms
+                .map(Duration::from_millis),
             block_size,
             selector,
             policy,
@@ -136,7 +142,7 @@ impl KvScheduler {
         // Background task: receive requests and periodically recheck pending
         tokio::spawn(async move {
             let mut request_rx = request_rx;
-            let mut recheck_interval = tokio::time::interval(Duration::from_secs(60));
+            let mut recheck_interval = tokio::time::interval(ROUTER_QUEUE_RECHECK_INTERVAL);
             tracing::trace!("scheduler background task started");
 
             loop {
@@ -202,6 +208,7 @@ impl KvScheduler {
             priority_jump,
             expected_output_tokens,
             allowed_worker_ids,
+            disallowed_workers: None,
             resp_tx: Some(resp_tx),
         };
 

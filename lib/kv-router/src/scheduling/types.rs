@@ -27,6 +27,12 @@ pub enum KvSchedulerError {
 
     #[error("failed to initialize event publisher: {0}")]
     InitFailed(String),
+
+    #[error("scheduler queue full: pending={pending}, limit={limit}")]
+    QueueFull { pending: usize, limit: usize },
+
+    #[error("scheduler queue wait timeout after {waited_ms}ms (limit {limit_ms}ms)")]
+    QueueWaitTimeout { waited_ms: u64, limit_ms: u64 },
 }
 
 #[derive(Debug)]
@@ -52,6 +58,8 @@ pub struct SchedulingRequest {
     pub expected_output_tokens: Option<u32>,
     /// Optional set of allowed worker IDs to restrict routing decisions (EPP).
     pub allowed_worker_ids: Option<HashSet<WorkerId>>,
+    // Optional set of worker + dp-rank pairs that are temporarily saturated and must be skipped.
+    pub disallowed_workers: Option<HashSet<WorkerWithDpRank>>,
     pub resp_tx: Option<tokio::sync::oneshot::Sender<Result<SchedulingResponse, KvSchedulerError>>>,
 }
 

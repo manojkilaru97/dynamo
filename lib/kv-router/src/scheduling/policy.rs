@@ -123,6 +123,7 @@ mod tests {
             priority_jump,
             expected_output_tokens: None,
             allowed_worker_ids: None,
+            disallowed_workers: None,
             resp_tx: None,
         }
     }

@@ -104,10 +104,23 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         assert!(request.isl_tokens > 0);
 
         let allowed_ids = request.allowed_worker_ids.as_ref();
+        let disallowed_workers = request.disallowed_workers.as_ref();
 
-        if allowed_ids.map_or(workers.is_empty(), |ids| {
-            !workers.keys().any(|wid| ids.contains(wid))
-        }) {
+        let has_eligible_workers = workers.iter().any(|(wid, config)| {
+            if allowed_ids.is_some_and(|ids| !ids.contains(wid)) {
+                return false;
+            }
+            let data_parallel_size = config.data_parallel_size();
+            let data_parallel_start_rank = config.data_parallel_start_rank();
+            (data_parallel_start_rank..(data_parallel_start_rank + data_parallel_size)).any(
+                |dp_rank| {
+                    let worker = WorkerWithDpRank::new(*wid, dp_rank);
+                    disallowed_workers.is_none_or(|workers| !workers.contains(&worker))
+                },
+            )
+        });
+
+        if !has_eligible_workers {
             return Err(KvSchedulerError::NoEndpoints);
         }
 
@@ -136,6 +149,9 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             for dp_rank in data_parallel_start_rank..(data_parallel_start_rank + data_parallel_size)
             {
                 let worker = WorkerWithDpRank::new(*worker_id, dp_rank);
+                if disallowed_workers.is_some_and(|workers| workers.contains(&worker)) {
+                    continue;
+                }
 
                 let overlap = *overlaps.get(&worker).unwrap_or(&0);
 

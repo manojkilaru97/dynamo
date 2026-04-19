@@ -32,6 +32,8 @@ _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "router_max_tree_size",
     "router_prune_target_ratio",
     "router_queue_threshold",
+    "router_max_pending_per_worker",
+    "router_max_queue_wait_ms",
     "router_event_threads",
     "router_enable_cache_control",
     "router_queue_policy",
@@ -56,6 +58,8 @@ class KvRouterConfigBase(ConfigBase):
     router_max_tree_size: int
     router_prune_target_ratio: float
     router_queue_threshold: Optional[float]
+    router_max_pending_per_worker: Optional[int]
+    router_max_queue_wait_ms: Optional[int]
     router_event_threads: int
     router_enable_cache_control: bool
     router_queue_policy: str
@@ -233,6 +237,27 @@ class KvRouterArgGroup(ArgGroup):
                 "max_num_batched_tokens. Must be > 0."
             ),
             arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--router-max-pending-per-worker",
+            env_var="DYN_ROUTER_MAX_PENDING_PER_WORKER",
+            default=8,
+            help=(
+                "KV Router: Maximum number of scheduler-queue requests to allow per eligible worker "
+                "before rejecting new traffic early."
+            ),
+            arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--router-max-queue-wait-ms",
+            env_var="DYN_ROUTER_MAX_QUEUE_WAIT_MS",
+            default=30000,
+            help=(
+                "KV Router: Maximum time a request may wait in the scheduler queue before it is failed."
+            ),
+            arg_type=int,
         )
         add_argument(
             g,
