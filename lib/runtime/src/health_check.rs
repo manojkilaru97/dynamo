@@ -10,12 +10,10 @@ use crate::protocols::maybe_error::MaybeError;
 use crate::{DistributedRuntime, SystemHealth};
 use futures::StreamExt;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, error, info, warn};
 
 /// Configuration for health check behavior
@@ -24,6 +22,8 @@ pub struct HealthCheckConfig {
     pub canary_wait_time: Duration,
     /// Timeout for health check requests
     pub request_timeout: Duration,
+    /// How long a worker can go without a fully successful health check before it is fenced
+    pub success_ttl: Duration,
 }
 
 impl Default for HealthCheckConfig {
@@ -33,6 +33,7 @@ impl Default for HealthCheckConfig {
             request_timeout: Duration::from_secs(
                 crate::config::DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS,
             ),
+            success_ttl: Duration::from_secs(crate::config::DEFAULT_HEALTH_CHECK_SUCCESS_TTL_SECS),
         }
     }
 }
@@ -42,12 +43,49 @@ impl Default for HealthCheckConfig {
 type RouterCache =
     Arc<Mutex<HashMap<String, Arc<PushRouter<serde_json::Value, Annotated<serde_json::Value>>>>>>;
 
+fn should_keep_endpoint_ready_after_failure(
+    last_success: Option<Instant>,
+    now: Instant,
+    success_ttl: Duration,
+) -> bool {
+    last_success
+        .map(|last_success| now.saturating_duration_since(last_success) < success_ttl)
+        .unwrap_or(false)
+}
+
+async fn consume_health_check_stream<S, T>(mut response_stream: S) -> anyhow::Result<usize>
+where
+    S: futures::Stream<Item = T> + Unpin,
+    T: MaybeError,
+{
+    let mut response_count = 0usize;
+
+    while let Some(response) = response_stream.next().await {
+        response_count += 1;
+        if let Some(error) = response.err() {
+            return Err(anyhow::anyhow!(
+                "Health check returned an error response after {} response item(s): {}",
+                response_count,
+                error
+            ));
+        }
+    }
+
+    if response_count == 0 {
+        Err(anyhow::anyhow!("Health check got no response"))
+    } else {
+        Ok(response_count)
+    }
+}
+
 /// Health check manager that monitors endpoint health
 pub struct HealthCheckManager {
     drt: DistributedRuntime,
     config: HealthCheckConfig,
     /// Cache of PushRouters and payloads for each endpoint
     router_cache: RouterCache,
+    /// Last time an endpoint completed a full health check successfully
+    last_success: Arc<Mutex<HashMap<String, Instant>>>,
     /// Track per-endpoint health check tasks
     /// Maps: endpoint_subject -> task_handle
     endpoint_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
@@ -59,8 +97,58 @@ impl HealthCheckManager {
             drt,
             config,
             router_cache: Arc::new(Mutex::new(HashMap::new())),
+            last_success: Arc::new(Mutex::new(HashMap::new())),
             endpoint_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn last_success(&self, endpoint_subject: &str) -> Option<Instant> {
+        self.last_success.lock().get(endpoint_subject).copied()
+    }
+
+    fn should_probe_on_activity(&self, endpoint_subject: &str) -> bool {
+        !should_keep_endpoint_ready_after_failure(
+            self.last_success(endpoint_subject),
+            Instant::now(),
+            self.config.success_ttl,
+        )
+    }
+
+    fn mark_endpoint_ready(&self, endpoint_subject: &str) {
+        self.last_success
+            .lock()
+            .insert(endpoint_subject.to_string(), Instant::now());
+        self.drt
+            .system_health()
+            .lock()
+            .set_endpoint_health_status(endpoint_subject, HealthStatus::Ready);
+    }
+
+    fn mark_endpoint_not_ready_if_stale(&self, endpoint_subject: &str, failure: &str) {
+        let now = Instant::now();
+        let last_success = self.last_success(endpoint_subject);
+
+        if should_keep_endpoint_ready_after_failure(last_success, now, self.config.success_ttl) {
+            if let Some(last_success) = last_success {
+                warn!(
+                    "Health check failed for {} but last full success was {:?} ago (< {:?}); keeping endpoint ready. Failure: {}",
+                    endpoint_subject,
+                    now.saturating_duration_since(last_success),
+                    self.config.success_ttl,
+                    failure
+                );
+            }
+            return;
+        }
+
+        warn!(
+            "Marking {} as not ready after health check failure and stale success window {:?}. Failure: {}",
+            endpoint_subject, self.config.success_ttl, failure
+        );
+        self.drt
+            .system_health()
+            .lock()
+            .set_endpoint_health_status(endpoint_subject, HealthStatus::NotReady);
     }
 
     /// Get or create a PushRouter for an endpoint
@@ -165,9 +253,28 @@ impl HealthCheckManager {
                     }
 
                     _ = notifier.notified() => {
-                        // Activity detected - reset timer for this endpoint only
-                        debug!("Activity detected for {}, resetting health check timer", endpoint_subject);
-                        // Loop continues, timer resets
+                        if manager.should_probe_on_activity(&endpoint_subject) {
+                            debug!(
+                                "Activity detected for {} with stale health-check success; sending immediate health check",
+                                endpoint_subject
+                            );
+
+                            let target = manager.drt.system_health().lock().get_health_check_target(&endpoint_subject);
+
+                            if let Some(target) = target {
+                                if let Err(e) = manager.send_health_check_request(&endpoint_subject, &target.payload).await {
+                                    error!("Failed to send activity-triggered health check for {}: {}", endpoint_subject, e);
+                                }
+                            } else {
+                                error!(
+                                    "CRITICAL: Health check target for {} disappeared unexpectedly during activity-triggered probe!",
+                                    endpoint_subject
+                                );
+                                break;
+                            }
+                        } else {
+                            debug!("Activity detected for {}, resetting health check timer", endpoint_subject);
+                        }
                     }
                 }
             }
@@ -263,9 +370,13 @@ impl HealthCheckManager {
         let endpoint = component.endpoint(&target.instance.endpoint);
 
         // Get or create router for this endpoint
-        let router = self
-            .get_or_create_router(endpoint_subject, endpoint)
-            .await?;
+        let router = match self.get_or_create_router(endpoint_subject, endpoint).await {
+            Ok(router) => router,
+            Err(e) => {
+                self.mark_endpoint_not_ready_if_stale(endpoint_subject, &e.to_string());
+                return Err(e);
+            }
+        };
 
         // Wait for watch stream to discover instances before checking
         // This ensures the router's client has populated its instance list
@@ -286,97 +397,64 @@ impl HealthCheckManager {
                 );
             }
             Ok(Err(e)) => {
-                return Err(anyhow::anyhow!(
+                let err = anyhow::anyhow!(
                     "Failed to discover instances for {} during health check: {}",
                     endpoint_subject,
                     e
-                ));
+                );
+                self.mark_endpoint_not_ready_if_stale(endpoint_subject, &err.to_string());
+                return Err(err);
             }
             Err(_) => {
-                return Err(anyhow::anyhow!(
+                let err = anyhow::anyhow!(
                     "Timeout waiting for instance discovery for {} during health check",
                     endpoint_subject
-                ));
+                );
+                self.mark_endpoint_not_ready_if_stale(endpoint_subject, &err.to_string());
+                return Err(err);
             }
         }
 
         // Create the request context
         let request: SingleIn<serde_json::Value> = Context::new(payload.clone());
-
-        // Clone what we need for the spawned task
-        let system_health = self.drt.system_health().clone();
-        let endpoint_subject_owned = endpoint_subject.to_string();
         let instance_id = target.instance.instance_id;
         let timeout = self.config.request_timeout;
 
-        // Spawn task to send health check and wait for response
-        tokio::spawn(async move {
-            let result = tokio::time::timeout(timeout, async {
-                // Call direct() on the PushRouter to target specific instance
-                match router.direct(request, instance_id).await {
-                    Ok(mut response_stream) => {
-                        // Get the first response to verify endpoint is alive
-                        let is_healthy = if let Some(response) = response_stream.next().await {
-                            // Check if response indicates an error
-                            if let Some(error) = response.err() {
-                                warn!(
-                                    "Health check error response from {}: {:?}",
-                                    endpoint_subject_owned, error
-                                );
-                                false
-                            } else {
-                                debug!("Health check successful for {}", endpoint_subject_owned);
-                                true
-                            }
-                        } else {
-                            warn!(
-                                "Health check got no response from {}",
-                                endpoint_subject_owned
-                            );
-                            false
-                        };
-
-                        tokio::spawn(async move {
-                            // We need to consume the rest of the stream to avoid warnings on the frontend.
-                            response_stream.for_each(|_| async {}).await;
-                        });
-
-                        // Update health status based on response
-                        system_health.lock().set_endpoint_health_status(
-                            &endpoint_subject_owned,
-                            if is_healthy {
-                                HealthStatus::Ready
-                            } else {
-                                HealthStatus::NotReady
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Health check request failed for {}: {}",
-                            endpoint_subject_owned, e
-                        );
-                        system_health.lock().set_endpoint_health_status(
-                            &endpoint_subject_owned,
-                            HealthStatus::NotReady,
-                        );
-                    }
-                }
-            })
-            .await;
-
-            // Handle timeout
-            if result.is_err() {
-                warn!("Health check timeout for {}", endpoint_subject_owned);
-                system_health
-                    .lock()
-                    .set_endpoint_health_status(&endpoint_subject_owned, HealthStatus::NotReady);
+        let result = tokio::time::timeout(timeout, async {
+            match router.direct(request, instance_id).await {
+                Ok(response_stream) => consume_health_check_stream(response_stream).await,
+                Err(e) => Err(anyhow::anyhow!(
+                    "Health check request failed for {}: {}",
+                    endpoint_subject,
+                    e
+                )),
             }
+        })
+        .await;
 
-            debug!("Health check completed for {}", endpoint_subject_owned);
-        });
-
-        Ok(())
+        match result {
+            Ok(Ok(response_count)) => {
+                debug!(
+                    "Health check completed successfully for {} after consuming {} response item(s)",
+                    endpoint_subject, response_count
+                );
+                self.mark_endpoint_ready(endpoint_subject);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                self.mark_endpoint_not_ready_if_stale(endpoint_subject, &e.to_string());
+                Err(e)
+            }
+            Err(_) => {
+                let err = anyhow::anyhow!(
+                    "Health check timed out for {} after {:?}",
+                    endpoint_subject,
+                    timeout
+                );
+                self.mark_endpoint_not_ready_if_stale(endpoint_subject, &err.to_string());
+                Err(err)
+            }
+        }
     }
 }
 
@@ -435,6 +513,68 @@ pub async fn get_health_check_status(
     }))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    #[tokio::test]
+    async fn test_consume_health_check_stream_requires_full_completion() {
+        let response_stream = stream::iter(vec![
+            Annotated::from_data(serde_json::json!({"chunk": 1})),
+            Annotated::from_data(serde_json::json!({"chunk": 2})),
+        ]);
+
+        let response_count = consume_health_check_stream(response_stream).await.unwrap();
+        assert_eq!(response_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_consume_health_check_stream_fails_if_error_arrives_after_first_chunk() {
+        let response_stream = stream::iter(vec![
+            Annotated::from_data(serde_json::json!({"chunk": 1})),
+            Annotated::from_error("late stream failure".to_string()),
+        ]);
+
+        let err = consume_health_check_stream(response_stream)
+            .await
+            .expect_err("stream should fail when any later chunk is an error");
+        assert!(err.to_string().contains("late stream failure"));
+    }
+
+    #[tokio::test]
+    async fn test_consume_health_check_stream_rejects_empty_stream() {
+        let response_stream = stream::iter(Vec::<Annotated<serde_json::Value>>::new());
+
+        let err = consume_health_check_stream(response_stream)
+            .await
+            .expect_err("empty streams should be unhealthy");
+        assert!(err.to_string().contains("no response"));
+    }
+
+    #[test]
+    fn test_should_keep_endpoint_ready_after_failure_only_with_recent_success() {
+        let now = Instant::now();
+        let success_ttl = Duration::from_secs(120);
+
+        assert!(should_keep_endpoint_ready_after_failure(
+            Some(now - Duration::from_secs(60)),
+            now,
+            success_ttl,
+        ));
+        assert!(!should_keep_endpoint_ready_after_failure(
+            Some(now - Duration::from_secs(121)),
+            now,
+            success_ttl,
+        ));
+        assert!(!should_keep_endpoint_ready_after_failure(
+            None,
+            now,
+            success_ttl
+        ));
+    }
+}
+
 // ===============================
 // Integration Tests (require DRT)
 // ===============================
@@ -455,6 +595,7 @@ mod integration_tests {
         let config = HealthCheckConfig {
             canary_wait_time,
             request_timeout,
+            success_ttl: Duration::from_secs(120),
         };
 
         let manager = HealthCheckManager::new(drt.clone(), config);
@@ -524,6 +665,7 @@ mod integration_tests {
         let config = HealthCheckConfig {
             canary_wait_time: Duration::from_secs(5),
             request_timeout: Duration::from_secs(1),
+            success_ttl: Duration::from_secs(120),
         };
 
         let manager = Arc::new(HealthCheckManager::new(drt.clone(), config));

@@ -952,20 +952,20 @@ async fn completions_single(
 
         let mut response =
             NvCreateCompletionResponse::from_annotated_stream(stream, parsing_options)
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    "Failed to fold completions stream for {}: {:?}",
-                    request_id,
-                    e
-                );
-                let err_response = ErrorMessage::internal_server_error(&format!(
-                    "Failed to fold completions stream for {}: {:?}",
-                    request_id, e
-                ));
-                inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-                err_response
-            })?;
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "Failed to fold completions stream for {}: {:?}",
+                        request_id,
+                        e
+                    );
+                    let err_response = ErrorMessage::internal_server_error(&format!(
+                        "Failed to fold completions stream for {}: {:?}",
+                        request_id, e
+                    ));
+                    inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+                    err_response
+                })?;
         response.inner.model = model.clone();
 
         emit_openai_response_log(
@@ -1148,20 +1148,20 @@ async fn completions_batch(
 
         let mut response =
             NvCreateCompletionResponse::from_annotated_stream(stream, parsing_options)
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    "Failed to fold completions stream for {}: {:?}",
-                    request_id,
-                    e
-                );
-                let err_response = ErrorMessage::internal_server_error(&format!(
-                    "Failed to fold completions stream for {}: {:?}",
-                    request_id, e
-                ));
-                inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-                err_response
-            })?;
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "Failed to fold completions stream for {}: {:?}",
+                        request_id,
+                        e
+                    );
+                    let err_response = ErrorMessage::internal_server_error(&format!(
+                        "Failed to fold completions stream for {}: {:?}",
+                        request_id, e
+                    ));
+                    inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+                    err_response
+                })?;
         response.inner.model = model.clone();
 
         inflight_guard.mark_ok();
@@ -1265,7 +1265,8 @@ async fn handler_chat_completions(
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
-    let payload_value = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
+    let payload_value =
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
     let payload_obj = payload_value.as_object();
     let request_id = get_or_create_request_id(
         payload_obj
@@ -1296,9 +1297,7 @@ async fn handler_chat_completions(
         serde_json::from_slice(&body).map_err(|e| {
             let err_response = ErrorMessage::from_http_error(HttpError {
                 code: 400,
-                message: format!(
-                    "Failed to deserialize the JSON body into the target type: {e}"
-                ),
+                message: format!("Failed to deserialize the JSON body into the target type: {e}"),
             });
             emit_openai_response_log(
                 &request_id,
@@ -1621,7 +1620,9 @@ fn is_final_chat_payload_chunk(
         return data.usage.is_some();
     }
 
-    data.choices.iter().any(|choice| choice.finish_reason.is_some())
+    data.choices
+        .iter()
+        .any(|choice| choice.finish_reason.is_some())
 }
 
 /// OpenAI Chat Completions Request Handler
