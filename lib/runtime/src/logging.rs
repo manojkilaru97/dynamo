@@ -976,15 +976,15 @@ where
                 }
             }
 
-            // Panic if we still don't have required IDs
-            if trace_id.is_none() {
-                panic!(
-                    "trace_id is not set in on_enter - OtelData may not be properly initialized"
+            // In fallback / local-only logging mode there may be no OTEL IDs yet.
+            // Do not panic the process; skip distributed context for this span.
+            if trace_id.is_none() || span_id.is_none() {
+                tracing::warn!(
+                    has_trace_id = trace_id.is_some(),
+                    has_span_id = span_id.is_some(),
+                    "OpenTelemetry IDs not available in on_enter; skipping distributed trace context"
                 );
-            }
-
-            if span_id.is_none() {
-                panic!("span_id is not set in on_enter - OtelData may not be properly initialized");
+                return;
             }
 
             let span_level = span.metadata().level();
