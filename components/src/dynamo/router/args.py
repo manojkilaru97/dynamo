@@ -30,6 +30,9 @@ def build_kv_router_config(router_config: DynamoRouterConfig) -> KvRouterConfig:
         router_ttl_secs=router_config.router_ttl_secs,
         router_max_tree_size=router_config.router_max_tree_size,
         router_prune_target_ratio=router_config.router_prune_target_ratio,
+        router_queue_threshold=router_config.router_queue_threshold,
+        router_max_pending_per_worker=router_config.router_max_pending_per_worker,
+        router_max_queue_wait_ms=router_config.router_max_queue_wait_ms,
         router_event_threads=router_config.router_event_threads,
     )
 

@@ -113,6 +113,10 @@ impl ActiveSequences {
         count.round() as usize
     }
 
+    pub fn active_requests(&self) -> usize {
+        self.active_seqs.len()
+    }
+
     /// Find all blocks in a request that have only a single strong reference (only used by this request)
     /// and insert them into fractional_blocks with the given fraction value.
     pub fn set_single_ref_blocks_as_fractional(&mut self, request_id: &RequestId, fraction: f64) {

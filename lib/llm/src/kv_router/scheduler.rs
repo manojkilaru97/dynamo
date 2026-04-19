@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+
+const ROUTER_QUEUE_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
@@ -42,6 +44,12 @@ pub enum KvSchedulerError {
 
     #[error("failed to initialize event publisher: {0}")]
     InitFailed(String),
+
+    #[error("scheduler queue full: pending={pending}, limit={limit}")]
+    QueueFull { pending: usize, limit: usize },
+
+    #[error("scheduler queue wait timeout after {waited_ms}ms (limit {limit_ms}ms)")]
+    QueueWaitTimeout { waited_ms: u64, limit_ms: u64 },
 }
 
 #[derive(Debug)]
@@ -67,6 +75,8 @@ pub struct SchedulingRequest {
     pub priority_jump: f64,
     /// Optional set of allowed worker IDs to restrict routing decisions (EPP).
     pub allowed_worker_ids: Option<HashSet<WorkerId>>,
+    /// Optional set of worker + dp-rank pairs that are temporarily saturated and must be skipped.
+    pub disallowed_workers: Option<HashSet<WorkerWithDpRank>>,
     resp_tx: Option<tokio::sync::oneshot::Sender<Result<SchedulingResponse, KvSchedulerError>>>,
 }
 
@@ -158,6 +168,10 @@ impl KvScheduler {
             slots.clone(),
             workers_with_configs.clone(),
             kv_router_config.router_queue_threshold,
+            kv_router_config.router_max_pending_per_worker,
+            kv_router_config
+                .router_max_queue_wait_ms
+                .map(Duration::from_millis),
             block_size,
             selector,
         ));
@@ -166,7 +180,7 @@ impl KvScheduler {
         // Background task: receive requests and periodically recheck pending
         tokio::spawn(async move {
             let mut request_rx = request_rx;
-            let mut recheck_interval = tokio::time::interval(Duration::from_secs(60));
+            let mut recheck_interval = tokio::time::interval(ROUTER_QUEUE_RECHECK_INTERVAL);
             tracing::trace!("scheduler background task started");
 
             loop {
@@ -228,6 +242,7 @@ impl KvScheduler {
             lora_name,
             priority_jump,
             allowed_worker_ids,
+            disallowed_workers: None,
             resp_tx: Some(resp_tx),
         };
 
@@ -423,6 +438,7 @@ impl WorkerSelector for DefaultWorkerSelector {
         let isl = request.isl_tokens;
         let request_blocks = isl.div_ceil(block_size as usize);
         let overlaps = &request.overlaps.scores;
+        let disallowed_workers = request.disallowed_workers.as_ref();
 
         let decode_blocks = &request.decode_blocks;
         let prefill_tokens = &request.prefill_tokens;
@@ -445,6 +461,9 @@ impl WorkerSelector for DefaultWorkerSelector {
 
             for dp_rank in data_parallel_start_rank..data_parallel_start_rank + data_parallel_size {
                 let worker = WorkerWithDpRank::new(*worker_id, dp_rank);
+                if disallowed_workers.is_some_and(|workers| workers.contains(&worker)) {
+                    continue;
+                }
 
                 // Get overlap for this worker (defaults to 0 if not in overlaps)
                 let overlap = *overlaps.get(&worker).unwrap_or(&0);
@@ -472,6 +491,10 @@ impl WorkerSelector for DefaultWorkerSelector {
                     worker.dp_rank
                 );
             }
+        }
+
+        if worker_logits.is_empty() {
+            return Err(KvSchedulerError::NoEndpoints);
         }
 
         // Use softmax sampling to select worker(s)

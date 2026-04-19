@@ -64,6 +64,8 @@ class FrontendConfig(ConfigBase):
     router_track_output_blocks: bool
     router_event_threads: int
     router_queue_threshold: Optional[float]
+    router_max_pending_per_worker: Optional[int]
+    router_max_queue_wait_ms: Optional[int]
     decode_fallback: bool
 
     migration_limit: int
@@ -377,6 +379,28 @@ class FrontendArgGroup(ArgGroup):
                 "hints. Must be > 0. If not set, queueing is disabled."
             ),
             arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--router-max-pending-per-worker",
+            env_var="DYN_ROUTER_MAX_PENDING_PER_WORKER",
+            default=8,
+            help=(
+                "KV Router: maximum number of scheduler-queued requests per eligible "
+                "worker before rejecting new requests. Set empty/None to disable."
+            ),
+            arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--router-max-queue-wait-ms",
+            env_var="DYN_ROUTER_MAX_QUEUE_WAIT_MS",
+            default=300000,
+            help=(
+                "KV Router: maximum time in milliseconds a request may wait in the "
+                "scheduler queue before being failed."
+            ),
+            arg_type=int,
         )
         add_negatable_bool_argument(
             g,
