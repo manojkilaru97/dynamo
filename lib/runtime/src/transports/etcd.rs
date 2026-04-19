@@ -83,17 +83,43 @@ impl Client {
                     })?;
 
                 let lease_id = if config.attach_lease {
-                    // TTL=60s: gives ~10 reconnect attempts (max_backoff=5s) before expiry.
-                    // 10s was too short — a transient CoreDNS overload (~8-30s) during
-                    // simultaneous scale-up of many instances exhausted the deadline in 1-2 tries.
-                    create_lease(connector.clone(), 60, token)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Unable to create lease. Check etcd server status at {}",
-                                config.etcd_url.join(", ")
-                            )
-                        })?
+                    // Give etcd leader election / write readiness time to settle.
+                    // TCP or /health may be up before lease grant is actually writable.
+                    const INITIAL_LEASE_RETRY_WINDOW_SECS: u64 = 45;
+                    const INITIAL_LEASE_RETRY_BACKOFF_SECS: u64 = 2;
+
+                    let deadline = std::time::Instant::now()
+                        + Duration::from_secs(INITIAL_LEASE_RETRY_WINDOW_SECS);
+                    let mut attempt: u32 = 0;
+
+                    loop {
+                        attempt += 1;
+                        match create_lease(connector.clone(), 60, token.clone()).await {
+                            Ok(lease_id) => break lease_id,
+                            Err(err) => {
+                                if std::time::Instant::now() >= deadline {
+                                    return Err(err).with_context(|| {
+                                        format!(
+                                            "Unable to create lease after {} attempts. Check etcd server status at {}",
+                                            attempt,
+                                            config.etcd_url.join(", ")
+                                        )
+                                    });
+                                }
+
+                                tracing::warn!(
+                                    attempt,
+                                    error = %err,
+                                    retry_backoff_secs = INITIAL_LEASE_RETRY_BACKOFF_SECS,
+                                    "Initial etcd lease creation failed; retrying"
+                                );
+                                tokio::time::sleep(Duration::from_secs(
+                                    INITIAL_LEASE_RETRY_BACKOFF_SECS,
+                                ))
+                                .await;
+                            }
+                        }
+                    }
                 } else {
                     0
                 };
