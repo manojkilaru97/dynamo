@@ -41,7 +41,18 @@ COPY --from=dynamo_base $CARGO_HOME $CARGO_HOME
 
 # Install system dependencies
 # Cache dnf downloads; sharing=locked avoids dnf/rpm races with concurrent builds.
+# The manylinux AlmaLinux 8.10 image can receive stale mirrorlist entries that 404.
+# Force the canonical repo.almalinux.org baseurls before dnf install so runtime
+# image builds do not fail on transient mirror churn.
 RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
+    sed -i 's|^mirrorlist=https://mirrors.almalinux.org/mirrorlist/\$releasever/baseos|#mirrorlist=https://mirrors.almalinux.org/mirrorlist/\$releasever/baseos|' /etc/yum.repos.d/almalinux.repo && \
+    sed -i 's|^# baseurl=https://repo.almalinux.org/almalinux/\$releasever/BaseOS/\$basearch/os/|baseurl=https://repo.almalinux.org/almalinux/\$releasever/BaseOS/\$basearch/os/|' /etc/yum.repos.d/almalinux.repo && \
+    sed -i 's|^mirrorlist=https://mirrors.almalinux.org/mirrorlist/\$releasever/appstream|#mirrorlist=https://mirrors.almalinux.org/mirrorlist/\$releasever/appstream|' /etc/yum.repos.d/almalinux.repo && \
+    sed -i 's|^# baseurl=https://repo.almalinux.org/almalinux/\$releasever/AppStream/\$basearch/os/|baseurl=https://repo.almalinux.org/almalinux/\$releasever/AppStream/\$basearch/os/|' /etc/yum.repos.d/almalinux.repo && \
+    sed -i 's|^mirrorlist=https://mirrors.almalinux.org/mirrorlist/\$releasever/extras|#mirrorlist=https://mirrors.almalinux.org/mirrorlist/\$releasever/extras|' /etc/yum.repos.d/almalinux.repo && \
+    sed -i 's|^# baseurl=https://repo.almalinux.org/almalinux/\$releasever/extras/\$basearch/os/|baseurl=https://repo.almalinux.org/almalinux/\$releasever/extras/\$basearch/os/|' /etc/yum.repos.d/almalinux.repo && \
+    sed -i 's|^mirrorlist=https://mirrors.almalinux.org/mirrorlist/\$releasever/powertools|#mirrorlist=https://mirrors.almalinux.org/mirrorlist/\$releasever/powertools|' /etc/yum.repos.d/almalinux-powertools.repo && \
+    sed -i 's|^# baseurl=https://repo.almalinux.org/almalinux/\$releasever/PowerTools/\$basearch/os/|baseurl=https://repo.almalinux.org/almalinux/\$releasever/PowerTools/\$basearch/os/|' /etc/yum.repos.d/almalinux-powertools.repo && \
     dnf install -y almalinux-release-synergy && \
     dnf config-manager --set-enabled powertools && \
     dnf install -y \
