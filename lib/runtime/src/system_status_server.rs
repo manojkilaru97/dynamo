@@ -168,7 +168,7 @@ pub async fn spawn_system_status_server(
             &live_path,
             get({
                 let state = Arc::clone(&server_state);
-                move || health_handler(state)
+                move || live_handler(state)
             }),
         )
         .route(
@@ -260,10 +260,9 @@ pub async fn spawn_system_status_server(
 /// Health handler with optional active health checking
 #[tracing::instrument(skip_all, level = "trace")]
 async fn health_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
-    // Get basic health status
     let system_health = state.drt().system_health();
     let system_health_lock = system_health.lock();
-    let (healthy, endpoints) = system_health_lock.get_health_status();
+    let (healthy, endpoints, reasons) = system_health_lock.get_health_status_with_reasons();
     let uptime = Some(system_health_lock.uptime());
     drop(system_health_lock);
 
@@ -278,11 +277,27 @@ async fn health_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
         "status": healthy_string,
         "uptime": uptime,
         "endpoints": endpoints,
+        "reasons": reasons,
     });
 
-    tracing::trace!("Response {}", response.to_string());
+    if healthy {
+        tracing::trace!(response = %response, "health response");
+    } else {
+        tracing::warn!(response = %response, "health returning 503");
+    }
 
     (status_code, response.to_string())
+}
+
+#[tracing::instrument(skip_all, level = "trace")]
+async fn live_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
+    let uptime = Some(state.drt().system_health().lock().uptime());
+    let response = json!({
+        "status": "live",
+        "uptime": uptime,
+    });
+    tracing::trace!(response = %response, "live response");
+    (StatusCode::OK, response.to_string())
 }
 
 /// Metrics handler with DistributedRuntime uptime
@@ -841,12 +856,12 @@ mod integration_tests {
                 match custom_live_path {
                     None => {
                         // When using default paths, test the default paths
-                        test_cases.push(("/live", expected_status, expected_body));
+                        test_cases.push(("/live", 200, "live"));
                     }
                     Some(clp) => {
                         // When using custom paths, default paths should not exist
                         test_cases.push(("/live", 404, "Route not found"));
-                        test_cases.push((clp, expected_status, expected_body));
+                        test_cases.push((clp, 200, "live"));
                     }
                 }
                 test_cases.push(("/someRandomPathNotFoundHere", 404, "Route not found"));
@@ -974,6 +989,7 @@ mod integration_tests {
                 // Health should be not ready (503) initially
                 assert_eq!(status, 503, "Health should be 503 (not ready) initially, got: {}", status);
                 assert!(body.contains("\"status\":\"notready\""), "Health should contain status notready");
+                assert!(body.contains("\"reasons\":"), "Health should include reasons field");
 
                 // Now create a namespace, component, and endpoint to make the system healthy
                 let namespace = drt.namespace("ns1234").unwrap();
@@ -1063,7 +1079,7 @@ mod integration_tests {
                 let client = reqwest::Client::new();
                 for (path, expect_200, expect_body) in [
                     ("/health", true, "ready"),
-                    ("/live", true, "ready"),
+                    ("/live", true, "live"),
                     ("/someRandomPathNotFoundHere", false, "Route not found"),
                 ] {
                     println!("[test] Sending request to {}", path);
