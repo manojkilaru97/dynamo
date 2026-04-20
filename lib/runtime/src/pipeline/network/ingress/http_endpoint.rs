@@ -249,6 +249,7 @@ async fn handle_shared_request(
     let component_name = handler.component_name.clone();
     let endpoint_name = handler.endpoint_name.clone();
     let instance_id = handler.instance_id;
+    let system_health = handler.system_health.clone();
 
     tokio::spawn(async move {
         tracing::trace!(instance_id, "handling new HTTP request");
@@ -269,9 +270,17 @@ async fn handle_shared_request(
             .await;
         match result {
             Ok(_) => {
+                system_health
+                    .lock()
+                    .record_endpoint_request_result(endpoint_name.as_ref(), true);
                 tracing::trace!(instance_id, "request handled successfully");
             }
             Err(e) => {
+                if !matches!(e, crate::pipeline::PipelineError::ServiceOverloaded(_)) {
+                    system_health
+                        .lock()
+                        .record_endpoint_request_result(endpoint_name.as_ref(), false);
+                }
                 tracing::warn!("Failed to handle request: {}", e.to_string());
             }
         }

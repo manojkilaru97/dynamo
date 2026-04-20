@@ -206,9 +206,11 @@ fn make_clear_event_with_dp_rank(worker_id: u64, dp_rank: u32) -> RouterEvent {
 #[rstest]
 fn indexer_template(#[values("single", "sharded", "flat", "concurrent")] variant: &str) {}
 
-fn make_indexer(variant: &str) -> Box<dyn KvIndexerInterface> {
+fn make_indexer_with_metrics(
+    variant: &str,
+    metrics: Arc<KvIndexerMetrics>,
+) -> Box<dyn KvIndexerInterface> {
     let token = CancellationToken::new();
-    let metrics = Arc::new(KvIndexerMetrics::new_unregistered());
     let kv_block_size = 32;
 
     match variant {
@@ -218,14 +220,23 @@ fn make_indexer(variant: &str) -> Box<dyn KvIndexerInterface> {
             PositionalIndexer::new(32),
             4,
             kv_block_size,
+            metrics,
         )),
         "concurrent" => Box::new(ThreadPoolIndexer::new(
             ConcurrentRadixTree::new(),
             4,
             kv_block_size,
+            metrics,
         )),
         _ => panic!("Unknown variant: {}", variant),
     }
+}
+
+fn make_indexer(variant: &str) -> Box<dyn KvIndexerInterface> {
+    make_indexer_with_metrics(
+        variant,
+        Arc::new(KvIndexerMetrics::new_unregistered()),
+    )
 }
 
 /// Ensure queued indexer work is drained, then give a short settle window.
@@ -234,6 +245,35 @@ fn make_indexer(variant: &str) -> Box<dyn KvIndexerInterface> {
 async fn flush_and_settle(index: &dyn KvIndexerInterface) {
     index.flush().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+#[test]
+fn test_kv_miss_quarantine_state_machine() {
+    let policy = KvMissQuarantinePolicy {
+        miss_threshold: Some(1),
+        window: Duration::from_secs(60),
+        cooldown: Duration::from_secs(300),
+    };
+    let metrics = KvIndexerMetrics::new_unregistered_with_quarantine_policy(policy);
+
+    assert!(!metrics.should_drop_event(7));
+    assert_eq!(
+        metrics.record_event_applied(
+            7,
+            METRIC_EVENT_STORED,
+            Err(KvCacheEventError::ParentBlockNotFound),
+        ),
+        WorkerKvEventAction::NewlyQuarantined
+    );
+    assert!(metrics.should_drop_event(7));
+    assert_eq!(
+        metrics.record_event_applied(
+            7,
+            METRIC_EVENT_STORED,
+            Err(KvCacheEventError::ParentBlockNotFound),
+        ),
+        WorkerKvEventAction::DropQuarantined
+    );
 }
 
 #[tokio::test]

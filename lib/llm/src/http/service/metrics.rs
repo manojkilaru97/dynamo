@@ -15,7 +15,7 @@ use dynamo_runtime::{
     },
 };
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts,
 };
 use serde::Serialize;
 use std::{
@@ -25,6 +25,13 @@ use std::{
 
 use crate::local_model::runtime_config::ModelRuntimeConfig;
 use crate::model_card::ModelDeploymentCard;
+use crate::protocols::openai::{
+    chat_completions::NvCreateChatCompletionRequest, common_ext::StructuredOutputsParams,
+};
+use dynamo_async_openai::types::{
+    ChatCompletionRequestMessage, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionToolChoiceOption, ResponseFormat,
+};
 use dynamo_runtime::metrics::prometheus_names::clamp_u64_to_i64;
 
 pub use prometheus::Registry;
@@ -245,6 +252,14 @@ pub struct Metrics {
     output_tokens_counter: IntCounterVec,
     time_to_first_token: HistogramVec,
     inter_token_latency: HistogramVec,
+    request_type_image_total: IntCounter,
+    request_type_video_total: IntCounter,
+    request_type_tool_call_total: IntCounter,
+    request_type_structured_output_total: IntCounter,
+    request_type_streaming_total: IntCounter,
+    request_tool_choice_total: IntCounterVec,
+    request_structured_output_kind_total: IntCounterVec,
+    request_structured_output_backend_total: IntCounterVec,
 
     // Runtime configuration metrics. Note: Some of these metrics represent counter-like values from
     // source systems, but are implemented as gauges because they are copied/synchronized from upstream
@@ -390,6 +405,128 @@ pub struct ResponseMetricCollector {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestShapeObservation {
+    tool_choice: &'static str,
+    structured_output_kind: &'static str,
+    structured_output_backend: String,
+    has_image: bool,
+    has_video: bool,
+    is_streaming: bool,
+}
+
+fn normalize_tool_choice(
+    tool_choice: Option<&ChatCompletionToolChoiceOption>,
+    has_tools: bool,
+) -> &'static str {
+    match tool_choice {
+        Some(ChatCompletionToolChoiceOption::None) => "none",
+        Some(ChatCompletionToolChoiceOption::Auto) => "auto",
+        Some(ChatCompletionToolChoiceOption::Required) => "required",
+        Some(ChatCompletionToolChoiceOption::Named(_)) => "named_function",
+        None if has_tools => "auto",
+        None => "none",
+    }
+}
+
+fn structured_outputs_kind(params: Option<&StructuredOutputsParams>) -> Option<&'static str> {
+    let params = params?;
+    if params.structural_tag.is_some() {
+        return Some("structural_tag");
+    }
+    if params.json.is_some() {
+        return Some("json");
+    }
+    if params.json_object == Some(true) {
+        return Some("json_object");
+    }
+    if params.regex.is_some() {
+        return Some("regex");
+    }
+    if params.choice.as_ref().is_some_and(|choice| !choice.is_empty()) {
+        return Some("choice");
+    }
+    if params.grammar.is_some() {
+        return Some("grammar");
+    }
+    Some("structured_outputs")
+}
+
+fn detect_structured_output_kind(request: &NvCreateChatCompletionRequest) -> &'static str {
+    if request.common.guided_structural_tag.is_some() {
+        return "structural_tag";
+    }
+    if request.common.guided_json.is_some() {
+        return "json";
+    }
+    if request.common.guided_regex.is_some() {
+        return "regex";
+    }
+    if request.common.guided_choice.as_ref().is_some_and(|choice| !choice.is_empty()) {
+        return "choice";
+    }
+    if request.common.guided_grammar.is_some() {
+        return "grammar";
+    }
+    if let Some(kind) = structured_outputs_kind(request.structured_outputs.as_ref()) {
+        return kind;
+    }
+    match request.inner.response_format.as_ref() {
+        Some(ResponseFormat::JsonObject) => "json_object",
+        Some(ResponseFormat::JsonSchema { .. }) => "json_schema",
+        _ => "none",
+    }
+}
+
+fn detect_modalities(request: &NvCreateChatCompletionRequest) -> (bool, bool) {
+    let mut has_image = false;
+    let mut has_video = false;
+    for message in &request.inner.messages {
+        let ChatCompletionRequestMessage::User(user) = message else {
+            continue;
+        };
+        let ChatCompletionRequestUserMessageContent::Array(parts) = &user.content else {
+            continue;
+        };
+        for part in parts {
+            match part {
+                ChatCompletionRequestUserMessageContentPart::ImageUrl(_) => has_image = true,
+                ChatCompletionRequestUserMessageContentPart::VideoUrl(_) => has_video = true,
+                _ => {}
+            }
+        }
+    }
+    (has_image, has_video)
+}
+
+fn observe_request_shape(
+    request: &NvCreateChatCompletionRequest,
+    streaming: bool,
+) -> RequestShapeObservation {
+    let has_tools = request
+        .inner
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty());
+    let tool_choice = normalize_tool_choice(request.inner.tool_choice.as_ref(), has_tools);
+    let structured_output_kind = detect_structured_output_kind(request);
+    let structured_output_backend = request
+        .common
+        .guided_decoding_backend
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let (has_image, has_video) = detect_modalities(request);
+
+    RequestShapeObservation {
+        tool_choice,
+        structured_output_kind,
+        structured_output_backend,
+        has_image,
+        has_video,
+        is_streaming: streaming,
     }
 }
 
@@ -544,6 +681,63 @@ impl Metrics {
         )
         .unwrap();
 
+        let request_type_image_total = IntCounter::new(
+            frontend_metric_name("request_type_image_total"),
+            "Total Dynamo frontend requests containing images",
+        )
+        .unwrap();
+
+        let request_type_video_total = IntCounter::new(
+            frontend_metric_name("request_type_video_total"),
+            "Total Dynamo frontend requests containing videos",
+        )
+        .unwrap();
+
+        let request_type_tool_call_total = IntCounter::new(
+            frontend_metric_name("request_type_tool_call_total"),
+            "Total Dynamo frontend requests with tool calls enabled",
+        )
+        .unwrap();
+
+        let request_type_structured_output_total = IntCounter::new(
+            frontend_metric_name("request_type_structured_output_total"),
+            "Total Dynamo frontend requests with structured outputs enabled",
+        )
+        .unwrap();
+
+        let request_type_streaming_total = IntCounter::new(
+            frontend_metric_name("request_type_streaming_total"),
+            "Total Dynamo frontend requests using streaming responses",
+        )
+        .unwrap();
+
+        let request_tool_choice_total = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name("request_tool_choice_total"),
+                "Total Dynamo frontend requests by tool choice",
+            ),
+            &["tool_choice"],
+        )
+        .unwrap();
+
+        let request_structured_output_kind_total = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name("request_structured_output_kind_total"),
+                "Total Dynamo frontend requests by structured output kind",
+            ),
+            &["kind"],
+        )
+        .unwrap();
+
+        let request_structured_output_backend_total = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name("request_structured_output_backend_total"),
+                "Total Dynamo frontend requests by structured output backend",
+            ),
+            &["backend"],
+        )
+        .unwrap();
+
         // Time to first token buckets: configurable via DYN_METRICS_TTFT_{MIN,MAX,COUNT}
         let (ttft_min, ttft_max, ttft_count) =
             parse_bucket_config("DYN_METRICS_TTFT", 0.001, 480.0, 18);
@@ -684,6 +878,14 @@ impl Metrics {
             output_tokens_counter,
             time_to_first_token,
             inter_token_latency,
+            request_type_image_total,
+            request_type_video_total,
+            request_type_tool_call_total,
+            request_type_structured_output_total,
+            request_type_streaming_total,
+            request_tool_choice_total,
+            request_structured_output_kind_total,
+            request_structured_output_backend_total,
             model_total_kv_blocks,
             model_max_num_seqs,
             model_max_num_batched_tokens,
@@ -787,6 +989,14 @@ impl Metrics {
         registry.register(Box::new(self.output_tokens_counter.clone()))?;
         registry.register(Box::new(self.time_to_first_token.clone()))?;
         registry.register(Box::new(self.inter_token_latency.clone()))?;
+        registry.register(Box::new(self.request_type_image_total.clone()))?;
+        registry.register(Box::new(self.request_type_video_total.clone()))?;
+        registry.register(Box::new(self.request_type_tool_call_total.clone()))?;
+        registry.register(Box::new(self.request_type_structured_output_total.clone()))?;
+        registry.register(Box::new(self.request_type_streaming_total.clone()))?;
+        registry.register(Box::new(self.request_tool_choice_total.clone()))?;
+        registry.register(Box::new(self.request_structured_output_kind_total.clone()))?;
+        registry.register(Box::new(self.request_structured_output_backend_total.clone()))?;
 
         // Register runtime configuration metrics
         registry.register(Box::new(self.model_total_kv_blocks.clone()))?;
@@ -929,6 +1139,39 @@ impl Metrics {
     /// Create a new [`ResponseMetricCollector`] for collecting per-response metrics (i.e., TTFT, ITL)
     pub fn create_response_collector(self: Arc<Self>, model: &str) -> ResponseMetricCollector {
         ResponseMetricCollector::new(self, model.to_string().to_lowercase())
+    }
+
+    pub fn observe_chat_request_shape(
+        &self,
+        request: &NvCreateChatCompletionRequest,
+        streaming: bool,
+    ) {
+        let observation = observe_request_shape(request, streaming);
+
+        if observation.is_streaming {
+            self.request_type_streaming_total.inc();
+        }
+        if observation.has_image {
+            self.request_type_image_total.inc();
+        }
+        if observation.has_video {
+            self.request_type_video_total.inc();
+        }
+        if observation.tool_choice != "none" {
+            self.request_type_tool_call_total.inc();
+            self.request_tool_choice_total
+                .with_label_values(&[observation.tool_choice])
+                .inc();
+        }
+        if observation.structured_output_kind != "none" {
+            self.request_type_structured_output_total.inc();
+            self.request_structured_output_kind_total
+                .with_label_values(&[observation.structured_output_kind])
+                .inc();
+            self.request_structured_output_backend_total
+                .with_label_values(&[observation.structured_output_backend.as_str()])
+                .inc();
+        }
     }
 
     /// Create a new [`HttpQueueGuard`] for tracking HTTP processing queue
@@ -1709,6 +1952,86 @@ mod tests {
                 "Bucket values should be in increasing order after deduplication"
             );
         }
+    }
+
+
+    #[test]
+    fn test_observe_chat_request_shape_records_tool_choice_metrics() {
+        let metrics = Arc::new(Metrics::new());
+        let registry = prometheus::Registry::new();
+        metrics.register(&registry).unwrap();
+
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "What is 2+2?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "calculator",
+                    "description": "Compute arithmetic expressions",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"expression": {"type": "string"}},
+                        "required": ["expression"]
+                    }
+                }
+            }],
+            "tool_choice": "auto"
+        }))
+        .unwrap();
+
+        metrics.observe_chat_request_shape(&request, false);
+
+        assert_eq!(metrics.request_type_tool_call_total.get(), 1);
+        assert_eq!(
+            metrics
+                .request_tool_choice_total
+                .with_label_values(&["auto"])
+                .get(),
+            1
+        );
+        assert_eq!(metrics.request_type_structured_output_total.get(), 0);
+        assert_eq!(metrics.request_type_streaming_total.get(), 0);
+    }
+
+    #[test]
+    fn test_observe_chat_request_shape_records_structured_multimodal_metrics() {
+        let metrics = Arc::new(Metrics::new());
+        let registry = prometheus::Registry::new();
+        metrics.register(&registry).unwrap();
+
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,ZmFrZQ=="}}
+                ]
+            }],
+            "response_format": {"type": "json_object"}
+        }))
+        .unwrap();
+
+        metrics.observe_chat_request_shape(&request, true);
+
+        assert_eq!(metrics.request_type_image_total.get(), 1);
+        assert_eq!(metrics.request_type_streaming_total.get(), 1);
+        assert_eq!(metrics.request_type_structured_output_total.get(), 1);
+        assert_eq!(
+            metrics
+                .request_structured_output_kind_total
+                .with_label_values(&["json_object"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .request_structured_output_backend_total
+                .with_label_values(&["default"])
+                .get(),
+            1
+        );
     }
 
     #[test]

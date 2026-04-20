@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     DumpRequest, GetWorkersRequest, KvIndexerInterface, KvIndexerMetrics, KvRouterError,
-    MatchRequest, RadixTree, RoutingDecisionRequest,
+    MatchRequest, RadixTree, RoutingDecisionRequest, WorkerKvEventAction,
+    METRIC_STATUS_DROPPED_QUARANTINED,
 };
 use crate::indexer::pruning::{BlockEntry, PruneConfig, PruneManager};
 use crate::protocols::*;
@@ -48,6 +49,16 @@ fn apply_event_with_prune_tracking(
     let event_type = KvIndexerMetrics::get_event_type(&event.event.data);
     let event_id = event.event.event_id;
     let worker_id = event.worker_id;
+
+    if metrics.should_drop_event(worker_id) {
+        metrics.record_dropped_event(
+            worker_id,
+            event_type,
+            METRIC_STATUS_DROPPED_QUARANTINED,
+        );
+        return;
+    }
+
     let event_for_prune = prune_manager.is_some().then(|| event.clone());
     let result = trie.apply_event(event);
     let result_is_ok = result.is_ok();
@@ -55,7 +66,22 @@ fn apply_event_with_prune_tracking(
     tracing::trace!(
         "Applied KV event to global radix tree: event_type={event_type}, event_id={event_id}, worker_id={worker_id}, success={result_is_ok}, global_radix_tree_size={tree_size}"
     );
-    metrics.increment_event_applied(event_type, result);
+
+    match metrics.record_event_applied(worker_id, event_type, result) {
+        WorkerKvEventAction::NewlyQuarantined => {
+            tracing::warn!(
+                worker_id = worker_id.to_string(),
+                "KV miss spike detected; quarantining worker overlap state"
+            );
+            trie.remove_worker(worker_id);
+            return;
+        }
+        WorkerKvEventAction::DropQuarantined => {
+            trie.remove_worker(worker_id);
+            return;
+        }
+        WorkerKvEventAction::Apply => {}
+    }
 
     let Some(pm) = prune_manager.as_mut() else {
         return;

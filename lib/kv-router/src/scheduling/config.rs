@@ -135,6 +135,19 @@ pub struct KvRouterConfig {
     /// When false (default), cache_control is ignored and no cache_control client is created.
     pub router_enable_cache_control: bool,
 
+    /// Number of KV index misses within the rolling window that trigger router-side quarantine
+    /// of a worker's overlap state. When None, worker quarantine is disabled.
+    pub router_kv_miss_quarantine_threshold: Option<u64>,
+
+    /// Rolling window for KV miss-based worker quarantine, in seconds.
+    #[validate(range(min = 0.0))]
+    pub router_kv_miss_quarantine_window_secs: f64,
+
+    /// Cooldown period after a worker is quarantined, in seconds. During cooldown, live KV events
+    /// from that worker are ignored so the router treats its overlap state as untrusted.
+    #[validate(range(min = 0.0))]
+    pub router_kv_miss_quarantine_cooldown_secs: f64,
+
     /// Skip blocking for workers at init time (default: false).
     /// When true, the router starts immediately without waiting for discovery-based
     /// workers and workers are provided externally per-request (e.g., EPP).
@@ -173,6 +186,9 @@ impl Default for KvRouterConfig {
             router_max_queue_wait_ms: Some(30_000),
             router_event_threads: 4,
             router_enable_cache_control: false,
+            router_kv_miss_quarantine_threshold: None,
+            router_kv_miss_quarantine_window_secs: 60.0,
+            router_kv_miss_quarantine_cooldown_secs: 300.0,
             skip_initial_worker_wait: false,
             router_queue_policy: RouterQueuePolicy::default(),
             remote_indexer_component: None,

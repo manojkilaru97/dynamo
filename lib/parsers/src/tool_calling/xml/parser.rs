@@ -229,7 +229,7 @@ fn get_arguments_config(
         }
     }
 
-    tracing::warn!("Tool '{}' is not defined in the tools list.", func_name);
+    tracing::debug!("Tool '{}' is not defined in the tools list.", func_name);
     HashMap::new()
 }
 

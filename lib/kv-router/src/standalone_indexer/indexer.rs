@@ -60,6 +60,7 @@ pub fn create_indexer(block_size: u32, num_threads: usize) -> Indexer {
             ConcurrentRadixTree::new(),
             num_threads,
             block_size,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
         )))
     } else {
         Indexer::Single(KvIndexer::new_with_frequency(

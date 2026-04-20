@@ -32,7 +32,10 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{SyncIndexer, WorkerTask};
+use super::{
+    KvIndexerMetrics, SyncIndexer, WorkerKvEventAction, WorkerTask,
+    METRIC_STATUS_DROPPED_QUARANTINED,
+};
 use crate::protocols::*;
 
 /// Thread-safe shared reference to a Block.
@@ -623,14 +626,40 @@ impl ConcurrentRadixTree {
 // ============================================================================
 
 impl SyncIndexer for ConcurrentRadixTree {
-    fn worker(&self, event_receiver: flume::Receiver<WorkerTask>) -> anyhow::Result<()> {
+    fn worker(
+        &self,
+        event_receiver: flume::Receiver<WorkerTask>,
+        metrics: std::sync::Arc<KvIndexerMetrics>,
+    ) -> anyhow::Result<()> {
         let mut lookup = FxHashMap::default();
 
         while let Ok(task) = event_receiver.recv() {
             match task {
                 WorkerTask::Event(event) => {
-                    if let Err(e) = self.apply_event(&mut lookup, event) {
-                        tracing::warn!("Failed to apply event: {:?}", e);
+                    let worker_id = event.worker_id;
+                    let event_type = KvIndexerMetrics::get_event_type(&event.event.data);
+                    if metrics.should_drop_event(worker_id) {
+                        metrics.record_dropped_event(
+                            worker_id,
+                            event_type,
+                            METRIC_STATUS_DROPPED_QUARANTINED,
+                        );
+                        continue;
+                    }
+
+                    let result = self.apply_event(&mut lookup, event);
+                    match metrics.record_event_applied(worker_id, event_type, result) {
+                        WorkerKvEventAction::NewlyQuarantined => {
+                            tracing::warn!(
+                                worker_id = worker_id.to_string(),
+                                "KV miss spike detected; quarantining worker overlap state"
+                            );
+                            self.remove_or_clear_worker_blocks(&mut lookup, worker_id, false);
+                        }
+                        WorkerKvEventAction::Apply => {}
+                        WorkerKvEventAction::DropQuarantined => {
+                            self.remove_or_clear_worker_blocks(&mut lookup, worker_id, false);
+                        }
                     }
                 }
                 WorkerTask::RemoveWorker(worker_id) => {

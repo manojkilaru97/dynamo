@@ -1118,6 +1118,9 @@ class KvRouterConfig:
         router_queue_threshold: Optional[float] = 2.0,
         router_event_threads: int = 4,
         router_enable_cache_control: bool = False,
+        router_kv_miss_quarantine_threshold: Optional[int] = None,
+        router_kv_miss_quarantine_window_secs: float = 60.0,
+        router_kv_miss_quarantine_cooldown_secs: float = 300.0,
         router_queue_policy: str = "fcfs",
     ) -> None:
         """
@@ -1151,6 +1154,14 @@ class KvRouterConfig:
                 When > 1, uses a concurrent radix tree with a thread pool.
             router_enable_cache_control: Enable cache control (PIN with TTL) via the worker's
                 cache_control service mesh endpoint (default: False).
+            router_kv_miss_quarantine_threshold: Number of KV index parent/remove misses in the
+                rolling window that trigger router-side overlap quarantine for a worker.
+                Set to None to disable (default: None).
+            router_kv_miss_quarantine_window_secs: Rolling time window in seconds used for KV
+                miss-based worker quarantine (default: 60.0).
+            router_kv_miss_quarantine_cooldown_secs: Cooldown in seconds after a worker's KV
+                overlap state is quarantined. During cooldown, live KV events from that worker
+                are ignored (default: 300.0).
             router_queue_policy: Scheduling policy for the router queue (default: "fcfs").
                 "fcfs": first-come first-served with priority bumps — optimizes tail TTFT.
                 "wspt": weighted shortest processing time (Smith's rule) — optimizes average TTFT.

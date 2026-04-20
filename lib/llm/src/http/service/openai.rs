@@ -1712,6 +1712,10 @@ async fn chat_completions(
         return Err(err_response);
     }
 
+    state
+        .metrics_clone()
+        .observe_chat_request_shape(request.content(), streaming);
+
     // Create HTTP queue guard after template resolution so labels are correct
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
@@ -2291,6 +2295,10 @@ async fn responses(
             include_usage: true,
             continuous_usage_stats: false,
         });
+
+    state
+        .metrics_clone()
+        .observe_chat_request_shape(&chat_request, streaming);
 
     let request = context.map(|mut _req| chat_request);
 

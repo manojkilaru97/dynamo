@@ -9,7 +9,10 @@ use dynamo_kv_router::{
     ConcurrentRadixTree, ThreadPoolIndexer,
     approx::PruneConfig,
     config::{KvRouterConfig, RouterConfigOverride},
-    indexer::{GetWorkersRequest, KvIndexer, KvIndexerInterface, KvIndexerMetrics, KvRouterError},
+    indexer::{
+        GetWorkersRequest, KvIndexer, KvIndexerInterface, KvIndexerMetrics,
+        KvMissQuarantinePolicy, KvRouterError,
+    },
     protocols::KV_EVENT_SUBJECT,
     protocols::{
         BlockExtraInfo, DpRank, LocalBlockHash, OverlapScores, RouterEvent, RouterRequest,
@@ -135,6 +138,18 @@ pub enum Indexer {
 }
 
 impl Indexer {
+    fn miss_quarantine_policy(kv_router_config: &KvRouterConfig) -> KvMissQuarantinePolicy {
+        KvMissQuarantinePolicy {
+            miss_threshold: kv_router_config.router_kv_miss_quarantine_threshold,
+            window: Duration::from_secs_f64(
+                kv_router_config.router_kv_miss_quarantine_window_secs,
+            ),
+            cooldown: Duration::from_secs_f64(
+                kv_router_config.router_kv_miss_quarantine_cooldown_secs,
+            ),
+        }
+    }
+
     pub async fn new(
         component: &dynamo_runtime::component::Component,
         kv_router_config: &KvRouterConfig,
@@ -165,7 +180,10 @@ impl Indexer {
         // with TTL/pruning regardless of event_threads, since updates come from
         // routing decisions only, not live KV events from workers.
         if !kv_router_config.use_kv_events {
-            let kv_indexer_metrics = KvIndexerMetrics::from_component(component);
+            let kv_indexer_metrics = KvIndexerMetrics::from_component_with_quarantine_policy(
+                component,
+                Self::miss_quarantine_policy(kv_router_config),
+            );
             let cancellation_token = component.drt().primary_token();
             let prune_config = Some(PruneConfig {
                 ttl: Duration::from_secs_f64(kv_router_config.router_ttl_secs),
@@ -182,14 +200,22 @@ impl Indexer {
         }
 
         if kv_router_config.router_event_threads > 1 {
+            let kv_indexer_metrics = KvIndexerMetrics::from_component_with_quarantine_policy(
+                component,
+                Self::miss_quarantine_policy(kv_router_config),
+            );
             return Ok(Indexer::Concurrent(Arc::new(ThreadPoolIndexer::new(
                 ConcurrentRadixTree::new(),
                 kv_router_config.router_event_threads as usize,
                 block_size,
+                kv_indexer_metrics,
             ))));
         }
 
-        let kv_indexer_metrics = KvIndexerMetrics::from_component(component);
+        let kv_indexer_metrics = KvIndexerMetrics::from_component_with_quarantine_policy(
+            component,
+            Self::miss_quarantine_policy(kv_router_config),
+        );
         let cancellation_token = component.drt().primary_token();
 
         Ok(Indexer::KvIndexer(KvIndexer::new_with_frequency(

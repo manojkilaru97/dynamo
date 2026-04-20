@@ -36,6 +36,9 @@ _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "router_max_queue_wait_ms",
     "router_event_threads",
     "router_enable_cache_control",
+    "router_kv_miss_quarantine_threshold",
+    "router_kv_miss_quarantine_window_secs",
+    "router_kv_miss_quarantine_cooldown_secs",
     "router_queue_policy",
     "remote_indexer_component",
 )
@@ -62,6 +65,9 @@ class KvRouterConfigBase(ConfigBase):
     router_max_queue_wait_ms: Optional[int]
     router_event_threads: int
     router_enable_cache_control: bool
+    router_kv_miss_quarantine_threshold: Optional[int]
+    router_kv_miss_quarantine_window_secs: float
+    router_kv_miss_quarantine_cooldown_secs: float
     router_queue_policy: str
     remote_indexer_component: Optional[str]
 
@@ -282,6 +288,39 @@ class KvRouterArgGroup(ArgGroup):
                 "a cache_control service mesh client and fires pin_prefix after generation for "
                 "requests with nvext.cache_control."
             ),
+        )
+        add_argument(
+            g,
+            flag_name="--router-kv-miss-quarantine-threshold",
+            env_var="DYN_ROUTER_KV_MISS_QUARANTINE_THRESHOLD",
+            default=None,
+            help=(
+                "KV Router: Number of parent/remove miss events within the quarantine window "
+                "that cause the router to distrust a worker's KV overlap state. "
+                "Set to None to disable quarantine."
+            ),
+            arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--router-kv-miss-quarantine-window-secs",
+            env_var="DYN_ROUTER_KV_MISS_QUARANTINE_WINDOW_SECS",
+            default=60.0,
+            help=(
+                "KV Router: Rolling time window in seconds for KV miss-based worker quarantine."
+            ),
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--router-kv-miss-quarantine-cooldown-secs",
+            env_var="DYN_ROUTER_KV_MISS_QUARANTINE_COOLDOWN_SECS",
+            default=300.0,
+            help=(
+                "KV Router: Cooldown in seconds after a worker's KV overlap state is quarantined. "
+                "During cooldown, live KV events from that worker are ignored."
+            ),
+            arg_type=float,
         )
         add_argument(
             g,

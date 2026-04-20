@@ -40,9 +40,34 @@ pub struct RealTrafficHealthConfig {
     pub failure_threshold: f64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestOutcome {
+    Success,
+    Failure,
+    Overloaded,
+}
+
+impl RequestOutcome {
+    fn is_failure(self) -> bool {
+        matches!(self, Self::Failure)
+    }
+
+    fn is_eligible_for_failure_ratio(self) -> bool {
+        !matches!(self, Self::Overloaded)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Overloaded => "overloaded",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RealTrafficWindow {
-    events: VecDeque<(Instant, bool)>,
+    events: VecDeque<(Instant, RequestOutcome)>,
     status: HealthStatus,
 }
 
@@ -56,9 +81,9 @@ impl Default for RealTrafficWindow {
 }
 
 impl RealTrafficWindow {
-    fn record(&mut self, now: Instant, success: bool, config: &RealTrafficHealthConfig) {
+    fn record(&mut self, now: Instant, outcome: RequestOutcome, config: &RealTrafficHealthConfig) {
         self.prune(now, config.window);
-        self.events.push_back((now, success));
+        self.events.push_back((now, outcome));
         self.status = self.compute_status(config);
     }
 
@@ -72,9 +97,36 @@ impl RealTrafficWindow {
     }
 
     fn sample_counts(&self) -> (usize, usize) {
-        let total = self.events.len();
-        let failures = self.events.iter().filter(|(_, success)| !*success).count();
+        let mut total = 0usize;
+        let mut failures = 0usize;
+
+        for (_, outcome) in &self.events {
+            if !outcome.is_eligible_for_failure_ratio() {
+                continue;
+            }
+            total += 1;
+            if outcome.is_failure() {
+                failures += 1;
+            }
+        }
+
         (total, failures)
+    }
+
+    fn outcome_counts(&self) -> (usize, usize, usize) {
+        let mut successes = 0usize;
+        let mut failures = 0usize;
+        let mut overloaded = 0usize;
+
+        for (_, outcome) in &self.events {
+            match outcome {
+                RequestOutcome::Success => successes += 1,
+                RequestOutcome::Failure => failures += 1,
+                RequestOutcome::Overloaded => overloaded += 1,
+            }
+        }
+
+        (successes, failures, overloaded)
     }
 
     fn compute_status(&self, config: &RealTrafficHealthConfig) -> HealthStatus {
@@ -99,10 +151,10 @@ impl RealTrafficWindow {
 
     fn has_success_within(&mut self, now: Instant, within: Duration) -> bool {
         self.prune(now, within);
-        self.events
-            .iter()
-            .rev()
-            .any(|(ts, success)| *success && now.saturating_duration_since(*ts) <= within)
+        self.events.iter().rev().any(|(ts, outcome)| {
+            matches!(outcome, RequestOutcome::Success)
+                && now.saturating_duration_since(*ts) <= within
+        })
     }
 
     fn reason_at(&mut self, now: Instant, config: &RealTrafficHealthConfig) -> Option<String> {
@@ -150,8 +202,19 @@ pub struct SystemHealth {
     use_endpoint_health_status: Vec<String>,
     health_path: String,
     live_path: String,
+    endpoint_last_health_check_success: Arc<std::sync::RwLock<HashMap<String, Instant>>>,
     start_time: Instant,
     uptime_gauge: OnceLock<prometheus::Gauge>,
+    overall_ready_gauge: OnceLock<prometheus::Gauge>,
+    endpoint_health_status_gauge: OnceLock<prometheus::GaugeVec>,
+    endpoint_real_traffic_failure_ratio_gauge: OnceLock<prometheus::GaugeVec>,
+    endpoint_real_traffic_samples_gauge: OnceLock<prometheus::GaugeVec>,
+    endpoint_real_traffic_outcome_samples_gauge: OnceLock<prometheus::GaugeVec>,
+    health_check_last_success_age_seconds_gauge: OnceLock<prometheus::GaugeVec>,
+    health_check_requests_started_total: OnceLock<prometheus::IntCounterVec>,
+    health_check_requests_completed_total: OnceLock<prometheus::IntCounterVec>,
+    health_check_last_duration_seconds_gauge: OnceLock<prometheus::GaugeVec>,
+    system_status_requests_total: OnceLock<prometheus::IntCounterVec>,
 }
 
 impl SystemHealth {
@@ -185,8 +248,19 @@ impl SystemHealth {
             use_endpoint_health_status,
             health_path,
             live_path,
+            endpoint_last_health_check_success: Arc::new(std::sync::RwLock::new(HashMap::new())),
             start_time: Instant::now(),
             uptime_gauge: OnceLock::new(),
+            overall_ready_gauge: OnceLock::new(),
+            endpoint_health_status_gauge: OnceLock::new(),
+            endpoint_real_traffic_failure_ratio_gauge: OnceLock::new(),
+            endpoint_real_traffic_samples_gauge: OnceLock::new(),
+            endpoint_real_traffic_outcome_samples_gauge: OnceLock::new(),
+            health_check_last_success_age_seconds_gauge: OnceLock::new(),
+            health_check_requests_started_total: OnceLock::new(),
+            health_check_requests_completed_total: OnceLock::new(),
+            health_check_last_duration_seconds_gauge: OnceLock::new(),
+            system_status_requests_total: OnceLock::new(),
         }
     }
 
@@ -199,11 +273,63 @@ impl SystemHealth {
         endpoint_health.insert(endpoint.to_string(), status);
     }
 
+    pub fn record_health_check_success(&self, endpoint: &str) {
+        self.endpoint_last_health_check_success
+            .write()
+            .unwrap()
+            .insert(endpoint.to_string(), Instant::now());
+    }
+
+    pub fn record_health_check_request_started(&self, endpoint: &str, trigger: &str) {
+        if let Some(counter) = self.health_check_requests_started_total.get() {
+            counter.with_label_values(&[endpoint, trigger]).inc();
+        }
+    }
+
+    pub fn record_health_check_request_completed(
+        &self,
+        endpoint: &str,
+        trigger: &str,
+        result: &str,
+        elapsed: Duration,
+    ) {
+        if let Some(counter) = self.health_check_requests_completed_total.get() {
+            counter
+                .with_label_values(&[endpoint, trigger, result])
+                .inc();
+        }
+        if let Some(gauge) = self.health_check_last_duration_seconds_gauge.get() {
+            gauge
+                .with_label_values(&[endpoint, trigger, result])
+                .set(elapsed.as_secs_f64());
+        }
+    }
+
+    pub fn record_system_status_request(&self, route: &str, status_code: u16) {
+        if let Some(counter) = self.system_status_requests_total.get() {
+            let status = status_code.to_string();
+            counter.with_label_values(&[route, status.as_str()]).inc();
+        }
+    }
+
     pub fn record_endpoint_request_result(&self, endpoint: &str, success: bool) {
+        let outcome = if success {
+            RequestOutcome::Success
+        } else {
+            RequestOutcome::Failure
+        };
+        self.record_endpoint_request_outcome(endpoint, outcome);
+    }
+
+    pub fn record_endpoint_request_overload(&self, endpoint: &str) {
+        self.record_endpoint_request_outcome(endpoint, RequestOutcome::Overloaded);
+    }
+
+    fn record_endpoint_request_outcome(&self, endpoint: &str, outcome: RequestOutcome) {
         let now = Instant::now();
         let mut windows = self.endpoint_real_traffic_health.write().unwrap();
         let window = windows.entry(endpoint.to_string()).or_default();
-        window.record(now, success, &self.real_traffic_health_config);
+        window.record(now, outcome, &self.real_traffic_health_config);
     }
 
     pub fn get_endpoint_real_traffic_health_status(&self, endpoint: &str) -> Option<HealthStatus> {
@@ -413,6 +539,202 @@ impl SystemHealth {
         Ok(())
     }
 
+
+    pub fn initialize_health_observability_metrics<T: MetricsHierarchy>(
+        &self,
+        registry: &T,
+    ) -> anyhow::Result<()> {
+        let overall_ready_gauge = registry.metrics().create_gauge(
+            distributed_runtime::OVERALL_READY,
+            "Current overall readiness state of the DistributedRuntime (1=ready, 0=not ready)",
+            &[],
+        )?;
+        self.overall_ready_gauge
+            .set(overall_ready_gauge)
+            .map_err(|_| anyhow::anyhow!("overall_ready_gauge already initialized"))?;
+
+        let endpoint_health_status_gauge = registry.metrics().create_gaugevec(
+            distributed_runtime::ENDPOINT_HEALTH_STATUS,
+            "Current per-endpoint health state by status kind (1=ready, 0=not ready)",
+            &["endpoint", "status_kind"],
+            &[],
+        )?;
+        self.endpoint_health_status_gauge
+            .set(endpoint_health_status_gauge)
+            .map_err(|_| anyhow::anyhow!("endpoint_health_status_gauge already initialized"))?;
+
+        let endpoint_real_traffic_failure_ratio_gauge = registry.metrics().create_gaugevec(
+            distributed_runtime::ENDPOINT_REAL_TRAFFIC_FAILURE_RATIO,
+            "Current rolling real-traffic failure ratio per endpoint",
+            &["endpoint"],
+            &[],
+        )?;
+        self.endpoint_real_traffic_failure_ratio_gauge
+            .set(endpoint_real_traffic_failure_ratio_gauge)
+            .map_err(|_| anyhow::anyhow!(
+                "endpoint_real_traffic_failure_ratio_gauge already initialized"
+            ))?;
+
+        let endpoint_real_traffic_samples_gauge = registry.metrics().create_gaugevec(
+            distributed_runtime::ENDPOINT_REAL_TRAFFIC_SAMPLES,
+            "Current rolling real-traffic sample count per endpoint used by the health failure ratio",
+            &["endpoint"],
+            &[],
+        )?;
+        self.endpoint_real_traffic_samples_gauge
+            .set(endpoint_real_traffic_samples_gauge)
+            .map_err(|_| anyhow::anyhow!("endpoint_real_traffic_samples_gauge already initialized"))?;
+
+        let endpoint_real_traffic_outcome_samples_gauge = registry.metrics().create_gaugevec(
+            distributed_runtime::ENDPOINT_REAL_TRAFFIC_OUTCOME_SAMPLES,
+            "Current rolling real-traffic sample count per endpoint broken out by outcome",
+            &["endpoint", "outcome"],
+            &[],
+        )?;
+        self.endpoint_real_traffic_outcome_samples_gauge
+            .set(endpoint_real_traffic_outcome_samples_gauge)
+            .map_err(|_| anyhow::anyhow!(
+                "endpoint_real_traffic_outcome_samples_gauge already initialized"
+            ))?;
+
+        let health_check_last_success_age_seconds_gauge = registry.metrics().create_gaugevec(
+            distributed_runtime::HEALTH_CHECK_LAST_SUCCESS_AGE_SECONDS,
+            "Seconds since the last successful active health check per endpoint (-1 if never)",
+            &["endpoint"],
+            &[],
+        )?;
+        self.health_check_last_success_age_seconds_gauge
+            .set(health_check_last_success_age_seconds_gauge)
+            .map_err(|_| anyhow::anyhow!(
+                "health_check_last_success_age_seconds_gauge already initialized"
+            ))?;
+
+        let health_check_requests_started_total = registry.metrics().create_intcountervec(
+            distributed_runtime::HEALTH_CHECK_REQUESTS_STARTED_TOTAL,
+            "Total active health check requests started",
+            &["endpoint", "trigger"],
+            &[],
+        )?;
+        self.health_check_requests_started_total
+            .set(health_check_requests_started_total)
+            .map_err(|_| anyhow::anyhow!("health_check_requests_started_total already initialized"))?;
+
+        let health_check_requests_completed_total = registry.metrics().create_intcountervec(
+            distributed_runtime::HEALTH_CHECK_REQUESTS_COMPLETED_TOTAL,
+            "Total active health check requests completed by result",
+            &["endpoint", "trigger", "result"],
+            &[],
+        )?;
+        self.health_check_requests_completed_total
+            .set(health_check_requests_completed_total)
+            .map_err(|_| anyhow::anyhow!("health_check_requests_completed_total already initialized"))?;
+
+        let health_check_last_duration_seconds_gauge = registry.metrics().create_gaugevec(
+            distributed_runtime::HEALTH_CHECK_LAST_DURATION_SECONDS,
+            "Last observed active health check duration in seconds",
+            &["endpoint", "trigger", "result"],
+            &[],
+        )?;
+        self.health_check_last_duration_seconds_gauge
+            .set(health_check_last_duration_seconds_gauge)
+            .map_err(|_| anyhow::anyhow!("health_check_last_duration_seconds_gauge already initialized"))?;
+
+        let system_status_requests_total = registry.metrics().create_intcountervec(
+            distributed_runtime::SYSTEM_STATUS_REQUESTS_TOTAL,
+            "Total system status endpoint requests by route and HTTP status",
+            &["route", "status"],
+            &[],
+        )?;
+        self.system_status_requests_total
+            .set(system_status_requests_total)
+            .map_err(|_| anyhow::anyhow!("system_status_requests_total already initialized"))?;
+
+        Ok(())
+    }
+
+    pub fn update_health_observability_gauges(&self) {
+        let now = Instant::now();
+        let (healthy, _, _) = self.get_health_status_with_reasons();
+
+        if let Some(gauge) = self.overall_ready_gauge.get() {
+            gauge.set(if healthy { 1.0 } else { 0.0 });
+        }
+
+        let endpoint_health = self.endpoint_health.read().unwrap();
+        let mut endpoint_real_traffic_health = self.endpoint_real_traffic_health.write().unwrap();
+        let endpoint_last_health_check_success = self.endpoint_last_health_check_success.read().unwrap();
+
+        for endpoint in endpoint_health.keys() {
+            let base_ready = endpoint_health
+                .get(endpoint)
+                .is_some_and(|status| *status == HealthStatus::Ready);
+
+            let (real_ready, failure_ratio, total_samples, success_samples, failure_samples, overloaded_samples) = endpoint_real_traffic_health
+                .get_mut(endpoint)
+                .map(|window| {
+                    let status = window.status_at(now, &self.real_traffic_health_config);
+                    let (total, failures) = window.sample_counts();
+                    let (success_samples, failure_samples, overloaded_samples) =
+                        window.outcome_counts();
+                    let failure_ratio = if total == 0 {
+                        0.0
+                    } else {
+                        failures as f64 / total as f64
+                    };
+                    (
+                        status == HealthStatus::Ready,
+                        failure_ratio,
+                        total as f64,
+                        success_samples as f64,
+                        failure_samples as f64,
+                        overloaded_samples as f64,
+                    )
+                })
+                .unwrap_or((true, 0.0, 0.0, 0.0, 0.0, 0.0));
+
+            let effective_ready = base_ready && real_ready;
+
+            if let Some(gauge) = self.endpoint_health_status_gauge.get() {
+                gauge
+                    .with_label_values(&[endpoint.as_str(), "base"])
+                    .set(if base_ready { 1.0 } else { 0.0 });
+                gauge
+                    .with_label_values(&[endpoint.as_str(), "real_traffic"])
+                    .set(if real_ready { 1.0 } else { 0.0 });
+                gauge
+                    .with_label_values(&[endpoint.as_str(), "effective"])
+                    .set(if effective_ready { 1.0 } else { 0.0 });
+            }
+
+            if let Some(gauge) = self.endpoint_real_traffic_failure_ratio_gauge.get() {
+                gauge.with_label_values(&[endpoint]).set(failure_ratio);
+            }
+
+            if let Some(gauge) = self.endpoint_real_traffic_samples_gauge.get() {
+                gauge.with_label_values(&[endpoint]).set(total_samples);
+            }
+
+            if let Some(gauge) = self.endpoint_real_traffic_outcome_samples_gauge.get() {
+                gauge
+                    .with_label_values(&[endpoint, RequestOutcome::Success.label()])
+                    .set(success_samples);
+                gauge
+                    .with_label_values(&[endpoint, RequestOutcome::Failure.label()])
+                    .set(failure_samples);
+                gauge
+                    .with_label_values(&[endpoint, RequestOutcome::Overloaded.label()])
+                    .set(overloaded_samples);
+            }
+
+            if let Some(gauge) = self.health_check_last_success_age_seconds_gauge.get() {
+                let age_seconds = endpoint_last_health_check_success
+                    .get(endpoint)
+                    .map(|last| now.saturating_duration_since(*last).as_secs_f64())
+                    .unwrap_or(-1.0);
+                gauge.with_label_values(&[endpoint]).set(age_seconds);
+            }
+        }
+    }
     pub fn uptime(&self) -> std::time::Duration {
         self.start_time.elapsed()
     }
@@ -560,5 +882,24 @@ mod tests {
             .get("generate")
             .expect("missing generate reason")
             .contains("real traffic failure ratio"));
+    }
+
+    #[test]
+    fn test_real_traffic_overload_does_not_count_as_failure() {
+        let system_health = make_system_health(RealTrafficHealthConfig {
+            window: Duration::from_secs(600),
+            min_samples: 3,
+            failure_threshold: 0.8,
+        });
+
+        system_health.record_endpoint_request_overload("generate");
+        system_health.record_endpoint_request_result("generate", true);
+        system_health.record_endpoint_request_result("generate", true);
+        system_health.record_endpoint_request_result("generate", true);
+
+        assert_eq!(
+            system_health.get_endpoint_real_traffic_health_status("generate"),
+            Some(HealthStatus::Ready)
+        );
     }
 }

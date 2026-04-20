@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use rustc_hash::FxBuildHasher;
 use tokio::sync::oneshot;
 
-use super::{KvIndexerInterface, KvRouterError, SyncIndexer, WorkerTask};
+use super::{KvIndexerInterface, KvIndexerMetrics, KvRouterError, SyncIndexer, WorkerTask};
 use crate::protocols::*;
 
 /// Generic wrapper that provides [`KvIndexerInterface`] for any [`SyncIndexer`] backend.
@@ -55,6 +55,9 @@ pub struct ThreadPoolIndexer<T: SyncIndexer> {
 
     /// Handles to worker threads for joining on shutdown.
     thread_handles: Mutex<Vec<JoinHandle<()>>>,
+
+    /// Shared metrics and quarantine state.
+    _metrics: Arc<KvIndexerMetrics>,
 }
 
 impl<T: SyncIndexer> ThreadPoolIndexer<T> {
@@ -72,7 +75,12 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
     /// # Panics
     ///
     /// Panics if `num_workers` is 0.
-    pub fn new(backend: T, num_workers: usize, kv_block_size: u32) -> Self {
+    pub fn new(
+        backend: T,
+        num_workers: usize,
+        kv_block_size: u32,
+        metrics: Arc<KvIndexerMetrics>,
+    ) -> Self {
         assert!(num_workers > 0, "Number of workers must be greater than 0");
 
         let backend = Arc::new(backend);
@@ -83,9 +91,10 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
             worker_event_senders.push(event_sender);
 
             let backend = Arc::clone(&backend);
+            let metrics = Arc::clone(&metrics);
 
             let handle = std::thread::spawn(move || {
-                backend.worker(event_receiver).unwrap();
+                backend.worker(event_receiver, metrics).unwrap();
             });
             thread_handles.push(handle);
         }
@@ -98,6 +107,7 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
             num_workers,
             kv_block_size,
             thread_handles: Mutex::new(thread_handles),
+            _metrics: Arc::clone(&metrics),
         }
     }
 
