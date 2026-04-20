@@ -141,6 +141,39 @@ impl HealthCheckManager {
             return;
         }
 
+        let (current_status, real_traffic_window, real_traffic_status, has_recent_real_success) = {
+            let system_health = self.drt.system_health();
+            let system_health_lock = system_health.lock();
+            let real_traffic_window = system_health_lock.real_traffic_window();
+            let real_traffic_status = system_health_lock
+                .get_endpoint_real_traffic_health_status(endpoint_subject)
+                .unwrap_or(HealthStatus::Ready);
+            let has_recent_real_success = system_health_lock
+                .has_recent_endpoint_success(endpoint_subject, real_traffic_window);
+            let current_status = system_health_lock
+                .get_endpoint_health_status(endpoint_subject)
+                .unwrap_or(HealthStatus::NotReady);
+            (current_status, real_traffic_window, real_traffic_status, has_recent_real_success)
+        };
+
+        if matches!(real_traffic_status, HealthStatus::Ready)
+            && (matches!(current_status, HealthStatus::Ready) || has_recent_real_success)
+        {
+            self.drt
+                .system_health()
+                .lock()
+                .set_endpoint_health_status(endpoint_subject, HealthStatus::Ready);
+            warn!(
+                "Health check failed for {} but real traffic window is healthy over {:?}; keeping endpoint ready. recent_real_success={}, previous_status={:?}. Failure: {}",
+                endpoint_subject,
+                real_traffic_window,
+                has_recent_real_success,
+                current_status,
+                failure
+            );
+            return;
+        }
+
         warn!(
             "Marking {} as not ready after health check failure and stale success window {:?}. Failure: {}",
             endpoint_subject, self.config.success_ttl, failure
@@ -683,6 +716,85 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_stale_canary_keeps_ready_when_real_traffic_window_is_healthy() {
+        let drt = create_test_drt_async().await;
+
+        let endpoint = "test.endpoint.real-traffic-ready";
+        let payload = serde_json::json!({
+            "prompt": "test",
+            "_health_check": true
+        });
+
+        drt.system_health().lock().register_health_check_target(
+            endpoint,
+            crate::component::Instance {
+                component: "test_component".to_string(),
+                endpoint: "test_endpoint_real_traffic_ready".to_string(),
+                namespace: "test_namespace".to_string(),
+                instance_id: 1001,
+                transport: crate::component::TransportType::Nats(endpoint.to_string()),
+            },
+            payload,
+        );
+
+        drt.system_health()
+            .lock()
+            .set_endpoint_health_status(endpoint, HealthStatus::Ready);
+        drt.system_health()
+            .lock()
+            .record_endpoint_request_result(endpoint, true);
+
+        let manager = HealthCheckManager::new(drt.clone(), HealthCheckConfig::default());
+        manager.mark_endpoint_not_ready_if_stale(endpoint, "forced test failure");
+
+        let status = drt
+            .system_health()
+            .lock()
+            .get_endpoint_health_status(endpoint);
+        assert_eq!(status, Some(HealthStatus::Ready));
+    }
+
+    #[tokio::test]
+    async fn test_stale_canary_marks_not_ready_when_real_traffic_window_is_bad() {
+        let drt = create_test_drt_async().await;
+
+        let endpoint = "test.endpoint.real-traffic-bad";
+        let payload = serde_json::json!({
+            "prompt": "test",
+            "_health_check": true
+        });
+
+        drt.system_health().lock().register_health_check_target(
+            endpoint,
+            crate::component::Instance {
+                component: "test_component".to_string(),
+                endpoint: "test_endpoint_real_traffic_bad".to_string(),
+                namespace: "test_namespace".to_string(),
+                instance_id: 1002,
+                transport: crate::component::TransportType::Nats(endpoint.to_string()),
+            },
+            payload,
+        );
+
+        drt.system_health()
+            .lock()
+            .set_endpoint_health_status(endpoint, HealthStatus::Ready);
+        for _ in 0..20 {
+            drt.system_health()
+                .lock()
+                .record_endpoint_request_result(endpoint, false);
+        }
+
+        let manager = HealthCheckManager::new(drt.clone(), HealthCheckConfig::default());
+        manager.mark_endpoint_not_ready_if_stale(endpoint, "forced test failure");
+
+        let status = drt
+            .system_health()
+            .lock()
+            .get_endpoint_health_status(endpoint);
+        assert_eq!(status, Some(HealthStatus::NotReady));
+    }
+
     async fn test_endpoint_health_check_notifier_created() {
         let drt = create_test_drt_async().await;
 
