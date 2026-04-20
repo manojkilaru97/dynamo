@@ -120,7 +120,11 @@ impl PushEndpoint {
                             tracing::trace!(instance_id, "request handled successfully");
                         }
                         Err(e) => {
-                            if !matches!(e, crate::pipeline::PipelineError::ServiceOverloaded(_)) {
+                            if matches!(e, crate::pipeline::PipelineError::ServiceOverloaded(_)) {
+                                system_health
+                                    .lock()
+                                    .record_endpoint_request_overload(endpoint_name.as_ref());
+                            } else {
                                 system_health
                                     .lock()
                                     .record_endpoint_request_result(endpoint_name.as_ref(), false);
