@@ -295,11 +295,16 @@ where
         };
 
         let context = stream.context();
+        let mut streamed_error: Option<String> = None;
+        let mut publish_failure: Option<PipelineError> = None;
 
         // TODO: Detect end-of-stream using Server-Sent Events (SSE)
         let mut send_complete_final = true;
         while let Some(resp) = stream.next().await {
             tracing::trace!("Sending response: {:?}", resp);
+            if streamed_error.is_none() {
+                streamed_error = resp.err().map(|err| err.to_string());
+            }
             let resp_wrapper = NetworkStreamWrapper {
                 data: Some(resp),
                 complete_final: false,
@@ -312,10 +317,6 @@ where
             if (publisher.send(resp_bytes.into()).await).is_err() {
                 send_complete_final = false;
                 if publisher.network_failed() {
-                    // TCP write failed (iptables RST, peer disconnect). The response is lost.
-                    // context.is_stopped() may also be true here if a ControlMessage::Stop
-                    // raced in on the read half at the same time — making this look like a
-                    // clean cancellation when it was actually a network drop.
                     tracing::error!(
                         "Failed to publish response for stream {} (network failure, request dropped)",
                         context.id()
@@ -327,7 +328,6 @@ where
                             .inc();
                     }
                 } else if context.is_stopped() {
-                    // Channel closed because the context was stopped — client cancelled cleanly.
                     tracing::warn!(
                         "Failed to publish response for stream {} (client cancelled)",
                         context.id()
@@ -338,7 +338,6 @@ where
                             .inc();
                     }
                 } else {
-                    // Channel closed for an unexpected reason.
                     tracing::error!("Failed to publish response for stream {}", context.id());
                     context.stop_generating();
                     if let Some(m) = self.metrics() {
@@ -346,9 +345,22 @@ where
                             .with_label_values(&[work_handler::error_types::PUBLISH_RESPONSE])
                             .inc();
                     }
+                    publish_failure = Some(PipelineError::Generic(format!(
+                        "Failed to publish response for stream {}",
+                        context.id()
+                    )));
                 }
                 break;
             }
+        }
+        if let Some(error) = publish_failure {
+            return Err(error);
+        }
+        if let Some(error) = streamed_error {
+            return Err(PipelineError::Generic(format!(
+                "Response stream returned error: {}",
+                error
+            )));
         }
         if send_complete_final {
             let resp_wrapper = NetworkStreamWrapper::<U> {
@@ -370,6 +382,12 @@ where
                         .with_label_values(&[work_handler::error_types::PUBLISH_FINAL])
                         .inc();
                 }
+                if !publisher.network_failed() && !context.is_stopped() {
+                    return Err(PipelineError::Generic(format!(
+                        "Failed to publish complete final for stream {}",
+                        context.id()
+                    )));
+                }
             }
             // Notify the health check manager that the stream has finished.
             // This resets the timer, delaying the next canary health check.
@@ -377,7 +395,6 @@ where
                 notifier.notify_one();
             }
         }
-
         // Ensure the metrics guard is not dropped until the end of the function.
         drop(_inflight_guard);
 

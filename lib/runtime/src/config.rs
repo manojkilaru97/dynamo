@@ -31,6 +31,12 @@ pub const DEFAULT_CANARY_WAIT_TIME_SECS: u64 = 10;
 pub const DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Default grace window after the last full health check success before fencing
 pub const DEFAULT_HEALTH_CHECK_SUCCESS_TTL_SECS: u64 = 120;
+// Default real-traffic failure window before fencing based on admitted request outcomes
+pub const DEFAULT_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS: u64 = 600;
+// Minimum admitted real requests required before real-traffic failure fencing applies
+pub const DEFAULT_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES: usize = 20;
+// Failure ratio threshold for real-traffic failure fencing
+pub const DEFAULT_HEALTH_CHECK_REAL_FAILURE_THRESHOLD: f64 = 0.8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerConfig {
@@ -185,6 +191,24 @@ pub struct RuntimeConfig {
     #[builder(default = "DEFAULT_HEALTH_CHECK_SUCCESS_TTL_SECS")]
     #[builder_field_attr(serde(skip_serializing_if = "Option::is_none"))]
     pub health_check_success_ttl_secs: u64,
+
+    // Rolling window in seconds for admitted real-request failure fencing
+    // Set this at runtime with environment variable DYN_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS
+    #[builder(default = "DEFAULT_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS")]
+    #[builder_field_attr(serde(skip_serializing_if = "Option::is_none"))]
+    pub health_check_real_failure_window_secs: u64,
+
+    // Minimum admitted real requests in the rolling window before failure fencing applies
+    // Set this at runtime with environment variable DYN_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES
+    #[builder(default = "DEFAULT_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES")]
+    #[builder_field_attr(serde(skip_serializing_if = "Option::is_none"))]
+    pub health_check_real_failure_min_samples: usize,
+
+    // Failure ratio threshold for admitted real requests in the rolling window
+    // Set this at runtime with environment variable DYN_HEALTH_CHECK_REAL_FAILURE_THRESHOLD
+    #[builder(default = "DEFAULT_HEALTH_CHECK_REAL_FAILURE_THRESHOLD")]
+    #[builder_field_attr(serde(skip_serializing_if = "Option::is_none"))]
+    pub health_check_real_failure_threshold: f64,
 }
 
 impl fmt::Display for RuntimeConfig {
@@ -221,6 +245,21 @@ impl fmt::Display for RuntimeConfig {
             f,
             ", health_check_success_ttl_secs={}",
             self.health_check_success_ttl_secs
+        )?;
+        write!(
+            f,
+            ", health_check_real_failure_window_secs={}",
+            self.health_check_real_failure_window_secs
+        )?;
+        write!(
+            f,
+            ", health_check_real_failure_min_samples={}",
+            self.health_check_real_failure_min_samples
+        )?;
+        write!(
+            f,
+            ", health_check_real_failure_threshold={}",
+            self.health_check_real_failure_threshold
         )?;
 
         Ok(())
@@ -293,6 +332,9 @@ impl RuntimeConfig {
                             "ENABLED" => "health_check_enabled",
                             "REQUEST_TIMEOUT" => "health_check_request_timeout_secs",
                             "SUCCESS_TTL" => "health_check_success_ttl_secs",
+                            "REAL_FAILURE_WINDOW_SECS" => "health_check_real_failure_window_secs",
+                            "REAL_FAILURE_MIN_SAMPLES" => "health_check_real_failure_min_samples",
+                            "REAL_FAILURE_THRESHOLD" => "health_check_real_failure_threshold",
                             _ => k.as_str(),
                         };
                         Some(mapped_key.into())
@@ -376,6 +418,9 @@ impl RuntimeConfig {
             canary_wait_time_secs: DEFAULT_CANARY_WAIT_TIME_SECS,
             health_check_request_timeout_secs: DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS,
             health_check_success_ttl_secs: DEFAULT_HEALTH_CHECK_SUCCESS_TTL_SECS,
+            health_check_real_failure_window_secs: DEFAULT_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS,
+            health_check_real_failure_min_samples: DEFAULT_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES,
+            health_check_real_failure_threshold: DEFAULT_HEALTH_CHECK_REAL_FAILURE_THRESHOLD,
         }
     }
 
@@ -413,6 +458,9 @@ impl Default for RuntimeConfig {
             canary_wait_time_secs: DEFAULT_CANARY_WAIT_TIME_SECS,
             health_check_request_timeout_secs: DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS,
             health_check_success_ttl_secs: DEFAULT_HEALTH_CHECK_SUCCESS_TTL_SECS,
+            health_check_real_failure_window_secs: DEFAULT_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS,
+            health_check_real_failure_min_samples: DEFAULT_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES,
+            health_check_real_failure_threshold: DEFAULT_HEALTH_CHECK_REAL_FAILURE_THRESHOLD,
         }
     }
 }

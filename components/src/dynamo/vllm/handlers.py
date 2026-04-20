@@ -40,6 +40,14 @@ from dynamo.runtime.logging import configure_dynamo_logging
 
 from .engine_monitor import VllmEngineMonitor
 from .multimodal_utils.hash_utils import compute_mm_uuids_from_images
+from .request_metrics import (
+    create_request_metrics_context,
+    record_request_cancelled,
+    record_request_failure,
+    record_request_start,
+    record_structured_output_backend,
+    record_request_success,
+)
 
 # Multimodal data dictionary keys
 IMAGE_URL_KEY: Final = "image_url"
@@ -485,7 +493,13 @@ class BaseWorkerHandler(ABC):
     async def generate(self, request, context) -> AsyncGenerator[dict, None]:
         raise NotImplementedError
 
-    async def _monitor_abort(self, context, request_id, is_prefill):
+    async def _monitor_abort(
+        self,
+        context,
+        request_id,
+        is_prefill,
+        request_metrics_context=None,
+    ):
         """
         Background task that monitors for context cancellation and shutdown.
         Aborts the request if either occurs. Raises GeneratorExit if shutdown was triggered.
@@ -520,9 +534,19 @@ class BaseWorkerHandler(ABC):
                 f"Aborted {'Prefill ' if is_prefill else ''}Request ID: {request_id}"
             )
 
-            # Check which event triggered and raise GeneratorExit if shutdown
             if shutdown_task and shutdown_task in done:
+                if request_metrics_context is not None:
+                    record_request_cancelled(
+                        request_metrics_context,
+                        reason="shutdown_cancelled",
+                    )
                 raise GeneratorExit("Engine was shut down during generation.")
+
+            if request_metrics_context is not None:
+                record_request_cancelled(
+                    request_metrics_context,
+                    reason="client_cancelled",
+                )
 
         except asyncio.CancelledError:
             # Task was cancelled, normal cleanup if not aborted
@@ -531,12 +555,25 @@ class BaseWorkerHandler(ABC):
             logger.error(f"Error in abort monitor for request {request_id}: {e}")
 
     @asynccontextmanager
-    async def _abort_monitor(self, context, request_id, is_prefill=False):
+    async def _abort_monitor(
+        self,
+        context,
+        request_id,
+        is_prefill=False,
+        request_metrics_context=None,
+    ):
         """
         Context manager that creates and automatically cleans up an abort monitoring task.
         If shutdown event was triggered, raises GeneratorExit on exit.
         """
-        task = asyncio.create_task(self._monitor_abort(context, request_id, is_prefill))
+        task = asyncio.create_task(
+            self._monitor_abort(
+                context,
+                request_id,
+                is_prefill,
+                request_metrics_context=request_metrics_context,
+            )
+        )
         try:
             yield task
         finally:
@@ -1275,6 +1312,7 @@ class BaseWorkerHandler(ABC):
         embedding_sequence_length=None,
         trace_headers=None,
         priority=0,
+        request_metrics_context=None,
     ):
         try:
             # Log LoRA usage for this generation (debug level to avoid log spam)
@@ -1303,8 +1341,12 @@ class BaseWorkerHandler(ABC):
                         request_id,
                         lora_request,
                     )
-                    # Use string format "error: message" for consistency with vLLM's string-based finish_reason
-                    # Rust will parse this into FinishReason::Error(message)
+                    if request_metrics_context is not None:
+                        record_request_failure(
+                            request_metrics_context,
+                            failure_type="no_outputs",
+                            finish_reason="error",
+                        )
                     yield {
                         "finish_reason": "error: No outputs from vLLM engine",
                         "token_ids": [],
@@ -1315,7 +1357,6 @@ class BaseWorkerHandler(ABC):
                 next_total_toks = len(output.token_ids)
                 out = {"token_ids": output.token_ids[num_output_tokens_so_far:]}
 
-                # Extract logprobs for new tokens if available
                 tokenizer = getattr(self.engine_client, "tokenizer", None)
                 log_probs, top_logprobs = self._extract_logprobs(
                     output, num_output_tokens_so_far, tokenizer=tokenizer
@@ -1326,12 +1367,12 @@ class BaseWorkerHandler(ABC):
                     out["top_logprobs"] = top_logprobs
 
                 if output.finish_reason:
-                    out["finish_reason"] = normalize_finish_reason(output.finish_reason)
+                    normalized_finish_reason = normalize_finish_reason(output.finish_reason)
+                    out["finish_reason"] = normalized_finish_reason
                     out["completion_usage"] = BaseWorkerHandler._build_completion_usage(
                         request_output=res,
                         embedding_sequence_length=embedding_sequence_length,
                     )
-                    # Log completion with LoRA info (debug level to avoid log spam)
                     self._log_with_lora_context(
                         "Completed token generation for request {request_id}{lora_info}: "
                         "{output_tokens} output tokens, finish_reason={finish_reason}",
@@ -1340,13 +1381,31 @@ class BaseWorkerHandler(ABC):
                         output_tokens=next_total_toks,
                         finish_reason=output.finish_reason,
                     )
+                    if request_metrics_context is not None:
+                        record_request_success(
+                            request_metrics_context,
+                            finish_reason=normalized_finish_reason,
+                        )
                 if output.stop_reason:
                     out["stop_reason"] = output.stop_reason
                 yield out
                 num_output_tokens_so_far = next_total_toks
 
+            if request_metrics_context is not None and not request_metrics_context.terminal_recorded:
+                record_request_failure(
+                    request_metrics_context,
+                    failure_type="missing_finish_reason",
+                    finish_reason="error",
+                )
+
         except EngineDeadError as e:
             logger.error(f"vLLM EngineDeadError: {e}")
+            if request_metrics_context is not None:
+                record_request_failure(
+                    request_metrics_context,
+                    failure_type="engine_dead",
+                    finish_reason="error",
+                )
             logger.warning("Initiating Dynamo Runtime shutdown.")
             self.runtime.shutdown()
             os._exit(1)
@@ -1395,21 +1454,43 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
     async def _generate_token_mode(self, request, context, request_id):
         """Generate tokens using internal protocol format (token-in-token-out)."""
-        # Extract and decode multimodal data if present
-        multi_modal_data = await self._extract_multimodal_data(request)
+        model_name = request.get("model")
+        lora_request = self._resolve_lora_request(model_name)
+        request_metrics_context = create_request_metrics_context(
+            request,
+            mode="decode_tokens",
+            lora_request=lora_request,
+        )
+        record_request_start(request_metrics_context)
 
-        # Build prompt from request (handles both prompt_embeds and token_ids)
+        try:
+            sampling_params = build_sampling_params(
+                request, self.default_sampling_params, self.model_max_len
+            )
+            record_structured_output_backend(
+                request_metrics_context,
+                sampling_params,
+            )
+            multi_modal_data = await self._extract_multimodal_data(request)
+        except Exception:
+            record_request_failure(
+                request_metrics_context,
+                failure_type="request_setup_error",
+                finish_reason="error",
+            )
+            raise
+
         prompt, embedding_sequence_length, error = self._build_prompt_from_request(
             request, request_id, multi_modal_data
         )
         if error is not None:
+            record_request_failure(
+                request_metrics_context,
+                failure_type="invalid_prompt",
+                finish_reason=error.get("finish_reason"),
+            )
             yield error
             return
-
-        # Build sampling params from request
-        sampling_params = build_sampling_params(
-            request, self.default_sampling_params, self.model_max_len
-        )
 
         prefill_result = request.get("prefill_result")
         if prefill_result and isinstance(prefill_result, dict):
@@ -1430,9 +1511,6 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             prefill_result.get("prompt_tokens_details") if prefill_result else None
         )
 
-        # Extract LoRA request if present
-        model_name = request.get("model")
-        lora_request = self._resolve_lora_request(model_name)
         if lora_request:
             logger.info(
                 f"Decode request {request_id} will use LoRA adapter: {model_name} (ID: {lora_request.lora_int_id})"
@@ -1447,7 +1525,11 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
         trace_headers = build_trace_headers(context)
 
-        async with self._abort_monitor(context, request_id):
+        async with self._abort_monitor(
+            context,
+            request_id,
+            request_metrics_context=request_metrics_context,
+        ):
             try:
                 async for tok in self.generate_tokens(
                     prompt,
@@ -1458,6 +1540,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     embedding_sequence_length=embedding_sequence_length,
                     trace_headers=trace_headers,
                     priority=priority,
+                    request_metrics_context=request_metrics_context,
                 ):
                     if prefill_result is not None and "completion_usage" in tok:
                         tok["completion_usage"][
@@ -1466,27 +1549,45 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     yield tok
             except EngineDeadError as e:
                 logger.error(f"vLLM EngineDeadError: {e}")
+                record_request_failure(
+                    request_metrics_context,
+                    failure_type="engine_dead",
+                    finish_reason="error",
+                )
                 logger.warning("Initiating Dynamo Runtime shutdown.")
                 self.runtime.shutdown()
                 os._exit(1)
 
     async def _generate_text_mode(self, request, context, request_id):
         """Generate text using OpenAI-compatible format (text-in-text-out)."""
-        # Get text input using InputParamManager
-        input_data = self.input_param_manager.get_input_param(
-            request, use_tokenizer=True
+        request_metrics_context = create_request_metrics_context(
+            request,
+            mode="decode_text",
         )
+        record_request_start(request_metrics_context)
 
-        # Build prompt for vLLM
-        if isinstance(input_data, list):
-            prompt = TokensPrompt(prompt_token_ids=input_data)
-        else:
-            prompt = TextPrompt(prompt=input_data)
-
-        # Build sampling params from OpenAI-style request
-        sampling_params = build_sampling_params_openai(
-            request, self.default_sampling_params
-        )
+        try:
+            input_data = self.input_param_manager.get_input_param(
+                request, use_tokenizer=True
+            )
+            if isinstance(input_data, list):
+                prompt = TokensPrompt(prompt_token_ids=input_data)
+            else:
+                prompt = TextPrompt(prompt=input_data)
+            sampling_params = build_sampling_params_openai(
+                request, self.default_sampling_params
+            )
+            record_structured_output_backend(
+                request_metrics_context,
+                sampling_params,
+            )
+        except Exception:
+            record_request_failure(
+                request_metrics_context,
+                failure_type="request_setup_error",
+                finish_reason="error",
+            )
+            raise
 
         routing = request.get("routing") or {}
         dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
@@ -1496,7 +1597,11 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
         trace_headers = build_trace_headers(context)
 
-        async with self._abort_monitor(context, request_id):
+        async with self._abort_monitor(
+            context,
+            request_id,
+            request_metrics_context=request_metrics_context,
+        ):
             try:
                 gen = self.engine_client.generate(
                     prompt,
@@ -1509,6 +1614,11 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
                 async for res in gen:
                     if not res.outputs:
+                        record_request_failure(
+                            request_metrics_context,
+                            failure_type="no_outputs",
+                            finish_reason="error",
+                        )
                         yield {
                             "id": openai_request_id,
                             "created": int(time.time()),
@@ -1525,9 +1635,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         break
 
                     output = res.outputs[0]
-                    # Calculate the delta text (new text since last chunk)
                     delta_text = output.text[len(previous_text) :]
                     previous_text = output.text
+                    normalized_finish_reason = normalize_finish_reason(output.finish_reason)
 
                     choice_data = {
                         "index": 0,
@@ -1535,7 +1645,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                             "role": "assistant",
                             "content": delta_text,
                         },
-                        "finish_reason": normalize_finish_reason(output.finish_reason),
+                        "finish_reason": normalized_finish_reason,
                     }
 
                     chunk = {
@@ -1550,11 +1660,27 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         chunk["usage"] = BaseWorkerHandler._build_completion_usage(
                             request_output=res,
                         )
+                        record_request_success(
+                            request_metrics_context,
+                            finish_reason=normalized_finish_reason,
+                        )
 
                     yield chunk
 
+                if not request_metrics_context.terminal_recorded:
+                    record_request_failure(
+                        request_metrics_context,
+                        failure_type="missing_finish_reason",
+                        finish_reason="error",
+                    )
+
             except EngineDeadError as e:
                 logger.error(f"vLLM EngineDeadError: {e}")
+                record_request_failure(
+                    request_metrics_context,
+                    failure_type="engine_dead",
+                    finish_reason="error",
+                )
                 logger.warning("Initiating Dynamo Runtime shutdown.")
                 self.runtime.shutdown()
                 os._exit(1)
@@ -1598,25 +1724,46 @@ class PrefillWorkerHandler(BaseWorkerHandler):
 
     async def _generate_token_mode(self, request, context, request_id):
         """Generate prefill using internal protocol format (token-in-token-out)."""
-        # Extract and decode multimodal data if present
-        multi_modal_data = await self._extract_multimodal_data(request)
+        model_name = request.get("model")
+        lora_request = self._resolve_lora_request(model_name)
+        request_metrics_context = create_request_metrics_context(
+            request,
+            mode="prefill_tokens",
+            is_prefill=True,
+            lora_request=lora_request,
+        )
+        record_request_start(request_metrics_context)
 
-        # Build prompt from request (handles both prompt_embeds and token_ids)
+        try:
+            sampling_params = build_sampling_params(
+                request, self.default_sampling_params, self.model_max_len
+            )
+            record_structured_output_backend(
+                request_metrics_context,
+                sampling_params,
+            )
+            multi_modal_data = await self._extract_multimodal_data(request)
+        except Exception:
+            record_request_failure(
+                request_metrics_context,
+                failure_type="request_setup_error",
+                finish_reason="error",
+            )
+            raise
+
         prompt, embedding_sequence_length, error = self._build_prompt_from_request(
             request, request_id, multi_modal_data, log_prefix="Prefill "
         )
         if error is not None:
-            # Prefill errors need disaggregated_params field
             error["disaggregated_params"] = None
+            record_request_failure(
+                request_metrics_context,
+                failure_type="invalid_prompt",
+                finish_reason=error.get("finish_reason"),
+            )
             yield error
             return
 
-        # Build sampling params from request using shared utility
-        sampling_params = build_sampling_params(
-            request, self.default_sampling_params, self.model_max_len
-        )
-
-        # Configure for prefill-only mode with remote decode
         if sampling_params.extra_args is None:
             sampling_params.extra_args = {}
         sampling_params.extra_args["kv_transfer_params"] = {
@@ -1629,16 +1776,11 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             "remote_host": None,
             "remote_port": None,
         }
-        # Add only missing keys
-        for k, v in sampling_params_defaults.items():
-            sampling_params.extra_args["kv_transfer_params"].setdefault(k, v)
-        # Override for prefill: only generate 1 token
+        for key, value in sampling_params_defaults.items():
+            sampling_params.extra_args["kv_transfer_params"].setdefault(key, value)
         sampling_params.max_tokens = 1
         sampling_params.min_tokens = 1
 
-        # Extract LoRA request if present
-        model_name = request.get("model")
-        lora_request = self._resolve_lora_request(model_name)
         if lora_request:
             logger.info(
                 f"Prefill request {request_id} will use LoRA adapter: {model_name} "
@@ -1655,7 +1797,12 @@ class PrefillWorkerHandler(BaseWorkerHandler):
 
         trace_headers = build_trace_headers(context)
 
-        async with self._abort_monitor(context, request_id, is_prefill=True):
+        async with self._abort_monitor(
+            context,
+            request_id,
+            is_prefill=True,
+            request_metrics_context=request_metrics_context,
+        ):
             try:
                 gen = self.engine_client.generate(
                     prompt,
@@ -1668,6 +1815,11 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 )
             except EngineDeadError as e:
                 logger.error(f"vLLM EngineDeadError: {e}")
+                record_request_failure(
+                    request_metrics_context,
+                    failure_type="engine_dead",
+                    finish_reason="error",
+                )
                 logger.warning("Initiating Dynamo Runtime shutdown.")
                 self.runtime.shutdown()
                 os._exit(1)
@@ -1675,7 +1827,21 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             async for res in gen:
                 logger.debug(f"kv transfer params: {res.kv_transfer_params}")
 
-                token_ids = res.outputs[0].token_ids if res.outputs else []
+                if not res.outputs:
+                    record_request_failure(
+                        request_metrics_context,
+                        failure_type="no_outputs",
+                        finish_reason="error",
+                    )
+                    yield {
+                        "token_ids": [],
+                        "disaggregated_params": None,
+                        "completion_usage": None,
+                    }
+                    break
+
+                token_ids = res.outputs[0].token_ids
+                finish_reason = normalize_finish_reason(res.outputs[0].finish_reason)
 
                 output: Dict[str, Any] = {
                     "token_ids": list(token_ids),
@@ -1690,7 +1856,6 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                     ),
                 }
 
-                # Log prefill completion with LoRA info
                 self._log_with_lora_context(
                     "Prefill completed for request {request_id}{lora_info}: "
                     "generated {token_count} token(s), has_kv_params={has_kv_params}",
@@ -1701,4 +1866,16 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                     has_kv_params=res.kv_transfer_params is not None,
                 )
 
+                record_request_success(
+                    request_metrics_context,
+                    finish_reason=finish_reason or "prefill",
+                )
                 yield output
+                break
+
+            if not request_metrics_context.terminal_recorded:
+                record_request_failure(
+                    request_metrics_context,
+                    failure_type="missing_finish_reason",
+                    finish_reason="error",
+                )

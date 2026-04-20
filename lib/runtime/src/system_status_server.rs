@@ -280,6 +280,12 @@ async fn health_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
         "reasons": reasons,
     });
 
+    state
+        .drt()
+        .system_health()
+        .lock()
+        .record_system_status_request("health", status_code.as_u16());
+
     if healthy {
         tracing::trace!(response = %response, "health response");
     } else {
@@ -296,6 +302,11 @@ async fn live_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
         "status": "live",
         "uptime": uptime,
     });
+    state
+        .drt()
+        .system_health()
+        .lock()
+        .record_system_status_request("live", StatusCode::OK.as_u16());
     tracing::trace!(response = %response, "live response");
     (StatusCode::OK, response.to_string())
 }
@@ -312,13 +323,24 @@ async fn metrics_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
     let response = match state.drt().metrics().prometheus_expfmt() {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!("Failed to get metrics from registry: {}", e);
+            tracing::error!("Failed to get metrics from registry: {e}");
+            state
+                .drt()
+                .system_health()
+                .lock()
+                .record_system_status_request("metrics", StatusCode::INTERNAL_SERVER_ERROR.as_u16());
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to get metrics".to_string(),
             );
         }
     };
+
+    state
+        .drt()
+        .system_health()
+        .lock()
+        .record_system_status_request("metrics", StatusCode::OK.as_u16());
 
     (StatusCode::OK, response)
 }
@@ -331,6 +353,11 @@ async fn metadata_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
         Some(metadata) => metadata,
         None => {
             tracing::debug!("Metadata endpoint called but no discovery metadata available");
+            state
+                .drt()
+                .system_health()
+                .lock()
+                .record_system_status_request("metadata", StatusCode::NOT_FOUND.as_u16());
             return (
                 StatusCode::NOT_FOUND,
                 "Discovery metadata not available".to_string(),
@@ -346,10 +373,20 @@ async fn metadata_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
     match serde_json::to_string(&*metadata_guard) {
         Ok(json) => {
             tracing::trace!("Returning metadata: {} bytes", json.len());
+            state
+                .drt()
+                .system_health()
+                .lock()
+                .record_system_status_request("metadata", StatusCode::OK.as_u16());
             (StatusCode::OK, json).into_response()
         }
         Err(e) => {
-            tracing::error!("Failed to serialize metadata: {}", e);
+            tracing::error!("Failed to serialize metadata: {e}");
+            state
+                .drt()
+                .system_health()
+                .lock()
+                .record_system_status_request("metadata", StatusCode::INTERNAL_SERVER_ERROR.as_u16());
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to serialize metadata".to_string(),
@@ -711,11 +748,29 @@ mod integration_tests {
             // SystemStatusState is already created in distributed.rs
             // so we don't need to create it again here
 
-            // The uptime_seconds metric should already be registered and available
-            let response = drt.metrics().prometheus_expfmt().unwrap();
-            println!("Full metrics response:\n{}", response);
+            {
+                let system_health = drt.system_health();
+                let system_health = system_health.lock();
+                system_health.set_endpoint_health_status("generate", crate::config::HealthStatus::Ready);
+                system_health.record_endpoint_request_result("generate", true);
+                system_health.record_health_check_success("generate");
+                system_health.record_health_check_request_started("generate", "idle");
+                system_health.record_health_check_request_completed(
+                    "generate",
+                    "idle",
+                    "success",
+                    std::time::Duration::from_millis(10),
+                );
+                system_health.record_system_status_request("health", 200);
+                system_health.record_system_status_request("live", 200);
+                system_health.update_uptime_gauge();
+                system_health.update_health_observability_gauges();
+            }
 
-            // Check that uptime_seconds metric is present with correct namespace
+            let response = drt.metrics().prometheus_expfmt().unwrap();
+            println!("Full metrics response:
+{}", response);
+
             assert!(
                 response.contains("# HELP dynamo_component_uptime_seconds"),
                 "Should contain uptime_seconds help text"
@@ -727,6 +782,42 @@ mod integration_tests {
             assert!(
                 response.contains("dynamo_component_uptime_seconds"),
                 "Should contain uptime_seconds metric with correct namespace"
+            );
+            assert!(
+                response.contains("dynamo_component_health_check_requests_started_total"),
+                "Should contain canary start counter"
+            );
+            assert!(
+                response.contains("dynamo_component_health_check_requests_completed_total"),
+                "Should contain canary completion counter"
+            );
+            assert!(
+                response.contains("dynamo_component_health_check_last_duration_seconds"),
+                "Should contain canary duration gauge"
+            );
+            assert!(
+                response.contains("dynamo_component_system_status_requests_total"),
+                "Should contain system status request counter"
+            );
+            assert!(
+                response.contains("dynamo_component_overall_ready"),
+                "Should contain overall readiness gauge"
+            );
+            assert!(
+                response.contains("dynamo_component_endpoint_health_status"),
+                "Should contain per-endpoint readiness gauge"
+            );
+            assert!(
+                response.contains("dynamo_component_endpoint_real_traffic_failure_ratio"),
+                "Should contain real traffic failure ratio gauge"
+            );
+            assert!(
+                response.contains("dynamo_component_endpoint_real_traffic_samples"),
+                "Should contain real traffic sample gauge"
+            );
+            assert!(
+                response.contains("dynamo_component_health_check_last_success_age_seconds"),
+                "Should contain canary last success age gauge"
             );
         })
         .await;

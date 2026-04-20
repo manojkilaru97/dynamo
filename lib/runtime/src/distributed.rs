@@ -125,6 +125,13 @@ impl DistributedRuntime {
             use_endpoint_health_status,
             health_endpoint_path,
             live_endpoint_path,
+            crate::system_health::RealTrafficHealthConfig {
+                window: std::time::Duration::from_secs(
+                    config.health_check_real_failure_window_secs,
+                ),
+                min_samples: config.health_check_real_failure_min_samples,
+                failure_threshold: config.health_check_real_failure_threshold,
+            },
         )));
 
         // Initialize discovery client based on backend configuration
@@ -192,20 +199,20 @@ impl DistributedRuntime {
             engine_routes: crate::engine_routes::EngineRouteRegistry::new(),
         };
 
-        // Initialize the uptime gauge in SystemHealth
-        distributed_runtime
-            .system_health
-            .lock()
-            .initialize_uptime_gauge(&distributed_runtime)?;
+        {
+            let system_health = distributed_runtime.system_health.lock();
+            system_health.initialize_uptime_gauge(&distributed_runtime)?;
+            system_health.initialize_health_observability_metrics(&distributed_runtime)?;
+        }
 
-        // Register an update callback so the uptime gauge is refreshed before
-        // every Prometheus scrape (both system status server and frontend).
         {
             let system_health = distributed_runtime.system_health.clone();
             distributed_runtime
                 .metrics_registry
                 .add_update_callback(std::sync::Arc::new(move || {
-                    system_health.lock().update_uptime_gauge();
+                    let system_health = system_health.lock();
+                    system_health.update_uptime_gauge();
+                    system_health.update_health_observability_gauges();
                     Ok(())
                 }));
         }

@@ -231,7 +231,7 @@ fn parse_section_block(
         if let Some(tools) = tools
             && !tools.iter().any(|t| t.name == function_name)
         {
-            tracing::warn!("Tool '{}' is not defined in the tools list.", function_name);
+            tracing::debug!("Tool '{}' is not defined in the tools list.", function_name);
         }
 
         // Validate JSON arguments

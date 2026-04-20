@@ -164,6 +164,48 @@ def test_build_sampling_params_restores_structural_tag_guided_decoding():
     assert sampling_params.skip_reading_prefix_cache is True
 
 
+def test_build_sampling_params_prefers_guidance_for_minimax_structural_tag_json_schema():
+    request = {
+        "model": "minimaxai/minimax-m2.7",
+        "sampling_options": {
+            "guided_decoding": {
+                "structural_tag": '{"type":"sequence","elements":[{"type":"tag","begin":"","content":{"type":"any_text"},"end":"</think>"},{"type":"json_schema","json_schema":{"type":"object"}}]}',
+                "_dynamo_structural_content_type": "json_schema",
+            }
+        },
+        "stop_conditions": {},
+        "output_options": {},
+    }
+
+    sampling_params = build_sampling_params(request, default_sampling_params={})
+
+    assert sampling_params.structured_outputs is not None
+    assert sampling_params.structured_outputs._backend == "guidance"
+    assert sampling_params.structured_outputs._backend_was_auto is True
+    assert sampling_params.skip_reading_prefix_cache is True
+
+
+def test_build_sampling_params_prefers_xgrammar_for_minimax_structural_tag_regex():
+    request = {
+        "model": "minimaxai/minimax-m2.7",
+        "sampling_options": {
+            "guided_decoding": {
+                "structural_tag": '{"type":"sequence","elements":[{"type":"tag","begin":"","content":{"type":"any_text"},"end":"</think>"},{"type":"regex","pattern":"yes|no"}]}',
+                "_dynamo_structural_content_type": "regex",
+            }
+        },
+        "stop_conditions": {},
+        "output_options": {},
+    }
+
+    sampling_params = build_sampling_params(request, default_sampling_params={})
+
+    assert sampling_params.structured_outputs is not None
+    assert sampling_params.structured_outputs._backend == "xgrammar"
+    assert sampling_params.structured_outputs._backend_was_auto is True
+    assert sampling_params.skip_reading_prefix_cache is True
+
+
 def test_request_needs_cache_isolation_for_forced_tool_choice():
     request = {"tool_choice": {"type": "function", "function": {"name": "calculate"}}}
     request_for_sampling = SimpleNamespace(tool_choice=None, structured_outputs=None)

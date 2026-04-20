@@ -32,6 +32,9 @@ class DynamoRouterConfig(ConfigBase):
     router_max_pending_per_worker: int | None
     router_max_queue_wait_ms: int | None
     router_event_threads: int
+    router_kv_miss_quarantine_threshold: int | None
+    router_kv_miss_quarantine_window_secs: float
+    router_kv_miss_quarantine_cooldown_secs: float
 
     def validate(self) -> None:
         """Validate config invariants (aligned with Rust KvRouterConfig where applicable)."""

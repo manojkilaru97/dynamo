@@ -399,6 +399,33 @@ pub mod task_tracker {
 pub mod distributed_runtime {
     /// Total uptime of the DistributedRuntime in seconds
     pub const UPTIME_SECONDS: &str = "uptime_seconds";
+
+    /// Total number of health check requests started
+    pub const HEALTH_CHECK_REQUESTS_STARTED_TOTAL: &str = "health_check_requests_started_total";
+
+    /// Total number of health check requests completed by result
+    pub const HEALTH_CHECK_REQUESTS_COMPLETED_TOTAL: &str = "health_check_requests_completed_total";
+
+    /// Last observed health check duration in seconds
+    pub const HEALTH_CHECK_LAST_DURATION_SECONDS: &str = "health_check_last_duration_seconds";
+
+    /// Total system status endpoint requests by route and HTTP status
+    pub const SYSTEM_STATUS_REQUESTS_TOTAL: &str = "system_status_requests_total";
+
+    /// Current overall readiness state of the worker or frontend (1=ready, 0=not ready)
+    pub const OVERALL_READY: &str = "overall_ready";
+
+    /// Current per-endpoint health state (1=ready, 0=not ready) by status kind
+    pub const ENDPOINT_HEALTH_STATUS: &str = "endpoint_health_status";
+
+    /// Current real-traffic failure ratio per endpoint over the rolling window
+    pub const ENDPOINT_REAL_TRAFFIC_FAILURE_RATIO: &str = "endpoint_real_traffic_failure_ratio";
+
+    /// Current real-traffic sample count per endpoint over the rolling window
+    pub const ENDPOINT_REAL_TRAFFIC_SAMPLES: &str = "endpoint_real_traffic_samples";
+
+    /// Age in seconds since the last successful active health check per endpoint
+    pub const HEALTH_CHECK_LAST_SUCCESS_AGE_SECONDS: &str = "health_check_last_success_age_seconds";
 }
 
 /// KVBM

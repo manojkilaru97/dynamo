@@ -272,7 +272,7 @@ impl HealthCheckManager {
                         let target = manager.drt.system_health().lock().get_health_check_target(&endpoint_subject);
 
                         if let Some(target) = target {
-                            if let Err(e) = manager.send_health_check_request(&endpoint_subject, &target.payload).await {
+                            if let Err(e) = manager.send_health_check_request(&endpoint_subject, &target.payload, "idle").await {
                                 error!("Failed to send health check for {}: {}", endpoint_subject, e);
                             }
                         } else {
@@ -295,7 +295,7 @@ impl HealthCheckManager {
                             let target = manager.drt.system_health().lock().get_health_check_target(&endpoint_subject);
 
                             if let Some(target) = target {
-                                if let Err(e) = manager.send_health_check_request(&endpoint_subject, &target.payload).await {
+                                if let Err(e) = manager.send_health_check_request(&endpoint_subject, &target.payload, "activity").await {
                                     error!("Failed to send activity-triggered health check for {}: {}", endpoint_subject, e);
                                 }
                             } else {
@@ -382,7 +382,14 @@ impl HealthCheckManager {
         &self,
         endpoint_subject: &str,
         payload: &serde_json::Value,
+        trigger: &str,
     ) -> anyhow::Result<()> {
+        let started_at = Instant::now();
+        self.drt
+            .system_health()
+            .lock()
+            .record_health_check_request_started(endpoint_subject, trigger);
+
         let target = self
             .drt
             .system_health()
@@ -397,27 +404,29 @@ impl HealthCheckManager {
             endpoint_subject, target.instance.instance_id
         );
 
-        // Create the Endpoint directly from the Instance info
         let namespace = self.drt.namespace(&target.instance.namespace)?;
         let component = namespace.component(&target.instance.component)?;
         let endpoint = component.endpoint(&target.instance.endpoint);
 
-        // Get or create router for this endpoint
         let router = match self.get_or_create_router(endpoint_subject, endpoint).await {
             Ok(router) => router,
             Err(e) => {
+                self.drt
+                    .system_health()
+                    .lock()
+                    .record_health_check_request_completed(
+                        endpoint_subject,
+                        trigger,
+                        "error",
+                        started_at.elapsed(),
+                    );
                 self.mark_endpoint_not_ready_if_stale(endpoint_subject, &e.to_string());
                 return Err(e);
             }
         };
 
-        // Wait for watch stream to discover instances before checking
-        // This ensures the router's client has populated its instance list
-        // from etcd before we attempt to send the health check request.
-        // Without this, the first health check can fail due to a race condition
-        // where the watch stream hasn't completed its initial discovery yet.
         match tokio::time::timeout(
-            Duration::from_secs(10), // 10 second timeout for discovery
+            Duration::from_secs(10),
             router.client.wait_for_instances(),
         )
         .await
@@ -435,6 +444,15 @@ impl HealthCheckManager {
                     endpoint_subject,
                     e
                 );
+                self.drt
+                    .system_health()
+                    .lock()
+                    .record_health_check_request_completed(
+                        endpoint_subject,
+                        trigger,
+                        "error",
+                        started_at.elapsed(),
+                    );
                 self.mark_endpoint_not_ready_if_stale(endpoint_subject, &err.to_string());
                 return Err(err);
             }
@@ -443,12 +461,20 @@ impl HealthCheckManager {
                     "Timeout waiting for instance discovery for {} during health check",
                     endpoint_subject
                 );
+                self.drt
+                    .system_health()
+                    .lock()
+                    .record_health_check_request_completed(
+                        endpoint_subject,
+                        trigger,
+                        "timeout",
+                        started_at.elapsed(),
+                    );
                 self.mark_endpoint_not_ready_if_stale(endpoint_subject, &err.to_string());
                 return Err(err);
             }
         }
 
-        // Create the request context
         let request: SingleIn<serde_json::Value> = Context::new(payload.clone());
         let instance_id = target.instance.instance_id;
         let timeout = self.config.request_timeout;
@@ -471,10 +497,30 @@ impl HealthCheckManager {
                     "Health check completed successfully for {} after consuming {} response item(s)",
                     endpoint_subject, response_count
                 );
+                {
+                    let system_health = self.drt.system_health();
+                    let system_health = system_health.lock();
+                    system_health.record_health_check_success(endpoint_subject);
+                    system_health.record_health_check_request_completed(
+                        endpoint_subject,
+                        trigger,
+                        "success",
+                        started_at.elapsed(),
+                    );
+                }
                 self.mark_endpoint_ready(endpoint_subject);
                 Ok(())
             }
             Ok(Err(e)) => {
+                self.drt
+                    .system_health()
+                    .lock()
+                    .record_health_check_request_completed(
+                        endpoint_subject,
+                        trigger,
+                        "error",
+                        started_at.elapsed(),
+                    );
                 self.mark_endpoint_not_ready_if_stale(endpoint_subject, &e.to_string());
                 Err(e)
             }
@@ -484,6 +530,15 @@ impl HealthCheckManager {
                     endpoint_subject,
                     timeout
                 );
+                self.drt
+                    .system_health()
+                    .lock()
+                    .record_health_check_request_completed(
+                        endpoint_subject,
+                        trigger,
+                        "timeout",
+                        started_at.elapsed(),
+                    );
                 self.mark_endpoint_not_ready_if_stale(endpoint_subject, &err.to_string());
                 Err(err)
             }

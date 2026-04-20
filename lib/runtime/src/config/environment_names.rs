@@ -54,7 +54,22 @@ pub mod logging {
         /// Spec: https://opentelemetry.io/docs/specs/otel/protocol/exporter/
         pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 
-        /// Service name for OTLP traces
+        /// OTLP exporter transport protocol shared by all signals when signal-specific vars are unset.
+        /// Supported values: grpc, http/protobuf
+        pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+
+        /// OTLP exporter transport protocol for traces.
+        /// Supported values: grpc, http/protobuf
+        pub const OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
+
+        /// OTLP exporter endpoint URL for logs (defaults to traces endpoint if unset)
+        pub const OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT";
+
+        /// OTLP exporter transport protocol for logs.
+        /// Supported values: grpc, http/protobuf
+        pub const OTEL_EXPORTER_OTLP_LOGS_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL";
+
+        /// Service name for OTLP traces and logs
         pub const OTEL_SERVICE_NAME: &str = "OTEL_SERVICE_NAME";
     }
 }
@@ -115,6 +130,18 @@ pub mod runtime {
 
         /// Grace window after the last successful health check before the endpoint is fenced
         pub const DYN_HEALTH_CHECK_SUCCESS_TTL: &str = "DYN_HEALTH_CHECK_SUCCESS_TTL";
+
+        // Rolling window in seconds for admitted real-request failure fencing
+        pub const DYN_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS: &str =
+            "DYN_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS";
+
+        // Minimum admitted real requests required before failure fencing applies
+        pub const DYN_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES: &str =
+            "DYN_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES";
+
+        // Failure ratio threshold for admitted real-request fencing
+        pub const DYN_HEALTH_CHECK_REAL_FAILURE_THRESHOLD: &str =
+            "DYN_HEALTH_CHECK_REAL_FAILURE_THRESHOLD";
     }
 }
 
@@ -419,7 +446,11 @@ mod tests {
             logging::DYNAMO_LOG_PAYLOADS,
             logging::otlp::OTEL_EXPORT_ENABLED,
             logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            logging::otlp::OTEL_EXPORTER_OTLP_PROTOCOL,
+            logging::otlp::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
             logging::otlp::OTEL_SERVICE_NAME,
+            logging::otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
+            logging::otlp::OTEL_EXPORTER_OTLP_LOGS_PROTOCOL,
             // Runtime
             runtime::DYN_RUNTIME_NUM_WORKER_THREADS,
             runtime::DYN_RUNTIME_MAX_BLOCKING_THREADS,
