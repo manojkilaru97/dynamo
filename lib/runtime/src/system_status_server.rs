@@ -816,6 +816,10 @@ mod integration_tests {
                 "Should contain real traffic sample gauge"
             );
             assert!(
+                response.contains("dynamo_component_endpoint_real_traffic_outcome_samples"),
+                "Should contain real traffic outcome sample gauge"
+            );
+            assert!(
                 response.contains("dynamo_component_health_check_last_success_age_seconds"),
                 "Should contain canary last success age gauge"
             );

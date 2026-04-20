@@ -424,6 +424,9 @@ pub mod distributed_runtime {
     /// Current real-traffic sample count per endpoint over the rolling window
     pub const ENDPOINT_REAL_TRAFFIC_SAMPLES: &str = "endpoint_real_traffic_samples";
 
+    /// Current real-traffic sample count per endpoint over the rolling window, broken out by outcome
+    pub const ENDPOINT_REAL_TRAFFIC_OUTCOME_SAMPLES: &str = "endpoint_real_traffic_outcome_samples";
+
     /// Age in seconds since the last successful active health check per endpoint
     pub const HEALTH_CHECK_LAST_SUCCESS_AGE_SECONDS: &str = "health_check_last_success_age_seconds";
 }

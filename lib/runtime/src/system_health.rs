@@ -715,14 +715,13 @@ impl SystemHealth {
             }
 
             if let Some(gauge) = self.endpoint_real_traffic_outcome_samples_gauge.get() {
+                let success_labels = [endpoint.as_str(), RequestOutcome::Success.label()];
+                let failure_labels = [endpoint.as_str(), RequestOutcome::Failure.label()];
+                let overloaded_labels = [endpoint.as_str(), RequestOutcome::Overloaded.label()];
+                gauge.with_label_values(&success_labels).set(success_samples);
+                gauge.with_label_values(&failure_labels).set(failure_samples);
                 gauge
-                    .with_label_values(&[endpoint, RequestOutcome::Success.label()])
-                    .set(success_samples);
-                gauge
-                    .with_label_values(&[endpoint, RequestOutcome::Failure.label()])
-                    .set(failure_samples);
-                gauge
-                    .with_label_values(&[endpoint, RequestOutcome::Overloaded.label()])
+                    .with_label_values(&overloaded_labels)
                     .set(overloaded_samples);
             }
 
@@ -858,7 +857,11 @@ mod tests {
         let mut window = RealTrafficWindow::default();
         let now = Instant::now();
 
-        window.record(now - Duration::from_secs(601), false, &config);
+        window.record(
+            now - Duration::from_secs(601),
+            RequestOutcome::Failure,
+            &config,
+        );
 
         assert_eq!(window.status_at(now, &config), HealthStatus::Ready);
     }

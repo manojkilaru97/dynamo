@@ -210,7 +210,12 @@ impl SharedTcpServer {
                     .record_endpoint_request_result(&work_item.endpoint_name, true);
             }
             Err(e) => {
-                if !matches!(e, crate::pipeline::PipelineError::ServiceOverloaded(_)) {
+                if matches!(e, crate::pipeline::PipelineError::ServiceOverloaded(_)) {
+                    work_item
+                        .system_health
+                        .lock()
+                        .record_endpoint_request_overload(&work_item.endpoint_name);
+                } else {
                     work_item
                         .system_health
                         .lock()

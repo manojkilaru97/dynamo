@@ -59,6 +59,80 @@ configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 
 
+def _build_token_error_response(message: str) -> dict[str, Any]:
+    return {
+        "finish_reason": f"error: {message}",
+        "token_ids": [],
+    }
+
+
+def _build_prefill_error_response(message: str) -> dict[str, Any]:
+    return {
+        "finish_reason": f"error: {message}",
+        "token_ids": [],
+        "disaggregated_params": None,
+        "completion_usage": None,
+    }
+
+
+def _build_text_error_chunk(message: str, request_id: str) -> dict[str, Any]:
+    return {
+        "id": request_id,
+        "created": int(time.time()),
+        "object": "chat.completion.chunk",
+        "model": "unknown",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": "error",
+            }
+        ],
+        "error": {"message": message},
+    }
+
+
+class DecodeWallClockTimeoutError(RuntimeError):
+    pass
+
+
+class VllmEngineQuiesceController:
+    def __init__(self, engine_client: Any):
+        self._engine_client = engine_client
+        self._is_quiesced = False
+
+    @property
+    def is_quiesced(self) -> bool:
+        return self._is_quiesced
+
+    async def quiesce(self, *args: object) -> bool:
+        if self._is_quiesced:
+            return False
+
+        level = args[0] if args else None
+        await self._engine_client.pause_generation()
+        if level is None:
+            await self._engine_client.sleep()
+        else:
+            await self._engine_client.sleep(level)
+        self._is_quiesced = True
+        return True
+
+    async def resume(self, tags: list[str] | None = None) -> bool:
+        if not self._is_quiesced:
+            return False
+
+        if tags is None:
+            await self._engine_client.wake_up()
+        else:
+            await self._engine_client.wake_up(tags)
+        await self._engine_client.resume_generation()
+        return True
+
+    def mark_resumed(self) -> None:
+        self._is_quiesced = False
+
+
 @dataclass(frozen=True)
 class LoRAInfo:
     """Metadata for a loaded LoRA adapter."""
@@ -408,6 +482,83 @@ class BaseWorkerHandler(ABC):
 
         # Store shutdown event for graceful shutdown monitoring
         self.shutdown_event = shutdown_event
+        self.max_decode_wall_clock_secs = self._get_positive_float_env(
+            "DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS"
+        )
+
+    @staticmethod
+    def _get_positive_float_env(name: str) -> float | None:
+        value = os.environ.get(name)
+        if value in (None, ""):
+            return None
+        try:
+            parsed = float(value)
+        except ValueError:
+            logger.warning("Ignoring invalid %s=%r", name, value)
+            return None
+        if parsed <= 0:
+            return None
+        return parsed
+
+    async def _raise_decode_timeout(
+        self,
+        request_id: str,
+        request_metrics_context=None,
+    ) -> None:
+        timeout_secs = self.max_decode_wall_clock_secs
+        if timeout_secs is None:
+            raise DecodeWallClockTimeoutError("decode timeout triggered without configuration")
+
+        message = f"Decode wall clock timeout after {timeout_secs:g}s"
+        logger.warning("%s for request %s", message, request_id)
+        try:
+            await self.engine_client.abort(request_id)
+        except Exception as abort_error:
+            logger.warning(
+                "Failed to abort request %s after decode timeout: %s",
+                request_id,
+                abort_error,
+            )
+
+        if request_metrics_context is not None:
+            record_request_failure(
+                request_metrics_context,
+                failure_type="decode_timeout",
+                finish_reason="error",
+            )
+
+        raise DecodeWallClockTimeoutError(message)
+
+    async def _iterate_with_decode_timeout(
+        self,
+        gen,
+        request_id: str,
+        request_metrics_context=None,
+    ):
+        timeout_secs = self.max_decode_wall_clock_secs
+        if timeout_secs is None:
+            async for item in gen:
+                yield item
+            return
+
+        deadline = time.monotonic() + timeout_secs
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await self._raise_decode_timeout(
+                    request_id, request_metrics_context=request_metrics_context
+                )
+
+            try:
+                item = await asyncio.wait_for(gen.__anext__(), timeout=remaining)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                await self._raise_decode_timeout(
+                    request_id, request_metrics_context=request_metrics_context
+                )
+            else:
+                yield item
 
     async def sleep(self, body: dict) -> dict:
         """Sleep the engine to release GPU memory and unregister from discovery.
@@ -1332,7 +1483,9 @@ class BaseWorkerHandler(ABC):
             )
 
             num_output_tokens_so_far = 0
-            async for res in gen:
+            async for res in self._iterate_with_decode_timeout(
+                gen, request_id, request_metrics_context=request_metrics_context
+            ):
                 # res is vllm's RequestOutput
 
                 if not res.outputs:
@@ -1472,6 +1625,16 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 sampling_params,
             )
             multi_modal_data = await self._extract_multimodal_data(request)
+        except ValueError as e:
+            message = str(e)
+            logger.warning("Rejecting decode request %s: %s", request_id, message)
+            record_request_failure(
+                request_metrics_context,
+                failure_type="invalid_request",
+                finish_reason="error",
+            )
+            yield _build_token_error_response(message)
+            return
         except Exception:
             record_request_failure(
                 request_metrics_context,
@@ -1547,6 +1710,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                             "prompt_tokens_details"
                         ] = prefill_prompt_tokens_details
                     yield tok
+            except DecodeWallClockTimeoutError as e:
+                yield _build_token_error_response(str(e))
             except EngineDeadError as e:
                 logger.error(f"vLLM EngineDeadError: {e}")
                 record_request_failure(
@@ -1612,7 +1777,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     priority=priority,
                 )
 
-                async for res in gen:
+                async for res in self._iterate_with_decode_timeout(
+                    gen, request_id, request_metrics_context=request_metrics_context
+                ):
                     if not res.outputs:
                         record_request_failure(
                             request_metrics_context,
@@ -1674,6 +1841,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         finish_reason="error",
                     )
 
+            except DecodeWallClockTimeoutError as e:
+                yield _build_text_error_chunk(str(e), openai_request_id)
             except EngineDeadError as e:
                 logger.error(f"vLLM EngineDeadError: {e}")
                 record_request_failure(
@@ -1743,6 +1912,16 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 sampling_params,
             )
             multi_modal_data = await self._extract_multimodal_data(request)
+        except ValueError as e:
+            message = str(e)
+            logger.warning("Rejecting prefill request %s: %s", request_id, message)
+            record_request_failure(
+                request_metrics_context,
+                failure_type="invalid_request",
+                finish_reason="error",
+            )
+            yield _build_prefill_error_response(message)
+            return
         except Exception:
             record_request_failure(
                 request_metrics_context,
