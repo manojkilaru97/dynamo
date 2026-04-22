@@ -58,6 +58,8 @@ DECODED_VARIANT_KEY: Final = "Decoded"
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 
+SERVICE_OVERLOADED_ERROR_TYPE: Final = "service_overloaded"
+
 
 def _build_token_error_response(message: str) -> dict[str, Any]:
     return {
@@ -72,6 +74,59 @@ def _build_prefill_error_response(message: str) -> dict[str, Any]:
         "token_ids": [],
         "disaggregated_params": None,
         "completion_usage": None,
+    }
+
+
+def _build_overload_extra_args(
+    message: str,
+    *,
+    current_total_requests: int | None = None,
+    total_request_limit: int | None = None,
+) -> dict[str, Any]:
+    extra_args: dict[str, Any] = {
+        "dynamo_error_type": SERVICE_OVERLOADED_ERROR_TYPE,
+        "error_message": message,
+    }
+    if current_total_requests is not None:
+        extra_args["worker_total_requests"] = current_total_requests
+    if total_request_limit is not None:
+        extra_args["worker_total_request_limit"] = total_request_limit
+    return extra_args
+
+
+def _build_token_overload_response(
+    message: str,
+    *,
+    current_total_requests: int | None = None,
+    total_request_limit: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "finish_reason": {"error": message},
+        "token_ids": [],
+        "extra_args": _build_overload_extra_args(
+            message,
+            current_total_requests=current_total_requests,
+            total_request_limit=total_request_limit,
+        ),
+    }
+
+
+def _build_prefill_overload_response(
+    message: str,
+    *,
+    current_total_requests: int | None = None,
+    total_request_limit: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "finish_reason": {"error": message},
+        "token_ids": [],
+        "disaggregated_params": None,
+        "completion_usage": None,
+        "extra_args": _build_overload_extra_args(
+            message,
+            current_total_requests=current_total_requests,
+            total_request_limit=total_request_limit,
+        ),
     }
 
 
@@ -90,6 +145,22 @@ def _build_text_error_chunk(message: str, request_id: str) -> dict[str, Any]:
         ],
         "error": {"message": message},
     }
+
+
+def _build_text_overload_chunk(
+    message: str,
+    request_id: str,
+    *,
+    current_total_requests: int | None = None,
+    total_request_limit: int | None = None,
+) -> dict[str, Any]:
+    chunk = _build_text_error_chunk(message, request_id)
+    chunk["extra_args"] = _build_overload_extra_args(
+        message,
+        current_total_requests=current_total_requests,
+        total_request_limit=total_request_limit,
+    )
+    return chunk
 
 
 class DecodeWallClockTimeoutError(RuntimeError):
@@ -485,6 +556,11 @@ class BaseWorkerHandler(ABC):
         self.max_decode_wall_clock_secs = self._get_positive_float_env(
             "DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS"
         )
+        self._request_admission_lock = asyncio.Lock()
+        self._pending_request_admissions = 0
+        self.max_total_requests = self._get_positive_int_env(
+            "DYN_REQUEST_MAX_TOTAL_REQUESTS"
+        ) or self._get_default_max_total_requests()
 
     @staticmethod
     def _get_positive_float_env(name: str) -> float | None:
@@ -499,6 +575,131 @@ class BaseWorkerHandler(ABC):
         if parsed <= 0:
             return None
         return parsed
+
+    @staticmethod
+    def _get_positive_int_env(name: str) -> int | None:
+        value = os.environ.get(name)
+        if value in (None, ""):
+            return None
+        try:
+            parsed = int(value)
+        except ValueError:
+            logger.warning("Ignoring invalid %s=%r", name, value)
+            return None
+        if parsed <= 0:
+            return None
+        return parsed
+
+    def _get_default_max_total_requests(self) -> int | None:
+        scheduler_config = getattr(
+            getattr(self.engine_client, "vllm_config", None),
+            "scheduler_config",
+            None,
+        )
+        value = getattr(scheduler_config, "max_num_seqs", None)
+        if value in (None, ""):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid scheduler max_num_seqs=%r", value)
+            return None
+        if parsed <= 0:
+            return None
+        return parsed
+
+    def _current_total_local_requests(self) -> int | None:
+        output_processor = getattr(self.engine_client, "output_processor", None)
+        if output_processor is None:
+            return None
+        getter = getattr(output_processor, "get_num_unfinished_requests", None)
+        if getter is None:
+            return None
+        try:
+            return int(getter())
+        except Exception as e:
+            logger.warning("Failed to read local unfinished request count: %s", e)
+            return None
+
+    async def _try_reserve_request_slot(
+        self, request_id: str
+    ) -> tuple[bool, int | None, int | None]:
+        limit = self.max_total_requests
+        if limit is None:
+            return True, None, None
+
+        async with self._request_admission_lock:
+            current_total = self._current_total_local_requests()
+            if current_total is None:
+                return True, None, limit
+
+            observed_total = current_total + self._pending_request_admissions
+            if observed_total >= limit:
+                logger.info(
+                    "Rejecting request %s due to local total request limit: %s/%s",
+                    request_id,
+                    observed_total,
+                    limit,
+                )
+                return False, observed_total, limit
+
+            self._pending_request_admissions += 1
+            return True, observed_total + 1, limit
+
+    async def _release_request_slot_reservation(self) -> None:
+        async with self._request_admission_lock:
+            if self._pending_request_admissions > 0:
+                self._pending_request_admissions -= 1
+
+    async def _iterate_engine_stream(
+        self,
+        gen,
+        request_id: str,
+        request_metrics_context=None,
+        *,
+        enforce_decode_timeout: bool = False,
+        release_request_admission: bool = False,
+    ):
+        timeout_secs = (
+            self.max_decode_wall_clock_secs if enforce_decode_timeout else None
+        )
+        deadline = time.monotonic() + timeout_secs if timeout_secs is not None else None
+        admission_released = not release_request_admission
+
+        async def release_admission_once() -> None:
+            nonlocal admission_released
+            if not admission_released:
+                admission_released = True
+                await self._release_request_slot_reservation()
+
+        while True:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    await release_admission_once()
+                    await self._raise_decode_timeout(
+                        request_id, request_metrics_context=request_metrics_context
+                    )
+                next_item = asyncio.wait_for(gen.__anext__(), timeout=remaining)
+            else:
+                next_item = gen.__anext__()
+
+            try:
+                item = await next_item
+            except StopAsyncIteration:
+                await release_admission_once()
+                break
+            except asyncio.TimeoutError:
+                await release_admission_once()
+                await self._raise_decode_timeout(
+                    request_id, request_metrics_context=request_metrics_context
+                )
+            except Exception:
+                await release_admission_once()
+                raise
+            else:
+                await release_admission_once()
+                yield item
 
     async def _raise_decode_timeout(
         self,
@@ -535,30 +736,13 @@ class BaseWorkerHandler(ABC):
         request_id: str,
         request_metrics_context=None,
     ):
-        timeout_secs = self.max_decode_wall_clock_secs
-        if timeout_secs is None:
-            async for item in gen:
-                yield item
-            return
-
-        deadline = time.monotonic() + timeout_secs
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                await self._raise_decode_timeout(
-                    request_id, request_metrics_context=request_metrics_context
-                )
-
-            try:
-                item = await asyncio.wait_for(gen.__anext__(), timeout=remaining)
-            except StopAsyncIteration:
-                break
-            except asyncio.TimeoutError:
-                await self._raise_decode_timeout(
-                    request_id, request_metrics_context=request_metrics_context
-                )
-            else:
-                yield item
+        async for item in self._iterate_engine_stream(
+            gen,
+            request_id,
+            request_metrics_context=request_metrics_context,
+            enforce_decode_timeout=True,
+        ):
+            yield item
 
     async def sleep(self, body: dict) -> dict:
         """Sleep the engine to release GPU memory and unregister from discovery.
@@ -1464,6 +1648,7 @@ class BaseWorkerHandler(ABC):
         trace_headers=None,
         priority=0,
         request_metrics_context=None,
+        release_request_admission: bool = False,
     ):
         try:
             # Log LoRA usage for this generation (debug level to avoid log spam)
@@ -1483,8 +1668,12 @@ class BaseWorkerHandler(ABC):
             )
 
             num_output_tokens_so_far = 0
-            async for res in self._iterate_with_decode_timeout(
-                gen, request_id, request_metrics_context=request_metrics_context
+            async for res in self._iterate_engine_stream(
+                gen,
+                request_id,
+                request_metrics_context=request_metrics_context,
+                enforce_decode_timeout=True,
+                release_request_admission=release_request_admission,
             ):
                 # res is vllm's RequestOutput
 
@@ -1686,6 +1875,26 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
         priority = routing.get("priority", 0)
 
+        reserved, current_total_requests, total_request_limit = await self._try_reserve_request_slot(
+            request_id
+        )
+        if not reserved:
+            message = (
+                f"Worker local total request limit reached "
+                f"({current_total_requests}/{total_request_limit})"
+            )
+            record_request_failure(
+                request_metrics_context,
+                failure_type="service_overloaded",
+                finish_reason="error",
+            )
+            yield _build_token_overload_response(
+                message,
+                current_total_requests=current_total_requests,
+                total_request_limit=total_request_limit,
+            )
+            return
+
         trace_headers = build_trace_headers(context)
 
         async with self._abort_monitor(
@@ -1704,6 +1913,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     trace_headers=trace_headers,
                     priority=priority,
                     request_metrics_context=request_metrics_context,
+                    release_request_admission=reserved,
                 ):
                     if prefill_result is not None and "completion_usage" in tok:
                         tok["completion_usage"][
@@ -1760,6 +1970,27 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         openai_request_id = request.get("id") or request.get("request_id", request_id)
         previous_text = ""
 
+        reserved, current_total_requests, total_request_limit = await self._try_reserve_request_slot(
+            request_id
+        )
+        if not reserved:
+            message = (
+                f"Worker local total request limit reached "
+                f"({current_total_requests}/{total_request_limit})"
+            )
+            record_request_failure(
+                request_metrics_context,
+                failure_type="service_overloaded",
+                finish_reason="error",
+            )
+            yield _build_text_overload_chunk(
+                message,
+                openai_request_id,
+                current_total_requests=current_total_requests,
+                total_request_limit=total_request_limit,
+            )
+            return
+
         trace_headers = build_trace_headers(context)
 
         async with self._abort_monitor(
@@ -1777,8 +2008,12 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     priority=priority,
                 )
 
-                async for res in self._iterate_with_decode_timeout(
-                    gen, request_id, request_metrics_context=request_metrics_context
+                async for res in self._iterate_engine_stream(
+                    gen,
+                    request_id,
+                    request_metrics_context=request_metrics_context,
+                    enforce_decode_timeout=True,
+                    release_request_admission=reserved,
                 ):
                     if not res.outputs:
                         record_request_failure(
@@ -1974,6 +2209,26 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
         priority = routing.get("priority", 0)
 
+        reserved, current_total_requests, total_request_limit = await self._try_reserve_request_slot(
+            request_id
+        )
+        if not reserved:
+            message = (
+                f"Worker local total request limit reached "
+                f"({current_total_requests}/{total_request_limit})"
+            )
+            record_request_failure(
+                request_metrics_context,
+                failure_type="service_overloaded",
+                finish_reason="error",
+            )
+            yield _build_prefill_overload_response(
+                message,
+                current_total_requests=current_total_requests,
+                total_request_limit=total_request_limit,
+            )
+            return
+
         trace_headers = build_trace_headers(context)
 
         async with self._abort_monitor(
@@ -2003,7 +2258,12 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 self.runtime.shutdown()
                 os._exit(1)
 
-            async for res in gen:
+            async for res in self._iterate_engine_stream(
+                gen,
+                request_id,
+                request_metrics_context=request_metrics_context,
+                release_request_admission=reserved,
+            ):
                 logger.debug(f"kv transfer params: {res.kv_transfer_params}")
 
                 if not res.outputs:

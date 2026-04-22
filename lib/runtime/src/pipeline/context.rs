@@ -113,6 +113,18 @@ impl<T: Send + Sync + 'static> Context<T> {
         self.transfer(())
     }
 
+    pub fn clone_shallow(&self) -> Self
+    where
+        T: Clone,
+    {
+        Context {
+            current: self.current.clone(),
+            controller: self.controller.clone(),
+            registry: self.registry.clone_shared_only(),
+            stages: self.stages.clone(),
+        }
+    }
+
     pub fn stages(&self) -> &Vec<String> {
         &self.stages
     }

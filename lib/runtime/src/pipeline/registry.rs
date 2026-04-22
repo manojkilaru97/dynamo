@@ -48,6 +48,17 @@ impl Registry {
         }
     }
 
+    /// Clone shared state while dropping unique entries.
+    ///
+    /// This is used for retry/fanout paths where request-scoped shared metadata must
+    /// survive but unique takable values cannot be duplicated safely.
+    pub fn clone_shared_only(&self) -> Self {
+        Registry {
+            shared_storage: self.shared_storage.clone(),
+            unique_storage: HashMap::new(),
+        }
+    }
+
     /// Check if a shared object exists in the registry by key.
     pub fn contains_shared(&self, key: &str) -> bool {
         self.shared_storage.contains_key(key)

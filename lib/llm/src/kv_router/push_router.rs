@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use dynamo_runtime::{
@@ -38,6 +42,37 @@ struct WorkerSelection {
     instance_id: u64,
     dp_rank: u32,
     overlap_amount: u32,
+}
+
+const WORKER_OVERLOAD_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
+fn retry_allowed_workers(
+    all_worker_ids: &HashSet<u64>,
+    base_allowed_worker_ids: Option<&HashSet<u64>>,
+    attempted_workers: &HashSet<u64>,
+) -> Option<HashSet<u64>> {
+    let mut allowed_worker_ids = base_allowed_worker_ids
+        .cloned()
+        .unwrap_or_else(|| all_worker_ids.clone());
+    allowed_worker_ids.retain(|worker_id| !attempted_workers.contains(worker_id));
+    Some(allowed_worker_ids)
+}
+
+fn is_service_overloaded_output(item: &Annotated<LLMEngineOutput>) -> bool {
+    item.data
+        .as_ref()
+        .is_some_and(LLMEngineOutput::is_service_overloaded)
+}
+
+fn is_service_overloaded_error(error: &Error) -> bool {
+    error
+        .downcast_ref::<dynamo_runtime::pipeline::PipelineError>()
+        .is_some_and(|pipeline_error| {
+            matches!(
+                pipeline_error,
+                dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(_)
+            )
+        })
 }
 
 /// Drop guard that manages the full lifecycle of a routed request:
@@ -194,13 +229,15 @@ impl KvPushRouter {
         request: &PreprocessedRequest,
         phase: RequestPhase,
         is_query_only: bool,
+        allowed_worker_ids_override: Option<HashSet<u64>>,
     ) -> Result<WorkerSelection, Error> {
         let routing = request.routing.as_ref();
         let lora_name = routing.and_then(|r| r.lora_name.clone());
         let priority_jump = routing.and_then(|r| r.priority_jump).unwrap_or(0.0);
         let dp_rank = routing.and_then(|r| r.dp_rank).unwrap_or(0);
         let expected_output_tokens = routing.and_then(|r| r.expected_output_tokens);
-        let allowed_worker_ids = routing.and_then(|r| r.allowed_worker_ids.clone());
+        let allowed_worker_ids = allowed_worker_ids_override
+            .or_else(|| routing.and_then(|r| r.allowed_worker_ids.clone()));
         let (routing_token_ids, block_mm_infos) = request.block_mm_routing_info();
 
         // Get pre-selected worker based on phase, with backend_instance_id as fallback
@@ -340,61 +377,22 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             .unwrap_or(RequestPhase::Aggregated);
 
         let block_size = self.chooser.block_size() as usize;
-        let selection = self
-            .select_worker(&context_id, &request, phase, is_query_only)
-            .instrument(tracing::info_span!("kv_router.select_worker"))
-            .await?;
-        let WorkerSelection {
-            instance_id,
-            dp_rank,
-            overlap_amount,
-        } = selection;
-
-        // In approximate mode (use_kv_events=false), record the routing decision
-        // so the indexer can track cache state based on routing decisions.
-        // This covers both pre-selected workers and find_best_match selections.
-        if !is_query_only && !self.chooser.kv_router_config().use_kv_events {
-            let worker = WorkerWithDpRank::new(instance_id, dp_rank);
-            let mut tokens_with_hashes =
-                TokensWithHashes::new(request.token_ids.clone(), self.chooser.block_size());
-            if let Err(e) = self
-                .chooser
-                .indexer()
-                .process_routing_decision_for_request(&mut tokens_with_hashes, worker)
-                .await
-            {
-                tracing::warn!(
-                    request_id = %context_id,
-                    worker_id = instance_id,
-                    dp_rank = dp_rank,
-                    error = %e,
-                    "Failed to record routing decision in approximate mode"
-                );
-            }
-        }
-
-        // Record routing metrics on tracker and observe ISL + prefill start.
         let request_metrics =
             RouterRequestMetrics::from_component(self.chooser.client().endpoint.component());
-        if let Some(ref tracker) = request.tracker {
-            let (routing_token_ids, _) = request.block_mm_routing_info();
-            let isl_blocks = routing_token_ids.len().div_ceil(block_size);
-            tracker.record_kv_hit(overlap_amount, isl_blocks);
-            tracker.record_isl(
-                routing_token_ids.len(),
-                overlap_amount as usize * block_size,
-            );
-            tracker.record_worker_full(instance_id, dp_rank, self.chooser.worker_type());
-            if let Some(hit_rate) = tracker.kv_hit_rate() {
-                request_metrics.kv_hit_rate.observe(hit_rate);
-            }
-        }
         request_metrics
             .input_sequence_tokens
             .observe(request.token_ids.len() as f64);
 
-        // Handle query-only requests: early return with worker info
         if is_query_only {
+            let selection = self
+                .select_worker(&context_id, &request, phase, true, None)
+                .instrument(tracing::info_span!("kv_router.select_worker"))
+                .await?;
+            let WorkerSelection {
+                instance_id,
+                dp_rank: _,
+                overlap_amount: _,
+            } = selection;
             let stream_context = request.context().clone();
             let worker_id_info = request.tracker.as_ref().and_then(|t| t.get_worker_info());
 
@@ -417,38 +415,211 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             return Ok(ResponseStream::new(Box::pin(stream), stream_context));
         }
 
-        // Route to worker
+        let request_template = request.clone_shallow();
+        let chooser = self.chooser.clone();
+        let tracker = request.tracker.clone();
         let isl_tokens = request.token_ids.len();
         let expected_output_tokens = request
             .routing
             .as_ref()
             .and_then(|r| r.expected_output_tokens);
         let track_output_blocks = self.chooser.kv_router_config().router_track_output_blocks;
-        let tracker = request.tracker.clone();
+        let base_allowed_worker_ids = request
+            .routing
+            .as_ref()
+            .and_then(|r| r.allowed_worker_ids.clone());
+        let all_worker_ids: HashSet<u64> = self.chooser.client().instance_ids().into_iter().collect();
+        let retry_deadline = self
+            .chooser
+            .kv_router_config()
+            .router_max_queue_wait_ms
+            .map(|wait_ms| Instant::now() + Duration::from_millis(wait_ms));
+        let candidate_pool_size = base_allowed_worker_ids
+            .as_ref()
+            .map(HashSet::len)
+            .unwrap_or_else(|| all_worker_ids.len());
+        let mut attempted_workers = HashSet::new();
 
-        let (mut backend_input, context) = request.into_parts();
-        backend_input.routing_mut().dp_rank = Some(dp_rank);
-        let updated_request = context.map(|_| backend_input);
+        let (selection, mut response_stream, first_item, stream_context) = loop {
+            let allowed_worker_ids = retry_allowed_workers(
+                &all_worker_ids,
+                base_allowed_worker_ids.as_ref(),
+                &attempted_workers,
+            );
 
-        // Record prefill start right before pushing to backend (OnceLock: first call wins).
-        if let Some(ref tracker) = tracker {
-            tracker.record_prefill_start();
+            if allowed_worker_ids.as_ref().is_some_and(HashSet::is_empty) {
+                if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(Error::new(dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(
+                        format!(
+                            "All workers reached the local total request limit before frontend queue wait expired for request {context_id}"
+                        ),
+                    )));
+                }
+                attempted_workers.clear();
+                tokio::time::sleep(WORKER_OVERLOAD_RETRY_BACKOFF).await;
+                continue;
+            }
+
+            let selection = self
+                .select_worker(
+                    &context_id,
+                    &request_template,
+                    phase,
+                    false,
+                    allowed_worker_ids.clone(),
+                )
+                .instrument(tracing::info_span!("kv_router.select_worker"))
+                .await?;
+
+            let WorkerSelection {
+                instance_id,
+                dp_rank,
+                overlap_amount,
+            } = selection;
+
+            let attempt_request = request_template.clone_shallow();
+            let (mut backend_input, context) = attempt_request.into_parts();
+            backend_input.routing_mut().dp_rank = Some(dp_rank);
+            backend_input.routing_mut().allowed_worker_ids = allowed_worker_ids.clone();
+            let updated_request = context.map(|_| backend_input);
+
+            if let Some(ref tracker) = tracker {
+                tracker.record_prefill_start();
+            }
+
+            let route_result = self
+                .inner
+                .direct(updated_request, instance_id)
+                .instrument(tracing::info_span!(
+                    "kv_router.route_request",
+                    request_id = %context_id,
+                    worker_id = instance_id,
+                    dp_rank = dp_rank,
+                    overlap_blocks = overlap_amount,
+                    phase = ?phase,
+                ))
+                .await;
+
+            let mut response_stream = match route_result {
+                Ok(response_stream) => response_stream,
+                Err(error) if is_service_overloaded_error(&error) => {
+                    if let Err(free_error) = chooser.free(&context_id).await {
+                        tracing::warn!(
+                            "Failed to free request {} after overload routing error: {free_error}",
+                            context_id
+                        );
+                    }
+                    attempted_workers.insert(instance_id);
+                    if attempted_workers.len() >= candidate_pool_size.max(1) {
+                        if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                            return Err(Error::new(dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(
+                                format!(
+                                    "All workers reached the local total request limit before frontend queue wait expired for request {context_id}"
+                                ),
+                            )));
+                        }
+                        attempted_workers.clear();
+                        tokio::time::sleep(WORKER_OVERLOAD_RETRY_BACKOFF).await;
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+            let Some(first_item) = response_stream.next().await else {
+                if let Err(free_error) = chooser.free(&context_id).await {
+                    tracing::warn!(
+                        "Failed to free request {} after empty initial worker response: {free_error}",
+                        context_id
+                    );
+                }
+                return Err(anyhow::anyhow!(
+                    "Worker {instance_id} returned an empty initial response stream for request {context_id}"
+                ));
+            };
+
+            if is_service_overloaded_output(&first_item) {
+                tracing::info!(
+                    request_id = %context_id,
+                    worker_id = instance_id,
+                    dp_rank = dp_rank,
+                    "Worker rejected request due to local total request limit; retrying another worker"
+                );
+                if let Err(free_error) = chooser.free(&context_id).await {
+                    tracing::warn!(
+                        "Failed to free request {} after worker-local overload: {free_error}",
+                        context_id
+                    );
+                }
+                attempted_workers.insert(instance_id);
+                if attempted_workers.len() >= candidate_pool_size.max(1) {
+                    if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return Err(Error::new(dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(
+                            format!(
+                                "All workers reached the local total request limit before frontend queue wait expired for request {context_id}"
+                            ),
+                        )));
+                    }
+                    attempted_workers.clear();
+                    tokio::time::sleep(WORKER_OVERLOAD_RETRY_BACKOFF).await;
+                }
+                continue;
+            }
+
+            let stream_context = response_stream.context();
+            break (
+                WorkerSelection {
+                    instance_id,
+                    dp_rank,
+                    overlap_amount,
+                },
+                response_stream,
+                first_item,
+                stream_context,
+            );
+        };
+
+        let WorkerSelection {
+            instance_id,
+            dp_rank,
+            overlap_amount,
+        } = selection;
+
+        if !self.chooser.kv_router_config().use_kv_events {
+            let worker = WorkerWithDpRank::new(instance_id, dp_rank);
+            let mut tokens_with_hashes =
+                TokensWithHashes::new(request_template.token_ids.clone(), self.chooser.block_size());
+            if let Err(e) = self
+                .chooser
+                .indexer()
+                .process_routing_decision_for_request(&mut tokens_with_hashes, worker)
+                .await
+            {
+                tracing::warn!(
+                    request_id = %context_id,
+                    worker_id = instance_id,
+                    dp_rank = dp_rank,
+                    error = %e,
+                    "Failed to record routing decision in approximate mode"
+                );
+            }
         }
 
-        let chooser = self.chooser.clone();
-        let mut response_stream = self
-            .inner
-            .direct(updated_request, instance_id)
-            .instrument(tracing::info_span!(
-                "kv_router.route_request",
-                request_id = %context_id,
-                worker_id = instance_id,
-                dp_rank = dp_rank,
-                overlap_blocks = overlap_amount,
-                phase = ?phase,
-            ))
-            .await?;
-        let stream_context = response_stream.context();
+        if let Some(ref tracker) = tracker {
+            let (routing_token_ids, _) = request_template.block_mm_routing_info();
+            let isl_blocks = routing_token_ids.len().div_ceil(block_size);
+            tracker.record_kv_hit(overlap_amount, isl_blocks);
+            tracker.record_isl(
+                routing_token_ids.len(),
+                overlap_amount as usize * block_size,
+            );
+            tracker.record_worker_full(instance_id, dp_rank, self.chooser.worker_type());
+            tracker.record_router_queue_depth(self.chooser.pending_count());
+            if let Some(hit_rate) = tracker.kv_hit_rate() {
+                request_metrics.kv_hit_rate.observe(hit_rate);
+            }
+        }
+
         let context_for_monitoring = stream_context.clone();
 
         let wrapped_stream = Box::pin(async_stream::stream! {
@@ -468,6 +639,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                 block_size,
                 expected_output_tokens,
             };
+            let mut pending_first_item = Some(first_item);
 
             loop {
                 tokio::select! {
@@ -478,7 +650,13 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                         break;
                     }
 
-                    item = response_stream.next() => {
+                    item = async {
+                        if let Some(item) = pending_first_item.take() {
+                            Some(item)
+                        } else {
+                            response_stream.next().await
+                        }
+                    } => {
                         let Some(item) = item else {
                             break;
                         };
