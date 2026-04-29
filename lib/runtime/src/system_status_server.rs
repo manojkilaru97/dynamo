@@ -328,7 +328,10 @@ async fn metrics_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
                 .drt()
                 .system_health()
                 .lock()
-                .record_system_status_request("metrics", StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+                .record_system_status_request(
+                    "metrics",
+                    StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to get metrics".to_string(),
@@ -386,7 +389,10 @@ async fn metadata_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
                 .drt()
                 .system_health()
                 .lock()
-                .record_system_status_request("metadata", StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+                .record_system_status_request(
+                    "metadata",
+                    StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to serialize metadata".to_string(),
@@ -751,7 +757,8 @@ mod integration_tests {
             {
                 let system_health = drt.system_health();
                 let system_health = system_health.lock();
-                system_health.set_endpoint_health_status("generate", crate::config::HealthStatus::Ready);
+                system_health
+                    .set_endpoint_health_status("generate", crate::config::HealthStatus::Ready);
                 system_health.record_endpoint_request_result("generate", true);
                 system_health.record_health_check_success("generate");
                 system_health.record_health_check_request_started("generate", "idle");
@@ -768,8 +775,11 @@ mod integration_tests {
             }
 
             let response = drt.metrics().prometheus_expfmt().unwrap();
-            println!("Full metrics response:
-{}", response);
+            println!(
+                "Full metrics response:
+{}",
+                response
+            );
 
             assert!(
                 response.contains("# HELP dynamo_component_uptime_seconds"),

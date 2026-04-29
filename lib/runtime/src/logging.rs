@@ -73,7 +73,7 @@ use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry::{global, trace::Tracer};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{Protocol, WithExportConfig};
+use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity};
 use opentelemetry::trace::TracerProvider as _;
@@ -215,7 +215,8 @@ fn build_tracer_provider(
     service_name: &str,
     resource: &Resource,
 ) -> Result<(SdkTracerProvider, Option<String>), Box<dyn std::error::Error>> {
-    let Some(traces_endpoint) = otlp_env_var(env_logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT) else {
+    let Some(traces_endpoint) = otlp_env_var(env_logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+    else {
         return Ok((build_local_tracer_provider(service_name), None));
     };
 
@@ -240,6 +241,7 @@ fn build_tracer_provider(
             let span_exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
                 .with_protocol(Protocol::HttpBinary)
+                .with_http_client(reqwest::blocking::Client::new())
                 .with_endpoint(&traces_endpoint)
                 .build()?;
 
@@ -287,6 +289,7 @@ fn build_logger_provider(
             let log_exporter = opentelemetry_otlp::LogExporter::builder()
                 .with_http()
                 .with_protocol(Protocol::HttpBinary)
+                .with_http_client(reqwest::blocking::Client::new())
                 .with_endpoint(&logs_endpoint)
                 .build()?;
 
@@ -1172,7 +1175,8 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
                 .with_service_name(service_name.clone())
                 .build();
 
-            let (tracer_provider, traces_endpoint) = build_tracer_provider(&service_name, &resource)?;
+            let (tracer_provider, traces_endpoint) =
+                build_tracer_provider(&service_name, &resource)?;
             let (logger_provider_opt, logs_endpoint) = build_logger_provider(&resource)?;
 
             if let Some(logger_provider) = logger_provider_opt.as_ref() {
@@ -1243,7 +1247,8 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
                 .with_service_name(service_name.clone())
                 .build();
 
-            let (tracer_provider, traces_endpoint) = build_tracer_provider(&service_name, &resource)?;
+            let (tracer_provider, traces_endpoint) =
+                build_tracer_provider(&service_name, &resource)?;
             let (logger_provider_opt, logs_endpoint) = build_logger_provider(&resource)?;
 
             if let Some(logger_provider) = logger_provider_opt.as_ref() {
@@ -1375,11 +1380,29 @@ fn json_value_to_any_value(value: serde_json::Value) -> AnyValue {
         )),
         serde_json::Value::Object(map) => AnyValue::Map(Box::new(
             map.into_iter()
-                .filter(|(_, value)| !value.is_null())
                 .map(|(key, value)| (Key::new(key), json_value_to_any_value(value)))
                 .collect(),
         )),
     }
+}
+
+fn json_value_contains_null(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Array(items) => items.iter().any(json_value_contains_null),
+        serde_json::Value::Object(map) => map.values().any(json_value_contains_null),
+        _ => false,
+    }
+}
+
+fn json_payload_to_any_value(value: serde_json::Value) -> AnyValue {
+    if json_value_contains_null(&value) {
+        if let Ok(payload) = serde_json::to_string(&value) {
+            return AnyValue::String(payload.into());
+        }
+    }
+
+    json_value_to_any_value(value)
 }
 
 /// Emit a structured OTEL log record for canonical request/response payload logging.
@@ -1403,7 +1426,14 @@ pub fn emit_payload_log(body: &'static str, target: &'static str, fields: serde_
     if let serde_json::Value::Object(map) = fields {
         record.add_attributes(
             map.into_iter()
-                .map(|(key, value)| (Key::new(key), json_value_to_any_value(value))),
+                .map(|(key, value)| {
+                    let value = if key == "payload" || key == "headers" {
+                        json_payload_to_any_value(value)
+                    } else {
+                        json_value_to_any_value(value)
+                    };
+                    (Key::new(key), value)
+                }),
         );
     }
 
@@ -2257,8 +2287,14 @@ pub mod tests {
     #[test]
     fn test_parse_otlp_transport_variants() {
         assert_eq!(parse_otlp_transport("grpc"), Some(OtlpTransport::Grpc));
-        assert_eq!(parse_otlp_transport("http/protobuf"), Some(OtlpTransport::HttpBinary));
-        assert_eq!(parse_otlp_transport("http"), Some(OtlpTransport::HttpBinary));
+        assert_eq!(
+            parse_otlp_transport("http/protobuf"),
+            Some(OtlpTransport::HttpBinary)
+        );
+        assert_eq!(
+            parse_otlp_transport("http"),
+            Some(OtlpTransport::HttpBinary)
+        );
         assert_eq!(parse_otlp_transport("bogus"), None);
     }
 
@@ -2266,8 +2302,14 @@ pub mod tests {
     fn test_resolve_otlp_transport_defaults_from_endpoint_shape() {
         temp_env::with_vars(
             [
-                (env_logging::otlp::OTEL_EXPORTER_OTLP_PROTOCOL, None::<String>),
-                (env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_PROTOCOL, None::<String>),
+                (
+                    env_logging::otlp::OTEL_EXPORTER_OTLP_PROTOCOL,
+                    None::<String>,
+                ),
+                (
+                    env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_PROTOCOL,
+                    None::<String>,
+                ),
             ],
             || {
                 assert_eq!(
@@ -2291,7 +2333,10 @@ pub mod tests {
     #[test]
     fn test_explicit_signal_protocol_overrides_endpoint_shape() {
         temp_env::with_vars(
-            [(env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_PROTOCOL, Some("http/protobuf"))],
+            [(
+                env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_PROTOCOL,
+                Some("http/protobuf"),
+            )],
             || {
                 assert_eq!(
                     resolve_otlp_transport(
@@ -2308,11 +2353,26 @@ pub mod tests {
     fn test_otlp_exporters_do_not_default_to_localhost_when_endpoints_are_unset() {
         temp_env::with_vars(
             [
-                (env_logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, None::<String>),
-                (env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, None::<String>),
-                (env_logging::otlp::OTEL_EXPORTER_OTLP_PROTOCOL, None::<String>),
-                (env_logging::otlp::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, None::<String>),
-                (env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_PROTOCOL, None::<String>),
+                (
+                    env_logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+                    None::<String>,
+                ),
+                (
+                    env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
+                    None::<String>,
+                ),
+                (
+                    env_logging::otlp::OTEL_EXPORTER_OTLP_PROTOCOL,
+                    None::<String>,
+                ),
+                (
+                    env_logging::otlp::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+                    None::<String>,
+                ),
+                (
+                    env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_PROTOCOL,
+                    None::<String>,
+                ),
             ],
             || {
                 let resource = Resource::builder_empty()

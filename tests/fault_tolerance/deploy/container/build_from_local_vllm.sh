@@ -2,7 +2,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Build script for Dynamo with local/pre-built vLLM images
+# Build script for Dynamo with local/pre-built vLLM images.
+#
+# DO NOT USE THIS FOR MINIMAX RELEASE IMAGES.
+# FOR MINIMAX RELEASE IMAGES:
+#   NEVER REBUILD THE BASE vLLM IMAGE HERE.
+#   ALWAYS USE /home/scratch.mkilaru_gpu/mistral/Dockerfile.release_dynamo_local_vllm_overlay
+#   SO THE FLOW IS:
+#     build/update Dynamo runtime -> overlay local ds/vllm -> push final tag
 
 set -e
 
@@ -180,4 +187,3 @@ echo ""
 echo "To push to registry:"
 echo "  docker tag $OUTPUT_TAG <your-registry>/$OUTPUT_TAG"
 echo "  docker push <your-registry>/$OUTPUT_TAG"
-

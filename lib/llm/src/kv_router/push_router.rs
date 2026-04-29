@@ -428,7 +428,8 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             .routing
             .as_ref()
             .and_then(|r| r.allowed_worker_ids.clone());
-        let all_worker_ids: HashSet<u64> = self.chooser.client().instance_ids().into_iter().collect();
+        let all_worker_ids: HashSet<u64> =
+            self.chooser.client().instance_ids().into_iter().collect();
         let retry_deadline = self
             .chooser
             .kv_router_config()
@@ -449,11 +450,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
 
             if allowed_worker_ids.as_ref().is_some_and(HashSet::is_empty) {
                 if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Err(Error::new(dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(
-                        format!(
+                    return Err(Error::new(
+                        dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(format!(
                             "All workers reached the local total request limit before frontend queue wait expired for request {context_id}"
-                        ),
-                    )));
+                        )),
+                    ));
                 }
                 attempted_workers.clear();
                 tokio::time::sleep(WORKER_OVERLOAD_RETRY_BACKOFF).await;
@@ -512,11 +513,13 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                     attempted_workers.insert(instance_id);
                     if attempted_workers.len() >= candidate_pool_size.max(1) {
                         if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                            return Err(Error::new(dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(
-                                format!(
-                                    "All workers reached the local total request limit before frontend queue wait expired for request {context_id}"
+                            return Err(Error::new(
+                                dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(
+                                    format!(
+                                        "All workers reached the local total request limit before frontend queue wait expired for request {context_id}"
+                                    ),
                                 ),
-                            )));
+                            ));
                         }
                         attempted_workers.clear();
                         tokio::time::sleep(WORKER_OVERLOAD_RETRY_BACKOFF).await;
@@ -554,11 +557,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                 attempted_workers.insert(instance_id);
                 if attempted_workers.len() >= candidate_pool_size.max(1) {
                     if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        return Err(Error::new(dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(
-                            format!(
+                        return Err(Error::new(
+                            dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(format!(
                                 "All workers reached the local total request limit before frontend queue wait expired for request {context_id}"
-                            ),
-                        )));
+                            )),
+                        ));
                     }
                     attempted_workers.clear();
                     tokio::time::sleep(WORKER_OVERLOAD_RETRY_BACKOFF).await;
@@ -587,8 +590,10 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
 
         if !self.chooser.kv_router_config().use_kv_events {
             let worker = WorkerWithDpRank::new(instance_id, dp_rank);
-            let mut tokens_with_hashes =
-                TokensWithHashes::new(request_template.token_ids.clone(), self.chooser.block_size());
+            let mut tokens_with_hashes = TokensWithHashes::new(
+                request_template.token_ids.clone(),
+                self.chooser.block_size(),
+            );
             if let Err(e) = self
                 .chooser
                 .indexer()

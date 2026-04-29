@@ -257,6 +257,7 @@ pub struct Metrics {
     request_type_tool_call_total: IntCounter,
     request_type_structured_output_total: IntCounter,
     request_type_streaming_total: IntCounter,
+    request_input_tools_total: IntCounter,
     request_tool_choice_total: IntCounterVec,
     request_structured_output_kind_total: IntCounterVec,
     request_structured_output_backend_total: IntCounterVec,
@@ -413,6 +414,7 @@ struct RequestShapeObservation {
     tool_choice: &'static str,
     structured_output_kind: &'static str,
     structured_output_backend: String,
+    tool_count: usize,
     has_image: bool,
     has_video: bool,
     is_streaming: bool,
@@ -446,7 +448,11 @@ fn structured_outputs_kind(params: Option<&StructuredOutputsParams>) -> Option<&
     if params.regex.is_some() {
         return Some("regex");
     }
-    if params.choice.as_ref().is_some_and(|choice| !choice.is_empty()) {
+    if params
+        .choice
+        .as_ref()
+        .is_some_and(|choice| !choice.is_empty())
+    {
         return Some("choice");
     }
     if params.grammar.is_some() {
@@ -465,7 +471,12 @@ fn detect_structured_output_kind(request: &NvCreateChatCompletionRequest) -> &'s
     if request.common.guided_regex.is_some() {
         return "regex";
     }
-    if request.common.guided_choice.as_ref().is_some_and(|choice| !choice.is_empty()) {
+    if request
+        .common
+        .guided_choice
+        .as_ref()
+        .is_some_and(|choice| !choice.is_empty())
+    {
         return "choice";
     }
     if request.common.guided_grammar.is_some() {
@@ -511,6 +522,7 @@ fn observe_request_shape(
         .tools
         .as_ref()
         .is_some_and(|tools| !tools.is_empty());
+    let tool_count = request.inner.tools.as_ref().map_or(0, |tools| tools.len());
     let tool_choice = normalize_tool_choice(request.inner.tool_choice.as_ref(), has_tools);
     let structured_output_kind = detect_structured_output_kind(request);
     let structured_output_backend = request
@@ -524,6 +536,7 @@ fn observe_request_shape(
         tool_choice,
         structured_output_kind,
         structured_output_backend,
+        tool_count,
         has_image,
         has_video,
         is_streaming: streaming,
@@ -711,6 +724,12 @@ impl Metrics {
         )
         .unwrap();
 
+        let request_input_tools_total = IntCounter::new(
+            frontend_metric_name("request_input_tools_total"),
+            "Total tools supplied across Dynamo frontend requests",
+        )
+        .unwrap();
+
         let request_tool_choice_total = IntCounterVec::new(
             Opts::new(
                 frontend_metric_name("request_tool_choice_total"),
@@ -883,6 +902,7 @@ impl Metrics {
             request_type_tool_call_total,
             request_type_structured_output_total,
             request_type_streaming_total,
+            request_input_tools_total,
             request_tool_choice_total,
             request_structured_output_kind_total,
             request_structured_output_backend_total,
@@ -994,9 +1014,12 @@ impl Metrics {
         registry.register(Box::new(self.request_type_tool_call_total.clone()))?;
         registry.register(Box::new(self.request_type_structured_output_total.clone()))?;
         registry.register(Box::new(self.request_type_streaming_total.clone()))?;
+        registry.register(Box::new(self.request_input_tools_total.clone()))?;
         registry.register(Box::new(self.request_tool_choice_total.clone()))?;
         registry.register(Box::new(self.request_structured_output_kind_total.clone()))?;
-        registry.register(Box::new(self.request_structured_output_backend_total.clone()))?;
+        registry.register(Box::new(
+            self.request_structured_output_backend_total.clone(),
+        ))?;
 
         // Register runtime configuration metrics
         registry.register(Box::new(self.model_total_kv_blocks.clone()))?;
@@ -1159,6 +1182,8 @@ impl Metrics {
         }
         if observation.tool_choice != "none" {
             self.request_type_tool_call_total.inc();
+            self.request_input_tools_total
+                .inc_by(observation.tool_count as u64);
             self.request_tool_choice_total
                 .with_label_values(&[observation.tool_choice])
                 .inc();
@@ -1954,7 +1979,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_observe_chat_request_shape_records_tool_choice_metrics() {
         let metrics = Arc::new(Metrics::new());
@@ -1983,6 +2007,7 @@ mod tests {
         metrics.observe_chat_request_shape(&request, false);
 
         assert_eq!(metrics.request_type_tool_call_total.get(), 1);
+        assert_eq!(metrics.request_input_tools_total.get(), 1);
         assert_eq!(
             metrics
                 .request_tool_choice_total
