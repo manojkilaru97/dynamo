@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "runtime-protocols")]
 use std::sync::Arc;
+use std::sync::Mutex;
 #[cfg(all(feature = "metrics", feature = "runtime-protocols"))]
 use std::sync::OnceLock;
-use std::sync::Mutex;
 
 use dashmap::DashMap;
 #[cfg(feature = "runtime-protocols")]
@@ -90,7 +90,8 @@ const KV_CACHE_EVENTS_APPLIED_NAME: &str = "dynamo_kvrouter_kv_cache_events_appl
 #[cfg(feature = "metrics")]
 const KV_CACHE_EVENTS_APPLIED_BY_WORKER_SUFFIX: &str = "kv_cache_events_applied_by_worker_total";
 #[cfg(feature = "metrics")]
-const KV_CACHE_EVENTS_APPLIED_BY_WORKER_NAME: &str = "dynamo_kvrouter_kv_cache_events_applied_by_worker_total";
+const KV_CACHE_EVENTS_APPLIED_BY_WORKER_NAME: &str =
+    "dynamo_kvrouter_kv_cache_events_applied_by_worker_total";
 #[cfg(feature = "metrics")]
 const KV_CACHE_EVENTS_DROPPED_SUFFIX: &str = "kv_cache_events_dropped_total";
 #[cfg(feature = "metrics")]
@@ -194,16 +195,15 @@ impl KvIndexerMetrics {
         #[cfg(not(feature = "metrics"))]
         {
             let _ = component;
-            Arc::new(Self::new_unregistered_with_quarantine_policy(quarantine_policy))
+            Arc::new(Self::new_unregistered_with_quarantine_policy(
+                quarantine_policy,
+            ))
         }
     }
 
     #[cfg(feature = "runtime-protocols")]
     pub fn from_component(component: &Component) -> Arc<Self> {
-        Self::from_component_with_quarantine_policy(
-            component,
-            KvMissQuarantinePolicy::disabled(),
-        )
+        Self::from_component_with_quarantine_policy(component, KvMissQuarantinePolicy::disabled())
     }
 
     #[cfg(feature = "metrics")]
@@ -315,7 +315,12 @@ impl KvIndexerMetrics {
         false
     }
 
-    pub fn record_dropped_event(&self, worker_id: WorkerId, event_type: &'static str, reason: &'static str) {
+    pub fn record_dropped_event(
+        &self,
+        worker_id: WorkerId,
+        event_type: &'static str,
+        reason: &'static str,
+    ) {
         #[cfg(feature = "metrics")]
         {
             let worker_id_label = worker_id.to_string();
@@ -357,7 +362,10 @@ impl KvIndexerMetrics {
             return WorkerKvEventAction::Apply;
         }
 
-        let threshold = self.quarantine_policy.miss_threshold.expect("checked above");
+        let threshold = self
+            .quarantine_policy
+            .miss_threshold
+            .expect("checked above");
         let now = Instant::now();
         let state = self.worker_states.entry(worker_id).or_default();
 

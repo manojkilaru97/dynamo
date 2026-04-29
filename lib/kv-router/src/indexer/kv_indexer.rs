@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     DumpRequest, GetWorkersRequest, KvIndexerInterface, KvIndexerMetrics, KvRouterError,
-    MatchRequest, RadixTree, RoutingDecisionRequest, WorkerKvEventAction,
-    METRIC_STATUS_DROPPED_QUARANTINED,
+    METRIC_STATUS_DROPPED_QUARANTINED, MatchRequest, RadixTree, RoutingDecisionRequest,
+    WorkerKvEventAction,
 };
 use crate::indexer::pruning::{BlockEntry, PruneConfig, PruneManager};
 use crate::protocols::*;
@@ -51,11 +51,7 @@ fn apply_event_with_prune_tracking(
     let worker_id = event.worker_id;
 
     if metrics.should_drop_event(worker_id) {
-        metrics.record_dropped_event(
-            worker_id,
-            event_type,
-            METRIC_STATUS_DROPPED_QUARANTINED,
-        );
+        metrics.record_dropped_event(worker_id, event_type, METRIC_STATUS_DROPPED_QUARANTINED);
         return;
     }
 

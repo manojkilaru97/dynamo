@@ -10,8 +10,8 @@ use dynamo_kv_router::{
     approx::PruneConfig,
     config::{KvRouterConfig, RouterConfigOverride},
     indexer::{
-        GetWorkersRequest, KvIndexer, KvIndexerInterface, KvIndexerMetrics,
-        KvMissQuarantinePolicy, KvRouterError,
+        GetWorkersRequest, KvIndexer, KvIndexerInterface, KvIndexerMetrics, KvMissQuarantinePolicy,
+        KvRouterError,
     },
     protocols::KV_EVENT_SUBJECT,
     protocols::{
@@ -141,9 +141,7 @@ impl Indexer {
     fn miss_quarantine_policy(kv_router_config: &KvRouterConfig) -> KvMissQuarantinePolicy {
         KvMissQuarantinePolicy {
             miss_threshold: kv_router_config.router_kv_miss_quarantine_threshold,
-            window: Duration::from_secs_f64(
-                kv_router_config.router_kv_miss_quarantine_window_secs,
-            ),
+            window: Duration::from_secs_f64(kv_router_config.router_kv_miss_quarantine_window_secs),
             cooldown: Duration::from_secs_f64(
                 kv_router_config.router_kv_miss_quarantine_cooldown_secs,
             ),

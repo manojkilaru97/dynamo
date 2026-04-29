@@ -153,7 +153,12 @@ impl HealthCheckManager {
             let current_status = system_health_lock
                 .get_endpoint_health_status(endpoint_subject)
                 .unwrap_or(HealthStatus::NotReady);
-            (current_status, real_traffic_window, real_traffic_status, has_recent_real_success)
+            (
+                current_status,
+                real_traffic_window,
+                real_traffic_status,
+                has_recent_real_success,
+            )
         };
 
         if matches!(real_traffic_status, HealthStatus::Ready)
@@ -425,11 +430,8 @@ impl HealthCheckManager {
             }
         };
 
-        match tokio::time::timeout(
-            Duration::from_secs(10),
-            router.client.wait_for_instances(),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_secs(10), router.client.wait_for_instances())
+            .await
         {
             Ok(Ok(instances)) => {
                 debug!(

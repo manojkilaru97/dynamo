@@ -199,6 +199,186 @@ fn error_response_payload(response: &ErrorResponse) -> serde_json::Value {
     })
 }
 
+fn count_payload_modalities(payload: &serde_json::Value) -> (usize, usize, usize) {
+    fn count_content_parts(content: &serde_json::Value, counts: &mut (usize, usize, usize)) {
+        let Some(parts) = content.as_array() else {
+            return;
+        };
+        for part in parts {
+            let Some(part_type) = part.get("type").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            match part_type {
+                "image_url" | "input_image" => counts.0 += 1,
+                "video_url" => counts.1 += 1,
+                "audio_url" | "input_audio" => counts.2 += 1,
+                _ => {}
+            }
+        }
+    }
+
+    let mut counts = (0, 0, 0);
+    if let Some(messages) = payload.get("messages").and_then(serde_json::Value::as_array) {
+        for message in messages {
+            if let Some(content) = message.get("content") {
+                count_content_parts(content, &mut counts);
+            }
+        }
+    }
+    if let Some(input_items) = payload.get("input").and_then(serde_json::Value::as_array) {
+        for item in input_items {
+            let item_type = item
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            match item_type {
+                "image_url" | "input_image" => {
+                    counts.0 += 1;
+                    continue;
+                }
+                "audio_url" | "input_audio" => {
+                    counts.2 += 1;
+                    continue;
+                }
+                "video_url" => {
+                    counts.1 += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(content) = item.get("content") {
+                count_content_parts(content, &mut counts);
+            }
+        }
+    }
+    counts
+}
+
+fn normalize_payload_tool_choice(payload: &serde_json::Value) -> Option<&'static str> {
+    match payload.get("tool_choice") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(choice)) => match choice.as_str() {
+            "auto" => Some("auto"),
+            "none" => Some("none"),
+            "required" => Some("required"),
+            _ => Some("other"),
+        },
+        Some(serde_json::Value::Object(choice)) => {
+            if choice
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .is_some()
+            {
+                Some("named")
+            } else {
+                choice
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|choice_type| match choice_type {
+                        "auto" => "auto",
+                        "none" => "none",
+                        "required" => "required",
+                        "function" => "function",
+                        _ => "other",
+                    })
+                    .or(Some("named"))
+            }
+        }
+        Some(_) => Some("other"),
+    }
+}
+
+fn detect_payload_structured_output_kind(payload: &serde_json::Value) -> Option<&'static str> {
+    if let Some(response_format) = payload
+        .get("response_format")
+        .and_then(serde_json::Value::as_object)
+        && let Some(format_type) = response_format
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+    {
+        match format_type {
+            "json_schema" => return Some("json_schema"),
+            "json_object" => return Some("json_object"),
+            "structural_tag" => return Some("structural_tag"),
+            _ => {}
+        }
+    }
+
+    if let Some(structured_outputs) = payload.get("structured_outputs") {
+        if let Some(structured_outputs) = structured_outputs.as_object() {
+            if structured_outputs.is_empty() {
+                return None;
+            }
+            for key in [
+                "json",
+                "json_object",
+                "json_schema",
+                "structural_tag",
+                "regex",
+                "choice",
+                "grammar",
+            ] {
+                if structured_outputs.get(key).is_some_and(|value| !value.is_null()) {
+                    return Some(if key == "json" { "json_schema" } else { key });
+                }
+            }
+        }
+        return Some("structured_outputs");
+    }
+
+    if let Some(text) = payload.get("text").and_then(serde_json::Value::as_object)
+        && let Some(format) = text.get("format").and_then(serde_json::Value::as_object)
+        && let Some(format_type) = format.get("type").and_then(serde_json::Value::as_str)
+    {
+        match format_type {
+            "json_schema" => return Some("json_schema"),
+            "json_object" => return Some("json_object"),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn add_request_shape_log_attrs(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    payload: &serde_json::Value,
+) {
+    let (image_count, video_count, audio_count) = count_payload_modalities(payload);
+    let tool_count = payload
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let tool_choice = normalize_payload_tool_choice(payload);
+    let structured_output_kind = detect_payload_structured_output_kind(payload);
+
+    fields.insert("input_image_count".to_string(), image_count.into());
+    fields.insert("input_video_count".to_string(), video_count.into());
+    fields.insert("input_audio_count".to_string(), audio_count.into());
+    fields.insert("input_tool_count".to_string(), tool_count.into());
+    fields.insert("has_images".to_string(), (image_count > 0).into());
+    fields.insert("has_videos".to_string(), (video_count > 0).into());
+    fields.insert("has_audios".to_string(), (audio_count > 0).into());
+    fields.insert("has_tools".to_string(), (tool_count > 0).into());
+    fields.insert(
+        "has_tool_calls_enabled".to_string(),
+        (tool_count > 0 && tool_choice != Some("none")).into(),
+    );
+    fields.insert(
+        "has_structured_output".to_string(),
+        structured_output_kind.is_some().into(),
+    );
+    if let Some(tool_choice) = tool_choice {
+        fields.insert("tool_choice".to_string(), tool_choice.into());
+    }
+    if let Some(structured_output_kind) = structured_output_kind {
+        fields.insert(
+            "structured_output_kind".to_string(),
+            structured_output_kind.into(),
+        );
+    }
+}
+
 fn emit_openai_request_log(
     request_id: &str,
     model: &str,
@@ -211,18 +391,20 @@ fn emit_openai_request_log(
         return;
     }
 
+    let mut fields = serde_json::Map::new();
+    fields.insert("rid".to_string(), request_id.into());
+    fields.insert("request_id".to_string(), request_id.into());
+    fields.insert("model".to_string(), model.into());
+    fields.insert("endpoint".to_string(), endpoint.into());
+    fields.insert("streaming".to_string(), streaming.into());
+    fields.insert("headers".to_string(), headers.clone());
+    add_request_shape_log_attrs(&mut fields, &payload);
+    fields.insert("payload".to_string(), payload.clone());
+
     emit_payload_log(
         "openai.request",
         PAYLOAD_LOG_TARGET,
-        serde_json::json!({
-            "rid": request_id,
-            "request_id": request_id,
-            "model": model,
-            "endpoint": endpoint,
-            "streaming": streaming,
-            "headers": headers,
-            "payload": payload,
-        }),
+        serde_json::Value::Object(fields),
     );
 
     if endpoint == "responses" {

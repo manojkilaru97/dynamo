@@ -233,10 +233,7 @@ fn make_indexer_with_metrics(
 }
 
 fn make_indexer(variant: &str) -> Box<dyn KvIndexerInterface> {
-    make_indexer_with_metrics(
-        variant,
-        Arc::new(KvIndexerMetrics::new_unregistered()),
-    )
+    make_indexer_with_metrics(variant, Arc::new(KvIndexerMetrics::new_unregistered()))
 }
 
 /// Ensure queued indexer work is drained, then give a short settle window.

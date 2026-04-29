@@ -33,8 +33,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    KvIndexerMetrics, SyncIndexer, WorkerKvEventAction, WorkerTask,
-    METRIC_STATUS_DROPPED_QUARANTINED,
+    KvIndexerMetrics, METRIC_STATUS_DROPPED_QUARANTINED, SyncIndexer, WorkerKvEventAction,
+    WorkerTask,
 };
 use crate::protocols::*;
 

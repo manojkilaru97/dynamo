@@ -25,8 +25,8 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    KvIndexerMetrics, SyncIndexer, WorkerKvEventAction, WorkerTask,
-    METRIC_STATUS_DROPPED_QUARANTINED,
+    KvIndexerMetrics, METRIC_STATUS_DROPPED_QUARANTINED, SyncIndexer, WorkerKvEventAction,
+    WorkerTask,
 };
 use crate::protocols::{
     DpRank, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheEventError,

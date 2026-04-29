@@ -397,7 +397,10 @@ impl SystemHealth {
 
         let endpoint_is_ready = |endpoint: &str,
                                  endpoint_health: &HashMap<String, HealthStatus>,
-                                 endpoint_real_traffic_health: &mut HashMap<String, RealTrafficWindow>| {
+                                 endpoint_real_traffic_health: &mut HashMap<
+            String,
+            RealTrafficWindow,
+        >| {
             let base_ready = endpoint_health
                 .get(endpoint)
                 .is_some_and(|status| *status == HealthStatus::Ready);
@@ -411,7 +414,11 @@ impl SystemHealth {
 
         let healthy = if !self.use_endpoint_health_status.is_empty() {
             self.use_endpoint_health_status.iter().all(|endpoint| {
-                endpoint_is_ready(endpoint, &endpoint_health, &mut endpoint_real_traffic_health)
+                endpoint_is_ready(
+                    endpoint,
+                    &endpoint_health,
+                    &mut endpoint_real_traffic_health,
+                )
             })
         } else if !health_check_targets.is_empty() {
             health_check_targets.keys().all(|endpoint_subject| {
@@ -471,7 +478,8 @@ impl SystemHealth {
         }
 
         {
-            let mut endpoint_real_traffic_health = self.endpoint_real_traffic_health.write().unwrap();
+            let mut endpoint_real_traffic_health =
+                self.endpoint_real_traffic_health.write().unwrap();
             endpoint_real_traffic_health
                 .entry(key.clone())
                 .or_insert_with(RealTrafficWindow::default);
@@ -539,7 +547,6 @@ impl SystemHealth {
         Ok(())
     }
 
-
     pub fn initialize_health_observability_metrics<T: MetricsHierarchy>(
         &self,
         registry: &T,
@@ -571,9 +578,9 @@ impl SystemHealth {
         )?;
         self.endpoint_real_traffic_failure_ratio_gauge
             .set(endpoint_real_traffic_failure_ratio_gauge)
-            .map_err(|_| anyhow::anyhow!(
-                "endpoint_real_traffic_failure_ratio_gauge already initialized"
-            ))?;
+            .map_err(|_| {
+                anyhow::anyhow!("endpoint_real_traffic_failure_ratio_gauge already initialized")
+            })?;
 
         let endpoint_real_traffic_samples_gauge = registry.metrics().create_gaugevec(
             distributed_runtime::ENDPOINT_REAL_TRAFFIC_SAMPLES,
@@ -583,7 +590,9 @@ impl SystemHealth {
         )?;
         self.endpoint_real_traffic_samples_gauge
             .set(endpoint_real_traffic_samples_gauge)
-            .map_err(|_| anyhow::anyhow!("endpoint_real_traffic_samples_gauge already initialized"))?;
+            .map_err(|_| {
+                anyhow::anyhow!("endpoint_real_traffic_samples_gauge already initialized")
+            })?;
 
         let endpoint_real_traffic_outcome_samples_gauge = registry.metrics().create_gaugevec(
             distributed_runtime::ENDPOINT_REAL_TRAFFIC_OUTCOME_SAMPLES,
@@ -593,9 +602,9 @@ impl SystemHealth {
         )?;
         self.endpoint_real_traffic_outcome_samples_gauge
             .set(endpoint_real_traffic_outcome_samples_gauge)
-            .map_err(|_| anyhow::anyhow!(
-                "endpoint_real_traffic_outcome_samples_gauge already initialized"
-            ))?;
+            .map_err(|_| {
+                anyhow::anyhow!("endpoint_real_traffic_outcome_samples_gauge already initialized")
+            })?;
 
         let health_check_last_success_age_seconds_gauge = registry.metrics().create_gaugevec(
             distributed_runtime::HEALTH_CHECK_LAST_SUCCESS_AGE_SECONDS,
@@ -605,9 +614,9 @@ impl SystemHealth {
         )?;
         self.health_check_last_success_age_seconds_gauge
             .set(health_check_last_success_age_seconds_gauge)
-            .map_err(|_| anyhow::anyhow!(
-                "health_check_last_success_age_seconds_gauge already initialized"
-            ))?;
+            .map_err(|_| {
+                anyhow::anyhow!("health_check_last_success_age_seconds_gauge already initialized")
+            })?;
 
         let health_check_requests_started_total = registry.metrics().create_intcountervec(
             distributed_runtime::HEALTH_CHECK_REQUESTS_STARTED_TOTAL,
@@ -617,7 +626,9 @@ impl SystemHealth {
         )?;
         self.health_check_requests_started_total
             .set(health_check_requests_started_total)
-            .map_err(|_| anyhow::anyhow!("health_check_requests_started_total already initialized"))?;
+            .map_err(|_| {
+                anyhow::anyhow!("health_check_requests_started_total already initialized")
+            })?;
 
         let health_check_requests_completed_total = registry.metrics().create_intcountervec(
             distributed_runtime::HEALTH_CHECK_REQUESTS_COMPLETED_TOTAL,
@@ -627,7 +638,9 @@ impl SystemHealth {
         )?;
         self.health_check_requests_completed_total
             .set(health_check_requests_completed_total)
-            .map_err(|_| anyhow::anyhow!("health_check_requests_completed_total already initialized"))?;
+            .map_err(|_| {
+                anyhow::anyhow!("health_check_requests_completed_total already initialized")
+            })?;
 
         let health_check_last_duration_seconds_gauge = registry.metrics().create_gaugevec(
             distributed_runtime::HEALTH_CHECK_LAST_DURATION_SECONDS,
@@ -637,7 +650,9 @@ impl SystemHealth {
         )?;
         self.health_check_last_duration_seconds_gauge
             .set(health_check_last_duration_seconds_gauge)
-            .map_err(|_| anyhow::anyhow!("health_check_last_duration_seconds_gauge already initialized"))?;
+            .map_err(|_| {
+                anyhow::anyhow!("health_check_last_duration_seconds_gauge already initialized")
+            })?;
 
         let system_status_requests_total = registry.metrics().create_intcountervec(
             distributed_runtime::SYSTEM_STATUS_REQUESTS_TOTAL,
@@ -662,14 +677,22 @@ impl SystemHealth {
 
         let endpoint_health = self.endpoint_health.read().unwrap();
         let mut endpoint_real_traffic_health = self.endpoint_real_traffic_health.write().unwrap();
-        let endpoint_last_health_check_success = self.endpoint_last_health_check_success.read().unwrap();
+        let endpoint_last_health_check_success =
+            self.endpoint_last_health_check_success.read().unwrap();
 
         for endpoint in endpoint_health.keys() {
             let base_ready = endpoint_health
                 .get(endpoint)
                 .is_some_and(|status| *status == HealthStatus::Ready);
 
-            let (real_ready, failure_ratio, total_samples, success_samples, failure_samples, overloaded_samples) = endpoint_real_traffic_health
+            let (
+                real_ready,
+                failure_ratio,
+                total_samples,
+                success_samples,
+                failure_samples,
+                overloaded_samples,
+            ) = endpoint_real_traffic_health
                 .get_mut(endpoint)
                 .map(|window| {
                     let status = window.status_at(now, &self.real_traffic_health_config);
@@ -718,8 +741,12 @@ impl SystemHealth {
                 let success_labels = [endpoint.as_str(), RequestOutcome::Success.label()];
                 let failure_labels = [endpoint.as_str(), RequestOutcome::Failure.label()];
                 let overloaded_labels = [endpoint.as_str(), RequestOutcome::Overloaded.label()];
-                gauge.with_label_values(&success_labels).set(success_samples);
-                gauge.with_label_values(&failure_labels).set(failure_samples);
+                gauge
+                    .with_label_values(&success_labels)
+                    .set(success_samples);
+                gauge
+                    .with_label_values(&failure_labels)
+                    .set(failure_samples);
                 gauge
                     .with_label_values(&overloaded_labels)
                     .set(overloaded_samples);
@@ -881,10 +908,12 @@ mod tests {
 
         let (healthy, _endpoints, reasons) = system_health.get_health_status_with_reasons();
         assert!(!healthy);
-        assert!(reasons
-            .get("generate")
-            .expect("missing generate reason")
-            .contains("real traffic failure ratio"));
+        assert!(
+            reasons
+                .get("generate")
+                .expect("missing generate reason")
+                .contains("real traffic failure ratio")
+        );
     }
 
     #[test]
