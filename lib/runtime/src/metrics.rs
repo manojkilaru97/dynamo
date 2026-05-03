@@ -7,6 +7,7 @@
 //! with automatic label injection and hierarchical naming support.
 
 pub mod prometheus_names;
+pub mod frontend_perf;
 pub mod request_plane;
 pub mod work_handler_perf;
 
@@ -889,6 +890,21 @@ impl MetricsRegistry {
             .unwrap()
             .register(collector)
             .map_err(|e| anyhow::anyhow!("Failed to register metric: {}", e))
+    }
+
+    /// Add a metric collector and log registration failures instead of failing startup.
+    pub fn add_metric_or_warn(
+        &self,
+        collector: Box<dyn prometheus::core::Collector>,
+        metric_name: &str,
+    ) {
+        if let Err(err) = self.add_metric(collector) {
+            tracing::warn!(
+                metric = metric_name,
+                error = %err,
+                "failed to register prometheus metric"
+            );
+        }
     }
 
     /// Get a read guard to the Prometheus registry for scraping

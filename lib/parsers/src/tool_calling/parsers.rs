@@ -3004,6 +3004,299 @@ weather forecasting
         assert_eq!(args["items"], serde_json::json!([1, 2, 3, 4, 5]));
     }
 
+    #[tokio::test]
+    async fn test_qwen3_coder_recovers_stripped_single_tool_parameter_prefix() {
+        let input = r#">
+vLLM structured outputs overview
+</parameter>
+<parameter=max_results>
+5
+</parameter>"#;
+        let tools = vec![ToolDefinition {
+            name: "search_web".to_string(),
+            parameters: Some(serde_json::json!({
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer"}
+                },
+                "required": ["query"]
+            })),
+        }];
+
+        let (result, content) =
+            detect_and_parse_tool_call(input, Some("qwen3_coder"), Some(&tools))
+                .await
+                .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "search_web");
+        assert_eq!(args["query"], "vLLM structured outputs overview");
+        assert_eq!(args["max_results"], 5);
+    }
+
+    #[tokio::test]
+    async fn test_qwen3_coder_recovers_equals_prefixed_parameter_name() {
+        let input = r#"=query>
+SELECT date('now') AS today;
+</parameter>
+<parameter=dialect>
+sqlite
+</parameter>"#;
+        let tools = vec![ToolDefinition {
+            name: "execute_sql".to_string(),
+            parameters: Some(serde_json::json!({
+                "properties": {
+                    "query": {"type": "string"},
+                    "dialect": {
+                        "type": "string",
+                        "enum": ["sqlite", "postgres", "mysql"]
+                    }
+                },
+                "required": ["query", "dialect"]
+            })),
+        }];
+
+        let (result, content) =
+            detect_and_parse_tool_call(input, Some("qwen3_coder"), Some(&tools))
+                .await
+                .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "execute_sql");
+        assert_eq!(args["query"], "SELECT date('now') AS today;");
+        assert_eq!(args["dialect"], "sqlite");
+    }
+
+    #[tokio::test]
+    async fn test_qwen3_coder_recovers_missing_enum_parameter_marker() {
+        let input = r#"=query>
+SELECT COUNT(*) AS n FROM users>
+sqlite
+</parameter>
+</function>
+</tool_call>"#;
+        let tools = vec![ToolDefinition {
+            name: "execute_sql".to_string(),
+            parameters: Some(serde_json::json!({
+                "properties": {
+                    "query": {"type": "string"},
+                    "dialect": {
+                        "type": "string",
+                        "enum": ["sqlite", "postgres", "mysql"]
+                    }
+                },
+                "required": ["query", "dialect"]
+            })),
+        }];
+
+        let (result, content) =
+            detect_and_parse_tool_call(input, Some("qwen3_coder"), Some(&tools))
+                .await
+                .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "execute_sql");
+        assert_eq!(args["query"], "SELECT COUNT(*) AS n FROM users");
+        assert_eq!(args["dialect"], "sqlite");
+    }
+
+    #[tokio::test]
+    async fn test_qwen3_coder_recovers_optional_enum_trailing_line() {
+        let input = r#"=location>
+San Francisco, California, USA
+fahrenheit
+</parameter>
+</function>"#;
+        let tools = vec![
+            ToolDefinition {
+                name: "get_current_weather".to_string(),
+                parameters: Some(serde_json::json!({
+                    "properties": {
+                        "location": {"type": "string"},
+                        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                    },
+                    "required": ["location"]
+                })),
+            },
+            ToolDefinition {
+                name: "name_a_color".to_string(),
+                parameters: Some(serde_json::json!({
+                    "properties": {"color_hex": {"type": "string"}},
+                    "required": ["color_hex"]
+                })),
+            },
+        ];
+
+        let (result, content) =
+            detect_and_parse_tool_call(input, Some("qwen3_coder"), Some(&tools))
+                .await
+                .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "get_current_weather");
+        assert_eq!(args["location"], "San Francisco, California, USA");
+        assert_eq!(args["unit"], "fahrenheit");
+    }
+
+    #[tokio::test]
+    async fn test_qwen3_coder_recovers_empty_head_with_unique_standard_param() {
+        let input = r#">
+<parameter=name>
+Harry James Potter
+</parameter>
+</function>"#;
+        let tools = vec![
+            ToolDefinition {
+                name: "describe_harry_potter_character".to_string(),
+                parameters: Some(serde_json::json!({
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"]
+                })),
+            },
+            ToolDefinition {
+                name: "name_a_color".to_string(),
+                parameters: Some(serde_json::json!({
+                    "properties": {"color_hex": {"type": "string"}},
+                    "required": ["color_hex"]
+                })),
+            },
+        ];
+
+        let (result, content) =
+            detect_and_parse_tool_call(input, Some("qwen3_coder"), Some(&tools))
+                .await
+                .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "describe_harry_potter_character");
+        assert_eq!(args["name"], "Harry James Potter");
+    }
+
+    #[tokio::test]
+    async fn test_qwen3_coder_recovers_empty_head_value_from_later_unique_param() {
+        let input = r#">
+cache invalidation incidents
+</parameter>
+<parameter=filters>
+{"date_range": {"from": "2026-01-01", "to": "2026-03-31"}}
+</parameter>
+</function>
+</tool_call>"#;
+        let tools = vec![
+            ToolDefinition {
+                name: "search_documents".to_string(),
+                parameters: Some(serde_json::json!({
+                    "properties": {
+                        "query": {"type": "string"},
+                        "filters": {"type": "object"}
+                    },
+                    "required": ["query"]
+                })),
+            },
+            ToolDefinition {
+                name: "calculate".to_string(),
+                parameters: Some(serde_json::json!({
+                    "properties": {"expression": {"type": "string"}},
+                    "required": ["expression"]
+                })),
+            },
+        ];
+
+        let (result, content) =
+            detect_and_parse_tool_call(input, Some("qwen3_coder"), Some(&tools))
+                .await
+                .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "search_documents");
+        assert_eq!(args["query"], "cache invalidation incidents");
+        assert_eq!(args["filters"]["date_range"]["from"], "2026-01-01");
+    }
+
+    #[tokio::test]
+    async fn test_qwen3_coder_recovers_bare_parameter_equals_head() {
+        let input = r#"parameter=record_id>
+record_123
+</parameter>
+</function>
+</tool_call>"#;
+        let tools = vec![
+            ToolDefinition {
+                name: "fetch_record".to_string(),
+                parameters: Some(serde_json::json!({
+                    "properties": {"record_id": {"type": "string"}},
+                    "required": ["record_id"]
+                })),
+            },
+            ToolDefinition {
+                name: "lookup_records".to_string(),
+                parameters: Some(serde_json::json!({
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                })),
+            },
+        ];
+
+        let (result, content) =
+            detect_and_parse_tool_call(input, Some("qwen3_coder"), Some(&tools))
+                .await
+                .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "fetch_record");
+        assert_eq!(args["record_id"], "record_123");
+    }
+
+    #[tokio::test]
+    async fn test_qwen3_coder_recovers_suffix_parameter_head() {
+        let input = r#"_id>
+record_123
+</parameter>
+</function>
+</tool_call>"#;
+        let tools = vec![
+            ToolDefinition {
+                name: "fetch_record".to_string(),
+                parameters: Some(serde_json::json!({
+                    "properties": {"record_id": {"type": "string"}},
+                    "required": ["record_id"]
+                })),
+            },
+            ToolDefinition {
+                name: "lookup_records".to_string(),
+                parameters: Some(serde_json::json!({
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                })),
+            },
+        ];
+
+        let (result, content) =
+            detect_and_parse_tool_call(input, Some("qwen3_coder"), Some(&tools))
+                .await
+                .unwrap();
+
+        assert_eq!(content, Some("".to_string()));
+        assert_eq!(result.len(), 1);
+        let (name, args) = extract_name_and_args(result[0].clone());
+        assert_eq!(name, "fetch_record");
+        assert_eq!(args["record_id"], "record_123");
+    }
+
     // MiniMax-M2.1 parser tests
     #[tokio::test]
     async fn test_minimax_m2_simple_tool_call() {

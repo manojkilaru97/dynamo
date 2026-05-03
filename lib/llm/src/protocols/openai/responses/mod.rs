@@ -42,6 +42,12 @@ pub struct NvCreateResponse {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nvext: Option<NvExt>,
+
+    /// Internal marker set by the HTTP normalization layer when the client sends
+    /// `reasoning.effort=none`. The upstream typed model does not accept `none`,
+    /// but Qwen still needs an explicit template flag to suppress thinking.
+    #[serde(default, skip_serializing, rename = "dynamo_disable_reasoning")]
+    pub disable_reasoning: bool,
 }
 
 #[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone)]
@@ -528,13 +534,15 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
         // still thinks (GLM-4.7 template always injects <think>), and the reasoning parser
         // needs to run to split reasoning_content from content.
         //
-        // Only set enable_thinking=false when the user explicitly requests no reasoning
-        // AND guided decoding is active (to avoid structural_tag wrapping).
-        let chat_template_args = if response_format.is_some() && resp.inner.reasoning.is_some() {
-            // Guided decoding WITH explicit reasoning → enable thinking
-            // The Python handler generates a structural_tag with sequence format
+        // Qwen-style reasoning budget control is not available here. If Responses
+        // passes a reasoning object through to the chat bridge, short normal answers
+        // can be parsed as reasoning-only output with no final text item. Keep the
+        // public reasoning field for compatibility, but suppress template thinking
+        // whenever reasoning was explicit so Responses stays usable for text/tools/
+        // structured output.
+        let chat_template_args = if resp.disable_reasoning || resp.inner.reasoning.is_some() {
             let mut args = std::collections::HashMap::new();
-            args.insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
+            args.insert("enable_thinking".to_string(), serde_json::Value::Bool(false));
             Some(args)
         } else {
             // No guided decoding, or guided decoding without explicit reasoning param:

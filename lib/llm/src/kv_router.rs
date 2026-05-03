@@ -360,6 +360,10 @@ impl KvRouter {
         &self.kv_router_config
     }
 
+    pub fn pending_count(&self) -> usize {
+        self.scheduler.pending_count()
+    }
+
     /// Give these tokens, find the worker with the best match in it's KV cache.
     /// Returns the best worker (with dp_rank) and overlap amount in number of blocks.
     /// Now also takes optional context_id for request tracking.
@@ -429,8 +433,7 @@ impl KvRouter {
             .instrument(tracing::info_span!("kv_router.schedule"))
             .await
             .map_err(|e| match e {
-                dynamo_kv_router::scheduling::KvSchedulerError::QueueFull { .. }
-                | dynamo_kv_router::scheduling::KvSchedulerError::QueueWaitTimeout { .. } => {
+                KvSchedulerError::QueueFull { .. } | KvSchedulerError::QueueWaitTimeout { .. } => {
                     Error::new(PipelineError::ServiceOverloaded(e.to_string()))
                 }
                 _ => Error::new(e),

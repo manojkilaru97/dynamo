@@ -295,6 +295,10 @@ impl KvScheduler {
         self.slots.worker_type()
     }
 
+    pub fn pending_count(&self) -> usize {
+        self.queue.pending_count()
+    }
+
     pub fn add_output_block(
         &self,
         request_id: &str,

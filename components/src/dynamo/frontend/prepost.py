@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -231,6 +232,11 @@ def preprocess_chat_request_sync(
 
 
 class StreamingPostProcessor:
+    _STRIPPED_XML_PARAMETER_RE = re.compile(
+        r"^\s*[A-Za-z_][A-Za-z0-9_-]*>\s*(?:\{|\[|\"|[0-9]|true|false|null)",
+        re.IGNORECASE,
+    )
+
     def __init__(
         self,
         *,
@@ -254,6 +260,17 @@ class StreamingPostProcessor:
             if reasoning_parser_class
             else None
         )
+        reasoning_parser_name = (
+            reasoning_parser_class.__name__.lower() if reasoning_parser_class else ""
+        )
+        thinking_enabled = bool(
+            chat_template_kwargs.get("enable_thinking")
+            or chat_template_kwargs.get("thinking")
+        )
+        self._split_qwen_implicit_reasoning = (
+            thinking_enabled and "qwen" in reasoning_parser_name
+        )
+        self._implicit_reasoning_pending = ""
         self._fast_plain_text = (
             self.tool_parser is None and self.reasoning_parser is None
         )
@@ -266,6 +283,7 @@ class StreamingPostProcessor:
         self.previous_token_ids: list[int] = []
         self.reasoning_is_done = False
         self.in_progress_tool_calls: dict[int, DeltaToolCall] = {}
+        self._emitted_tool_calls = False
         # Buffer for post-reasoning tool text when </think> and <tool_call>
         # arrive in the same chunk.  The streaming tool parser cannot handle
         # this correctly, so we accumulate text here and fall back to the
@@ -311,6 +329,52 @@ class StreamingPostProcessor:
             self.tool_parser is not None
             and self.request_for_sampling.tool_choice != "none"
         )
+
+    def _looks_like_tool_control_text(self, text: str | None) -> bool:
+        if not text:
+            return False
+        stripped = text.lstrip()
+        return (
+            stripped.startswith("<tool_call")
+            or stripped.startswith("<function")
+            or stripped.startswith("<parameter")
+            or stripped.startswith("</parameter")
+            or stripped.startswith("</function")
+            or stripped.startswith("</tool_call")
+            or "<tool_call" in text
+            or "<function" in text
+            or "<parameter" in text
+            or "</parameter" in text
+            or "</function" in text
+            or "</tool_call" in text
+            or bool(self._STRIPPED_XML_PARAMETER_RE.match(text))
+        )
+
+    def _tool_call_text_complete(self, text: str, output: Any) -> bool:
+        if output.finish_reason:
+            return True
+        tool_call_end = getattr(self.tool_parser, "tool_call_end_token", None)
+        if tool_call_end and tool_call_end in text:
+            return True
+        return "</tool_call>" in text
+
+    def _try_parse_accumulated_tool_text(
+        self,
+        text: str,
+        *,
+        output: Any,
+        saved_reasoning: str | None = None,
+    ) -> DeltaMessage | None:
+        if self.tool_parser is None or not self._looks_like_tool_control_text(text):
+            return None
+
+        if not self._tool_call_text_complete(text, output):
+            return None
+
+        parsed = self._extract_tool_calls_from_text(text, saved_reasoning=saved_reasoning)
+        if self.in_progress_tool_calls:
+            return parsed
+        return None
 
     @staticmethod
     def _compose_delta_message(
@@ -368,6 +432,41 @@ class StreamingPostProcessor:
             request=self.request_for_sampling,
         )
 
+    def _extract_qwen_implicit_reasoning(
+        self, delta_text: str, output: Any
+    ) -> DeltaMessage | None:
+        """Split Qwen reasoning that starts without an opening <think> tag."""
+
+        segment = self._implicit_reasoning_pending + delta_text
+        self._implicit_reasoning_pending = ""
+        if not segment:
+            return None
+
+        end_marker = "</think>"
+        end_pos = segment.find(end_marker)
+        if end_pos >= 0:
+            self.reasoning_is_done = True
+            reasoning = segment[:end_pos].replace("<think>", "")
+            content = segment[end_pos + len(end_marker) :]
+            return self._compose_delta_message(
+                reasoning=reasoning or None,
+                content=content or None,
+            )
+
+        if output.finish_reason:
+            # The model did not produce a reasoning end marker. Preserve output
+            # as normal content rather than returning an empty answer.
+            return self._compose_delta_message(None, segment)
+
+        keep = len(end_marker) - 1
+        if len(segment) <= keep:
+            self._implicit_reasoning_pending = segment
+            return None
+
+        self._implicit_reasoning_pending = segment[-keep:]
+        reasoning = segment[:-keep].replace("<think>", "")
+        return self._compose_delta_message(reasoning or None, None)
+
     def _merge_streaming_tool_calls(self, tool_calls: list[DeltaToolCall]) -> None:
         for tool_delta in tool_calls:
             existing = self.in_progress_tool_calls.get(tool_delta.index)
@@ -381,6 +480,7 @@ class StreamingPostProcessor:
         ]
 
     def _emit_tool_calls_choice(self, output: Any) -> dict[str, Any]:
+        self._emitted_tool_calls = True
         choice = {
             "index": output.index,
             "delta": {
@@ -395,10 +495,13 @@ class StreamingPostProcessor:
 
     @staticmethod
     def _build_choice(output: Any, delta: dict[str, Any]) -> dict[str, Any]:
+        finish_reason = output.finish_reason
+        if delta.get("tool_calls") and finish_reason == "stop":
+            finish_reason = "tool_calls"
         return {
             "index": output.index,
             "delta": delta,
-            "finish_reason": output.finish_reason,
+            "finish_reason": finish_reason,
             "logprobs": output.logprobs,
         }
 
@@ -446,6 +549,53 @@ class StreamingPostProcessor:
                 self.previous_text = current_text
                 self.previous_token_ids = current_token_ids
                 return None
+
+        elif (
+            not self.reasoning_is_done
+            and self.reasoning_parser
+            and self._split_qwen_implicit_reasoning
+        ):
+            delta_message = self._extract_qwen_implicit_reasoning(delta_text, output)
+
+            if self.reasoning_is_done:
+                saved_reasoning = delta_message.reasoning if delta_message else None
+                post_content = (delta_message.content if delta_message else None) or ""
+
+                self.previous_text = ""
+                self.previous_token_ids = []
+                current_text = ""
+                current_token_ids = []
+
+                tool_call_start = getattr(
+                    self.tool_parser, "tool_call_start_token", None
+                )
+                if post_content and tool_call_start and tool_call_start in post_content:
+                    self._tool_text_buffer = post_content
+                    if output.finish_reason:
+                        buffered_text = self._tool_text_buffer
+                        self._tool_text_buffer = None
+                        delta_message = self._extract_tool_calls_from_text(
+                            buffered_text,
+                            saved_reasoning=saved_reasoning,
+                        )
+                    else:
+                        delta_message = self._compose_delta_message(
+                            saved_reasoning,
+                            None,
+                        )
+                else:
+                    delta_message = self._compose_delta_message(
+                        reasoning=saved_reasoning,
+                        content=post_content if post_content else None,
+                    )
+                    if post_content and self._should_parse_tools():
+                        parsed_message = self._try_parse_accumulated_tool_text(
+                            post_content,
+                            output=output,
+                            saved_reasoning=saved_reasoning,
+                        )
+                        if parsed_message is not None:
+                            delta_message = parsed_message
 
         elif not self.reasoning_is_done and self.reasoning_parser:
             delta_message = self.reasoning_parser.extract_reasoning_streaming(
@@ -503,6 +653,14 @@ class StreamingPostProcessor:
                         reasoning=saved_reasoning,
                         content=post_content if post_content else None,
                     )
+                    if post_content and self._should_parse_tools():
+                        parsed_message = self._try_parse_accumulated_tool_text(
+                            post_content,
+                            output=output,
+                            saved_reasoning=saved_reasoning,
+                        )
+                        if parsed_message is not None:
+                            delta_message = parsed_message
             elif (
                 delta_message
                 and delta_message.content
@@ -534,11 +692,31 @@ class StreamingPostProcessor:
                         delta_token_ids=delta_token_ids,
                     )
 
+        if (
+            delta_message
+            and delta_message.content
+            and self._should_parse_tools()
+            and self._looks_like_tool_control_text(delta_message.content)
+        ):
+            parsed_message = self._try_parse_accumulated_tool_text(
+                current_text,
+                output=output,
+                saved_reasoning=delta_message.reasoning,
+            )
+            if parsed_message is not None:
+                delta_message = parsed_message
+            elif not output.finish_reason:
+                self.previous_text = current_text
+                self.previous_token_ids = current_token_ids
+                return None
+
         choice = None
         if delta_message is None:
             if self.in_progress_tool_calls:
                 choice = self._emit_tool_calls_choice(output)
-            elif output.finish_reason:
+            elif output.finish_reason and not (
+                self._emitted_tool_calls and output.finish_reason == "stop"
+            ):
                 choice = self._build_choice(output, {})
         elif delta_message.tool_calls:
             self._merge_streaming_tool_calls(delta_message.tool_calls)
@@ -560,13 +738,16 @@ class StreamingPostProcessor:
             if has_tool_calls:
                 delta["tool_calls"] = self._dump_in_progress_tool_calls()
                 self.in_progress_tool_calls.clear()
+                self._emitted_tool_calls = True
             if len(delta) > 1:
                 choice = self._build_choice(output, delta)
                 if has_tool_calls and choice:
                     choice["finish_reason"] = "tool_calls"
         elif self.in_progress_tool_calls:
             choice = self._emit_tool_calls_choice(output)
-        elif output.finish_reason:
+        elif output.finish_reason and not (
+            self._emitted_tool_calls and output.finish_reason == "stop"
+        ):
             choice = self._build_choice(output, {})
 
         self.previous_text = current_text

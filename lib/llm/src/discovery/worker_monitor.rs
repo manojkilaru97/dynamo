@@ -481,9 +481,10 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                         }
                     }
 
-                    // Handle KV metrics updates (ActiveLoad) - only if subscriber is available
-                    // Note: Prometheus gauges are updated directly by sequence.rs (router's own bookkeeping)
-                    // This branch only updates WorkerLoadState for busy detection thresholds
+                    // Handle KV metrics updates (ActiveLoad) - only if subscriber is available.
+                    // SGLang/round-robin deployments may not exercise sequence.rs router
+                    // bookkeeping, so publish the Prometheus gauges from the worker load
+                    // stream as the source of truth.
                     kv_event = kv_event_future => {
                         let Some(event_result) = kv_event else {
                             tracing::debug!("KV metrics stream closed");
@@ -515,6 +516,13 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                                 state.active_prefill_tokens.insert(dp_rank, active_tokens);
                             }
                         }
+                        WORKER_LOAD_METRICS.observe(
+                            worker_id,
+                            dp_rank,
+                            WORKER_TYPE_DECODE,
+                            active_load.active_decode_blocks.unwrap_or(0) as usize,
+                            active_load.active_prefill_tokens.unwrap_or(0) as usize,
+                        );
 
                         // Load thresholds dynamically - allows runtime updates
                         let current_active_decode_blocks_threshold =

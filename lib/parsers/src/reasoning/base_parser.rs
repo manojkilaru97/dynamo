@@ -26,12 +26,11 @@
 //!
 //! ## `force_reasoning` and tokenizer behavior
 //!
-//! Some models (e.g. GLM-5-FP8 served via ZAI) consume `<think>` as a special
-//! tokenizer token and never emit it as literal text. In that case use
-//! `force_reasoning=true` (`deepseek_r1` parser), which treats all output as
-//! reasoning until `</think>` is seen. Models that do emit `<think>` as text
-//! (standard serving, Qwen3, GLM-4.5) should use `force_reasoning=false`
-//! (`glm45`, `nemotron_deci`, `qwen3` parsers).
+//! Some models consume `<think>` as a special tokenizer token and never emit it
+//! as literal text. In that case use `force_reasoning=true`, which treats all
+//! output as reasoning until `</think>` is seen. This includes Qwen3-family
+//! serving paths where the chat template opens thinking but generation starts
+//! after the opening tag.
 
 use crate::{ParserResult, ReasoningParser};
 

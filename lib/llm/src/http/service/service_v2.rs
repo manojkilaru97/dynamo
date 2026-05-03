@@ -156,6 +156,14 @@ impl State {
         &self.cancel_token
     }
 
+    pub fn streaming_tool_dispatch_enabled(&self) -> bool {
+        env_is_truthy("DYN_ENABLE_STREAMING_TOOL_DISPATCH")
+    }
+
+    pub fn streaming_reasoning_dispatch_enabled(&self) -> bool {
+        env_is_truthy("DYN_ENABLE_STREAMING_REASONING_DISPATCH")
+    }
+
     // TODO
     pub fn sse_keep_alive(&self) -> Option<Duration> {
         None

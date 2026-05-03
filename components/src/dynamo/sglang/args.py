@@ -378,6 +378,12 @@ async def parse_args(args: list[str]) -> Config:
             "Using SGLang's built in tokenizer. Setting skip_tokenizer_init to False"
         )
         server_args.skip_tokenizer_init = False
+    elif dynamo_config.init_sglang_tokenizer_for_grammar:
+        logging.info(
+            "Initializing SGLang tokenizer for grammar backends while keeping Dynamo token I/O. "
+            "Setting skip_tokenizer_init to False"
+        )
+        server_args.skip_tokenizer_init = False
     else:
         logging.info(
             "Using dynamo's built in tokenizer. Setting skip_tokenizer_init to True"

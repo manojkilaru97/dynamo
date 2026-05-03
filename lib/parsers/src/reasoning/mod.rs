@@ -142,7 +142,7 @@ impl ReasoningParserType {
                 parser: Box::new(basic_parser),
             },
             ReasoningParserType::Qwen => ReasoningParserWrapper {
-                parser: Box::new(basic_parser),
+                parser: Box::new(force_reasoning_basic_parser),
             },
             ReasoningParserType::NemotronDeci => ReasoningParserWrapper {
                 parser: Box::new(basic_parser),
@@ -245,6 +245,17 @@ mod tests {
         for parser in available_parsers {
             assert!(parsers.contains(&parser));
         }
+    }
+
+    #[test]
+    fn test_qwen_parser_handles_implicit_opening_think() {
+        let mut parser = ReasoningParserType::Qwen.get_reasoning_parser();
+        let result = parser.parse_reasoning_streaming_incremental(
+            "Thinking Process</think>{\"answer\":\"ok\"}",
+            &[],
+        );
+        assert_eq!(result.reasoning_text, "Thinking Process");
+        assert_eq!(result.normal_text, "{\"answer\":\"ok\"}");
     }
 
     #[test]

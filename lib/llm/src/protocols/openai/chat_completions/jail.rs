@@ -165,6 +165,40 @@ impl ChoiceJailState {
         std::mem::take(&mut self.accumulated_content)
     }
 
+    fn absorb_or_emit_trailing(
+        &mut self,
+        choice: &ChatChoiceStream,
+        trailing_part: &str,
+        jail_stream: &JailedStream,
+        emissions: &mut Vec<ChoiceEmission>,
+    ) {
+        if trailing_part.is_empty() {
+            return;
+        }
+
+        if jail_stream.looks_like_tool_call_control_fragment(trailing_part)
+            || jail_stream.looks_like_stripped_xml_tool_call_fragment(trailing_part)
+            || jail_stream.looks_like_qwen3_coder_stripped_xml_prefix(trailing_part)
+            || jail_stream.should_start_jail(trailing_part)
+        {
+            self.is_jailed = true;
+            self.accumulated_content = trailing_part.to_string();
+            self.partial_match_buffer.clear();
+            return;
+        }
+
+        let trailing_choice = create_choice_stream(
+            choice.index,
+            choice.delta.role,
+            trailing_part,
+            None,
+            choice.finish_reason,
+            None,
+            choice.logprobs.clone(),
+        );
+        emissions.push(ChoiceEmission::Trailing(trailing_choice));
+    }
+
     /// Process incoming content and return what should be emitted (if anything)
     async fn process_content(
         &mut self,
@@ -174,6 +208,54 @@ impl ChoiceJailState {
     ) -> Vec<ChoiceEmission> {
         let mut emissions = Vec::new();
         if !self.is_jailed {
+            if jail_stream.looks_like_stripped_xml_tool_call_fragment(content)
+                || jail_stream.should_accumulate_qwen3_coder_control_fragment(
+                    content,
+                    self.emitted_tool_calls_count,
+                )
+            {
+                self.is_jailed = true;
+                self.accumulated_content = content.to_string();
+
+                let (should_end, split_pos) =
+                    jail_stream.should_end_jail(&self.accumulated_content).await;
+                if should_end {
+                    let (jailed_part, trailing_part) = self.accumulated_content.split_at(split_pos);
+                    let trailing_part = trailing_part.to_string();
+                    let tool_choice = jail_stream
+                        .create_tool_call_choice(
+                            choice.index,
+                            jailed_part,
+                            choice,
+                            self.emitted_tool_calls_count,
+                        )
+                        .await;
+
+                    if tool_choice.delta.tool_calls.is_some() {
+                        if let Some(ref tool_calls) = tool_choice.delta.tool_calls {
+                            self.emitted_tool_calls_count += tool_calls.len();
+                        }
+                        emissions.push(ChoiceEmission::ToolCall(tool_choice));
+                    } else if !jail_stream.choice_is_tool_control_fragment(&tool_choice) {
+                        emissions.push(ChoiceEmission::Content(tool_choice));
+                    }
+
+                    self.end_jail();
+                    self.absorb_or_emit_trailing(
+                        choice,
+                        &trailing_part,
+                        jail_stream,
+                        &mut emissions,
+                    );
+                }
+
+                return emissions;
+            }
+
+            if jail_stream.looks_like_tool_call_control_fragment(content) {
+                return emissions;
+            }
+
             // Use the marker matcher to detect complete/partial markers
             let match_result = jail_stream
                 .marker_matcher
@@ -226,24 +308,16 @@ impl ChoiceJailState {
                                 self.emitted_tool_calls_count += tool_calls.len();
                             }
                             emissions.push(ChoiceEmission::ToolCall(tool_choice));
-                        } else {
+                        } else if !jail_stream.choice_is_tool_control_fragment(&tool_choice) {
                             emissions.push(ChoiceEmission::Content(tool_choice));
                         }
 
-                        // Handle trailing content if any
-                        if !trailing_part.is_empty() {
-                            #[allow(deprecated)]
-                            let trailing_choice = create_choice_stream(
-                                choice.index,
-                                choice.delta.role,
-                                trailing_part,
-                                None,
-                                choice.finish_reason,
-                                None,
-                                choice.logprobs.clone(),
-                            );
-                            emissions.push(ChoiceEmission::Trailing(trailing_choice));
-                        }
+                        self.absorb_or_emit_trailing(
+                            choice,
+                            trailing_part,
+                            jail_stream,
+                            &mut emissions,
+                        );
                     } else {
                         // Start jailing with the marker and suffix
                         self.is_jailed = true;
@@ -326,6 +400,7 @@ impl ChoiceJailState {
             if should_end {
                 // Split the content
                 let (jailed_part, trailing_part) = self.accumulated_content.split_at(split_pos);
+                let trailing_part = trailing_part.to_string();
 
                 // Create the unjailed choice
                 let unjailed_choice = jail_stream
@@ -343,27 +418,18 @@ impl ChoiceJailState {
                         self.emitted_tool_calls_count += tool_calls.len();
                     }
                     emissions.push(ChoiceEmission::ToolCall(unjailed_choice));
-                } else {
+                } else if !jail_stream.choice_is_tool_control_fragment(&unjailed_choice) {
                     emissions.push(ChoiceEmission::Content(unjailed_choice));
-                }
-
-                // Handle trailing content if any
-                if !trailing_part.is_empty() {
-                    #[allow(deprecated)]
-                    let trailing_choice = create_choice_stream(
-                        choice.index,
-                        choice.delta.role,
-                        trailing_part,
-                        None,
-                        choice.finish_reason,
-                        None,
-                        choice.logprobs.clone(),
-                    );
-                    emissions.push(ChoiceEmission::Trailing(trailing_choice));
                 }
 
                 // End jailing
                 self.end_jail();
+                self.absorb_or_emit_trailing(
+                    choice,
+                    &trailing_part,
+                    jail_stream,
+                    &mut emissions,
+                );
             }
             // If not unjailing, don't emit anything (still accumulating)
         }
@@ -393,6 +459,15 @@ impl ChoiceJailState {
         }
 
         if self.is_jailed && !self.accumulated_content.is_empty() {
+            if self.emitted_tool_calls_count > 0
+                && jail_stream
+                    .is_incomplete_tool_call_fragment(&self.accumulated_content)
+                    .await
+            {
+                self.end_jail();
+                return None;
+            }
+
             // Create a dummy choice for the method call
             #[allow(deprecated)]
             let dummy_choice = create_choice_stream(
@@ -433,6 +508,8 @@ impl ChoiceJailState {
             // Determine emission type
             if final_choice.delta.tool_calls.is_some() {
                 Some(ChoiceEmission::ToolCall(final_choice))
+            } else if jail_stream.choice_is_tool_control_fragment(&final_choice) {
+                None
             } else {
                 Some(ChoiceEmission::Content(final_choice))
             }
@@ -681,6 +758,12 @@ impl JailedStream {
                             all_emissions.extend(emissions);
                         } else {
                             // Handle choices without content (e.g., final chunks with finish_reason)
+                            if let Some(tool_calls) = &choice.delta.tool_calls {
+                                let choice_state =
+                                    choice_states.get_or_create_state(choice.index, starts_jailed);
+                                choice_state.emitted_tool_calls_count += tool_calls.len();
+                            }
+
                             // Only filter out if this choice was ever jailed and lacks role
                             // (to avoid aggregator issues with deltas missing role after unjail)
                             let was_ever_jailed = choice_states.get_state(choice.index).is_some_and(
@@ -886,7 +969,36 @@ impl JailedStream {
         let tool_call_match = self.tool_call_parser.is_some()
             && detect_tool_call_start(content, self.tool_call_parser.as_deref()).unwrap_or(false);
 
-        sequence_match || tool_call_match
+        sequence_match
+            || tool_call_match
+            || self.looks_like_qwen3_coder_stripped_xml_prefix(content)
+    }
+
+    fn looks_like_qwen3_coder_stripped_xml_prefix(&self, content: &str) -> bool {
+        if self.tool_call_parser.as_deref() != Some("qwen3_coder") {
+            return false;
+        }
+        let trimmed = content.trim_start();
+        if trimmed.starts_with('<') {
+            return false;
+        }
+        if trimmed.starts_with('>') || trimmed.starts_with('=') {
+            return trimmed.contains('>');
+        }
+        if trimmed.starts_with("parameter=") {
+            return trimmed.contains('>');
+        }
+        trimmed.find('>').is_some_and(|end| {
+            let name = &trimmed[..end];
+            !name.is_empty()
+                && name.chars().enumerate().all(|(idx, ch)| {
+                    if idx == 0 {
+                        ch == '_' || ch.is_ascii_alphabetic()
+                    } else {
+                        ch == '_' || ch == '-' || ch.is_ascii_alphanumeric()
+                    }
+                })
+        })
     }
 
     fn strip_immediate_tool_control_prefix<'a>(&self, content: &'a str) -> &'a str {
@@ -930,8 +1042,16 @@ impl JailedStream {
         }
 
         let normalized = self.strip_immediate_tool_control_prefix(content);
-        if normalized.len() != content.len() && self.looks_like_immediate_tool_json_prefix(content)
-        {
+        let normalized_starts_json = match &self.jail_mode {
+            JailMode::Immediate {
+                format: ToolChoiceFormat::SingleObject { .. },
+            } => normalized.starts_with('{'),
+            JailMode::Immediate {
+                format: ToolChoiceFormat::ArrayOfTools,
+            } => normalized.starts_with('['),
+            JailMode::MarkerBased => false,
+        };
+        if normalized.len() != content.len() && normalized_starts_json {
             return Some(("", normalized));
         }
 
@@ -939,7 +1059,19 @@ impl JailedStream {
     }
 
     fn looks_like_immediate_tool_json_prefix(&self, content: &str) -> bool {
+        if self.tool_call_parser.is_some()
+            && detect_tool_call_start(content, self.tool_call_parser.as_deref()).unwrap_or(false)
+        {
+            return true;
+        }
+
         let trimmed = self.strip_immediate_tool_control_prefix(content);
+        if self.tool_call_parser.is_some()
+            && detect_tool_call_start(trimmed, self.tool_call_parser.as_deref()).unwrap_or(false)
+        {
+            return true;
+        }
+
         match &self.jail_mode {
             JailMode::Immediate {
                 format: ToolChoiceFormat::SingleObject { .. },
@@ -1115,7 +1247,14 @@ impl JailedStream {
                 };
 
                 // Path 2: Complete tool call(s) can be parsed (early exit)
-                let early_exit = self.should_exit_jail_early(accumulated_content).await;
+                let early_exit = if self.tool_call_parser.as_deref() == Some("qwen3_coder")
+                    && self.looks_like_stripped_xml_tool_call_fragment(accumulated_content)
+                    && !self.stripped_xml_fragment_has_complete_call_marker(accumulated_content)
+                {
+                    false
+                } else {
+                    self.should_exit_jail_early(accumulated_content).await
+                };
 
                 if let Some((end_pos, _)) = end_marker_info {
                     (true, end_pos)
@@ -1130,8 +1269,13 @@ impl JailedStream {
                         )
                         .await
                         {
-                            let split_pos =
-                                find_tool_call_end_position(accumulated_content, Some(parser));
+                            let split_pos = if self
+                                .looks_like_stripped_xml_tool_call_fragment(accumulated_content)
+                            {
+                                accumulated_content.len()
+                            } else {
+                                find_tool_call_end_position(accumulated_content, Some(parser))
+                            };
                             (true, split_pos)
                         } else {
                             (false, accumulated_content.len())
@@ -1144,6 +1288,27 @@ impl JailedStream {
                 }
             }
             JailMode::Immediate { format } => {
+                if let Some(parser) = &self.tool_call_parser {
+                    let tools_slice = self.tool_definitions.as_deref();
+                    if let Ok((tool_calls, _)) = try_tool_call_parse_aggregate(
+                        accumulated_content,
+                        Some(parser),
+                        tools_slice,
+                    )
+                    .await
+                        && !tool_calls.is_empty()
+                    {
+                        let split_pos = if self
+                            .looks_like_stripped_xml_tool_call_fragment(accumulated_content)
+                        {
+                            accumulated_content.len()
+                        } else {
+                            find_tool_call_end_position(accumulated_content, Some(parser))
+                        };
+                        return (true, split_pos);
+                    }
+                }
+
                 if let Some((_value, _json, _start, end)) =
                     self.parse_tool_choice_json_candidate(accumulated_content, format)
                 {
@@ -1151,6 +1316,219 @@ impl JailedStream {
                 }
                 (false, accumulated_content.len())
             }
+        }
+    }
+
+    async fn is_incomplete_tool_call_fragment(&self, content: &str) -> bool {
+        let Some(parser) = self.tool_call_parser.as_deref() else {
+            return false;
+        };
+        if !detect_tool_call_start(content, Some(parser)).unwrap_or(false) {
+            return false;
+        }
+        let tools_slice = self.tool_definitions.as_deref();
+        try_tool_call_parse_aggregate(content, Some(parser), tools_slice)
+            .await
+            .is_err()
+    }
+
+    fn looks_like_tool_call_control_fragment(&self, content: &str) -> bool {
+        let trimmed = content.trim_start();
+        trimmed.starts_with("<tool_call")
+            || trimmed.starts_with("<function")
+            || trimmed.starts_with("function=")
+            || trimmed.starts_with("function>")
+            || trimmed.starts_with("<parameter")
+            || trimmed.starts_with("parameter=")
+            || trimmed.starts_with("parameter>")
+            || trimmed.starts_with("</parameter")
+            || trimmed.starts_with("</function")
+            || trimmed.starts_with("</tool_call")
+            || trimmed
+                .trim_matches(|ch: char| ch.is_whitespace() || ch == '>')
+                .starts_with("</tool_call")
+    }
+
+    fn should_accumulate_qwen3_coder_control_fragment(
+        &self,
+        content: &str,
+        emitted_tool_calls_count: usize,
+    ) -> bool {
+        if self.tool_call_parser.as_deref() != Some("qwen3_coder") {
+            return false;
+        }
+
+        let trimmed = content.trim_start();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        // After a parsed call has already been emitted, isolated close markers
+        // can appear as parser tail noise. Drop those instead of opening a new
+        // jail buffer that would only finalize as raw XML.
+        if emitted_tool_calls_count > 0
+            && (trimmed.starts_with("</parameter")
+                || trimmed.starts_with("</function")
+                || trimmed.starts_with("</tool_call")
+                || trimmed
+                    .trim_matches(|ch: char| ch.is_whitespace() || ch == '>')
+                    .starts_with("</tool_call"))
+        {
+            return false;
+        }
+
+        self.looks_like_tool_call_control_fragment(content)
+    }
+
+    fn normal_text_for_tool_call_choice<'a>(&self, normal_text: Option<&'a str>) -> &'a str {
+        if self.tool_call_parser.as_deref() == Some("qwen3_coder") {
+            return "";
+        }
+
+        let Some(text) = normal_text else {
+            return "";
+        };
+        let stripped = text.trim();
+        if stripped.is_empty() || self.looks_like_tool_call_control_fragment(stripped) {
+            ""
+        } else {
+            text
+        }
+    }
+
+    fn looks_like_stripped_xml_tool_call_fragment(&self, content: &str) -> bool {
+        if self.tool_call_parser.as_deref() != Some("qwen3_coder") {
+            return false;
+        }
+        let Some(tools) = self.tool_definitions.as_ref() else {
+            return false;
+        };
+
+        let trimmed = content.trim_start();
+        if trimmed.starts_with('<') {
+            return false;
+        }
+        let Some(param_name_end) = trimmed.find('>') else {
+            return false;
+        };
+        let raw_param_name = trimmed[..param_name_end].trim();
+        let param_name = raw_param_name
+            .strip_prefix('=')
+            .or_else(|| raw_param_name.strip_prefix("parameter="))
+            .unwrap_or(raw_param_name);
+        let after_name = trimmed[param_name_end + 1..].trim_start();
+        if after_name.is_empty() {
+            return false;
+        }
+
+        let unique_param_match = if param_name.is_empty() {
+            if tools.len() != 1
+                && !after_name.contains("<parameter=")
+                && !after_name.contains("</parameter")
+                && !after_name.contains("</function")
+                && !after_name.contains("</tool_call")
+            {
+                return false;
+            }
+            false
+        } else if !param_name.chars().enumerate().all(|(idx, ch)| {
+            if idx == 0 {
+                ch == '_' || ch.is_ascii_alphabetic()
+            } else {
+                ch == '_' || ch == '-' || ch.is_ascii_alphanumeric()
+            }
+        }) {
+            return false;
+        } else if self.stripped_xml_param_maps_to_unique_tool(param_name, tools) {
+            true
+        } else if self
+            .canonical_stripped_xml_param_name(param_name, tools)
+            .is_some_and(|name| self.stripped_xml_param_maps_to_unique_tool(&name, tools))
+        {
+            true
+        } else {
+            return false;
+        };
+
+        unique_param_match
+            || after_name.contains("</parameter")
+            || after_name.contains("</function")
+            || after_name.contains("</tool_call")
+            || after_name.starts_with('{')
+            || after_name.starts_with('[')
+            || after_name.starts_with('"')
+            || after_name.starts_with('\'')
+            || after_name.starts_with("true")
+            || after_name.starts_with("false")
+            || after_name.starts_with("null")
+            || after_name
+                .chars()
+                .next()
+                .is_some_and(|ch| ch == '-' || ch.is_ascii_digit())
+            || tools.len() == 1
+    }
+
+    fn stripped_xml_fragment_has_complete_call_marker(&self, content: &str) -> bool {
+        content.contains("</function") || content.contains("</tool_call")
+    }
+
+    fn stripped_xml_param_maps_to_unique_tool(
+        &self,
+        param_name: &str,
+        tools: &[dynamo_parsers::tool_calling::ToolDefinition],
+    ) -> bool {
+        if tools.len() == 1 {
+            return true;
+        }
+
+        let mut matches = tools.iter().filter(|tool| {
+            tool.parameters
+                .as_ref()
+                .and_then(|params| params.get("properties"))
+                .and_then(|properties| properties.as_object())
+                .is_some_and(|properties| properties.contains_key(param_name))
+        });
+
+        matches.next().is_some() && matches.next().is_none()
+    }
+
+    fn canonical_stripped_xml_param_name(
+        &self,
+        param_name: &str,
+        tools: &[dynamo_parsers::tool_calling::ToolDefinition],
+    ) -> Option<String> {
+        if tools.iter().any(|tool| {
+            tool.parameters
+                .as_ref()
+                .and_then(|params| params.get("properties"))
+                .and_then(|properties| properties.as_object())
+                .is_some_and(|properties| properties.contains_key(param_name))
+        }) {
+            return Some(param_name.to_string());
+        }
+
+        let mut matches = tools
+            .iter()
+            .filter_map(|tool| tool.parameters.as_ref())
+            .filter_map(|params| params.get("properties"))
+            .filter_map(|properties| properties.as_object())
+            .flat_map(|properties| properties.keys())
+            .filter(|property_name| property_name.ends_with(param_name));
+
+        let first = matches.next()?.to_string();
+        if matches.next().is_none() {
+            Some(first)
+        } else {
+            None
+        }
+    }
+
+    fn choice_is_tool_control_fragment(&self, choice: &ChatChoiceStream) -> bool {
+        match choice.delta.content.as_ref() {
+            Some(dynamo_async_openai::types::ChatCompletionMessageContent::Text(text)) => {
+                self.looks_like_tool_call_control_fragment(text)
+            }
+            _ => false,
         }
     }
 
@@ -1193,7 +1571,7 @@ impl JailedStream {
                     let choice = create_choice_stream(
                         choice_index,
                         Some(Role::Assistant),
-                        normal_text.as_deref().unwrap_or(""),
+                        self.normal_text_for_tool_call_choice(normal_text.as_deref()),
                         Some(tool_call_chunks),
                         None,
                         None,
@@ -1236,7 +1614,7 @@ impl JailedStream {
                         choice
                     }
                     Ok(_) | Err(_) => {
-                        // Parsing failed, return as content
+                        // Parsing failed, return as content.
                         create_choice_stream(
                             choice_index,
                             Some(Role::Assistant),
@@ -1375,13 +1753,28 @@ impl JailedStream {
         stream! {
             tokio::pin!(input_stream);
             let mut has_tool_calls_per_choice: HashMap<u32, bool> = HashMap::new();
+            let mut emitted_finish_per_choice: HashMap<u32, bool> = HashMap::new();
+            let mut last_response: Option<NvCreateChatCompletionStreamResponse> = None;
+            let mut last_id: Option<String> = None;
+            let mut last_event: Option<String> = None;
+            let mut last_comment: Option<Vec<String>> = None;
 
             while let Some(mut response) = input_stream.next().await {
+                if let Some(data) = response.data.as_ref() {
+                    last_response = Some(data.clone());
+                    last_id = response.id.clone();
+                    last_event = response.event.clone();
+                    last_comment = response.comment.clone();
+                }
+
                 // Track if any choice emitted tool calls
                 if let Some(ref data) = response.data {
                     for choice in &data.choices {
                         if choice.delta.tool_calls.is_some() {
                             has_tool_calls_per_choice.insert(choice.index, true);
+                        }
+                        if choice.finish_reason.is_some() {
+                            emitted_finish_per_choice.insert(choice.index, true);
                         }
                     }
                 }
@@ -1424,6 +1817,44 @@ impl JailedStream {
                 }
 
                 yield response;
+            }
+
+            // Some backends can emit parsed tool-call chunks followed only by a
+            // usage chunk and [DONE]. OpenAI-compatible clients still need one
+            // terminal choice carrying finish_reason=tool_calls.
+            let missing_finish_choices: Vec<_> = has_tool_calls_per_choice
+                .iter()
+                .filter_map(|(index, has_tool_calls)| {
+                    if *has_tool_calls
+                        && !emitted_finish_per_choice.get(index).copied().unwrap_or(false)
+                    {
+                        Some(create_choice_stream(
+                            *index,
+                            None,
+                            "",
+                            None,
+                            Some(FinishReason::ToolCalls),
+                            None,
+                            None,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !missing_finish_choices.is_empty()
+                && let Some(mut data) = last_response
+            {
+                data.choices = missing_finish_choices;
+                data.usage = None;
+                yield Annotated {
+                    data: Some(data),
+                    id: last_id,
+                    event: last_event,
+                    comment: last_comment,
+                    error: None,
+                };
             }
         }
     }

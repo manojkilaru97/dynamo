@@ -67,6 +67,25 @@ pub fn try_tool_call_parse_xml(
     config: &XmlParserConfig,
     tools: Option<&[ToolDefinition]>,
 ) -> anyhow::Result<(Vec<ToolCallResponse>, Option<String>)> {
+    if let Some((tool_name, reconstructed)) =
+        reconstruct_stripped_single_tool_call(message, config, tools)
+    {
+        let (normal_text, tool_calls) = extract_tool_calls(&reconstructed, config, tools)?;
+        let normal_content = if tool_calls.is_empty() {
+            Some(message.to_string())
+        } else if normal_text.is_empty() {
+            Some("".to_string())
+        } else {
+            Some(normal_text)
+        };
+
+        tracing::debug!(
+            "Recovered stripped XML tool-call fragment as function '{}'",
+            tool_name
+        );
+        return Ok((tool_calls, normal_content));
+    }
+
     let (normal_text, tool_calls) = extract_tool_calls(message, config, tools)?;
 
     let normal_content = if normal_text.is_empty() {
@@ -76,6 +95,402 @@ pub fn try_tool_call_parse_xml(
     };
 
     Ok((tool_calls, normal_content))
+}
+
+fn reconstruct_stripped_single_tool_call(
+    message: &str,
+    config: &XmlParserConfig,
+    tools: Option<&[ToolDefinition]>,
+) -> Option<(String, String)> {
+    let tools = tools?;
+
+    let trimmed = message.trim_start();
+    if trimmed.contains(&config.tool_call_start_token) {
+        return None;
+    }
+
+    let params = collect_stripped_parameters(trimmed, config, tools)?;
+    if params.is_empty() {
+        return None;
+    }
+
+    let function_name = infer_tool_name_for_parameters(&params, tools)?;
+    if !has_required_parameters(&function_name, &params, tools) {
+        return None;
+    }
+
+    let mut reconstructed = String::new();
+    reconstructed.push_str(&config.tool_call_start_token);
+    reconstructed.push_str(&config.function_start_token);
+    reconstructed.push_str(&function_name);
+    reconstructed.push('>');
+    for (param_name, param_value) in &params {
+        reconstructed.push_str(&config.parameter_start_token);
+        reconstructed.push_str(param_name);
+        reconstructed.push('>');
+        reconstructed.push_str(param_value);
+        reconstructed.push_str(&config.parameter_end_token);
+    }
+    reconstructed.push_str(&config.function_end_token);
+    reconstructed.push_str(&config.tool_call_end_token);
+
+    Some((function_name, reconstructed))
+}
+
+fn is_parameter_name(param_name: &str) -> bool {
+    !param_name.is_empty()
+        && param_name.chars().enumerate().all(|(idx, ch)| {
+            if idx == 0 {
+                ch == '_' || ch.is_ascii_alphabetic()
+            } else {
+                ch == '_' || ch == '-' || ch.is_ascii_alphanumeric()
+            }
+        })
+}
+
+fn first_required_or_property_name(tools: &[ToolDefinition]) -> Option<String> {
+    if tools.len() != 1 {
+        return None;
+    }
+    let parameters = tools[0].parameters.as_ref()?;
+    if let Some(required) = parameters.get("required").and_then(|v| v.as_array())
+        && let Some(name) = required.first().and_then(|v| v.as_str())
+        && is_parameter_name(name)
+    {
+        return Some(name.to_string());
+    }
+    parameters
+        .get("properties")
+        .and_then(|properties| properties.as_object())
+        .and_then(|properties| properties.keys().next())
+        .filter(|name| is_parameter_name(name))
+        .cloned()
+}
+
+fn common_query_parameter_name(tools: &[ToolDefinition]) -> Option<String> {
+    tools
+        .iter()
+        .any(|tool| {
+            tool.parameters
+                .as_ref()
+                .and_then(|params| params.get("properties"))
+                .and_then(|properties| properties.as_object())
+                .is_some_and(|properties| properties.contains_key("query"))
+        })
+        .then(|| "query".to_string())
+}
+
+fn parse_stripped_parameter_head<'a>(
+    text: &'a str,
+    tools: &[ToolDefinition],
+) -> Option<(String, &'a str)> {
+    let text = text.trim_start();
+    let end = text.find('>')?;
+    let raw_name = text[..end].trim();
+    let param_name = if let Some(stripped) = raw_name.strip_prefix('=') {
+        stripped.trim()
+    } else if let Some(stripped) = raw_name.strip_prefix("parameter=") {
+        stripped.trim()
+    } else if raw_name.is_empty() {
+        ""
+    } else {
+        raw_name
+    };
+
+    let param_name = if param_name.is_empty() {
+        first_required_or_property_name(tools).or_else(|| common_query_parameter_name(tools))?
+    } else if is_parameter_name(param_name) {
+        canonical_parameter_name(param_name, tools).unwrap_or_else(|| param_name.to_string())
+    } else {
+        return None;
+    };
+
+    Some((param_name, &text[end + 1..]))
+}
+
+fn canonical_parameter_name(param_name: &str, tools: &[ToolDefinition]) -> Option<String> {
+    if tools.iter().any(|tool| {
+        tool.parameters
+            .as_ref()
+            .and_then(|params| params.get("properties"))
+            .and_then(|properties| properties.as_object())
+            .is_some_and(|properties| properties.contains_key(param_name))
+    }) {
+        return Some(param_name.to_string());
+    }
+
+    // The stream jail can sometimes consume the leading part of a Qwen XML
+    // parameter head, leaving fragments like "_id>" from "file_id>".
+    let mut matches = tools
+        .iter()
+        .filter_map(|tool| tool.parameters.as_ref())
+        .filter_map(|params| params.get("properties"))
+        .filter_map(|properties| properties.as_object())
+        .flat_map(|properties| properties.keys())
+        .filter(|property_name| property_name.ends_with(param_name));
+
+    let first = matches.next()?.to_string();
+    if matches.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn collect_stripped_parameters(
+    text: &str,
+    config: &XmlParserConfig,
+    tools: &[ToolDefinition],
+) -> Option<Vec<(String, String)>> {
+    let parameter_start = regex::escape(&config.parameter_start_token);
+    let parameter_end = regex::escape(&config.parameter_end_token);
+    let standard_pattern = format!(r"(?s){}([^>]+)>(.*?)(?:{}|$)", parameter_start, parameter_end);
+    let standard_regex = Regex::new(&standard_pattern).ok()?;
+
+    let mut params = Vec::new();
+    let first_standard_start = standard_regex.find(text).map(|m| m.start());
+
+    let leading = match first_standard_start {
+        Some(0) => "",
+        Some(pos) => &text[..pos],
+        None => text,
+    };
+    if let Some((name, after_head)) = parse_stripped_parameter_head(leading, tools)
+    {
+        let value = after_head
+            .split(&config.parameter_end_token)
+            .next()
+            .unwrap_or(after_head)
+            .split(&config.function_end_token)
+            .next()
+            .unwrap_or(after_head)
+            .split(&config.tool_call_end_token)
+            .next()
+            .unwrap_or(after_head)
+            .trim()
+            .to_string();
+        if !value.is_empty() {
+            params.push((name, value));
+        }
+    }
+
+    for cap in standard_regex.captures_iter(text) {
+        let Some(name) = cap.get(1).map(|m| strip_quotes(m.as_str().trim())) else {
+            continue;
+        };
+        if !is_parameter_name(name) {
+            continue;
+        }
+        let value = cap
+            .get(2)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+        if !value.is_empty() {
+            params.push((name.to_string(), value));
+        }
+    }
+
+    recover_empty_head_parameter_from_later_params(leading, &mut params, config, tools);
+    repair_missing_enum_parameter_from_trailing_line(&mut params, tools);
+
+    if params.is_empty() {
+        None
+    } else {
+        Some(params)
+    }
+}
+
+fn recover_empty_head_parameter_from_later_params(
+    leading: &str,
+    params: &mut Vec<(String, String)>,
+    config: &XmlParserConfig,
+    tools: &[ToolDefinition],
+) {
+    if params.is_empty() {
+        return;
+    }
+    let leading = leading.trim_start();
+    let Some(after_head) = leading.strip_prefix('>') else {
+        return;
+    };
+    let value = after_head
+        .split(&config.parameter_end_token)
+        .next()
+        .unwrap_or(after_head)
+        .split(&config.function_end_token)
+        .next()
+        .unwrap_or(after_head)
+        .split(&config.tool_call_end_token)
+        .next()
+        .unwrap_or(after_head)
+        .trim();
+    if value.is_empty() {
+        return;
+    }
+    let Some(function_name) = infer_tool_name_for_parameters(params, tools) else {
+        return;
+    };
+    let Some(tool) = tools.iter().find(|tool| tool.name == function_name) else {
+        return;
+    };
+    let Some(schema) = tool.parameters.as_ref() else {
+        return;
+    };
+    let name = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .and_then(|required| {
+            required
+                .iter()
+                .filter_map(|v| v.as_str())
+                .find(|name| !params.iter().any(|(param_name, _)| param_name == *name))
+        })
+        .or_else(|| {
+            schema
+                .get("properties")
+                .and_then(|properties| properties.as_object())
+                .and_then(|properties| {
+                    properties
+                        .keys()
+                        .map(|name| name.as_str())
+                        .find(|name| !params.iter().any(|(param_name, _)| param_name == *name))
+                })
+        });
+    let Some(name) = name else {
+        return;
+    };
+    if is_parameter_name(name) {
+        params.insert(0, (name.to_string(), value.to_string()));
+    }
+}
+
+fn repair_missing_enum_parameter_from_trailing_line(
+    params: &mut Vec<(String, String)>,
+    tools: &[ToolDefinition],
+) {
+    if params.len() != 1 {
+        return;
+    }
+
+    let present_name = params[0].0.clone();
+    let mut matching_tools = tools.iter().filter(|tool| {
+        tool.parameters
+            .as_ref()
+            .and_then(|schema| schema.get("properties"))
+            .and_then(|properties| properties.as_object())
+            .is_some_and(|properties| properties.contains_key(&present_name))
+    });
+    let Some(tool) = matching_tools.next() else {
+        return;
+    };
+    if matching_tools.next().is_some() {
+        return;
+    }
+    let Some(schema) = tool.parameters.as_ref() else {
+        return;
+    };
+
+    let Some(properties) = schema
+        .get("properties")
+        .and_then(|properties| properties.as_object())
+    else {
+        return;
+    };
+
+    let value = params[0].1.trim_end().to_string();
+    let Some((head, tail)) = value.rsplit_once('\n') else {
+        return;
+    };
+    let tail = tail
+        .trim()
+        .trim_start_matches('>')
+        .trim()
+        .trim_end_matches(&['>', '<'][..])
+        .trim();
+    if tail.is_empty() {
+        return;
+    }
+
+    let mut enum_matches = properties.iter().filter_map(|(name, property)| {
+        if name == &present_name || params.iter().any(|(param_name, _)| param_name == name) {
+            return None;
+        }
+        let matches_tail = property
+            .get("enum")
+            .and_then(|v| v.as_array())
+            .is_some_and(|enum_values| {
+                enum_values
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .any(|enum_value| enum_value == tail)
+            });
+        matches_tail.then_some(name.as_str())
+    });
+    let Some(missing_name) = enum_matches.next() else {
+        return;
+    };
+    if enum_matches.next().is_some() {
+        return;
+    }
+
+    params[0].1 = head.trim_end_matches('>').trim().to_string();
+    params.push((missing_name.to_string(), tail.to_string()));
+}
+
+fn infer_tool_name_for_parameters(
+    params: &[(String, String)],
+    tools: &[ToolDefinition],
+) -> Option<String> {
+    if tools.len() == 1 {
+        return Some(tools[0].name.clone());
+    }
+
+    let mut matches = tools
+        .iter()
+        .filter(|tool| {
+            let Some(properties) = tool
+                .parameters
+                .as_ref()
+                .and_then(|params| params.get("properties"))
+                .and_then(|properties| properties.as_object())
+            else {
+                return false;
+            };
+            params
+                .iter()
+                .all(|(param_name, _)| properties.contains_key(param_name))
+        })
+        .map(|tool| tool.name.clone());
+
+    let first = matches.next()?;
+    if matches.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn has_required_parameters(
+    function_name: &str,
+    params: &[(String, String)],
+    tools: &[ToolDefinition],
+) -> bool {
+    let Some(tool) = tools.iter().find(|tool| tool.name == function_name) else {
+        return false;
+    };
+    let required = tool
+        .parameters
+        .as_ref()
+        .and_then(|schema| schema.get("required"))
+        .and_then(|required| required.as_array());
+    let Some(required) = required else {
+        return true;
+    };
+
+    required
+        .iter()
+        .filter_map(|value| value.as_str())
+        .all(|name| params.iter().any(|(param_name, _)| param_name == name))
 }
 
 /// Extract tool calls and normal text from message.

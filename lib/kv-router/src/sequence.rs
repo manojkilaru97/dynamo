@@ -65,8 +65,7 @@ pub struct ActiveSequences {
 impl ActiveSequences {
     /// Create a new SharedSequenceManager instance
     pub fn new(block_size: usize) -> Self {
-        // TODO: make this not a hard req
-        assert!(block_size > 1, "block_size must be greater than 1");
+        assert!(block_size >= 1, "block_size must be at least 1");
 
         Self {
             active_seqs: HashMap::new(),
@@ -352,6 +351,27 @@ mod tests {
         assert_eq!(seq_manager.active_tokens(), 12);
 
         seq_manager.free(&"request_1".to_string());
+        assert_eq!(seq_manager.active_blocks(), 0);
+        assert_eq!(seq_manager.active_tokens(), 0);
+    }
+
+    #[test]
+    fn test_active_sequences_block_size_one() {
+        let mut seq_manager = ActiveSequences::new(1);
+
+        seq_manager.add_request("request_1".to_string(), Some(vec![1, 2, 3]), 3, 0, None);
+        assert_eq!(seq_manager.active_blocks(), 3);
+        assert_eq!(seq_manager.active_tokens(), 3);
+
+        seq_manager.add_request("request_2".to_string(), Some(vec![1, 2, 4]), 3, 2, None);
+        assert_eq!(seq_manager.active_blocks(), 4);
+        assert_eq!(seq_manager.active_tokens(), 4);
+
+        seq_manager.free(&"request_1".to_string());
+        assert_eq!(seq_manager.active_blocks(), 3);
+        assert_eq!(seq_manager.active_tokens(), 1);
+
+        seq_manager.free(&"request_2".to_string());
         assert_eq!(seq_manager.active_blocks(), 0);
         assert_eq!(seq_manager.active_tokens(), 0);
     }

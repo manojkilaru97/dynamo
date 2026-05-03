@@ -31,7 +31,7 @@ use anyhow::Context as _;
 use dynamo_runtime::{
     DistributedRuntime,
     component::Client,
-    engine::{AsyncEngineStream, Data},
+    engine::{AsyncEngine, AsyncEngineStream, Data, async_trait},
     pipeline::{
         Context, ManyOut, Operator, PushRouter, RouterMode, SegmentSource, ServiceBackend,
         ServiceEngine, ServiceFrontend, SingleIn, Source,
@@ -45,6 +45,28 @@ pub struct PreparedEngine {
     pub inspect_template: bool,
     pub card: Option<ModelDeploymentCard>,
     pub request_template: Option<RequestTemplate>,
+}
+
+struct MeasuredPushRouter {
+    inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+    request_metrics: Arc<RouterRequestMetrics>,
+}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<PreprocessedRequest>,
+        ManyOut<Annotated<LLMEngineOutput>>,
+        dynamo_runtime::pipeline::Error,
+    > for MeasuredPushRouter
+{
+    async fn generate(
+        &self,
+        request: SingleIn<PreprocessedRequest>,
+    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, dynamo_runtime::pipeline::Error> {
+        self.request_metrics.requests_total.inc();
+        self.inner.generate(request).await
+    }
 }
 
 impl PreparedEngine {
@@ -286,14 +308,17 @@ where
     // non-KV modes (Direct, Random, RoundRobin) where KvPushRouter is never created.
     // In KV mode, KvPushRouter::new() also calls from_component() (idempotent via
     // OnceLock), which covers the standalone router path as well.
-    RouterRequestMetrics::from_component(client.endpoint.component());
+    let router_request_metrics = RouterRequestMetrics::from_component(client.endpoint.component());
 
     let service_backend = match router_mode {
         RouterMode::Direct => {
             ServiceBackend::from_engine(Arc::new(DirectRoutingRouter::new(router)))
         }
         RouterMode::Random | RouterMode::RoundRobin => {
-            ServiceBackend::from_engine(Arc::new(router))
+            ServiceBackend::from_engine(Arc::new(MeasuredPushRouter {
+                inner: router,
+                request_metrics: router_request_metrics,
+            }))
         }
         RouterMode::KV => {
             let Some(chooser) = chooser else {

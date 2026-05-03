@@ -565,9 +565,87 @@ impl OpenAIPreprocessor {
         // Validate prompt token count against model's context length
         if let Some(count) = token_count {
             Self::validate_token_count(count, self.context_length)?;
+            self.cap_stop_conditions_to_remaining_context(request, builder, count)?;
         }
 
         Ok(annotations)
+    }
+
+    /// Clamp caller-provided output budget to the remaining context window.
+    ///
+    /// Some clients request `max_tokens == context_length` as a broad "give me as
+    /// much as possible" budget. Backends such as SGLang validate
+    /// `prompt_tokens + max_new_tokens <= context_length` and otherwise return a
+    /// worker-side exception. Clamp after prompt tokenization so the request stays
+    /// valid without hiding prompts that already consume the whole context.
+    fn cap_stop_conditions_to_remaining_context<
+        R: OAIChatLikeRequest
+            + AnnotationsProvider
+            + SamplingOptionsProvider
+            + StopConditionsProvider
+            + OutputOptionsProvider
+            + NvExtProvider,
+    >(
+        &self,
+        request: &R,
+        builder: &mut PreprocessedRequestBuilder,
+        token_count: usize,
+    ) -> Result<()> {
+        if self.context_length == 0 {
+            return Ok(());
+        }
+
+        let available_generation_tokens = self
+            .context_length
+            .saturating_sub(token_count as u32)
+            .saturating_sub(1);
+        if available_generation_tokens == 0 {
+            return Err(DynamoError::builder()
+                .error_type(ErrorType::InvalidArgument)
+                .message(format!(
+                    "This model's maximum context length is {} tokens. \
+                     However, your messages resulted in {} tokens, leaving no room for output tokens. \
+                     Please reduce the length of the messages.",
+                    self.context_length, token_count,
+                ))
+                .build()
+                .into());
+        }
+
+        let mut stop_conditions = request.extract_stop_conditions()?;
+        let requested_max_tokens = stop_conditions.max_tokens;
+        if let Some(max_tokens) = requested_max_tokens
+            && max_tokens > available_generation_tokens
+        {
+            tracing::warn!(
+                requested_max_tokens = max_tokens,
+                clamped_max_tokens = available_generation_tokens,
+                prompt_tokens = token_count,
+                context_length = self.context_length,
+                "Clamping request max_tokens to remaining model context"
+            );
+            stop_conditions.max_tokens = Some(available_generation_tokens);
+            if stop_conditions
+                .min_tokens
+                .is_some_and(|min_tokens| min_tokens > available_generation_tokens)
+            {
+                stop_conditions.min_tokens = Some(available_generation_tokens);
+            }
+
+            if let Some(stop_tokens) = &mut stop_conditions.stop_token_ids_hidden {
+                for eos_token in self.model_info.eos_token_ids() {
+                    if !stop_tokens.contains(&eos_token) {
+                        stop_tokens.push(eos_token);
+                    }
+                }
+            } else {
+                stop_conditions.stop_token_ids_hidden = Some(self.model_info.eos_token_ids());
+            }
+            stop_conditions.apply_ignore_eos();
+            builder.stop_conditions(stop_conditions);
+        }
+
+        Ok(())
     }
 
     /// Validate that the prompt token count does not consume the model's entire context length.
@@ -697,22 +775,6 @@ impl OpenAIPreprocessor {
             "Reasoning parser decision for postprocessing"
         );
 
-        // Reasoning Content Parsing Transformation Step
-        // Current Solution:
-        // This step operates on Deltas created by the transform_postprocessor_stream function
-        // Only access to text and not token_ids - so can not support parsing based on token_ids for now
-        // Future Solution:
-        // To address the limitation if needed in future: move this step before transform_postprocessor_stream and add new field of reasoning_content to the backend output
-        // Use backend_output.reasoning_content field to fill out the deltas.
-        let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if should_parse_reasoning {
-            Box::pin(Self::parse_reasoning_content_from_stream(
-                stream,
-                self.runtime_config.reasoning_parser.clone().unwrap(), // Safety: We already checked that parser is some, so gtg
-            ))
-        } else {
-            Box::pin(stream)
-        };
-
         // Check if tools are present and if we should apply jail
         let has_tools = request
             .inner
@@ -739,7 +801,7 @@ impl OpenAIPreprocessor {
         });
 
         // Apply jail conditionally
-        let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> = if should_jail {
+        let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if should_jail {
             tracing::warn!(
                 tool_choice = ?request.inner.tool_choice,
                 has_tools,
@@ -754,6 +816,20 @@ impl OpenAIPreprocessor {
             ))
         } else {
             Box::pin(stream)
+        };
+
+        // Reasoning Content Parsing Transformation Step
+        // Tool-call jail must run before reasoning parsing. Some tool-call
+        // formats (for example Qwen3-Coder XML) look like generic tagged text;
+        // if reasoning parsing runs first it can split one tool call across
+        // reasoning_content and content, making the tool parser unrecoverable.
+        let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> = if should_parse_reasoning {
+            Box::pin(Self::parse_reasoning_content_from_stream(
+                stream,
+                self.runtime_config.reasoning_parser.clone().unwrap(), // Safety: checked above.
+            ))
+        } else {
+            stream
         };
 
         Ok(transformed_stream)
@@ -869,11 +945,22 @@ impl OpenAIPreprocessor {
                         .as_ref()
                         .and_then(|t| t.decode_worker_type())
                         .map(String::from);
+                    let usage = inner.response_generator.get_usage();
+                    let cached_tokens = usage
+                        .prompt_tokens_details
+                        .as_ref()
+                        .and_then(|d| d.cached_tokens.map(|c| c as usize))
+                        .or_else(|| tracker.as_ref().and_then(|t| t.cached_tokens()));
+                    let input_tokens = if usage.prompt_tokens > 0 {
+                        usage.prompt_tokens as usize
+                    } else {
+                        isl
+                    };
                     let llm_metrics = LLMMetricAnnotation {
-                        input_tokens: isl,
+                        input_tokens,
                         output_tokens: current_osl,
                         chunk_tokens,
-                        cached_tokens: None,
+                        cached_tokens,
                         prefill_worker_id,
                         prefill_dp_rank,
                         prefill_worker_type,
@@ -929,14 +1016,16 @@ impl OpenAIPreprocessor {
                             .as_ref()
                             .and_then(|t| t.decode_worker_type())
                             .map(String::from);
+                        let cached_tokens = usage
+                            .prompt_tokens_details
+                            .as_ref()
+                            .and_then(|d| d.cached_tokens.map(|c| c as usize))
+                            .or_else(|| tracker.as_ref().and_then(|t| t.cached_tokens()));
                         let llm_metrics = LLMMetricAnnotation {
                             input_tokens: usage.prompt_tokens as usize,
                             output_tokens: usage.completion_tokens as usize,
                             chunk_tokens: 0,
-                            cached_tokens: usage
-                                .prompt_tokens_details
-                                .as_ref()
-                                .and_then(|d| d.cached_tokens.map(|c| c as usize)),
+                            cached_tokens,
                             prefill_worker_id,
                             prefill_dp_rank,
                             prefill_worker_type,
@@ -1081,7 +1170,7 @@ impl OpenAIPreprocessor {
         }
 
         // Configure jail based on tool_choice
-        match tool_choice {
+        match &tool_choice {
             Some(ChatCompletionToolChoiceOption::Named(named)) => {
                 // Immediate jail mode for named tool choice
                 builder = builder.tool_choice_named(named.function.name.clone());
@@ -1090,14 +1179,12 @@ impl OpenAIPreprocessor {
                 // Immediate jail mode for required tool choice
                 builder = builder.tool_choice_required();
             }
-            Some(ChatCompletionToolChoiceOption::Auto)
-            | Some(ChatCompletionToolChoiceOption::None)
-            | None => {
-                // Traditional marker-based jail for auto/none/unspecified
+            Some(ChatCompletionToolChoiceOption::Auto) | None => {
                 if let Some(parser) = tool_call_parser {
                     builder = builder.tool_call_parser(parser);
                 }
             }
+            Some(ChatCompletionToolChoiceOption::None) => {}
         }
 
         let jail = builder.build();
@@ -1149,11 +1236,16 @@ impl OpenAIPreprocessor {
                 }
                 false
             }
-            Some("glm45") => {
-                if let Some(args) = chat_template_args
-                    && let Some(enable_thinking) = args.get("enable_thinking")
-                {
-                    return enable_thinking == &serde_json::Value::Bool(false);
+            Some("glm45") | Some("qwen3") => {
+                if let Some(args) = chat_template_args {
+                    if let Some(enable_thinking) = args.get("enable_thinking") {
+                        return enable_thinking == &serde_json::Value::Bool(false);
+                    }
+                    if reasoning_parser == Some("qwen3")
+                        && let Some(thinking) = args.get("thinking")
+                    {
+                        return thinking == &serde_json::Value::Bool(false);
+                    }
                 }
                 false
             }
@@ -1639,6 +1731,31 @@ mod tests {
                 Some(&empty_args),
                 false,
                 "glm45 + empty args → enabled",
+            ),
+            (
+                Some("qwen3"),
+                Some(&enable_thinking_false),
+                true,
+                "qwen3 + enable_thinking=false → disabled",
+            ),
+            (
+                Some("qwen3"),
+                Some(&enable_thinking_true),
+                false,
+                "qwen3 + enable_thinking=true → enabled",
+            ),
+            (
+                Some("qwen3"),
+                Some(&thinking_false),
+                true,
+                "qwen3 + thinking=false alias → disabled",
+            ),
+            (Some("qwen3"), None, false, "qwen3 + no args → enabled"),
+            (
+                Some("qwen3"),
+                Some(&empty_args),
+                false,
+                "qwen3 + empty args → enabled",
             ),
             (
                 Some("basic"),

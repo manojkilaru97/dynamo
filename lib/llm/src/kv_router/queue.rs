@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
-use super::WorkerSelector;
 use super::protocols::WorkerWithDpRank;
 use super::scheduler::{SchedulingRequest, SchedulingResponse};
 use super::sequence::{ActiveSequencesMulti, SequenceRequest};
+use super::{WorkerId, WorkerSelector};
 use crate::discovery::RuntimeConfigWatch;
 
 /// Large default for max_num_batched_tokens when not configured (effectively disables queueing for that worker)

@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 import logging
+import os
+import re
 import time
 from typing import Any, AsyncGenerator, Dict, Optional
 
@@ -19,6 +22,13 @@ from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
 
 class DecodeWorkerHandler(BaseWorkerHandler):
     """Handler for decode workers in both aggregated and disaggregated serving modes."""
+
+    THINK_START = "<think>"
+    THINK_END = "</think>"
+    DEFAULT_XGRAMMAR_MAX_STRING_LENGTH = 4096
+    DEFAULT_XGRAMMAR_MAX_ARRAY_ITEMS = 64
+    DEFAULT_XGRAMMAR_MAX_OBJECT_PROPERTIES = 64
+    DEFAULT_XGRAMMAR_MAX_REASONING_CHARS = 8192
 
     def __init__(
         self,
@@ -57,6 +67,404 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         self.engine.shutdown()
         logging.info("Engine shutdown")
 
+    @staticmethod
+    def _choice_regex(choices: list[Any]) -> str:
+        return "(?:" + "|".join(re.escape(str(choice)) for choice in choices) + ")"
+
+    @staticmethod
+    def _as_json_string(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, separators=(",", ":"))
+
+    @staticmethod
+    def _literal_from_contains_pattern(pattern: str) -> Optional[str]:
+        if not (pattern.startswith(".*") and pattern.endswith(".*")):
+            return None
+        literal = pattern[2:-2]
+        # Only handle the safe subset emitted by our tests/common schemas: a
+        # contains-regex with no real regex operators except escaped literals.
+        if re.search(r"(?<!\\)[\[\]\(\)\{\}\|\+\?\^\$]", literal):
+            return None
+        return re.sub(r"\\(.)", r"\1", literal)
+
+    @staticmethod
+    def _bounded_char_class_pattern(
+        pattern: str,
+        min_length: Any,
+        max_length: Any,
+    ) -> Optional[str]:
+        match = re.fullmatch(r"^\^(\[(?:\\.|[^\]])+\])([+*])\$$", pattern)
+        if not match:
+            return None
+
+        char_class, quantifier = match.groups()
+        if '"' in char_class:
+            # SGLang/xgrammar can emit unescaped quote characters from JSON
+            # Schema string patterns, producing invalid JSON. Fall back to
+            # the length-only normalization for such broad printable classes.
+            return None
+        lower = 1 if quantifier == "+" else 0
+        if isinstance(min_length, int):
+            lower = max(lower, min_length)
+        if isinstance(max_length, int):
+            return f"{char_class}{{{lower},{max_length}}}"
+        return f"{char_class}{{{lower},}}"
+
+    @classmethod
+    def _normalize_json_schema_for_xgrammar(cls, schema: Any) -> Any:
+        """Adapt common JSON Schema features to SGLang/xgrammar's supported subset.
+
+        xgrammar currently ignores some combinations such as string pattern with
+        minLength/maxLength/format, and it does not force required fields that are
+        absent from properties. It can also keep generating forever when a schema
+        permits unbounded strings, arrays, or open objects. Normalizing here keeps
+        Dynamo's OpenAI-compatible behavior stricter without changing the
+        request-facing schema contract.
+        """
+        if isinstance(schema, bool) or schema is None:
+            return schema
+        if isinstance(schema, list):
+            return [cls._normalize_json_schema_for_xgrammar(item) for item in schema]
+        if not isinstance(schema, dict):
+            return schema
+
+        normalized = {
+            key: cls._normalize_json_schema_for_xgrammar(value)
+            for key, value in schema.items()
+        }
+
+        required = normalized.get("required")
+        properties = normalized.get("properties")
+
+        # Some real payloads use a property-bag shape like
+        # {"host": {...}, "port": {...}, "required": [...]}. Convert that to
+        # normal JSON Schema object form before handing it to xgrammar.
+        if properties is None and isinstance(required, list):
+            schema_keywords = {
+                "$schema",
+                "$defs",
+                "additionalProperties",
+                "allOf",
+                "anyOf",
+                "description",
+                "enum",
+                "format",
+                "items",
+                "maxItems",
+                "maxLength",
+                "maximum",
+                "minItems",
+                "minLength",
+                "minimum",
+                "not",
+                "oneOf",
+                "pattern",
+                "properties",
+                "required",
+                "title",
+                "type",
+            }
+            inferred_properties = {
+                key: value
+                for key, value in normalized.items()
+                if key not in schema_keywords and isinstance(value, dict)
+            }
+            if inferred_properties:
+                for key in inferred_properties:
+                    normalized.pop(key, None)
+                normalized["type"] = normalized.get("type") or "object"
+                normalized["properties"] = inferred_properties
+                properties = inferred_properties
+
+        if isinstance(required, list):
+            if not isinstance(properties, dict):
+                properties = {}
+                normalized["properties"] = properties
+            for key in required:
+                if isinstance(key, str) and key not in properties:
+                    properties[key] = {}
+
+        for combinator in ("oneOf", "anyOf"):
+            branches = normalized.get(combinator)
+            if isinstance(branches, list):
+                repaired_branches = []
+                for branch in branches:
+                    if isinstance(branch, dict):
+                        branch_properties = branch.get("properties")
+                        branch_required = branch.get("required")
+                        if (
+                            branch_required is None
+                            and isinstance(branch_properties, dict)
+                            and branch_properties
+                        ):
+                            branch = {
+                                **branch,
+                                "required": list(branch_properties.keys()),
+                            }
+                    repaired_branches.append(branch)
+                normalized[combinator] = repaired_branches
+
+        schema_type = normalized.get("type")
+        if schema_type == "string":
+            normalized.setdefault(
+                "maxLength", cls.DEFAULT_XGRAMMAR_MAX_STRING_LENGTH
+            )
+        elif schema_type == "array" or "items" in normalized:
+            normalized.setdefault("type", "array")
+            normalized.setdefault("maxItems", cls.DEFAULT_XGRAMMAR_MAX_ARRAY_ITEMS)
+        elif (
+            schema_type == "object"
+            or isinstance(properties, dict)
+            or "additionalProperties" in normalized
+        ):
+            normalized.setdefault("type", "object")
+            normalized.setdefault(
+                "maxProperties", cls.DEFAULT_XGRAMMAR_MAX_OBJECT_PROPERTIES
+            )
+
+        if (
+            normalized.get("type") == "object"
+            and isinstance(normalized.get("properties"), dict)
+            and isinstance(normalized.get("required"), list)
+        ):
+            # xgrammar can satisfy root anyOf/not constraints without preserving
+            # sibling object/required constraints. Prefer the concrete root
+            # object shape; it is the contract clients validate against.
+            for combinator in ("anyOf", "allOf", "not"):
+                normalized.pop(combinator, None)
+
+        if normalized.get("type") == "string":
+            pattern = normalized.get("pattern")
+            if isinstance(pattern, str):
+                literal = cls._literal_from_contains_pattern(pattern)
+                if literal:
+                    normalized.pop("pattern", None)
+                    normalized["enum"] = [literal]
+                elif bounded_pattern := cls._bounded_char_class_pattern(
+                    pattern,
+                    normalized.get("minLength"),
+                    normalized.get("maxLength"),
+                ):
+                    # xgrammar may ignore minLength/maxLength when pattern is
+                    # also present. Fold simple anchored char-class patterns
+                    # into a single regex so both character and length
+                    # constraints survive.
+                    normalized["pattern"] = bounded_pattern
+                    normalized.pop("minLength", None)
+                    normalized.pop("maxLength", None)
+                elif any(
+                    key in normalized
+                    for key in ("minLength", "maxLength", "format")
+                ):
+                    # xgrammar warns that this combination causes the length
+                    # constraints to be ignored. Prefer length bounds over a
+                    # loose character-class pattern because length violations
+                    # are not repairable after generation.
+                    normalized.pop("pattern", None)
+            if normalized.get("format") == "":
+                normalized.pop("format", None)
+
+        return normalized
+
+    @classmethod
+    def _guided_to_sglang_params(cls, guided: Any) -> Dict[str, Any]:
+        if not isinstance(guided, dict):
+            return {}
+
+        json_schema = guided.get("json")
+        if guided.get("json_object"):
+            json_schema = json_schema or {"type": "object"}
+        if json_schema is False:
+            return {"regex": "a" * 4096}
+        json_schema = cls._normalize_json_schema_for_xgrammar(json_schema)
+
+        regex = guided.get("regex")
+        choice = guided.get("choice")
+        grammar = guided.get("grammar")
+        structural_tag = guided.get("structural_tag")
+        enable_thinking = guided.get("enable_thinking")
+
+        if grammar is not None:
+            cls._validate_ebnf_grammar(grammar)
+
+        if choice and not regex:
+            regex = cls._choice_regex(choice)
+
+        if enable_thinking and structural_tag is None:
+            reasoning_content = {
+                "type": "regex",
+                "pattern": f"[^<]{{0,{cls.DEFAULT_XGRAMMAR_MAX_REASONING_CHARS}}}",
+            }
+            if json_schema is not None:
+                structural_tag = {
+                    "type": "sequence",
+                    "elements": [
+                        {
+                            "type": "tag",
+                            "begin": "",
+                            "content": reasoning_content,
+                            "end": "</think>",
+                        },
+                        {"type": "json_schema", "json_schema": json_schema},
+                    ],
+                }
+                json_schema = None
+            elif regex is not None:
+                structural_tag = {
+                    "type": "sequence",
+                    "elements": [
+                        {
+                            "type": "tag",
+                            "begin": "",
+                            "content": reasoning_content,
+                            "end": "</think>",
+                        },
+                        {"type": "regex", "pattern": regex},
+                    ],
+                }
+                regex = None
+            elif grammar is not None:
+                structural_tag = {
+                    "type": "sequence",
+                    "elements": [
+                        {
+                            "type": "tag",
+                            "begin": "",
+                            "content": reasoning_content,
+                            "end": "</think>",
+                        },
+                        {"type": "grammar", "grammar": grammar},
+                    ],
+                }
+                grammar = None
+
+        params: Dict[str, Any] = {}
+        if structural_tag is not None:
+            structural_tag = cls._normalize_structural_tag_for_sglang(structural_tag)
+            params["structural_tag"] = cls._as_json_string(structural_tag)
+        elif json_schema is not None:
+            params["json_schema"] = cls._as_json_string(json_schema)
+        elif regex is not None:
+            params["regex"] = regex
+        elif grammar is not None:
+            params["ebnf"] = grammar
+
+        return params
+
+    @staticmethod
+    def _validate_ebnf_grammar(grammar: Any) -> None:
+        if not isinstance(grammar, str):
+            raise ValueError("Grammar error: structured_outputs.grammar must be a string")
+        try:
+            import xgrammar as xgr
+
+            xgr.Grammar.from_ebnf(grammar)
+        except Exception as exc:
+            raise ValueError(f"Grammar error: {exc}") from exc
+
+    @staticmethod
+    def _normalize_structural_tag_for_sglang(structural_tag: Any) -> Any:
+        """Convert Dynamo/vLLM-style structural formats to SGLang's wrapper.
+
+        SGLang accepts either the legacy structural_tag object with
+        ``structures``/``triggers`` or the newer xgrammar wrapper:
+        ``{"type": "structural_tag", "format": ...}``.  Dynamo's guided
+        decoding path internally represents the inner xgrammar format directly
+        (for example ``{"type": "sequence", ...}``), so wrap that shape before
+        handing it to SGLang.
+        """
+
+        if not isinstance(structural_tag, dict):
+            return structural_tag
+        if "structures" in structural_tag:
+            return structural_tag
+        if structural_tag.get("type") == "structural_tag":
+            return structural_tag
+        if "format" in structural_tag:
+            return {"type": "structural_tag", "format": structural_tag["format"]}
+        return {"type": "structural_tag", "format": structural_tag}
+
+    @staticmethod
+    def _request_enable_thinking(request: Dict[str, Any]) -> bool:
+        """Return whether this request asked the chat template to enable thinking."""
+
+        sampling_options = request.get("sampling_options")
+        if isinstance(sampling_options, dict):
+            guided = sampling_options.get("guided_decoding")
+            if isinstance(guided, dict) and guided.get("enable_thinking") is not None:
+                return bool(guided.get("enable_thinking"))
+
+        guided = request.get("guided_decoding")
+        if isinstance(guided, dict) and guided.get("enable_thinking") is not None:
+            return bool(guided.get("enable_thinking"))
+
+        chat_template_kwargs = request.get("chat_template_kwargs")
+        if isinstance(chat_template_kwargs, dict):
+            if chat_template_kwargs.get("enable_thinking") is not None:
+                return bool(chat_template_kwargs.get("enable_thinking"))
+            if chat_template_kwargs.get("thinking") is not None:
+                return bool(chat_template_kwargs.get("thinking"))
+
+        return False
+
+    @classmethod
+    def _sampling_params_enable_thinking(cls, sampling_params: Dict[str, Any]) -> bool:
+        """Detect reasoning handoff after guided decoding was lowered to SGLang."""
+
+        structural_tag = sampling_params.get("structural_tag")
+        return isinstance(structural_tag, str) and cls.THINK_END in structural_tag
+
+    @classmethod
+    def _split_qwen_reasoning_delta(
+        cls,
+        delta: str,
+        state: Dict[str, Any],
+        *,
+        flush: bool,
+    ) -> Dict[str, str]:
+        """Split Qwen thinking text from answer content for SGLang text IO.
+
+        SGLang's text stream is cumulative text. For Qwen thinking mode, the
+        model may emit reasoning without an opening ``<think>`` and then close
+        with ``</think>`` before the constrained answer. OpenAI clients expect
+        that pre-answer span as ``reasoning_content``, not ``content``.
+        """
+
+        if state.get("done"):
+            return {"content": delta} if delta else {}
+
+        segment = state.get("pending", "") + delta
+        state["pending"] = ""
+        if not segment:
+            return {}
+
+        end = cls.THINK_END
+        end_pos = segment.find(end)
+        if end_pos >= 0:
+            state["done"] = True
+            reasoning = segment[:end_pos].replace(cls.THINK_START, "")
+            content = segment[end_pos + len(end) :]
+            split: Dict[str, str] = {}
+            if reasoning:
+                split["reasoning_content"] = reasoning
+            if content:
+                split["content"] = content
+            return split
+
+        keep = len(end) - 1
+        if flush:
+            reasoning = segment
+        elif len(segment) <= keep:
+            state["pending"] = segment
+            reasoning = ""
+        else:
+            reasoning = segment[:-keep]
+            state["pending"] = segment[-keep:]
+
+        reasoning = reasoning.replace(cls.THINK_START, "")
+        return {"reasoning_content": reasoning} if reasoning else {}
+
     def _build_sampling_params(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Build sampling params from request format.
 
@@ -66,28 +474,50 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         Returns:
             Dict of sampling parameters for SGLang engine.
         """
-        if self.skip_tokenizer_init:
-            # Token-based request format
+        if "sampling_options" in request or "stop_conditions" in request:
+            # Dynamo-preprocessed request format. This is used both with
+            # --skip-tokenizer-init and with tokenizer init enabled for SGLang
+            # xgrammar support.
             sampling_opts = request.get("sampling_options", {})
             stop_conditions = request.get("stop_conditions", {})
 
             param_mapping = {
+                "presence_penalty": sampling_opts.get("presence_penalty"),
+                "frequency_penalty": sampling_opts.get("frequency_penalty"),
+                "repetition_penalty": sampling_opts.get("repetition_penalty"),
                 "temperature": sampling_opts.get("temperature"),
                 "top_p": sampling_opts.get("top_p"),
                 "top_k": sampling_opts.get("top_k"),
+                "min_p": sampling_opts.get("min_p"),
                 "max_new_tokens": stop_conditions.get("max_tokens"),
                 "ignore_eos": stop_conditions.get("ignore_eos"),
             }
+            param_mapping.update(
+                self._guided_to_sglang_params(sampling_opts.get("guided_decoding"))
+            )
         else:
             # OpenAI request format
             param_mapping = {
+                "presence_penalty": request.get("presence_penalty"),
+                "frequency_penalty": request.get("frequency_penalty"),
+                "repetition_penalty": request.get("repetition_penalty"),
                 "temperature": request.get("temperature"),
                 "top_p": request.get("top_p"),
                 "top_k": request.get("top_k"),
+                "min_p": request.get("min_p"),
                 "max_new_tokens": request.get("max_tokens"),
             }
+            param_mapping.update(
+                self._guided_to_sglang_params(request.get("guided_decoding"))
+            )
 
-        return {k: v for k, v in param_mapping.items() if v is not None}
+        sampling_params = {k: v for k, v in param_mapping.items() if v is not None}
+        if os.environ.get("DYN_SGLANG_LOG_SAMPLING_PARAMS") == "1":
+            logging.warning(
+                "Dynamo SGLang sampling params: %s",
+                json.dumps(sampling_params, sort_keys=True)[:4000],
+            )
+        return sampling_params
 
     async def generate(
         self, request: Dict[str, Any], context: Context
@@ -108,6 +538,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         trace_id = context.trace_id
         sampling_params = self._build_sampling_params(request)
         input_param = self._get_input_param(request)
+        split_reasoning = self._request_enable_thinking(
+            request
+        ) or self._sampling_params_enable_thinking(sampling_params)
         return_routed_experts = getattr(
             self.config.server_args, "enable_return_routed_experts", False
         )
@@ -151,11 +584,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 **self._priority_kwargs(priority),
             )
 
-            if self.skip_tokenizer_init:
+            if not self.use_sglang_text_io:
                 async for out in self._process_token_stream(decode, context):
                     yield out
             else:
-                async for out in self._process_text_stream(decode, context):
+                async for out in self._process_text_stream(
+                    decode, context, split_reasoning=split_reasoning
+                ):
                     yield out
         else:
             # Extract image URLs for multimodal requests. SGLang's mm_data_processor
@@ -190,11 +625,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 data_parallel_rank=dp_rank,
                 **self._priority_kwargs(priority),
             )
-            if self.skip_tokenizer_init:
+            if not self.use_sglang_text_io:
                 async for out in self._process_token_stream(agg, context):
                     yield out
             else:
-                async for out in self._process_text_stream(agg, context):
+                async for out in self._process_text_stream(
+                    agg, context, split_reasoning=split_reasoning
+                ):
                     yield out
 
     async def _process_token_stream(
@@ -276,6 +713,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         self,
         stream_source: AsyncGenerator[Dict[str, Any], None],
         context: Context,
+        *,
+        split_reasoning: bool = False,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Process text-based stream output in OpenAI format.
 
@@ -287,6 +726,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             OpenAI-formatted chat completion chunk dicts.
         """
         count = 0
+        reasoning_state: Dict[str, Any] = {"done": not split_reasoning, "pending": ""}
 
         # Use Future pattern for request ID - will be set when first response arrives
         request_id_future = asyncio.Future()
@@ -316,10 +756,19 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 )
                 next_count = len(text)
                 delta = text[count:]
+                delta_payload = (
+                    self._split_qwen_reasoning_delta(
+                        delta, reasoning_state, flush=bool(finish_reason)
+                    )
+                    if split_reasoning
+                    else ({"content": delta} if delta else {})
+                )
+                if not delta_payload and finish_reason:
+                    delta_payload = {}
 
                 choice_data = {
                     "index": index,
-                    "delta": {"role": "assistant", "content": delta},
+                    "delta": {"role": "assistant", **delta_payload},
                     "finish_reason": finish_reason_type,
                 }
 

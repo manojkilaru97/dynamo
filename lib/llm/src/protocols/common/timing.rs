@@ -160,6 +160,9 @@ pub struct RequestTracker {
 
     /// Number of detokenize samples accumulated for this request
     detokenize_count: AtomicU64,
+
+    /// Router pending depth observed when this request was assigned.
+    router_queue_depth: AtomicU64,
 }
 
 impl RequestTracker {
@@ -193,6 +196,7 @@ impl RequestTracker {
             tokenize_latency: OnceLock::new(),
             detokenize_total_ns: AtomicU64::new(0),
             detokenize_count: AtomicU64::new(0),
+            router_queue_depth: AtomicU64::new(0),
         }
     }
 
@@ -344,6 +348,11 @@ impl RequestTracker {
                 let _ = self.decode_worker_type.set(worker_type);
             }
         }
+    }
+
+    pub fn record_router_queue_depth(&self, depth: usize) {
+        self.router_queue_depth
+            .store(depth as u64, Ordering::Relaxed);
     }
 
     pub fn record_tokenize_latency(&self, l: Duration) {

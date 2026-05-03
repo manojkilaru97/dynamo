@@ -131,12 +131,13 @@ class BaseWorkerHandler(BaseGenerativeHandler):
             self.kv_publisher = None
         self.serving_mode = config.serving_mode
         self.skip_tokenizer_init = config.server_args.skip_tokenizer_init
+        self.use_sglang_text_io = config.dynamo_args.use_sglang_tokenizer
         self.enable_trace = config.server_args.enable_trace
 
         if engine is not None:
             self.input_param_manager = InputParamManager(
                 self.engine.tokenizer_manager.tokenizer
-                if not self.skip_tokenizer_init
+                if self.use_sglang_text_io
                 else None
             )
             self._engine_supports_priority = (
@@ -398,8 +399,14 @@ class BaseWorkerHandler(BaseGenerativeHandler):
             self.publisher.cleanup()
 
     def _get_input_param(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        # Dynamo frontend already applies the chat template and tokenizes OpenAI
+        # requests. Prefer those token ids even when SGLang's tokenizer is
+        # initialized for features such as xgrammar constrained decoding.
+        if not self.use_sglang_text_io and request.get("token_ids") is not None:
+            return {"input_ids": request.get("token_ids")}
+
         request_input = self.input_param_manager.get_input_param(
-            request, use_tokenizer=not self.skip_tokenizer_init
+            request, use_tokenizer=self.use_sglang_text_io
         )
 
         return {

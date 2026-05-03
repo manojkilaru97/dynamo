@@ -4,6 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    path::Path,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -17,7 +18,7 @@ use axum::{
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
-        sse::{KeepAlive, Sse},
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
 };
@@ -57,6 +58,7 @@ use crate::protocols::openai::{
     embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse},
     images::{NvCreateImageRequest, NvImagesResponse},
     responses::{NvCreateResponse, NvResponse, ResponseParams, chat_completion_to_response},
+    tools,
     videos::{NvCreateVideoRequest, NvVideosResponse},
 };
 use crate::request_template::RequestTemplate;
@@ -88,6 +90,7 @@ pub(super) fn get_body_limit() -> usize {
 const PAYLOAD_LOG_TARGET: &str = "dynamo_payload";
 const PAYLOAD_LOG_FALLBACK_TARGET: &str = "dynamo_llm::http::service::service_v2";
 const MAX_PAYLOAD_ACCUMULATE_BYTES: usize = 256 * 1024;
+const REDACTED_MM_INPUT: &str = "[redacted-mm-input]";
 
 fn configured_max_output_len() -> Option<u32> {
     std::env::var(env_llm::DYN_MAX_OUTPUT_LEN)
@@ -162,6 +165,103 @@ fn apply_responses_max_output_len_cap_with(request: &mut NvCreateResponse, cap: 
     );
 }
 
+fn ensure_chat_template_thinking_disabled(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let target_key = if obj.contains_key("chat_template_kwargs") {
+        "chat_template_kwargs"
+    } else if obj.contains_key("chat_template_args") {
+        "chat_template_args"
+    } else {
+        "chat_template_kwargs"
+    };
+
+    if !obj.get(target_key).is_some_and(serde_json::Value::is_object) {
+        obj.insert(
+            target_key.to_string(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        );
+    }
+
+    if let Some(args) = obj
+        .get_mut(target_key)
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        args.insert(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        args.insert("thinking".to_string(), serde_json::Value::Bool(false));
+    }
+}
+
+fn has_explicit_chat_template_thinking_control(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    for key in ["chat_template_kwargs", "chat_template_args"] {
+        if let Some(args) = obj.get(key).and_then(serde_json::Value::as_object)
+            && (args.contains_key("enable_thinking") || args.contains_key("thinking"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn normalize_chat_compat_payload(payload: &mut serde_json::Value) {
+    let has_structured_output = detect_payload_structured_output_kind(payload).is_some();
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+
+    let reasoning_effort = obj
+        .get("reasoning_effort")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.to_ascii_lowercase());
+
+    match reasoning_effort.as_deref() {
+        // The public UI sends `none` for "no reasoning". async-openai does not model that
+        // enum variant, so translate it into the template control Dynamo already supports.
+        Some("none") => {
+            obj.remove("reasoning_effort");
+            ensure_chat_template_thinking_disabled(obj);
+        }
+        // Some clients expose a five-level UI. Dynamo/backends only understand OpenAI's
+        // low/medium/high values, so `max` should behave as the strongest supported level.
+        Some("max") => {
+            obj.insert(
+                "reasoning_effort".to_string(),
+                serde_json::Value::String("high".to_string()),
+            );
+        }
+        _ => {}
+    }
+
+    // OpenAI structured output schemas constrain assistant content, not hidden
+    // reasoning. For Qwen-style default-thinking models, leaving thinking
+    // implicit can put valid JSON into `reasoning_content`, which breaks
+    // OpenAI/LangChain structured-output clients. Keep explicit caller intent,
+    // but default structured output to non-thinking content mode.
+    if has_structured_output && !has_explicit_chat_template_thinking_control(obj) {
+        ensure_chat_template_thinking_disabled(obj);
+    }
+}
+
+fn ensure_chat_response_logprobs_field(response: &mut serde_json::Value) {
+    let Some(choices) = response
+        .get_mut("choices")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for choice in choices {
+        if let Some(choice_obj) = choice.as_object_mut() {
+            choice_obj
+                .entry("logprobs".to_string())
+                .or_insert(serde_json::Value::Null);
+        }
+    }
+}
+
 fn header_map_to_json(headers: &HeaderMap) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     for (name, value) in headers {
@@ -218,7 +318,10 @@ fn count_payload_modalities(payload: &serde_json::Value) -> (usize, usize, usize
     }
 
     let mut counts = (0, 0, 0);
-    if let Some(messages) = payload.get("messages").and_then(serde_json::Value::as_array) {
+    if let Some(messages) = payload
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+    {
         for message in messages {
             if let Some(content) = message.get("content") {
                 count_content_parts(content, &mut counts);
@@ -318,7 +421,10 @@ fn detect_payload_structured_output_kind(payload: &serde_json::Value) -> Option<
                 "choice",
                 "grammar",
             ] {
-                if structured_outputs.get(key).is_some_and(|value| !value.is_null()) {
+                if structured_outputs
+                    .get(key)
+                    .is_some_and(|value| !value.is_null())
+                {
                     return Some(if key == "json" { "json_schema" } else { key });
                 }
             }
@@ -379,6 +485,249 @@ fn add_request_shape_log_attrs(
     }
 }
 
+fn is_multimodal_reference(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("file://")
+        || lower.contains("data:image/")
+        || lower.contains("data:video/")
+        || lower.contains("data:audio/")
+        || lower.contains(";asset_id,")
+}
+
+fn redact_html_src_attrs(input: &str) -> Option<String> {
+    let lower = input.to_ascii_lowercase();
+    if !lower.contains("src=") || !is_multimodal_reference(input) {
+        return None;
+    }
+
+    let bytes = input.as_bytes();
+    let lower_bytes = lower.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+
+    while let Some(rel) = lower_bytes[cursor..]
+        .windows(4)
+        .position(|window| window == b"src=")
+    {
+        let src_pos = cursor + rel;
+        let quote_pos = src_pos + 4;
+        if quote_pos >= bytes.len() || (bytes[quote_pos] != b'\'' && bytes[quote_pos] != b'"') {
+            cursor = quote_pos.min(bytes.len());
+            continue;
+        }
+        let quote = bytes[quote_pos];
+        let value_start = quote_pos + 1;
+        let Some(value_rel_end) = bytes[value_start..].iter().position(|b| *b == quote) else {
+            break;
+        };
+        let value_end = value_start + value_rel_end;
+        let value = &input[value_start..value_end];
+
+        out.push_str(&input[cursor..value_start]);
+        if is_multimodal_reference(value) {
+            out.push_str(REDACTED_MM_INPUT);
+        } else {
+            out.push_str(value);
+        }
+        cursor = value_end;
+    }
+
+    if cursor == 0 {
+        return None;
+    }
+    out.push_str(&input[cursor..]);
+    Some(out)
+}
+
+fn redact_string_for_payload_log(value: &str) -> serde_json::Value {
+    if let Some(redacted) = redact_html_src_attrs(value) {
+        return redacted.into();
+    }
+    if is_multimodal_reference(value) {
+        return REDACTED_MM_INPUT.into();
+    }
+    value.into()
+}
+
+fn redact_media_container_for_payload_log(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(_) => REDACTED_MM_INPUT.into(),
+        serde_json::Value::Object(map) => {
+            let mut redacted = serde_json::Map::with_capacity(map.len());
+            for (key, child) in map {
+                if key == "url" {
+                    redacted.insert(key.clone(), REDACTED_MM_INPUT.into());
+                } else {
+                    redacted.insert(key.clone(), redact_multimodal_payload_for_logging(child));
+                }
+            }
+            serde_json::Value::Object(redacted)
+        }
+        _ => redact_multimodal_payload_for_logging(value),
+    }
+}
+
+fn redact_multimodal_payload_for_logging(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(redact_multimodal_payload_for_logging)
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let mut redacted = serde_json::Map::with_capacity(map.len());
+            for (key, child) in map {
+                let child = match key.as_str() {
+                    "image_url" | "video_url" | "audio_url" => {
+                        redact_media_container_for_payload_log(child)
+                    }
+                    "input_audio" => match child {
+                        serde_json::Value::Object(audio) => {
+                            let mut audio_map = serde_json::Map::with_capacity(audio.len());
+                            for (audio_key, audio_value) in audio {
+                                if audio_key == "data" {
+                                    audio_map.insert(audio_key.clone(), REDACTED_MM_INPUT.into());
+                                } else {
+                                    audio_map.insert(
+                                        audio_key.clone(),
+                                        redact_multimodal_payload_for_logging(audio_value),
+                                    );
+                                }
+                            }
+                            serde_json::Value::Object(audio_map)
+                        }
+                        _ => redact_multimodal_payload_for_logging(child),
+                    },
+                    _ => redact_multimodal_payload_for_logging(child),
+                };
+                redacted.insert(key.clone(), child);
+            }
+            serde_json::Value::Object(redacted)
+        }
+        serde_json::Value::String(s) => redact_string_for_payload_log(s),
+        _ => value.clone(),
+    }
+}
+
+fn header_value_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn resolve_nvcf_asset_url(url: &str, headers: &HeaderMap) -> Result<String, ErrorResponse> {
+    let Some((prefix, asset_id)) = url.split_once(";asset_id,") else {
+        return Ok(url.to_string());
+    };
+    let Some(mime) = prefix.strip_prefix("data:") else {
+        return Ok(url.to_string());
+    };
+    if !(mime.starts_with("image/") || mime.starts_with("video/") || mime.starts_with("audio/")) {
+        return Ok(url.to_string());
+    }
+
+    let asset_dir = header_value_str(headers, "nvcf-input-asset-dir")
+        .or_else(|| header_value_str(headers, "nvcf-asset-dir"))
+        .ok_or_else(|| ErrorMessage::bad_request_from_message("Missing NVCF asset directory"))?;
+    let allowed_ids = header_value_str(headers, "nvcf-input-asset-references")
+        .or_else(|| header_value_str(headers, "nvcf-function-asset-ids"))
+        .ok_or_else(|| ErrorMessage::bad_request_from_message("Missing NVCF asset references"))?;
+
+    let asset_id = asset_id.trim().trim_start_matches('/');
+    let allowed = allowed_ids
+        .split(',')
+        .map(|item| item.trim().trim_start_matches('/'))
+        .any(|item| item == asset_id);
+    if !allowed {
+        return Err(ErrorMessage::bad_request_from_message(format!(
+            "Asset id '{asset_id}' not permitted by NVCF asset references"
+        )));
+    }
+
+    let asset_root = Path::new(asset_dir)
+        .canonicalize()
+        .map_err(|err| ErrorMessage::bad_request_from_message(format!("Invalid NVCF asset directory: {err}")))?;
+    let file_path = asset_root.join(asset_id).canonicalize().map_err(|err| {
+        ErrorMessage::bad_request_from_message(format!("Invalid NVCF asset id '{asset_id}': {err}"))
+    })?;
+    if file_path.strip_prefix(&asset_root).is_err() {
+        return Err(ErrorMessage::bad_request_from_message(
+            "Asset path escapes NVCF asset directory",
+        ));
+    }
+
+    let bytes = std::fs::read(&file_path).map_err(|err| {
+        ErrorMessage::bad_request_from_message(format!("Failed to read NVCF asset '{asset_id}': {err}"))
+    })?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
+}
+
+fn resolve_nvcf_asset_refs_for_backend(
+    value: &serde_json::Value,
+    headers: &HeaderMap,
+) -> Result<serde_json::Value, ErrorResponse> {
+    match value {
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(resolve_nvcf_asset_refs_for_backend(item, headers)?);
+            }
+            Ok(serde_json::Value::Array(out))
+        }
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, child) in map {
+                out.insert(
+                    key.clone(),
+                    resolve_nvcf_asset_refs_for_backend(child, headers)?,
+                );
+            }
+            Ok(serde_json::Value::Object(out))
+        }
+        serde_json::Value::String(s) if s.contains(";asset_id,") => {
+            Ok(serde_json::Value::String(resolve_nvcf_asset_url(s, headers)?))
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+fn normalize_chat_response_payload_for_logging(
+    mut payload: serde_json::Value,
+    include_empty_tool_calls: bool,
+    strip_null_reasoning_content: bool,
+) -> serde_json::Value {
+    let Some(choices) = payload.get_mut("choices").and_then(serde_json::Value::as_array_mut) else {
+        return payload;
+    };
+
+    for choice in choices {
+        let Some(message) = choice
+            .get_mut("message")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if !message.contains_key("content") {
+            message.insert("content".to_string(), serde_json::Value::Null);
+        }
+        if strip_null_reasoning_content
+            && message
+                .get("reasoning_content")
+                .is_some_and(serde_json::Value::is_null)
+        {
+            message.remove("reasoning_content");
+        }
+        if include_empty_tool_calls && !message.contains_key("tool_calls") {
+            message.insert(
+                "tool_calls".to_string(),
+                serde_json::Value::Array(Vec::new()),
+            );
+        }
+    }
+
+    payload
+}
+
 fn emit_openai_request_log(
     request_id: &str,
     model: &str,
@@ -399,7 +748,10 @@ fn emit_openai_request_log(
     fields.insert("streaming".to_string(), streaming.into());
     fields.insert("headers".to_string(), headers.clone());
     add_request_shape_log_attrs(&mut fields, &payload);
-    fields.insert("payload".to_string(), payload.clone());
+    fields.insert(
+        "payload".to_string(),
+        redact_multimodal_payload_for_logging(&payload),
+    );
 
     emit_payload_log(
         "openai.request",
@@ -434,9 +786,34 @@ fn emit_openai_response_log(
     status_code: u16,
     payload: serde_json::Value,
 ) {
+    emit_openai_response_log_with_options(
+        request_id, model, endpoint, streaming, status_code, payload, false, false,
+    )
+}
+
+fn emit_openai_response_log_with_options(
+    request_id: &str,
+    model: &str,
+    endpoint: &'static str,
+    streaming: bool,
+    status_code: u16,
+    payload: serde_json::Value,
+    include_empty_tool_calls: bool,
+    strip_null_reasoning_content: bool,
+) {
     if !log_payloads_enabled() {
         return;
     }
+
+    let payload = if endpoint == "chat_completions" {
+        normalize_chat_response_payload_for_logging(
+            payload,
+            include_empty_tool_calls,
+            strip_null_reasoning_content,
+        )
+    } else {
+        payload
+    };
 
     emit_payload_log(
         "openai.response",
@@ -499,11 +876,15 @@ fn normalize_responses_reasoning(value: &mut serde_json::Value) {
 
     // The Responses API tests use effort=none to mean "disable reasoning".
     // The upstream typed model does not accept "none", so normalize it to
-    // omission rather than inventing a non-spec internal enum value.
+    // omission and carry an internal marker for the chat-completions bridge.
     reasoning_obj.remove("effort");
     if reasoning_obj.is_empty() {
         root.remove("reasoning");
     }
+    root.insert(
+        "dynamo_disable_reasoning".to_string(),
+        serde_json::Value::Bool(true),
+    );
 }
 
 fn normalize_responses_tools(value: &mut serde_json::Value) {
@@ -773,6 +1154,10 @@ fn map_backend_validation_error(error: &str) -> Option<ErrorResponse> {
 
     if trimmed.contains("VLLMValidationError:")
         || trimmed.contains("Failed to convert the grammar from GBNF to Lark:")
+        || (trimmed.contains("Failed to apply prompt template:")
+            && (trimmed.contains("Unexpected item type")
+                || trimmed.contains("invalid operation: Unexpected")
+                || trimmed.contains("unsupported")))
     {
         let detail = trimmed
             .split_once(": ")
@@ -1475,8 +1860,22 @@ async fn handler_chat_completions(
         payload_value.clone(),
     );
 
+    let mut backend_payload_value = resolve_nvcf_asset_refs_for_backend(&payload_value, &headers)
+        .map_err(|err_response| {
+            emit_openai_response_log(
+                &request_id,
+                &raw_model,
+                "chat_completions",
+                streaming,
+                err_response.0.as_u16(),
+                error_response_payload(&err_response),
+            );
+            err_response
+        })?;
+    normalize_chat_compat_payload(&mut backend_payload_value);
+
     let mut request: NvCreateChatCompletionRequest =
-        serde_json::from_slice(&body).map_err(|e| {
+        serde_json::from_value(backend_payload_value).map_err(|e| {
             let err_response = ErrorMessage::from_http_error(HttpError {
                 code: 400,
                 message: format!("Failed to deserialize the JSON body into the target type: {e}"),
@@ -1789,6 +2188,34 @@ fn accumulate_reasoning_dispatch(
     events
 }
 
+/// Normalize streaming finish_reason for backends that emit complete tool calls
+/// in one chunk and then send a separate terminal `stop` chunk.
+fn normalize_stream_tool_call_finish_reason(
+    response: &mut Annotated<NvCreateChatCompletionStreamResponse>,
+    choices_with_tool_calls: &mut HashSet<u32>,
+) {
+    let Some(data) = response.data.as_mut() else {
+        return;
+    };
+
+    for choice in &mut data.choices {
+        if choice
+            .delta
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tool_calls| !tool_calls.is_empty())
+        {
+            choices_with_tool_calls.insert(choice.index);
+        }
+
+        if choices_with_tool_calls.contains(&choice.index)
+            && choice.finish_reason == Some(dynamo_async_openai::types::FinishReason::Stop)
+        {
+            choice.finish_reason = Some(dynamo_async_openai::types::FinishReason::ToolCalls);
+        }
+    }
+}
+
 /// Returns `true` when any streaming chat choice carries a `finish_reason`.
 fn is_final_chat_payload_chunk(
     response: &Annotated<NvCreateChatCompletionStreamResponse>,
@@ -1915,6 +2342,13 @@ async fn chat_completions(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metrics_model);
+    let include_empty_tool_calls_in_stream_log = request
+        .inner
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty());
+    let request_wants_logprobs =
+        request.inner.logprobs.unwrap_or(false) || request.inner.top_logprobs.unwrap_or(0) > 0;
 
     // The preprocessor forces usage emission for chat-completion streams so clients always get
     // a final usage-only chunk. Match the actual emitted stream contract here rather than the
@@ -1966,12 +2400,14 @@ async fn chat_completions(
         let reasoning_dispatch_enabled = state.streaming_reasoning_dispatch_enabled();
         let mut reasoning_buffer: HashMap<u32, String> = HashMap::new();
         let mut dispatched_tool_ids: HashSet<String> = HashSet::new();
+        let mut choices_with_tool_calls: HashSet<u32> = HashSet::new();
 
         let log_payloads = log_payloads_enabled();
         let parsing_options_for_log = parsing_options.clone();
         let mut payload_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> = Vec::new();
         let request_id_for_log = request_id.clone();
         let model_for_log = model.clone();
+        let include_empty_tool_calls_in_stream_log = include_empty_tool_calls_in_stream_log;
 
         // flat_map lets us optionally prepend extra SSE events before each regular chunk:
         //   - `event: tool_call_dispatch`  — complete tool call detected early (tool dispatch)
@@ -1981,6 +2417,7 @@ async fn chat_completions(
             if let Some(data) = response.data.as_mut() {
                 data.model = model_for_log.clone();
             }
+            normalize_stream_tool_call_finish_reason(&mut response, &mut choices_with_tool_calls);
 
             // Extract side-channel events before the response is consumed by EventConverter.
             let mut events: Vec<Result<Event, axum::Error>> = vec![];
@@ -2026,7 +2463,7 @@ async fn chat_completions(
                         )
                         .await
                     {
-                        emit_openai_response_log(
+                        emit_openai_response_log_with_options(
                             &request_id_for_log,
                             &model_for_log,
                             "chat_completions",
@@ -2034,6 +2471,8 @@ async fn chat_completions(
                             StatusCode::OK.as_u16(),
                             serde_json::to_value(&final_response)
                                 .unwrap_or(serde_json::Value::Null),
+                            include_empty_tool_calls_in_stream_log,
+                            true,
                         );
                     }
                 });
@@ -2101,13 +2540,18 @@ async fn chat_completions(
                 })?;
         response.model = model.clone();
 
+        let mut response_payload = serde_json::to_value(&response).unwrap_or(serde_json::Value::Null);
+        if request_wants_logprobs {
+            ensure_chat_response_logprobs_field(&mut response_payload);
+        }
+
         emit_openai_response_log(
             &request_id,
             &model,
             "chat_completions",
             false,
             StatusCode::OK.as_u16(),
-            serde_json::to_value(&response).unwrap_or(serde_json::Value::Null),
+            response_payload.clone(),
         );
 
         inflight_guard.mark_ok();
@@ -2116,7 +2560,7 @@ async fn chat_completions(
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
         }
-        Ok(Json(response).into_response())
+        Ok(Json(response_payload).into_response())
     }
 }
 
@@ -2200,6 +2644,16 @@ pub fn validate_chat_completion_fields_generic(
             code: 400,
             message: VALIDATION_PREFIX.to_string()
                 + "When using `tool_choice`, `tools` must be set.",
+        }));
+    }
+
+    if let Some(tool_choice) = request.inner.tool_choice.as_ref()
+        && let Err(err) =
+            tools::get_json_schema_from_tools(Some(tool_choice), request.inner.tools.as_deref())
+    {
+        return Err(ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: VALIDATION_PREFIX.to_string() + &err.to_string(),
         }));
     }
 
@@ -2304,7 +2758,20 @@ async fn handler_responses(
         request_json.clone(),
     );
 
-    let normalized_request_json = normalize_responses_request_json(request_json);
+    let backend_request_json = resolve_nvcf_asset_refs_for_backend(&request_json, &headers)
+        .map_err(|err_response| {
+            emit_openai_response_log(
+                &request_id,
+                &raw_model,
+                "responses",
+                streaming,
+                err_response.0.as_u16(),
+                error_response_payload(&err_response),
+            );
+            err_response
+        })?;
+
+    let normalized_request_json = normalize_responses_request_json(backend_request_json);
     let mut request: NvCreateResponse =
         serde_json::from_value(normalized_request_json).map_err(|err| {
             let err_response = ErrorMessage::bad_request_from_message(format!(
@@ -3367,6 +3834,94 @@ mod tests {
         assert!(result.is_none(), "parallel_tool_calls should be supported");
     }
 
+    fn chat_stream_chunk(
+        index: u32,
+        tool_calls: Option<Vec<dynamo_async_openai::types::ChatCompletionMessageToolCallChunk>>,
+        finish_reason: Option<dynamo_async_openai::types::FinishReason>,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        Annotated {
+            data: Some(NvCreateChatCompletionStreamResponse {
+                id: "chatcmpl-test".to_string(),
+                choices: vec![dynamo_async_openai::types::ChatChoiceStream {
+                    index,
+                    delta: dynamo_async_openai::types::ChatCompletionStreamResponseDelta {
+                        content: None,
+                        function_call: None,
+                        tool_calls,
+                        role: None,
+                        refusal: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason,
+                    stop_reason: None,
+                    logprobs: None,
+                }],
+                created: 0,
+                model: "test-model".to_string(),
+                system_fingerprint: None,
+                object: "chat.completion.chunk".to_string(),
+                service_tier: None,
+                usage: None,
+                nvext: None,
+            }),
+            id: None,
+            event: None,
+            comment: None,
+            error: None,
+        }
+    }
+
+    fn test_tool_call_chunk() -> dynamo_async_openai::types::ChatCompletionMessageToolCallChunk {
+        dynamo_async_openai::types::ChatCompletionMessageToolCallChunk {
+            index: 0,
+            id: Some("call_1".to_string()),
+            r#type: Some(dynamo_async_openai::types::ChatCompletionToolType::Function),
+            function: Some(dynamo_async_openai::types::FunctionCallStream {
+                name: Some("search".to_string()),
+                arguments: Some(r#"{"query":"qwen"}"#.to_string()),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_normalize_stream_tool_call_finish_reason_rewrites_later_stop() {
+        let mut seen_tool_calls = HashSet::new();
+
+        let mut tool_chunk = chat_stream_chunk(0, Some(vec![test_tool_call_chunk()]), None);
+        normalize_stream_tool_call_finish_reason(&mut tool_chunk, &mut seen_tool_calls);
+
+        let mut final_chunk = chat_stream_chunk(
+            0,
+            None,
+            Some(dynamo_async_openai::types::FinishReason::Stop),
+        );
+        normalize_stream_tool_call_finish_reason(&mut final_chunk, &mut seen_tool_calls);
+
+        let choice = &final_chunk.data.as_ref().unwrap().choices[0];
+        assert_eq!(
+            choice.finish_reason,
+            Some(dynamo_async_openai::types::FinishReason::ToolCalls)
+        );
+    }
+
+    #[test]
+    fn test_normalize_stream_tool_call_finish_reason_preserves_plain_stop() {
+        let mut seen_tool_calls = HashSet::new();
+        let mut final_chunk = chat_stream_chunk(
+            0,
+            None,
+            Some(dynamo_async_openai::types::FinishReason::Stop),
+        );
+
+        normalize_stream_tool_call_finish_reason(&mut final_chunk, &mut seen_tool_calls);
+
+        let choice = &final_chunk.data.as_ref().unwrap().choices[0];
+        assert_eq!(
+            choice.finish_reason,
+            Some(dynamo_async_openai::types::FinishReason::Stop)
+        );
+    }
+
     #[test]
     fn test_validate_unsupported_fields_detects_flags() {
         #[allow(clippy::type_complexity)]
@@ -3621,6 +4176,66 @@ mod tests {
             assert_eq!(
                 error_response.1.message,
                 format!("{VALIDATION_PREFIX}Logprobs must be between 0 and 5, got 6")
+            );
+        }
+    }
+
+    #[test]
+    fn test_chat_completion_rejects_unknown_named_tool_choice() {
+        let request = NvCreateChatCompletionRequest {
+            inner: CreateChatCompletionRequest {
+                model: "test-model".to_string(),
+                messages: vec![ChatCompletionRequestMessage::User(
+                    ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Text("Hello".to_string()),
+                        name: None,
+                    },
+                )],
+                tools: Some(vec![dynamo_async_openai::types::ChatCompletionTool {
+                    r#type: dynamo_async_openai::types::ChatCompletionToolType::Function,
+                    function: dynamo_async_openai::types::FunctionObject {
+                        name: "xxyyzz".to_string(),
+                        description: Some("xxyyzz two numbers".to_string()),
+                        parameters: Some(serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "a": {"type": "integer"},
+                                "b": {"type": "integer"}
+                            },
+                            "required": ["a", "b"]
+                        })),
+                        strict: None,
+                    },
+                }]),
+                tool_choice: Some(ChatCompletionToolChoiceOption::Named(
+                    dynamo_async_openai::types::ChatCompletionNamedToolChoice {
+                        r#type: dynamo_async_openai::types::ChatCompletionToolType::Function,
+                        function: dynamo_async_openai::types::FunctionName {
+                            name: "zzyyxx".to_string(),
+                        },
+                    },
+                )),
+                ..Default::default()
+            },
+            common: Default::default(),
+            nvext: None,
+            chat_template_args: None,
+            media_io_kwargs: None,
+            structured_outputs: None,
+            request_id: None,
+            unsupported_fields: Default::default(),
+        };
+
+        let result = validate_chat_completion_fields_generic(&request);
+
+        assert!(result.is_err());
+        if let Err(error_response) = result {
+            assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
+            assert!(
+                error_response
+                    .1
+                    .message
+                    .contains("tool `zzyyxx` not found in the tools list")
             );
         }
     }
@@ -3933,6 +4548,61 @@ mod tests {
         // And validation should pass (no unsupported fields)
         let result = validate_completion_fields_generic(&request);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_structured_chat_defaults_to_non_thinking_template() {
+        let mut payload = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Return JSON"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object", "properties": {"answer": {"type": "string"}}}
+                }
+            }
+        });
+
+        normalize_chat_compat_payload(&mut payload);
+        let args = payload
+            .get("chat_template_kwargs")
+            .and_then(serde_json::Value::as_object)
+            .expect("chat_template_kwargs");
+
+        assert_eq!(
+            args.get("enable_thinking"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(args.get("thinking"), Some(&serde_json::Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_structured_chat_preserves_explicit_thinking_template() {
+        let mut payload = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Return JSON"}],
+            "chat_template_kwargs": {"enable_thinking": true},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object", "properties": {"answer": {"type": "string"}}}
+                }
+            }
+        });
+
+        normalize_chat_compat_payload(&mut payload);
+        let args = payload
+            .get("chat_template_kwargs")
+            .and_then(serde_json::Value::as_object)
+            .expect("chat_template_kwargs");
+
+        assert_eq!(
+            args.get("enable_thinking"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(args.get("thinking").is_none());
     }
 
     #[tokio::test]

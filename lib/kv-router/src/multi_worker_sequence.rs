@@ -123,7 +123,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         router_id: u64,
         worker_type: &'static str,
     ) -> Self {
-        assert!(block_size > 1, "block_size must be greater than 1");
+        assert!(block_size >= 1, "block_size must be at least 1");
 
         let workers = Arc::new(DashMap::new());
         let request_to_worker = Arc::new(DashMap::new());

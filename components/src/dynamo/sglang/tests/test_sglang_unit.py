@@ -3,6 +3,7 @@
 
 """Unit tests for SGLang backend components."""
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 import yaml
 
 from dynamo.sglang.args import parse_args
+from dynamo.sglang.request_handlers.llm.decode_handler import DecodeWorkerHandler
 from dynamo.sglang.tests.conftest import make_cli_args_fixture
 
 # Get path relative to this test file
@@ -219,6 +221,161 @@ async def test_disagg_config_section_must_be_dict(tmp_path, mock_sglang_cli):
         ValueError, match="Disagg config section 'prefill' must be a dictionary"
     ):
         await parse_args(sys.argv[1:])
+
+
+def test_xgrammar_schema_normalization_adds_runaway_bounds():
+    """Unbounded JSON schemas should not let constrained decoding run forever."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "metadata": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            },
+        },
+        "required": ["title", "tags", "metadata"],
+    }
+
+    normalized = DecodeWorkerHandler._normalize_json_schema_for_xgrammar(schema)
+
+    assert normalized["maxProperties"] == 64
+    assert normalized["properties"]["title"]["maxLength"] == 4096
+    assert normalized["properties"]["tags"]["maxItems"] == 64
+    assert normalized["properties"]["tags"]["items"]["maxLength"] == 4096
+    assert normalized["properties"]["metadata"]["maxProperties"] == 64
+    assert (
+        normalized["properties"]["metadata"]["additionalProperties"]["maxLength"]
+        == 4096
+    )
+
+
+def test_xgrammar_schema_normalization_preserves_explicit_bounds():
+    schema = {
+        "type": "object",
+        "maxProperties": 3,
+        "properties": {
+            "title": {"type": "string", "maxLength": 32},
+            "tags": {"type": "array", "maxItems": 2, "items": {"type": "string"}},
+        },
+    }
+
+    normalized = DecodeWorkerHandler._normalize_json_schema_for_xgrammar(schema)
+
+    assert normalized["maxProperties"] == 3
+    assert normalized["properties"]["title"]["maxLength"] == 32
+    assert normalized["properties"]["tags"]["maxItems"] == 2
+    assert normalized["properties"]["tags"]["items"]["maxLength"] == 4096
+
+
+def test_xgrammar_schema_normalization_disambiguates_oneof_object_branches():
+    schema = {
+        "type": "object",
+        "oneOf": [
+            {"properties": {"key": {"type": "string"}}},
+            {"properties": {"keys": {"type": "array", "items": {"type": "string"}}}},
+        ],
+    }
+
+    normalized = DecodeWorkerHandler._normalize_json_schema_for_xgrammar(schema)
+
+    assert normalized["oneOf"][0]["required"] == ["key"]
+    assert normalized["oneOf"][1]["required"] == ["keys"]
+
+
+def test_xgrammar_schema_normalization_keeps_root_object_over_side_anyof():
+    schema = {
+        "type": "object",
+        "properties": {"Age": {"type": "number"}},
+        "required": ["Age"],
+        "anyOf": [{"not": {"required": ["FirstName", "LastName"]}}],
+    }
+
+    normalized = DecodeWorkerHandler._normalize_json_schema_for_xgrammar(schema)
+
+    assert "anyOf" not in normalized
+    assert normalized["type"] == "object"
+    assert normalized["required"] == ["Age"]
+    assert normalized["properties"]["Age"]["type"] == "number"
+
+
+def test_thinking_guided_json_uses_bounded_reasoning_region():
+    params = DecodeWorkerHandler._guided_to_sglang_params(
+        {
+            "enable_thinking": True,
+            "json": {"type": "string", "enum": ["low", "medium", "high"]},
+        }
+    )
+
+    structural_tag = json.loads(params["structural_tag"])
+    reasoning_region = structural_tag["format"]["elements"][0]["content"]
+
+    assert reasoning_region["type"] == "regex"
+    assert "8192" in reasoning_region["pattern"]
+    assert reasoning_region["pattern"].startswith("[^<]")
+    assert "any_text" not in params["structural_tag"]
+
+
+def test_openai_sampling_params_preserve_sglang_controls():
+    handler = object.__new__(DecodeWorkerHandler)
+
+    params = handler._build_sampling_params(
+        {
+            "presence_penalty": 1.5,
+            "frequency_penalty": 0.25,
+            "repetition_penalty": 1.0,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "min_p": 0.0,
+            "seed": 1,
+            "max_tokens": 65536,
+        }
+    )
+
+    assert params == {
+        "presence_penalty": 1.5,
+        "frequency_penalty": 0.25,
+        "repetition_penalty": 1.0,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "max_new_tokens": 65536,
+    }
+
+
+def test_preprocessed_sampling_params_preserve_sglang_controls():
+    handler = object.__new__(DecodeWorkerHandler)
+
+    params = handler._build_sampling_params(
+        {
+            "sampling_options": {
+                "presence_penalty": 1.5,
+                "frequency_penalty": 0.25,
+                "repetition_penalty": 1.0,
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "top_k": 20,
+                "min_p": 0.0,
+                "seed": 1,
+            },
+            "stop_conditions": {"max_tokens": 65536, "ignore_eos": False},
+        }
+    )
+
+    assert params == {
+        "presence_penalty": 1.5,
+        "frequency_penalty": 0.25,
+        "repetition_penalty": 1.0,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "max_new_tokens": 65536,
+        "ignore_eos": False,
+    }
 
 
 @pytest.mark.asyncio

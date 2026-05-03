@@ -132,6 +132,24 @@ pub fn register_worker_load_metrics(
     Ok(())
 }
 
+pub static ROUTER_QUEUE_PENDING_REQUESTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            format!("{}_router_pending_requests", name_prefix::FRONTEND),
+            "Pending requests parked in the KV router scheduler queue",
+        ),
+        &[labels::WORKER_TYPE],
+    )
+    .expect("Failed to create router_pending_requests gauge")
+});
+
+pub fn register_router_queue_metrics(
+    registry: &prometheus::Registry,
+) -> Result<(), prometheus::Error> {
+    registry.register(Box::new(ROUTER_QUEUE_PENDING_REQUESTS.clone()))?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Routing overhead metrics (histograms)
 // ---------------------------------------------------------------------------

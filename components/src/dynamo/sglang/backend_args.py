@@ -35,6 +35,13 @@ class DynamoSGLangArgGroup(ArgGroup):
             default=False,
             help="Use SGLang's tokenizer for pre and post processing. This bypasses Dynamo's preprocessor and only v1/chat/completions will be available through the Dynamo frontend. Cannot be used with --custom-jinja-template.",
         )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--init-sglang-tokenizer-for-grammar",
+            env_var="DYN_SGL_INIT_TOKENIZER_FOR_GRAMMAR",
+            default=False,
+            help="Initialize SGLang's tokenizer so SGLang/xgrammar constrained decoding is available, while still using Dynamo tokenized input/output.",
+        )
 
         add_negatable_bool_argument(
             g,
@@ -87,6 +94,15 @@ class DynamoSGLangArgGroup(ArgGroup):
             default=None,
             help="Key to select from nested disaggregation configuration file (e.g., 'prefill', 'decode').",
         )
+        add_argument(
+            g,
+            flag_name="--dyn-served-model-alias",
+            env_var="DYN_SGL_SERVED_MODEL_ALIASES",
+            default=[],
+            arg_type=None,
+            nargs="*",
+            help="Additional served model aliases to register with Dynamo discovery.",
+        )
         add_negatable_bool_argument(
             g,
             flag_name="--video-generation-worker",
@@ -100,6 +116,7 @@ class DynamoSGLangConfig(ConfigBase):
     """Configuration for Dynamo SGLang wrapper (SGLang-specific only)."""
 
     use_sglang_tokenizer: bool
+    init_sglang_tokenizer_for_grammar: bool
     multimodal_processor: bool
     multimodal_encode_worker: bool
     multimodal_worker: bool
@@ -108,6 +125,7 @@ class DynamoSGLangConfig(ConfigBase):
 
     disagg_config: Optional[str] = None
     disagg_config_key: Optional[str] = None
+    dyn_served_model_alias: list[str] = []
 
     video_generation_worker: bool
 

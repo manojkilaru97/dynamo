@@ -14,7 +14,7 @@ use thiserror::Error;
 pub enum ToolChoiceError {
     #[error("tool_choice requires a matching `tools` array")]
     MissingTools,
-    #[error("tool `{0}` was not provided in `tools`")]
+    #[error("tool `{0}` not found in the tools list")]
     ToolNotFound(String),
     #[error("$defs for tool `{0}` must be an object")]
     InvalidDefinitionMap(String),

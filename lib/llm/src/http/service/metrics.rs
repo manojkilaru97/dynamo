@@ -254,13 +254,26 @@ pub struct Metrics {
     inter_token_latency: HistogramVec,
     request_type_image_total: IntCounter,
     request_type_video_total: IntCounter,
+    request_type_audio_total: IntCounter,
     request_type_tool_call_total: IntCounter,
     request_type_structured_output_total: IntCounter,
+    request_type_tool_call_total_alias: IntCounter,
+    request_type_structured_output_total_alias: IntCounter,
     request_type_streaming_total: IntCounter,
+    request_input_images_total: IntCounter,
+    request_input_videos_total: IntCounter,
+    request_input_audios_total: IntCounter,
     request_input_tools_total: IntCounter,
     request_tool_choice_total: IntCounterVec,
     request_structured_output_kind_total: IntCounterVec,
     request_structured_output_backend_total: IntCounterVec,
+    request_mode_total: IntCounterVec,
+    request_outcome_total: IntCounterVec,
+    request_finish_reason_total: IntCounterVec,
+    request_success_total: IntCounterVec,
+    http_requests_total: IntCounterVec,
+    prompt_tokens_total: IntCounterVec,
+    generation_tokens_total: IntCounterVec,
 
     // Runtime configuration metrics. Note: Some of these metrics represent counter-like values from
     // source systems, but are implemented as gauges because they are copied/synchronized from upstream
@@ -415,8 +428,9 @@ struct RequestShapeObservation {
     structured_output_kind: &'static str,
     structured_output_backend: String,
     tool_count: usize,
-    has_image: bool,
-    has_video: bool,
+    image_count: usize,
+    video_count: usize,
+    audio_count: usize,
     is_streaming: bool,
 }
 
@@ -492,9 +506,10 @@ fn detect_structured_output_kind(request: &NvCreateChatCompletionRequest) -> &'s
     }
 }
 
-fn detect_modalities(request: &NvCreateChatCompletionRequest) -> (bool, bool) {
-    let mut has_image = false;
-    let mut has_video = false;
+fn detect_modalities(request: &NvCreateChatCompletionRequest) -> (usize, usize, usize) {
+    let mut image_count = 0usize;
+    let mut video_count = 0usize;
+    let mut audio_count = 0usize;
     for message in &request.inner.messages {
         let ChatCompletionRequestMessage::User(user) = message else {
             continue;
@@ -504,13 +519,14 @@ fn detect_modalities(request: &NvCreateChatCompletionRequest) -> (bool, bool) {
         };
         for part in parts {
             match part {
-                ChatCompletionRequestUserMessageContentPart::ImageUrl(_) => has_image = true,
-                ChatCompletionRequestUserMessageContentPart::VideoUrl(_) => has_video = true,
+                ChatCompletionRequestUserMessageContentPart::ImageUrl(_) => image_count += 1,
+                ChatCompletionRequestUserMessageContentPart::VideoUrl(_) => video_count += 1,
+                ChatCompletionRequestUserMessageContentPart::InputAudio(_) => audio_count += 1,
                 _ => {}
             }
         }
     }
-    (has_image, has_video)
+    (image_count, video_count, audio_count)
 }
 
 fn observe_request_shape(
@@ -530,15 +546,16 @@ fn observe_request_shape(
         .guided_decoding_backend
         .clone()
         .unwrap_or_else(|| "default".to_string());
-    let (has_image, has_video) = detect_modalities(request);
+    let (image_count, video_count, audio_count) = detect_modalities(request);
 
     RequestShapeObservation {
         tool_choice,
         structured_output_kind,
         structured_output_backend,
         tool_count,
-        has_image,
-        has_video,
+        image_count,
+        video_count,
+        audio_count,
         is_streaming: streaming,
     }
 }
@@ -706,6 +723,12 @@ impl Metrics {
         )
         .unwrap();
 
+        let request_type_audio_total = IntCounter::new(
+            frontend_metric_name("request_type_audio_total"),
+            "Total Dynamo frontend requests containing audio",
+        )
+        .unwrap();
+
         let request_type_tool_call_total = IntCounter::new(
             frontend_metric_name("request_type_tool_call_total"),
             "Total Dynamo frontend requests with tool calls enabled",
@@ -718,9 +741,39 @@ impl Metrics {
         )
         .unwrap();
 
+        let request_type_tool_call_total_alias = IntCounter::new(
+            "request_type_tool_call_total",
+            "Total requests with tool calls enabled",
+        )
+        .unwrap();
+
+        let request_type_structured_output_total_alias = IntCounter::new(
+            "request_type_structured_output_total",
+            "Total requests with structured outputs enabled",
+        )
+        .unwrap();
+
         let request_type_streaming_total = IntCounter::new(
             frontend_metric_name("request_type_streaming_total"),
             "Total Dynamo frontend requests using streaming responses",
+        )
+        .unwrap();
+
+        let request_input_images_total = IntCounter::new(
+            frontend_metric_name("request_input_images_total"),
+            "Total image inputs supplied across Dynamo frontend requests",
+        )
+        .unwrap();
+
+        let request_input_videos_total = IntCounter::new(
+            frontend_metric_name("request_input_videos_total"),
+            "Total video inputs supplied across Dynamo frontend requests",
+        )
+        .unwrap();
+
+        let request_input_audios_total = IntCounter::new(
+            frontend_metric_name("request_input_audios_total"),
+            "Total audio inputs supplied across Dynamo frontend requests",
         )
         .unwrap();
 
@@ -756,6 +809,66 @@ impl Metrics {
             &["backend"],
         )
         .unwrap();
+
+        let request_mode_total = IntCounterVec::new(
+            Opts::new(
+                "request_mode_total",
+                "Total Dynamo frontend requests by response mode",
+            ),
+            &["mode"],
+        )
+        .unwrap();
+
+        let request_outcome_total = IntCounterVec::new(
+            Opts::new(
+                "request_outcome_total",
+                "Total Dynamo frontend requests by outcome",
+            ),
+            &["outcome"],
+        )
+        .unwrap();
+
+        let request_finish_reason_total = IntCounterVec::new(
+            Opts::new(
+                "request_finish_reason_total",
+                "Total Dynamo frontend requests by finish reason",
+            ),
+            &["finish_reason"],
+        )
+        .unwrap();
+
+        let request_success_total = IntCounterVec::new(
+            Opts::new(
+                "request_success_total",
+                "Total successfully completed chat requests",
+            ),
+            &["model", "finished_reason"],
+        )
+        .unwrap();
+
+        let http_requests_total = IntCounterVec::new(
+            Opts::new("http_requests_total", "Total HTTP requests processed"),
+            &["handler", "status"],
+        )
+        .unwrap();
+
+        let prompt_tokens_total = IntCounterVec::new(
+            Opts::new("prompt_tokens_total", "Total prompt tokens processed"),
+            &["model"],
+        )
+        .unwrap();
+
+        let generation_tokens_total = IntCounterVec::new(
+            Opts::new("generation_tokens_total", "Total generation tokens produced"),
+            &["model"],
+        )
+        .unwrap();
+        prompt_tokens_total
+            .with_label_values(&["unknown"])
+            .inc_by(0);
+        generation_tokens_total
+            .with_label_values(&["unknown"])
+            .inc_by(0);
 
         // Time to first token buckets: configurable via DYN_METRICS_TTFT_{MIN,MAX,COUNT}
         let (ttft_min, ttft_max, ttft_count) =
@@ -899,13 +1012,26 @@ impl Metrics {
             inter_token_latency,
             request_type_image_total,
             request_type_video_total,
+            request_type_audio_total,
             request_type_tool_call_total,
             request_type_structured_output_total,
+            request_type_tool_call_total_alias,
+            request_type_structured_output_total_alias,
             request_type_streaming_total,
+            request_input_images_total,
+            request_input_videos_total,
+            request_input_audios_total,
             request_input_tools_total,
             request_tool_choice_total,
             request_structured_output_kind_total,
             request_structured_output_backend_total,
+            request_mode_total,
+            request_outcome_total,
+            request_finish_reason_total,
+            request_success_total,
+            http_requests_total,
+            prompt_tokens_total,
+            generation_tokens_total,
             model_total_kv_blocks,
             model_max_num_seqs,
             model_max_num_batched_tokens,
@@ -1011,15 +1137,30 @@ impl Metrics {
         registry.register(Box::new(self.inter_token_latency.clone()))?;
         registry.register(Box::new(self.request_type_image_total.clone()))?;
         registry.register(Box::new(self.request_type_video_total.clone()))?;
+        registry.register(Box::new(self.request_type_audio_total.clone()))?;
         registry.register(Box::new(self.request_type_tool_call_total.clone()))?;
         registry.register(Box::new(self.request_type_structured_output_total.clone()))?;
+        registry.register(Box::new(self.request_type_tool_call_total_alias.clone()))?;
+        registry.register(Box::new(
+            self.request_type_structured_output_total_alias.clone(),
+        ))?;
         registry.register(Box::new(self.request_type_streaming_total.clone()))?;
+        registry.register(Box::new(self.request_input_images_total.clone()))?;
+        registry.register(Box::new(self.request_input_videos_total.clone()))?;
+        registry.register(Box::new(self.request_input_audios_total.clone()))?;
         registry.register(Box::new(self.request_input_tools_total.clone()))?;
         registry.register(Box::new(self.request_tool_choice_total.clone()))?;
         registry.register(Box::new(self.request_structured_output_kind_total.clone()))?;
         registry.register(Box::new(
             self.request_structured_output_backend_total.clone(),
         ))?;
+        registry.register(Box::new(self.request_mode_total.clone()))?;
+        registry.register(Box::new(self.request_outcome_total.clone()))?;
+        registry.register(Box::new(self.request_finish_reason_total.clone()))?;
+        registry.register(Box::new(self.request_success_total.clone()))?;
+        registry.register(Box::new(self.http_requests_total.clone()))?;
+        registry.register(Box::new(self.prompt_tokens_total.clone()))?;
+        registry.register(Box::new(self.generation_tokens_total.clone()))?;
 
         // Register runtime configuration metrics
         registry.register(Box::new(self.model_total_kv_blocks.clone()))?;
@@ -1174,14 +1315,31 @@ impl Metrics {
         if observation.is_streaming {
             self.request_type_streaming_total.inc();
         }
-        if observation.has_image {
+        if observation.image_count > 0 {
             self.request_type_image_total.inc();
+            self.request_input_images_total
+                .inc_by(observation.image_count as u64);
         }
-        if observation.has_video {
+        if observation.video_count > 0 {
             self.request_type_video_total.inc();
+            self.request_input_videos_total
+                .inc_by(observation.video_count as u64);
         }
+        if observation.audio_count > 0 {
+            self.request_type_audio_total.inc();
+            self.request_input_audios_total
+                .inc_by(observation.audio_count as u64);
+        }
+        self.request_mode_total
+            .with_label_values(&[if observation.is_streaming {
+                "stream"
+            } else {
+                "unary"
+            }])
+            .inc();
         if observation.tool_choice != "none" {
             self.request_type_tool_call_total.inc();
+            self.request_type_tool_call_total_alias.inc();
             self.request_input_tools_total
                 .inc_by(observation.tool_count as u64);
             self.request_tool_choice_total
@@ -1190,6 +1348,7 @@ impl Metrics {
         }
         if observation.structured_output_kind != "none" {
             self.request_type_structured_output_total.inc();
+            self.request_type_structured_output_total_alias.inc();
             self.request_structured_output_kind_total
                 .with_label_values(&[observation.structured_output_kind])
                 .inc();
@@ -1263,6 +1422,19 @@ impl InflightGuard {
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         let duration = self.timer.elapsed().as_secs_f64();
+        let outcome = if self.status == Status::Success {
+            "success"
+        } else if self.error_type == ErrorType::Cancelled {
+            "cancelled"
+        } else {
+            "failure"
+        };
+        let http_status = if self.status == Status::Success {
+            "2xx"
+        } else {
+            "error"
+        };
+        let handler = self.endpoint.handler_path();
 
         // Decrement the gauge when the guard is dropped
         self.metrics.dec_inflight_gauge(&self.model);
@@ -1277,6 +1449,29 @@ impl Drop for InflightGuard {
             &self.status,
             &self.error_type,
         );
+
+        self.metrics
+            .http_requests_total
+            .with_label_values(&[handler, http_status])
+            .inc();
+        self.metrics
+            .request_outcome_total
+            .with_label_values(&[outcome])
+            .inc();
+        self.metrics
+            .request_finish_reason_total
+            .with_label_values(&[if self.status == Status::Success {
+                "unknown"
+            } else {
+                self.error_type.as_str()
+            }])
+            .inc();
+        if self.status == Status::Success {
+            self.metrics
+                .request_success_total
+                .with_label_values(&[self.model.as_str(), "unknown"])
+                .inc();
+        }
 
         // Record the duration of the request
         self.metrics
@@ -1312,6 +1507,19 @@ impl Endpoint {
             Endpoint::Responses => "responses",
             Endpoint::AnthropicMessages => "anthropic_messages",
             Endpoint::Tensor => "tensor",
+        }
+    }
+
+    pub fn handler_path(&self) -> &'static str {
+        match self {
+            Endpoint::Completions => "/v1/completions",
+            Endpoint::ChatCompletions => "/v1/chat/completions",
+            Endpoint::Embeddings => "/v1/embeddings",
+            Endpoint::Images => "/v1/images/generations",
+            Endpoint::Videos => "/v1/videos/generations",
+            Endpoint::Responses => "/v1/responses",
+            Endpoint::AnthropicMessages => "/v1/messages",
+            Endpoint::Tensor => "/v1/tensor",
         }
     }
 }
@@ -1350,6 +1558,17 @@ impl ErrorType {
 
 impl ResponseMetricCollector {
     fn new(metrics: Arc<Metrics>, model: String) -> Self {
+        // Materialize token counter label sets before the first request completes.
+        // Some regression tests read /metrics before sending traffic and then use
+        // the selected metric name for exact delta checks.
+        metrics
+            .prompt_tokens_total
+            .with_label_values(&[&model])
+            .inc_by(0);
+        metrics
+            .generation_tokens_total
+            .with_label_values(&[&model])
+            .inc_by(0);
         ResponseMetricCollector {
             metrics,
             model,
@@ -1503,6 +1722,10 @@ impl ResponseMetricCollector {
                 .input_sequence_length
                 .with_label_values(&[&self.model])
                 .observe(isl as f64);
+            self.metrics
+                .prompt_tokens_total
+                .with_label_values(&[&self.model])
+                .inc_by(isl as u64);
         }
 
         let current_duration = self.start_time.elapsed();
@@ -1536,6 +1759,10 @@ impl ResponseMetricCollector {
         }
 
         self.last_response_time = Some(current_duration);
+        self.metrics
+            .generation_tokens_total
+            .with_label_values(&[&self.model])
+            .inc_by(num_tokens as u64);
     }
 }
 
@@ -1596,7 +1823,15 @@ pub fn process_response_and_observe_metrics<T>(
             drop(guard);
         }
 
-        response_collector.observe_response(metrics.input_tokens, metrics.chunk_tokens);
+        let observed_tokens = if response_collector.is_first_token()
+            && metrics.chunk_tokens == 0
+            && metrics.output_tokens > 0
+        {
+            metrics.output_tokens
+        } else {
+            metrics.chunk_tokens
+        };
+        response_collector.observe_response(metrics.input_tokens, observed_tokens);
     }
 }
 

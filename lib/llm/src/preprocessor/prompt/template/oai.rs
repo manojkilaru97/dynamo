@@ -404,9 +404,12 @@ impl OAIPromptFormatter for HfTokenizerConfigJsonFormatter {
         let rendered = tmpl.render(&ctx)?;
 
         // Debug: log rendered prompt (last 500 chars to see generation prompt + thinking tags)
-        // Use floor_char_boundary to avoid splitting multibyte UTF-8 characters (e.g. '…', Chinese)
+        // Avoid splitting multibyte UTF-8 characters (e.g. '...', Chinese).
         let prompt_tail = {
-            let safe_start = rendered.floor_char_boundary(rendered.len().saturating_sub(500));
+            let mut safe_start = rendered.len().saturating_sub(500);
+            while safe_start > 0 && !rendered.is_char_boundary(safe_start) {
+                safe_start -= 1;
+            }
             &rendered[safe_start..]
         };
         tracing::debug!(

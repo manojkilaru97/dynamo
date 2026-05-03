@@ -40,7 +40,7 @@ async def _register_model_with_runtime_config(
     runtime_config = await _get_runtime_config(engine, server_args, dynamo_args)
     input_type = input_type
 
-    if not server_args.skip_tokenizer_init:
+    if dynamo_args.use_sglang_tokenizer:
         logging.warning(
             "The skip-tokenizer-init flag was not set. Using the sglang tokenizer/detokenizer instead. The dynamo tokenizer/detokenizer will not be used and only v1/chat/completions will be available"
         )
@@ -60,6 +60,7 @@ async def _register_model_with_runtime_config(
             kv_cache_block_size=server_args.page_size,
             runtime_config=runtime_config,
             custom_template_path=dynamo_args.custom_jinja_template,
+            model_aliases=dynamo_args.dyn_served_model_alias or None,
         )
         logging.info("Successfully registered LLM with runtime config")
         return True
