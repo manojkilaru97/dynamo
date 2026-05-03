@@ -23,6 +23,7 @@ from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
 class DecodeWorkerHandler(BaseWorkerHandler):
     """Handler for decode workers in both aggregated and disaggregated serving modes."""
 
+    SERVICE_OVERLOADED_ERROR_TYPE = "service_overloaded"
     THINK_START = "<think>"
     THINK_END = "</think>"
     DEFAULT_XGRAMMAR_MAX_STRING_LENGTH = 4096
@@ -60,6 +61,140 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             )
         else:
             logging.info("Decode worker handler initialized (aggregated mode)")
+        self.max_total_requests = self._get_positive_int_env(
+            "DYN_REQUEST_MAX_TOTAL_REQUESTS"
+        ) or self._get_default_max_total_requests()
+        self._request_admission_lock = asyncio.Lock()
+        self._active_request_admissions = 0
+
+    @staticmethod
+    def _get_positive_int_env(name: str) -> Optional[int]:
+        value = os.environ.get(name)
+        if value in (None, ""):
+            return None
+        try:
+            parsed = int(value)
+        except ValueError:
+            logging.warning("Ignoring invalid %s=%r", name, value)
+            return None
+        if parsed <= 0:
+            return None
+        return parsed
+
+    def _get_default_max_total_requests(self) -> Optional[int]:
+        max_running_requests = getattr(
+            self.config.server_args, "max_running_requests", None
+        )
+        if max_running_requests in (None, ""):
+            return None
+        try:
+            per_dp_limit = int(max_running_requests)
+        except (TypeError, ValueError):
+            logging.warning(
+                "Ignoring invalid SGLang max_running_requests=%r",
+                max_running_requests,
+            )
+            return None
+        if per_dp_limit <= 0:
+            return None
+        dp_size = getattr(self.config.server_args, "dp_size", 1) or 1
+        try:
+            dp_size = max(1, int(dp_size))
+        except (TypeError, ValueError):
+            dp_size = 1
+        return per_dp_limit * dp_size
+
+    async def _try_reserve_request_slot(
+        self, request_id: str
+    ) -> tuple[bool, int | None, int | None]:
+        limit = self.max_total_requests
+        if limit is None:
+            return True, None, None
+
+        async with self._request_admission_lock:
+            current_total = self._active_request_admissions
+            if current_total >= limit:
+                logging.info(
+                    "Rejecting request %s due to local total request limit: %s/%s",
+                    request_id,
+                    current_total,
+                    limit,
+                )
+                return False, current_total, limit
+
+            self._active_request_admissions += 1
+            return True, current_total + 1, limit
+
+    async def _release_request_slot_reservation(self) -> None:
+        async with self._request_admission_lock:
+            if self._active_request_admissions > 0:
+                self._active_request_admissions -= 1
+
+    @classmethod
+    def _build_overload_extra_args(
+        cls,
+        message: str,
+        *,
+        current_total_requests: int | None = None,
+        total_request_limit: int | None = None,
+    ) -> dict[str, Any]:
+        extra_args: dict[str, Any] = {
+            "dynamo_error_type": cls.SERVICE_OVERLOADED_ERROR_TYPE,
+            "error_message": message,
+        }
+        if current_total_requests is not None:
+            extra_args["worker_total_requests"] = current_total_requests
+        if total_request_limit is not None:
+            extra_args["worker_total_request_limit"] = total_request_limit
+        return extra_args
+
+    @classmethod
+    def _build_token_overload_response(
+        cls,
+        message: str,
+        *,
+        current_total_requests: int | None = None,
+        total_request_limit: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "finish_reason": {"error": message},
+            "token_ids": [],
+            "extra_args": cls._build_overload_extra_args(
+                message,
+                current_total_requests=current_total_requests,
+                total_request_limit=total_request_limit,
+            ),
+        }
+
+    @classmethod
+    def _build_text_overload_chunk(
+        cls,
+        message: str,
+        request_id: str,
+        model: str,
+        *,
+        current_total_requests: int | None = None,
+        total_request_limit: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "id": request_id,
+            "created": int(time.time()),
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": ""},
+                    "finish_reason": "error",
+                }
+            ],
+            "model": model,
+            "object": "chat.completion.chunk",
+            "error": {"message": message},
+            "extra_args": cls._build_overload_extra_args(
+                message,
+                current_total_requests=current_total_requests,
+                total_request_limit=total_request_limit,
+            ),
+        }
 
     def cleanup(self) -> None:
         """Shutdown the engine and cleanup resources."""
@@ -546,93 +681,120 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         )
         priority = (request.get("routing") or {}).get("priority")
 
-        if self.serving_mode == DisaggregationMode.DECODE:
-            # Check if bootstrap_info is pre-computed in the request (from frontend)
-            bootstrap_info = request.get("bootstrap_info")
+        reserved, current_total_requests, total_request_limit = (
+            await self._try_reserve_request_slot(context.id())
+        )
+        if not reserved:
+            message = (
+                f"Worker local total request limit reached "
+                f"({current_total_requests}/{total_request_limit})"
+            )
+            if self.use_sglang_text_io:
+                yield self._build_text_overload_chunk(
+                    message,
+                    request.get("id") or request.get("request_id") or context.id(),
+                    self.config.server_args.served_model_name,
+                    current_total_requests=current_total_requests,
+                    total_request_limit=total_request_limit,
+                )
+            else:
+                yield self._build_token_overload_response(
+                    message,
+                    current_total_requests=current_total_requests,
+                    total_request_limit=total_request_limit,
+                )
+            return
 
-            if not bootstrap_info:
-                raise RuntimeError(
-                    "bootstrap_info is required for disaggregated decode but was not provided"
+        try:
+            if self.serving_mode == DisaggregationMode.DECODE:
+                # Check if bootstrap_info is pre-computed in the request (from frontend)
+                bootstrap_info = request.get("bootstrap_info")
+
+                if not bootstrap_info:
+                    raise RuntimeError(
+                        "bootstrap_info is required for disaggregated decode but was not provided"
+                    )
+
+                logging.debug(
+                    f"Using bootstrap_info: "
+                    f"host={bootstrap_info['bootstrap_host']}, "
+                    f"port={bootstrap_info['bootstrap_port']}, "
+                    f"room={bootstrap_info['bootstrap_room']}"
                 )
 
-            logging.debug(
-                f"Using bootstrap_info: "
-                f"host={bootstrap_info['bootstrap_host']}, "
-                f"port={bootstrap_info['bootstrap_port']}, "
-                f"room={bootstrap_info['bootstrap_room']}"
-            )
+                trace_header = (
+                    self._get_trace_header(context) if self.enable_trace else None
+                )
 
-            trace_header = (
-                self._get_trace_header(context) if self.enable_trace else None
-            )
+                # Extract dp_rank from routing info (set by KV router)
+                routing = request.get("routing") or {}
+                dp_rank = routing.get("dp_rank")
 
-            # Extract dp_rank from routing info (set by KV router)
-            routing = request.get("routing") or {}
-            dp_rank = routing.get("dp_rank")
+                decode = await self.engine.async_generate(
+                    **input_param,
+                    sampling_params=sampling_params,
+                    stream=True,
+                    return_routed_experts=return_routed_experts,
+                    bootstrap_host=bootstrap_info["bootstrap_host"],
+                    bootstrap_port=bootstrap_info["bootstrap_port"],
+                    bootstrap_room=bootstrap_info["bootstrap_room"],
+                    external_trace_header=trace_header,
+                    rid=trace_id,
+                    data_parallel_rank=dp_rank,
+                    **self._priority_kwargs(priority),
+                )
 
-            decode = await self.engine.async_generate(
-                **input_param,
-                sampling_params=sampling_params,
-                stream=True,
-                return_routed_experts=return_routed_experts,
-                bootstrap_host=bootstrap_info["bootstrap_host"],
-                bootstrap_port=bootstrap_info["bootstrap_port"],
-                bootstrap_room=bootstrap_info["bootstrap_room"],
-                external_trace_header=trace_header,
-                rid=trace_id,
-                data_parallel_rank=dp_rank,
-                **self._priority_kwargs(priority),
-            )
-
-            if not self.use_sglang_text_io:
-                async for out in self._process_token_stream(decode, context):
-                    yield out
+                if not self.use_sglang_text_io:
+                    async for out in self._process_token_stream(decode, context):
+                        yield out
+                else:
+                    async for out in self._process_text_stream(
+                        decode, context, split_reasoning=split_reasoning
+                    ):
+                        yield out
             else:
-                async for out in self._process_text_stream(
-                    decode, context, split_reasoning=split_reasoning
-                ):
-                    yield out
-        else:
-            # Extract image URLs for multimodal requests. SGLang's mm_data_processor
-            # handles loading/preprocessing, and the scheduler does vision encoding.
-            image_data = None
-            image_items = request.get("multi_modal_data", {}).get("image_url")
-            if image_items:
-                image_data = []
-                for item in image_items:
-                    if isinstance(item, str):
-                        image_data.append(item)
-                    elif isinstance(item, dict) and "Url" in item:
-                        image_data.append(item["Url"])
-                image_data = image_data or None
+                # Extract image URLs for multimodal requests. SGLang's mm_data_processor
+                # handles loading/preprocessing, and the scheduler does vision encoding.
+                image_data = None
+                image_items = request.get("multi_modal_data", {}).get("image_url")
+                if image_items:
+                    image_data = []
+                    for item in image_items:
+                        if isinstance(item, str):
+                            image_data.append(item)
+                        elif isinstance(item, dict) and "Url" in item:
+                            image_data.append(item["Url"])
+                    image_data = image_data or None
 
-            trace_header = (
-                self._get_trace_header(context) if self.enable_trace else None
-            )
+                trace_header = (
+                    self._get_trace_header(context) if self.enable_trace else None
+                )
 
-            # Extract dp_rank from routing info (set by KV router)
-            routing = request.get("routing") or {}
-            dp_rank = routing.get("dp_rank")
+                # Extract dp_rank from routing info (set by KV router)
+                routing = request.get("routing") or {}
+                dp_rank = routing.get("dp_rank")
 
-            agg = await self.engine.async_generate(
-                **input_param,
-                image_data=image_data,
-                sampling_params=sampling_params,
-                stream=True,
-                return_routed_experts=return_routed_experts,
-                external_trace_header=trace_header,
-                rid=trace_id,
-                data_parallel_rank=dp_rank,
-                **self._priority_kwargs(priority),
-            )
-            if not self.use_sglang_text_io:
-                async for out in self._process_token_stream(agg, context):
-                    yield out
-            else:
-                async for out in self._process_text_stream(
-                    agg, context, split_reasoning=split_reasoning
-                ):
-                    yield out
+                agg = await self.engine.async_generate(
+                    **input_param,
+                    image_data=image_data,
+                    sampling_params=sampling_params,
+                    stream=True,
+                    return_routed_experts=return_routed_experts,
+                    external_trace_header=trace_header,
+                    rid=trace_id,
+                    data_parallel_rank=dp_rank,
+                    **self._priority_kwargs(priority),
+                )
+                if not self.use_sglang_text_io:
+                    async for out in self._process_token_stream(agg, context):
+                        yield out
+                else:
+                    async for out in self._process_text_stream(
+                        agg, context, split_reasoning=split_reasoning
+                    ):
+                        yield out
+        finally:
+            await self._release_request_slot_reservation()
 
     async def _process_token_stream(
         self,
