@@ -25,7 +25,7 @@ admission-control behavior changes.
 | `DYN_ROUTER_MAX_PENDING_PER_WORKER` | Frontend / KV router | Caps router-side per-worker pending dispatch. This is wired for SGLang and vLLM. |
 | `DYN_REQUEST_MAX_TOTAL_REQUESTS` | Worker backend | Caps backend accepted requests per worker process. vLLM already supported this; SGLang support was added after the Qwen rebase. |
 | `DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS` | Worker backend | Cancels pathological long-running requests after the configured wall-clock limit. |
-| `DYN_ROUTER_QUEUE_WAIT_MS` | Frontend / KV router | Maximum time a routed request can wait in the frontend/router queue before timing out. |
+| `DYN_ROUTER_MAX_QUEUE_WAIT_MS` | Frontend / KV router | Maximum time a routed request can wait in the frontend/router queue before timing out. |
 | `DYN_HEALTH_CHECK_*` | Runtime health | Controls canary generation cadence, timeout, stale window, and readiness behavior. |
 | `DYN_REAL_TRAFFIC_HEALTH_*` | Runtime health | Lets recent real traffic keep readiness healthy even if canary checks are stale or noisy. |
 | `DYN_ROUTER_KV_MISS_QUARANTINE_*` | KV router | Quarantines a worker when KV parent/remove miss rate spikes. |
@@ -92,4 +92,3 @@ replica-loss coverage for Dynamo + SGLang.
 4. For vLLM, run replica-loss recovery. For SGLang, run the equivalent once added.
 5. Check Prometheus/OTel metrics for canary counts, `/live`, `/health`, request
    totals, queue depth, and overload/error labels.
-
