@@ -237,10 +237,10 @@ where
         };
 
         if !found {
-            return Err(anyhow::anyhow!(
+            return Err(Error::new(PipelineError::InstanceUnavailable(format!(
                 "instance_id={instance_id} not found for endpoint {}",
                 self.client.endpoint.id()
-            ));
+            ))));
         }
 
         self.generate_with_fault_detection(instance_id, request)

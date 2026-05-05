@@ -65,6 +65,7 @@ fn is_service_overloaded_error(error: &Error) -> bool {
             matches!(
                 pipeline_error,
                 dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(_)
+                    | dynamo_runtime::pipeline::PipelineError::InstanceUnavailable(_)
             )
         })
 }
@@ -528,7 +529,8 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                 );
                 while let Ok(Some(_)) =
                     tokio::time::timeout(Duration::from_millis(100), response_stream.next()).await
-                {}
+                {
+                }
                 if let Err(free_error) = chooser.free(&context_id).await {
                     tracing::warn!(
                         "Failed to free request {} after worker-local overload: {free_error}",
@@ -696,5 +698,21 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         tracing::debug!(worker_id = worker_id, "Direct routing to specified worker");
 
         self.inner.direct(request, worker_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_service_overloaded_error;
+    use dynamo_runtime::pipeline::PipelineError;
+
+    #[test]
+    fn retries_instance_unavailable_like_overload() {
+        let error: anyhow::Error = PipelineError::InstanceUnavailable(
+            "instance_id=123 not found for endpoint dynamo/backend/generate".to_string(),
+        )
+        .into();
+
+        assert!(is_service_overloaded_error(&error));
     }
 }

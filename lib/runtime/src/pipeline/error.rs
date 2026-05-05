@@ -123,6 +123,10 @@ pub enum PipelineError {
     /// All instances are busy and cannot handle new requests
     #[error("Service temporarily unavailable: {0}")]
     ServiceOverloaded(String),
+
+    /// A selected endpoint instance disappeared from discovery before dispatch.
+    #[error("Service temporarily unavailable: {0}")]
+    InstanceUnavailable(String),
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -1094,12 +1094,13 @@ impl ErrorMessage {
             return response;
         }
 
-        // First check for PipelineError::ServiceOverloaded
+        // First check for transient capacity/routing PipelineErrors.
         if let Some(pipeline_err) =
             err.downcast_ref::<dynamo_runtime::pipeline::error::PipelineError>()
             && matches!(
                 pipeline_err,
                 dynamo_runtime::pipeline::error::PipelineError::ServiceOverloaded(_)
+                    | dynamo_runtime::pipeline::error::PipelineError::InstanceUnavailable(_)
             )
         {
             return (
@@ -3832,6 +3833,22 @@ mod tests {
         assert_eq!(
             response.1.message,
             "Service temporarily unavailable: All workers are busy, please retry later"
+        );
+    }
+
+    #[test]
+    fn test_instance_unavailable_error_response_from_anyhow() {
+        use dynamo_runtime::pipeline::error::PipelineError;
+
+        let err: anyhow::Error = PipelineError::InstanceUnavailable(
+            "instance_id=123 not found for endpoint dynamo/backend/generate".to_string(),
+        )
+        .into();
+        let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
+        assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.1.message,
+            "Service temporarily unavailable: instance_id=123 not found for endpoint dynamo/backend/generate"
         );
     }
 
