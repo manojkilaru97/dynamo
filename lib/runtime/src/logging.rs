@@ -1424,17 +1424,14 @@ pub fn emit_payload_log(body: &'static str, target: &'static str, fields: serde_
     record.set_body(AnyValue::String(body.into()));
 
     if let serde_json::Value::Object(map) = fields {
-        record.add_attributes(
-            map.into_iter()
-                .map(|(key, value)| {
-                    let value = if key == "payload" || key == "headers" {
-                        json_payload_to_any_value(value)
-                    } else {
-                        json_value_to_any_value(value)
-                    };
-                    (Key::new(key), value)
-                }),
-        );
+        record.add_attributes(map.into_iter().map(|(key, value)| {
+            let value = if key == "payload" || key == "headers" {
+                json_payload_to_any_value(value)
+            } else {
+                json_value_to_any_value(value)
+            };
+            (Key::new(key), value)
+        }));
     }
 
     logger.emit(record);

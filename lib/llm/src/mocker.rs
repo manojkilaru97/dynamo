@@ -444,7 +444,13 @@ impl MockVllmEngine {
                             let metrics = metrics_rx.borrow().clone();
 
                             // Publish metrics using flat API
-                            if let Err(e) = publisher.publish(Some(metrics.dp_rank), metrics.active_decode_blocks) {
+                            if let Err(e) = publisher.publish(
+                                Some(metrics.dp_rank),
+                                metrics.active_decode_blocks,
+                                None,
+                                None,
+                                None,
+                            ) {
                                 tracing::warn!("Failed to publish metrics for DP rank {}: {e}", metrics.dp_rank);
                             } else {
                                 tracing::trace!("Published metrics for DP rank {}", metrics.dp_rank);

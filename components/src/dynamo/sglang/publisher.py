@@ -4,6 +4,7 @@
 import asyncio
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import sglang as sgl
@@ -82,6 +83,9 @@ class DynamoSglangPublisher:
         self.generate_endpoint = generate_endpoint
         self.metrics_publisher = WorkerMetricsPublisher()
         self.component_gauges = component_gauges
+        self.request_total_slots = self._positive_int_env(
+            "DYN_REQUEST_MAX_TOTAL_REQUESTS"
+        )
         # Endpoint creation is deferred to async context in setup_sgl_metrics
 
         # Set default values (can be overridden later if needed)
@@ -135,7 +139,14 @@ class DynamoSglangPublisher:
                     else self.dp_rank
                 )
                 active_decode_blocks = kv_metrics.kv_active_blocks
-                self.metrics_publisher.publish(dp_rank, active_decode_blocks)
+                self.metrics_publisher.publish(
+                    dp_rank,
+                    active_decode_blocks,
+                    getattr(kv_metrics, "request_active_slots", None),
+                    getattr(kv_metrics, "num_requests_waiting", None),
+                    self.request_total_slots
+                    or getattr(kv_metrics, "request_total_slots", None),
+                )
                 dp_rank_str = str(dp_rank)
                 # Publish total blocks (always available in KvMetrics)
                 self.component_gauges.set_total_blocks(
@@ -177,10 +188,24 @@ class DynamoSglangPublisher:
 
         logging.info("DynamoSglangPublisher cleanup complete")
 
+    @staticmethod
+    def _positive_int_env(name: str) -> Optional[int]:
+        value = os.getenv(name)
+        if not value:
+            return None
+        try:
+            parsed = int(value)
+        except ValueError:
+            logging.warning("Ignoring non-integer %s=%r", name, value)
+            return None
+        return parsed if parsed > 0 else None
+
     def init_engine_metrics_publish(self) -> None:
         """Publish initial dummy metrics to bootstrap the metrics endpoint."""
         logging.info("Sending dummy metrics to initialize")
-        self.metrics_publisher.publish(self.dp_rank, 0)
+        self.metrics_publisher.publish(
+            self.dp_rank, 0, 0, 0, self.request_total_slots
+        )
         dp_rank_str = str(self.dp_rank)
         self.component_gauges.set_total_blocks(dp_rank_str, 0)
         self.component_gauges.set_gpu_cache_usage(dp_rank_str, 0.0)

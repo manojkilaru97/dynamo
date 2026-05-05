@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Optional
 
 import pybase64
 import sglang as sgl
@@ -66,6 +66,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         ) or self._get_default_max_total_requests()
         self._request_admission_lock = asyncio.Lock()
         self._active_request_admissions = 0
+        self._active_request_admissions_high_water = 0
 
     @staticmethod
     def _get_positive_int_env(name: str) -> Optional[int]:
@@ -123,6 +124,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 return False, current_total, limit
 
             self._active_request_admissions += 1
+            if self._active_request_admissions > self._active_request_admissions_high_water:
+                self._active_request_admissions_high_water = self._active_request_admissions
+                logging.info(
+                    "Worker local total request slots in use: %s/%s",
+                    self._active_request_admissions,
+                    limit,
+                )
             return True, current_total + 1, limit
 
     async def _release_request_slot_reservation(self) -> None:
@@ -705,6 +713,15 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 )
             return
 
+        slot_released = False
+
+        async def release_request_slot_once() -> None:
+            nonlocal slot_released
+            if slot_released:
+                return
+            slot_released = True
+            await self._release_request_slot_reservation()
+
         try:
             if self.serving_mode == DisaggregationMode.DECODE:
                 # Check if bootstrap_info is pre-computed in the request (from frontend)
@@ -745,11 +762,16 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 )
 
                 if not self.use_sglang_text_io:
-                    async for out in self._process_token_stream(decode, context):
+                    async for out in self._process_token_stream(
+                        decode, context, release_request_slot_once
+                    ):
                         yield out
                 else:
                     async for out in self._process_text_stream(
-                        decode, context, split_reasoning=split_reasoning
+                        decode,
+                        context,
+                        release_request_slot_once,
+                        split_reasoning=split_reasoning,
                     ):
                         yield out
             else:
@@ -786,20 +808,26 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     **self._priority_kwargs(priority),
                 )
                 if not self.use_sglang_text_io:
-                    async for out in self._process_token_stream(agg, context):
+                    async for out in self._process_token_stream(
+                        agg, context, release_request_slot_once
+                    ):
                         yield out
                 else:
                     async for out in self._process_text_stream(
-                        agg, context, split_reasoning=split_reasoning
+                        agg,
+                        context,
+                        release_request_slot_once,
+                        split_reasoning=split_reasoning,
                     ):
                         yield out
         finally:
-            await self._release_request_slot_reservation()
+            await release_request_slot_once()
 
     async def _process_token_stream(
         self,
         stream_source: AsyncGenerator[Dict[str, Any], None],
         context: Context,
+        release_request_slot_once: Callable[[], Awaitable[None]],
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Process token-based stream output.
 
@@ -875,6 +903,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         self,
         stream_source: AsyncGenerator[Dict[str, Any], None],
         context: Context,
+        release_request_slot_once: Callable[[], Awaitable[None]],
         *,
         split_reasoning: bool = False,
     ) -> AsyncGenerator[Dict[str, Any], None]:

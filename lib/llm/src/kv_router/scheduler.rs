@@ -4,8 +4,10 @@
 use super::KvRouterConfig;
 use super::RouterConfigOverride;
 use super::WorkerSelector;
-use super::protocols::{DpRank, OverlapScores, WorkerId, WorkerSelectionResult, WorkerWithDpRank};
-use super::queue::SchedulerQueue;
+use super::protocols::{
+    ActiveLoad, DpRank, OverlapScores, WorkerId, WorkerSelectionResult, WorkerWithDpRank,
+};
+use super::queue::{SchedulerQueue, WorkerRequestLoads};
 use super::sequence::{
     ActiveSequencesMulti, SequenceError, SequenceRequest, create_multi_worker_sequences,
 };
@@ -14,6 +16,7 @@ use crate::local_model::runtime_config::ModelRuntimeConfig;
 use anyhow::Result;
 use dynamo_runtime::component::Component;
 use dynamo_runtime::traits::DistributedRuntimeProvider;
+use dynamo_runtime::transports::event_plane::EventSubscriber;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -24,6 +27,7 @@ const ROUTER_QUEUE_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
+use crate::kv_router::KV_METRICS_SUBJECT;
 use dynamo_tokens::SequenceHash;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +100,7 @@ pub struct KvScheduler {
     request_tx: tokio::sync::mpsc::Sender<SchedulingRequest>,
     slots: Arc<ActiveSequencesMulti>,
     queue: Arc<SchedulerQueue>,
+    request_loads: Arc<WorkerRequestLoads>,
 }
 
 impl KvScheduler {
@@ -164,6 +169,7 @@ impl KvScheduler {
         let (request_tx, request_rx) = tokio::sync::mpsc::channel::<SchedulingRequest>(1024);
         let scheduler_cancel_token = component.drt().primary_token();
 
+        let request_loads = Arc::new(WorkerRequestLoads::default());
         let queue = Arc::new(SchedulerQueue::new(
             slots.clone(),
             workers_with_configs.clone(),
@@ -174,8 +180,53 @@ impl KvScheduler {
                 .map(Duration::from_millis),
             block_size,
             selector,
+            request_loads.clone(),
         ));
         let queue_clone = queue.clone();
+        let request_loads_clone = request_loads.clone();
+        let metrics_queue = queue.clone();
+        let metrics_namespace = component.namespace().clone();
+        let metrics_cancel_token = component.drt().child_token();
+
+        tokio::spawn(async move {
+            let subscriber = match EventSubscriber::for_namespace(
+                &metrics_namespace,
+                KV_METRICS_SUBJECT,
+            )
+            .await
+            {
+                Ok(subscriber) => subscriber,
+                Err(error) => {
+                    tracing::warn!(
+                        "KvScheduler request-load metrics subscriber unavailable: {error}"
+                    );
+                    return;
+                }
+            };
+            let mut active_load_rx = subscriber.typed::<ActiveLoad>();
+
+            loop {
+                tokio::select! {
+                    _ = metrics_cancel_token.cancelled() => {
+                        tracing::debug!("KvScheduler request-load metrics subscriber shutting down");
+                        break;
+                    }
+                    event = active_load_rx.next() => {
+                        let Some(event) = event else {
+                            tracing::debug!("KvScheduler request-load metrics stream closed");
+                            break;
+                        };
+                        let Ok((_envelope, active_load)) = event else {
+                            tracing::warn!("KvScheduler request-load metrics receive error: {event:?}");
+                            continue;
+                        };
+                        if request_loads_clone.update_from_active_load(&active_load) {
+                            metrics_queue.update().await;
+                        }
+                    }
+                }
+            }
+        });
 
         // Background task: receive requests and periodically recheck pending
         tokio::spawn(async move {
@@ -210,7 +261,12 @@ impl KvScheduler {
             request_tx,
             slots,
             queue,
+            request_loads,
         })
+    }
+
+    pub fn request_loads(&self) -> Arc<WorkerRequestLoads> {
+        self.request_loads.clone()
     }
 
     #[allow(clippy::too_many_arguments)]

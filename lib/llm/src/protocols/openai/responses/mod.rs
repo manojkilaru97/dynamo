@@ -542,7 +542,10 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
         // structured output.
         let chat_template_args = if resp.disable_reasoning || resp.inner.reasoning.is_some() {
             let mut args = std::collections::HashMap::new();
-            args.insert("enable_thinking".to_string(), serde_json::Value::Bool(false));
+            args.insert(
+                "enable_thinking".to_string(),
+                serde_json::Value::Bool(false),
+            );
             Some(args)
         } else {
             // No guided decoding, or guided decoding without explicit reasoning param:

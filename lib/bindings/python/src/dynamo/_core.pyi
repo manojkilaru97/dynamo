@@ -388,6 +388,9 @@ class WorkerMetricsPublisher:
         self,
         dp_rank: Optional[int],
         active_decode_blocks: int,
+        request_active_slots: Optional[int] = None,
+        num_requests_waiting: Optional[int] = None,
+        request_total_slots: Optional[int] = None,
     ) -> None:
         """
         Publish worker metrics for load monitoring.
@@ -395,6 +398,9 @@ class WorkerMetricsPublisher:
         Args:
             dp_rank: Data parallel rank of the worker (None defaults to 0)
             active_decode_blocks: Number of active KV cache blocks
+            request_active_slots: Active requests owned by the backend scheduler
+            num_requests_waiting: Queued requests owned by the backend scheduler
+            request_total_slots: Per-worker request admission cap
         """
         ...
 

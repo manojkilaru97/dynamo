@@ -1,11 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    collections::HashSet,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use dynamo_runtime::{
@@ -43,8 +39,6 @@ struct WorkerSelection {
     dp_rank: u32,
     overlap_amount: u32,
 }
-
-const WORKER_OVERLOAD_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
 fn retry_allowed_workers(
     all_worker_ids: &HashSet<u64>,
@@ -430,11 +424,6 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             .and_then(|r| r.allowed_worker_ids.clone());
         let all_worker_ids: HashSet<u64> =
             self.chooser.client().instance_ids().into_iter().collect();
-        let retry_deadline = self
-            .chooser
-            .kv_router_config()
-            .router_max_queue_wait_ms
-            .map(|wait_ms| Instant::now() + Duration::from_millis(wait_ms));
         let candidate_pool_size = base_allowed_worker_ids
             .as_ref()
             .map(HashSet::len)
@@ -449,16 +438,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             );
 
             if allowed_worker_ids.as_ref().is_some_and(HashSet::is_empty) {
-                if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Err(Error::new(
-                        dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(format!(
-                            "All workers reached the local total request limit before frontend queue wait expired for request {context_id}"
-                        )),
-                    ));
-                }
-                attempted_workers.clear();
-                tokio::time::sleep(WORKER_OVERLOAD_RETRY_BACKOFF).await;
-                continue;
+                return Err(Error::new(
+                    dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(format!(
+                        "All workers reached the local total request limit for request {context_id}"
+                    )),
+                ));
             }
 
             let selection = self
@@ -512,17 +496,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                     }
                     attempted_workers.insert(instance_id);
                     if attempted_workers.len() >= candidate_pool_size.max(1) {
-                        if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                            return Err(Error::new(
-                                dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(
-                                    format!(
-                                        "All workers reached the local total request limit before frontend queue wait expired for request {context_id}"
-                                    ),
-                                ),
-                            ));
-                        }
-                        attempted_workers.clear();
-                        tokio::time::sleep(WORKER_OVERLOAD_RETRY_BACKOFF).await;
+                        return Err(Error::new(
+                            dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(format!(
+                                "All workers reached the local total request limit for request {context_id}"
+                            )),
+                        ));
                     }
                     continue;
                 }
@@ -548,6 +526,9 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                     dp_rank = dp_rank,
                     "Worker rejected request due to local total request limit; retrying another worker"
                 );
+                while let Ok(Some(_)) =
+                    tokio::time::timeout(Duration::from_millis(100), response_stream.next()).await
+                {}
                 if let Err(free_error) = chooser.free(&context_id).await {
                     tracing::warn!(
                         "Failed to free request {} after worker-local overload: {free_error}",
@@ -556,15 +537,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                 }
                 attempted_workers.insert(instance_id);
                 if attempted_workers.len() >= candidate_pool_size.max(1) {
-                    if retry_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        return Err(Error::new(
-                            dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(format!(
-                                "All workers reached the local total request limit before frontend queue wait expired for request {context_id}"
-                            )),
-                        ));
-                    }
-                    attempted_workers.clear();
-                    tokio::time::sleep(WORKER_OVERLOAD_RETRY_BACKOFF).await;
+                    return Err(Error::new(
+                        dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(format!(
+                            "All workers reached the local total request limit for request {context_id}"
+                        )),
+                    ));
                 }
                 continue;
             }

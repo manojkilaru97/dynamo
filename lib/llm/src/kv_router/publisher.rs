@@ -1033,6 +1033,9 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
 struct WorkerMetrics {
     dp_rank: DpRank,
     active_decode_blocks: u64,
+    request_active_slots: Option<u64>,
+    num_requests_waiting: Option<u64>,
+    request_total_slots: Option<u64>,
 }
 
 pub struct WorkerMetricsPublisher {
@@ -1051,15 +1054,28 @@ impl WorkerMetricsPublisher {
     /// # Arguments
     /// * `dp_rank` - Data parallel rank of the worker (None defaults to 0)
     /// * `active_decode_blocks` - Number of active KV cache blocks
-    pub fn publish(&self, dp_rank: Option<DpRank>, active_decode_blocks: u64) -> Result<()> {
+    pub fn publish(
+        &self,
+        dp_rank: Option<DpRank>,
+        active_decode_blocks: u64,
+        request_active_slots: Option<u64>,
+        num_requests_waiting: Option<u64>,
+        request_total_slots: Option<u64>,
+    ) -> Result<()> {
         let metrics = WorkerMetrics {
             dp_rank: dp_rank.unwrap_or(0),
             active_decode_blocks,
+            request_active_slots,
+            num_requests_waiting,
+            request_total_slots,
         };
         tracing::trace!(
-            "Publish metrics: dp_rank={}, active_decode_blocks={}",
+            "Publish metrics: dp_rank={}, active_decode_blocks={}, request_active_slots={:?}, num_requests_waiting={:?}, request_total_slots={:?}",
             metrics.dp_rank,
-            metrics.active_decode_blocks
+            metrics.active_decode_blocks,
+            metrics.request_active_slots,
+            metrics.num_requests_waiting,
+            metrics.request_total_slots,
         );
         self.tx
             .send(metrics)
@@ -1131,6 +1147,9 @@ impl WorkerMetricsPublisher {
                                 dp_rank: metrics.dp_rank,
                                 active_decode_blocks: Some(metrics.active_decode_blocks),
                                 active_prefill_tokens: None,
+                                request_active_slots: metrics.request_active_slots,
+                                num_requests_waiting: metrics.num_requests_waiting,
+                                request_total_slots: metrics.request_total_slots,
                             };
 
                             if let Err(e) = event_publisher.publish(&active_load).await {
@@ -2268,7 +2287,9 @@ mod test_integration_publisher {
         // Test 1: Publish 10 different metrics with 0.5ms intervals
         // Only the last one should be published after 1ms of stability
         for i in 0..10 {
-            publisher.publish(None, (i * 100) as u64).unwrap();
+            publisher
+                .publish(None, (i * 100) as u64, None, None, None)
+                .unwrap();
             tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
         }
 
@@ -2293,7 +2314,7 @@ mod test_integration_publisher {
 
         // Test 2: Publish 10 more metrics with same active_decode_blocks - should not trigger publish
         for _ in 0..10 {
-            publisher.publish(None, 900).unwrap(); // Keep same as last published
+            publisher.publish(None, 900, None, None, None).unwrap(); // Keep same as last published
             tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
         }
 

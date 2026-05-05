@@ -6,8 +6,8 @@
 //! This module provides a trait-based interface for creating and managing Prometheus metrics
 //! with automatic label injection and hierarchical naming support.
 
-pub mod prometheus_names;
 pub mod frontend_perf;
+pub mod prometheus_names;
 pub mod request_plane;
 pub mod work_handler_perf;
 

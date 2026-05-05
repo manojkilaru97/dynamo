@@ -174,7 +174,10 @@ fn ensure_chat_template_thinking_disabled(obj: &mut serde_json::Map<String, serd
         "chat_template_kwargs"
     };
 
-    if !obj.get(target_key).is_some_and(serde_json::Value::is_object) {
+    if !obj
+        .get(target_key)
+        .is_some_and(serde_json::Value::is_object)
+    {
         obj.insert(
             target_key.to_string(),
             serde_json::Value::Object(serde_json::Map::new()),
@@ -643,9 +646,9 @@ fn resolve_nvcf_asset_url(url: &str, headers: &HeaderMap) -> Result<String, Erro
         )));
     }
 
-    let asset_root = Path::new(asset_dir)
-        .canonicalize()
-        .map_err(|err| ErrorMessage::bad_request_from_message(format!("Invalid NVCF asset directory: {err}")))?;
+    let asset_root = Path::new(asset_dir).canonicalize().map_err(|err| {
+        ErrorMessage::bad_request_from_message(format!("Invalid NVCF asset directory: {err}"))
+    })?;
     let file_path = asset_root.join(asset_id).canonicalize().map_err(|err| {
         ErrorMessage::bad_request_from_message(format!("Invalid NVCF asset id '{asset_id}': {err}"))
     })?;
@@ -656,7 +659,9 @@ fn resolve_nvcf_asset_url(url: &str, headers: &HeaderMap) -> Result<String, Erro
     }
 
     let bytes = std::fs::read(&file_path).map_err(|err| {
-        ErrorMessage::bad_request_from_message(format!("Failed to read NVCF asset '{asset_id}': {err}"))
+        ErrorMessage::bad_request_from_message(format!(
+            "Failed to read NVCF asset '{asset_id}': {err}"
+        ))
     })?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     Ok(format!("data:{mime};base64,{encoded}"))
@@ -684,9 +689,9 @@ fn resolve_nvcf_asset_refs_for_backend(
             }
             Ok(serde_json::Value::Object(out))
         }
-        serde_json::Value::String(s) if s.contains(";asset_id,") => {
-            Ok(serde_json::Value::String(resolve_nvcf_asset_url(s, headers)?))
-        }
+        serde_json::Value::String(s) if s.contains(";asset_id,") => Ok(serde_json::Value::String(
+            resolve_nvcf_asset_url(s, headers)?,
+        )),
         _ => Ok(value.clone()),
     }
 }
@@ -696,7 +701,10 @@ fn normalize_chat_response_payload_for_logging(
     include_empty_tool_calls: bool,
     strip_null_reasoning_content: bool,
 ) -> serde_json::Value {
-    let Some(choices) = payload.get_mut("choices").and_then(serde_json::Value::as_array_mut) else {
+    let Some(choices) = payload
+        .get_mut("choices")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
         return payload;
     };
 
@@ -787,7 +795,14 @@ fn emit_openai_response_log(
     payload: serde_json::Value,
 ) {
     emit_openai_response_log_with_options(
-        request_id, model, endpoint, streaming, status_code, payload, false, false,
+        request_id,
+        model,
+        endpoint,
+        streaming,
+        status_code,
+        payload,
+        false,
+        false,
     )
 }
 
@@ -1862,20 +1877,20 @@ async fn handler_chat_completions(
 
     let mut backend_payload_value = resolve_nvcf_asset_refs_for_backend(&payload_value, &headers)
         .map_err(|err_response| {
-            emit_openai_response_log(
-                &request_id,
-                &raw_model,
-                "chat_completions",
-                streaming,
-                err_response.0.as_u16(),
-                error_response_payload(&err_response),
-            );
-            err_response
-        })?;
+        emit_openai_response_log(
+            &request_id,
+            &raw_model,
+            "chat_completions",
+            streaming,
+            err_response.0.as_u16(),
+            error_response_payload(&err_response),
+        );
+        err_response
+    })?;
     normalize_chat_compat_payload(&mut backend_payload_value);
 
-    let mut request: NvCreateChatCompletionRequest =
-        serde_json::from_value(backend_payload_value).map_err(|e| {
+    let mut request: NvCreateChatCompletionRequest = serde_json::from_value(backend_payload_value)
+        .map_err(|e| {
             let err_response = ErrorMessage::from_http_error(HttpError {
                 code: 400,
                 message: format!("Failed to deserialize the JSON body into the target type: {e}"),
@@ -2540,7 +2555,8 @@ async fn chat_completions(
                 })?;
         response.model = model.clone();
 
-        let mut response_payload = serde_json::to_value(&response).unwrap_or(serde_json::Value::Null);
+        let mut response_payload =
+            serde_json::to_value(&response).unwrap_or(serde_json::Value::Null);
         if request_wants_logprobs {
             ensure_chat_response_logprobs_field(&mut response_payload);
         }

@@ -3,13 +3,13 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
-use super::protocols::WorkerWithDpRank;
+use super::protocols::{ActiveLoad, WorkerWithDpRank};
 use super::scheduler::{SchedulingRequest, SchedulingResponse};
 use super::sequence::{ActiveSequencesMulti, SequenceRequest};
 use super::{WorkerId, WorkerSelector};
@@ -17,6 +17,54 @@ use crate::discovery::RuntimeConfigWatch;
 
 /// Large default for max_num_batched_tokens when not configured (effectively disables queueing for that worker)
 const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
+#[derive(Debug, Clone)]
+struct DpRequestLoad {
+    active: u64,
+    waiting: u64,
+    total_slots: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+pub struct WorkerRequestLoads {
+    inner: RwLock<HashMap<WorkerId, HashMap<u32, DpRequestLoad>>>,
+}
+
+impl WorkerRequestLoads {
+    pub fn update_from_active_load(&self, load: &ActiveLoad) -> bool {
+        let Some(active) = load.request_active_slots else {
+            return false;
+        };
+        let waiting = load.num_requests_waiting.unwrap_or(0);
+        let mut inner = self.inner.write().unwrap();
+        inner.entry(load.worker_id).or_default().insert(
+            load.dp_rank,
+            DpRequestLoad {
+                active,
+                waiting,
+                total_slots: load.request_total_slots,
+            },
+        );
+        true
+    }
+
+    pub fn total_requests_and_cap(&self, worker_id: WorkerId) -> Option<(u64, Option<u64>)> {
+        let inner = self.inner.read().unwrap();
+        let dp_loads = inner.get(&worker_id)?;
+        let mut total = 0u64;
+        let mut cap = None;
+
+        for load in dp_loads.values() {
+            total = total.saturating_add(load.active.saturating_add(load.waiting));
+            if let Some(total_slots) = load.total_slots
+                && total_slots > 0
+            {
+                cap = Some(cap.map_or(total_slots, |current: u64| current.min(total_slots)));
+            }
+        }
+
+        Some((total, cap))
+    }
+}
 
 /// Entry in the priority queue, ordered by effective arrival time (lower = higher priority).
 /// Effective arrival = elapsed time since queue start minus `priority_jump`.
@@ -67,6 +115,7 @@ pub struct SchedulerQueue {
     start_time: Instant,
     block_size: u32,
     selector: Box<dyn WorkerSelector + Send + Sync>,
+    request_loads: Arc<WorkerRequestLoads>,
 }
 
 impl SchedulerQueue {
@@ -78,6 +127,7 @@ impl SchedulerQueue {
         max_queue_wait: Option<Duration>,
         block_size: u32,
         selector: Box<dyn WorkerSelector + Send + Sync>,
+        request_loads: Arc<WorkerRequestLoads>,
     ) -> Self {
         if let Some(frac) = threshold_frac {
             tracing::info!("Router queue enabled with token threshold fraction {frac}");
@@ -104,6 +154,7 @@ impl SchedulerQueue {
             start_time: Instant::now(),
             block_size,
             selector,
+            request_loads,
         }
     }
 
@@ -325,6 +376,12 @@ impl SchedulerQueue {
         active_requests: &HashMap<WorkerWithDpRank, usize>,
     ) -> bool {
         if let Some(max_num_seqs) = config.max_num_seqs {
+            if let Some((total_requests, request_cap)) =
+                self.request_loads.total_requests_and_cap(worker.worker_id)
+            {
+                return total_requests >= request_cap.unwrap_or(max_num_seqs);
+            }
+
             let active = active_requests.get(&worker).copied().unwrap_or(0) as u64;
             if active >= max_num_seqs {
                 return true;
@@ -347,13 +404,13 @@ impl SchedulerQueue {
         let configs = self.workers_with_configs.borrow();
         let mut eligible_workers = 0usize;
 
-        for (&worker_id, config) in configs.iter() {
+        for (&worker_id, _config) in configs.iter() {
             if let Some(ids) = allowed
                 && !ids.contains(&worker_id)
             {
                 continue;
             }
-            eligible_workers += config.data_parallel_size as usize;
+            eligible_workers += 1;
         }
 
         (eligible_workers > 0).then_some(per_worker_limit.saturating_mul(eligible_workers))
@@ -396,5 +453,76 @@ impl SchedulerQueue {
                 limit_ms,
             }));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn active_load(
+        worker_id: WorkerId,
+        dp_rank: u32,
+        active: u64,
+        waiting: u64,
+        cap: Option<u64>,
+    ) -> ActiveLoad {
+        ActiveLoad {
+            worker_id,
+            dp_rank,
+            active_decode_blocks: None,
+            active_prefill_tokens: None,
+            request_active_slots: Some(active),
+            num_requests_waiting: Some(waiting),
+            request_total_slots: cap,
+        }
+    }
+
+    #[test]
+    fn worker_request_loads_sum_active_and_waiting_across_dp_ranks() {
+        let loads = WorkerRequestLoads::default();
+
+        assert!(loads.update_from_active_load(&active_load(7, 0, 3, 2, Some(16))));
+        assert!(loads.update_from_active_load(&active_load(7, 1, 4, 1, Some(16))));
+
+        assert_eq!(loads.total_requests_and_cap(7), Some((10, Some(16))));
+    }
+
+    #[test]
+    fn worker_request_loads_replace_rank_count_on_new_metric() {
+        let loads = WorkerRequestLoads::default();
+
+        loads.update_from_active_load(&active_load(7, 0, 16, 0, Some(16)));
+        assert_eq!(loads.total_requests_and_cap(7), Some((16, Some(16))));
+
+        loads.update_from_active_load(&active_load(7, 0, 2, 1, Some(16)));
+        assert_eq!(loads.total_requests_and_cap(7), Some((3, Some(16))));
+    }
+
+    #[test]
+    fn worker_request_loads_use_worker_level_min_cap_across_dp_ranks() {
+        let loads = WorkerRequestLoads::default();
+
+        loads.update_from_active_load(&active_load(7, 0, 1, 0, Some(32)));
+        loads.update_from_active_load(&active_load(7, 1, 1, 0, Some(16)));
+
+        assert_eq!(loads.total_requests_and_cap(7), Some((2, Some(16))));
+    }
+
+    #[test]
+    fn worker_request_loads_ignore_legacy_metrics_without_request_counts() {
+        let loads = WorkerRequestLoads::default();
+        let legacy_load = ActiveLoad {
+            worker_id: 7,
+            dp_rank: 0,
+            active_decode_blocks: Some(8),
+            active_prefill_tokens: None,
+            request_active_slots: None,
+            num_requests_waiting: None,
+            request_total_slots: Some(16),
+        };
+
+        assert!(!loads.update_from_active_load(&legacy_load));
+        assert_eq!(loads.total_requests_and_cap(7), None);
     }
 }

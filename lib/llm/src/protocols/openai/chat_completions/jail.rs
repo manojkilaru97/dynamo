@@ -424,12 +424,7 @@ impl ChoiceJailState {
 
                 // End jailing
                 self.end_jail();
-                self.absorb_or_emit_trailing(
-                    choice,
-                    &trailing_part,
-                    jail_stream,
-                    &mut emissions,
-                );
+                self.absorb_or_emit_trailing(choice, &trailing_part, jail_stream, &mut emissions);
             }
             // If not unjailing, don't emit anything (still accumulating)
         }

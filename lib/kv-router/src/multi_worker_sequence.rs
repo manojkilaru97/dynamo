@@ -507,6 +507,9 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             dp_rank: worker.dp_rank,
             active_decode_blocks: Some(active_blocks as u64),
             active_prefill_tokens: Some(active_tokens as u64),
+            request_active_slots: None,
+            num_requests_waiting: None,
+            request_total_slots: None,
         };
 
         self.publisher.publish_load(active_load);

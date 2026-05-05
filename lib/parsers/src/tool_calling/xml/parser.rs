@@ -244,7 +244,10 @@ fn collect_stripped_parameters(
 ) -> Option<Vec<(String, String)>> {
     let parameter_start = regex::escape(&config.parameter_start_token);
     let parameter_end = regex::escape(&config.parameter_end_token);
-    let standard_pattern = format!(r"(?s){}([^>]+)>(.*?)(?:{}|$)", parameter_start, parameter_end);
+    let standard_pattern = format!(
+        r"(?s){}([^>]+)>(.*?)(?:{}|$)",
+        parameter_start, parameter_end
+    );
     let standard_regex = Regex::new(&standard_pattern).ok()?;
 
     let mut params = Vec::new();
@@ -255,8 +258,7 @@ fn collect_stripped_parameters(
         Some(pos) => &text[..pos],
         None => text,
     };
-    if let Some((name, after_head)) = parse_stripped_parameter_head(leading, tools)
-    {
+    if let Some((name, after_head)) = parse_stripped_parameter_head(leading, tools) {
         let value = after_head
             .split(&config.parameter_end_token)
             .next()
@@ -415,15 +417,16 @@ fn repair_missing_enum_parameter_from_trailing_line(
         if name == &present_name || params.iter().any(|(param_name, _)| param_name == name) {
             return None;
         }
-        let matches_tail = property
-            .get("enum")
-            .and_then(|v| v.as_array())
-            .is_some_and(|enum_values| {
-                enum_values
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .any(|enum_value| enum_value == tail)
-            });
+        let matches_tail =
+            property
+                .get("enum")
+                .and_then(|v| v.as_array())
+                .is_some_and(|enum_values| {
+                    enum_values
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .any(|enum_value| enum_value == tail)
+                });
         matches_tail.then_some(name.as_str())
     });
     let Some(missing_name) = enum_matches.next() else {

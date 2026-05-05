@@ -859,7 +859,10 @@ impl Metrics {
         .unwrap();
 
         let generation_tokens_total = IntCounterVec::new(
-            Opts::new("generation_tokens_total", "Total generation tokens produced"),
+            Opts::new(
+                "generation_tokens_total",
+                "Total generation tokens produced",
+            ),
             &["model"],
         )
         .unwrap();

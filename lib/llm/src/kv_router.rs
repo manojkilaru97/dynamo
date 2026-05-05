@@ -436,6 +436,9 @@ impl KvRouter {
                 KvSchedulerError::QueueFull { .. } | KvSchedulerError::QueueWaitTimeout { .. } => {
                     Error::new(PipelineError::ServiceOverloaded(e.to_string()))
                 }
+                KvSchedulerError::NoEndpoints => {
+                    Error::new(PipelineError::ServiceOverloaded(e.to_string()))
+                }
                 _ => Error::new(e),
             })?;
         let total_elapsed = start.elapsed();

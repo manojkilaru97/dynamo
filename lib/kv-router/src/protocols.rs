@@ -185,6 +185,17 @@ pub struct ActiveLoad {
     pub active_decode_blocks: Option<u64>,
     /// Number of active prefill tokens (from scheduler's view).
     pub active_prefill_tokens: Option<u64>,
+    /// Number of requests currently running on this scheduler/DP rank.
+    #[serde(default)]
+    pub request_active_slots: Option<u64>,
+    /// Number of requests waiting on this scheduler/DP rank.
+    #[serde(default)]
+    pub num_requests_waiting: Option<u64>,
+    /// Worker-level total request cap. For Dynamo + SGLang this is usually
+    /// DYN_REQUEST_MAX_TOTAL_REQUESTS and is interpreted as a per-worker cap,
+    /// not a per-DP-rank cap.
+    #[serde(default)]
+    pub request_total_slots: Option<u64>,
 }
 
 /// A [`LocalBlockHash`] is a hash computed from the token IDs, optional multimodal metadata,
