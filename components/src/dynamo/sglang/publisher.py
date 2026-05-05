@@ -83,9 +83,8 @@ class DynamoSglangPublisher:
         self.generate_endpoint = generate_endpoint
         self.metrics_publisher = WorkerMetricsPublisher()
         self.component_gauges = component_gauges
-        self.request_total_slots = self._positive_int_env(
-            "DYN_REQUEST_MAX_TOTAL_REQUESTS"
-        )
+        self.dp_size = self._positive_int(getattr(self.server_args, "dp_size", 1)) or 1
+        self.request_total_slots_per_dp = self._request_total_slots_per_dp()
         # Endpoint creation is deferred to async context in setup_sgl_metrics
 
         # Set default values (can be overridden later if needed)
@@ -144,7 +143,7 @@ class DynamoSglangPublisher:
                     active_decode_blocks,
                     getattr(kv_metrics, "request_active_slots", None),
                     getattr(kv_metrics, "num_requests_waiting", None),
-                    self.request_total_slots
+                    self.request_total_slots_per_dp
                     or getattr(kv_metrics, "request_total_slots", None),
                 )
                 dp_rank_str = str(dp_rank)
@@ -193,6 +192,10 @@ class DynamoSglangPublisher:
         value = os.getenv(name)
         if not value:
             return None
+        return DynamoSglangPublisher._positive_int(value, name)
+
+    @staticmethod
+    def _positive_int(value, name: str = "value") -> Optional[int]:
         try:
             parsed = int(value)
         except ValueError:
@@ -200,15 +203,25 @@ class DynamoSglangPublisher:
             return None
         return parsed if parsed > 0 else None
 
+    def _request_total_slots_per_dp(self) -> Optional[int]:
+        total_slots = self._positive_int_env("DYN_REQUEST_MAX_TOTAL_REQUESTS")
+        if total_slots is None:
+            return None
+        # DYN_REQUEST_MAX_TOTAL_REQUESTS is a per-replica Dynamo admission cap.
+        # SGLang schedulers publish per-DP load, so expose a per-DP cap to the
+        # router while decode_handler.py keeps enforcing the per-replica guard.
+        return max(1, total_slots // self.dp_size)
+
     def init_engine_metrics_publish(self) -> None:
         """Publish initial dummy metrics to bootstrap the metrics endpoint."""
         logging.info("Sending dummy metrics to initialize")
-        self.metrics_publisher.publish(
-            self.dp_rank, 0, 0, 0, self.request_total_slots
-        )
-        dp_rank_str = str(self.dp_rank)
-        self.component_gauges.set_total_blocks(dp_rank_str, 0)
-        self.component_gauges.set_gpu_cache_usage(dp_rank_str, 0.0)
+        for dp_rank in range(self.dp_size):
+            self.metrics_publisher.publish(
+                dp_rank, 0, 0, 0, self.request_total_slots_per_dp
+            )
+            dp_rank_str = str(dp_rank)
+            self.component_gauges.set_total_blocks(dp_rank_str, 0)
+            self.component_gauges.set_gpu_cache_usage(dp_rank_str, 0.0)
 
     def init_kv_event_publish(self) -> List[KvEventPublisher]:
         """Initialize KV event publisher(s) if configured.

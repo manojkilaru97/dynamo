@@ -66,6 +66,7 @@ class FrontendConfig(ConfigBase):
     router_queue_threshold: Optional[float]
     router_max_pending_per_worker: Optional[int]
     router_max_queue_wait_ms: Optional[int]
+    router_dp_stale_selection_secs: Optional[int]
     decode_fallback: bool
 
     migration_limit: int
@@ -399,6 +400,18 @@ class FrontendArgGroup(ArgGroup):
             help=(
                 "KV Router: maximum time in milliseconds a request may wait in the "
                 "scheduler queue before being failed."
+            ),
+            arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--router-dp-stale-selection-secs",
+            env_var="DYN_ROUTER_DP_STALE_SELECTION_SECS",
+            default=None,
+            help=(
+                "KV Router: if set, prefer an eligible worker/DP that has not been "
+                "selected for this many seconds. This prevents DP starvation without "
+                "bypassing worker saturation caps."
             ),
             arg_type=int,
         )

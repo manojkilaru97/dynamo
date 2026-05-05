@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use dynamo_runtime::component::Endpoint;
@@ -34,6 +35,8 @@ const DEFAULT_KV_CACHE_BLOCK_SIZE: u32 = 16;
 /// We can't have it default to 0, so pick something
 /// 'pub' because the bindings use it for consistency.
 pub const DEFAULT_HTTP_PORT: u16 = 8080;
+
+const MODEL_CARD_REPUBLISH_INTERVAL_SECS: u64 = 30;
 
 pub struct LocalModelBuilder {
     model_path: Option<PathBuf>,
@@ -527,7 +530,27 @@ impl LocalModel {
             &self.card,
             model_suffix,
         )?;
-        let _instance = discovery.register(spec).await?;
+        let _instance = discovery.register(spec.clone()).await?;
+
+        // Keep the routing-critical model card present. If the initial startup
+        // publish is missed by discovery, a kube-ready worker can be invisible
+        // to the KV router until the pod is recycled.
+        let discovery = discovery.clone();
+        let cancel_token = endpoint.drt().primary_token();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(MODEL_CARD_REPUBLISH_INTERVAL_SECS));
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(err) = discovery.register(spec.clone()).await {
+                            tracing::warn!(%err, "failed to republish ModelDeploymentCard");
+                        }
+                    }
+                }
+            }
+        });
 
         Ok(())
     }

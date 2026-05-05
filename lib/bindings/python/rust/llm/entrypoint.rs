@@ -52,7 +52,7 @@ impl KvRouterConfig {
 #[pymethods]
 impl KvRouterConfig {
     #[new]
-    #[pyo3(signature = (overlap_score_weight=1.0, router_temperature=0.0, use_kv_events=true, durable_kv_events=false, router_replica_sync=false, router_track_active_blocks=true, router_track_output_blocks=false, router_assume_kv_reuse=true, router_snapshot_threshold=1000000, router_reset_states=false, router_ttl_secs=120.0, router_max_tree_size=1048576, router_prune_target_ratio=0.8, router_queue_threshold=Some(2.0), router_max_pending_per_worker=Some(8), router_max_queue_wait_ms=Some(30_000), router_event_threads=4))]
+    #[pyo3(signature = (overlap_score_weight=1.0, router_temperature=0.0, use_kv_events=true, durable_kv_events=false, router_replica_sync=false, router_track_active_blocks=true, router_track_output_blocks=false, router_assume_kv_reuse=true, router_snapshot_threshold=1000000, router_reset_states=false, router_ttl_secs=120.0, router_max_tree_size=1048576, router_prune_target_ratio=0.8, router_queue_threshold=Some(2.0), router_max_pending_per_worker=Some(8), router_max_queue_wait_ms=Some(30_000), router_dp_stale_selection_secs=None, router_event_threads=4))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         overlap_score_weight: f64,
@@ -71,6 +71,7 @@ impl KvRouterConfig {
         router_queue_threshold: Option<f64>,
         router_max_pending_per_worker: Option<usize>,
         router_max_queue_wait_ms: Option<u64>,
+        router_dp_stale_selection_secs: Option<u64>,
         router_event_threads: u32,
     ) -> Self {
         KvRouterConfig {
@@ -91,6 +92,7 @@ impl KvRouterConfig {
                 router_queue_threshold,
                 router_max_pending_per_worker,
                 router_max_queue_wait_ms,
+                router_dp_stale_selection_secs,
                 router_event_threads,
             },
         }

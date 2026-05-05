@@ -194,6 +194,7 @@ async def async_main():
             router_queue_threshold=config.router_queue_threshold,
             router_max_pending_per_worker=config.router_max_pending_per_worker,
             router_max_queue_wait_ms=config.router_max_queue_wait_ms,
+            router_dp_stale_selection_secs=config.router_dp_stale_selection_secs,
             router_event_threads=config.router_event_threads,
         )
     elif config.router_mode == "random":

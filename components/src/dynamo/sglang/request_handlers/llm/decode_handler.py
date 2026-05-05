@@ -89,21 +89,18 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         if max_running_requests in (None, ""):
             return None
         try:
-            per_dp_limit = int(max_running_requests)
+            total_limit = int(max_running_requests)
         except (TypeError, ValueError):
             logging.warning(
                 "Ignoring invalid SGLang max_running_requests=%r",
                 max_running_requests,
             )
             return None
-        if per_dp_limit <= 0:
+        if total_limit <= 0:
             return None
-        dp_size = getattr(self.config.server_args, "dp_size", 1) or 1
-        try:
-            dp_size = max(1, int(dp_size))
-        except (TypeError, ValueError):
-            dp_size = 1
-        return per_dp_limit * dp_size
+        # SGLang treats --max-running-requests as the per-replica total and
+        # divides it by dp_size internally. Do not multiply by dp_size here.
+        return total_limit
 
     async def _try_reserve_request_slot(
         self, request_id: str

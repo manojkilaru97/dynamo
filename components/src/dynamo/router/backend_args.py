@@ -31,6 +31,7 @@ class DynamoRouterConfig(ConfigBase):
     router_queue_threshold: float | None
     router_max_pending_per_worker: int | None
     router_max_queue_wait_ms: int | None
+    router_dp_stale_selection_secs: int | None
     router_event_threads: int
     router_kv_miss_quarantine_threshold: int | None
     router_kv_miss_quarantine_window_secs: float
@@ -221,6 +222,15 @@ class DynamoRouterArgGroup(ArgGroup):
             env_var="DYN_ROUTER_MAX_QUEUE_WAIT_MS",
             default=300000,
             help="KV Router: maximum time in milliseconds a request may wait in the scheduler queue before being failed.",
+            arg_type=int,
+        )
+
+        add_argument(
+            g,
+            flag_name="--router-dp-stale-selection-secs",
+            env_var="DYN_ROUTER_DP_STALE_SELECTION_SECS",
+            default=None,
+            help="KV Router: if set, prefer an eligible worker/DP that has not been selected for this many seconds.",
             arg_type=int,
         )
 

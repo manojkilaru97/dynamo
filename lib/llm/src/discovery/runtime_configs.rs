@@ -9,6 +9,7 @@ use dynamo_runtime::component::Endpoint;
 use dynamo_runtime::discovery::{DiscoveryQuery, watch_and_extract_field};
 use dynamo_runtime::prelude::DistributedRuntimeProvider;
 
+use crate::kv_router::metrics::observe_runtime_config_discovery;
 use crate::kv_router::protocols::WorkerId;
 use crate::local_model::runtime_config::ModelRuntimeConfig;
 use crate::model_card::ModelDeploymentCard;
@@ -62,10 +63,41 @@ pub async fn runtime_config_watch(endpoint: &Endpoint) -> anyhow::Result<Runtime
                 .collect();
             let configs = configs_rx.borrow_and_update().clone();
 
+            let only_in_endpoints: Vec<_> = instances
+                .iter()
+                .filter(|id| !configs.contains_key(id))
+                .copied()
+                .collect();
+            let only_in_configs: Vec<_> = configs
+                .keys()
+                .filter(|id| !instances.contains(id))
+                .copied()
+                .collect();
+            if !only_in_endpoints.is_empty() {
+                tracing::error!(
+                    endpoint_only_workers = ?only_in_endpoints,
+                    model_card_only_workers = ?only_in_configs,
+                    "runtime config discovery divergence; Endpoint workers without ModelDeploymentCards are invisible to the KV router"
+                );
+            } else if !only_in_configs.is_empty() {
+                tracing::warn!(
+                    model_card_only_workers = ?only_in_configs,
+                    "runtime config discovery divergence; stale ModelDeploymentCards exist without matching Endpoint workers"
+                );
+            }
+
             let ready: HashMap<WorkerId, ModelRuntimeConfig> = instances
-                .into_iter()
+                .iter()
+                .copied()
                 .filter_map(|id| configs.get(&id).map(|cfg| (id, cfg.clone())))
                 .collect();
+            observe_runtime_config_discovery(
+                instances.len(),
+                configs.len(),
+                ready.len(),
+                only_in_endpoints.len(),
+                only_in_configs.len(),
+            );
 
             // Only send if the joined result actually changed, to avoid waking
             // downstream consumers (wait_for, changed) on no-op recomputations.

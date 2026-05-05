@@ -33,6 +33,7 @@ def build_kv_router_config(router_config: DynamoRouterConfig) -> KvRouterConfig:
         router_queue_threshold=router_config.router_queue_threshold,
         router_max_pending_per_worker=router_config.router_max_pending_per_worker,
         router_max_queue_wait_ms=router_config.router_max_queue_wait_ms,
+        router_dp_stale_selection_secs=router_config.router_dp_stale_selection_secs,
         router_event_threads=router_config.router_event_threads,
     )
 

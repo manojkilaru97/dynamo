@@ -58,11 +58,19 @@ impl WorkerRequestLoads {
             if let Some(total_slots) = load.total_slots
                 && total_slots > 0
             {
-                cap = Some(cap.map_or(total_slots, |current: u64| current.min(total_slots)));
+                cap = Some(cap.map_or(total_slots, |current: u64| {
+                    current.saturating_add(total_slots)
+                }));
             }
         }
 
         Some((total, cap))
+    }
+
+    pub fn dp_requests_and_cap(&self, worker: WorkerWithDpRank) -> Option<(u64, Option<u64>)> {
+        let inner = self.inner.read().unwrap();
+        let load = inner.get(&worker.worker_id)?.get(&worker.dp_rank)?;
+        Some((load.active.saturating_add(load.waiting), load.total_slots))
     }
 }
 
@@ -375,6 +383,13 @@ impl SchedulerQueue {
         active_tokens: &HashMap<WorkerWithDpRank, usize>,
         active_requests: &HashMap<WorkerWithDpRank, usize>,
     ) -> bool {
+        if let Some((dp_requests, Some(dp_cap))) = self.request_loads.dp_requests_and_cap(worker)
+            && dp_cap > 0
+            && dp_requests >= dp_cap
+        {
+            return true;
+        }
+
         if let Some(max_num_seqs) = config.max_num_seqs {
             if let Some((total_requests, request_cap)) =
                 self.request_loads.total_requests_and_cap(worker.worker_id)
@@ -485,7 +500,11 @@ mod tests {
         assert!(loads.update_from_active_load(&active_load(7, 0, 3, 2, Some(16))));
         assert!(loads.update_from_active_load(&active_load(7, 1, 4, 1, Some(16))));
 
-        assert_eq!(loads.total_requests_and_cap(7), Some((10, Some(16))));
+        assert_eq!(loads.total_requests_and_cap(7), Some((10, Some(32))));
+        assert_eq!(
+            loads.dp_requests_and_cap(WorkerWithDpRank::new(7, 0)),
+            Some((5, Some(16)))
+        );
     }
 
     #[test]
@@ -500,13 +519,13 @@ mod tests {
     }
 
     #[test]
-    fn worker_request_loads_use_worker_level_min_cap_across_dp_ranks() {
+    fn worker_request_loads_sum_per_dp_caps_across_dp_ranks() {
         let loads = WorkerRequestLoads::default();
 
         loads.update_from_active_load(&active_load(7, 0, 1, 0, Some(32)));
         loads.update_from_active_load(&active_load(7, 1, 1, 0, Some(16)));
 
-        assert_eq!(loads.total_requests_and_cap(7), Some((2, Some(16))));
+        assert_eq!(loads.total_requests_and_cap(7), Some((2, Some(48))));
     }
 
     #[test]

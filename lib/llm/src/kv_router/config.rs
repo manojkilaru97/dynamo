@@ -89,6 +89,11 @@ pub struct KvRouterConfig {
     // Default: 30000ms.
     pub router_max_queue_wait_ms: Option<u64>,
 
+    // If set, an eligible worker/DP that has not been selected for this many
+    // seconds is preferred for one routing decision. This prevents deterministic
+    // KV routing from starving a DP indefinitely while preserving hard caps.
+    pub router_dp_stale_selection_secs: Option<u64>,
+
     /// Number of event processing threads for the KV indexer.
     /// When > 1, uses ConcurrentRadixTree with a thread pool instead of the
     /// single-threaded RadixTree. Default: 4.
@@ -115,6 +120,7 @@ impl Default for KvRouterConfig {
             router_queue_threshold: Some(2.0),
             router_max_pending_per_worker: Some(8),
             router_max_queue_wait_ms: Some(30_000),
+            router_dp_stale_selection_secs: None,
             router_event_threads: 4,
         }
     }

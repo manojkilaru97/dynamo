@@ -525,6 +525,9 @@ fn kv_router_config_from_env() -> KvRouterConfig {
     fn env_f64(key: &str) -> Option<f64> {
         std::env::var(key).ok().and_then(|v| v.parse().ok())
     }
+    fn env_u64(key: &str) -> Option<u64> {
+        std::env::var(key).ok().and_then(|v| v.parse().ok())
+    }
     fn env_bool(key: &str) -> Option<bool> {
         std::env::var(key)
             .ok()
@@ -553,6 +556,9 @@ fn kv_router_config_from_env() -> KvRouterConfig {
     if let Some(v) = env_bool("DYN_ROUTER_TRACK_OUTPUT_BLOCKS") {
         cfg.router_track_output_blocks = v;
     }
+    if let Some(v) = env_u64("DYN_ROUTER_DP_STALE_SELECTION_SECS") {
+        cfg.router_dp_stale_selection_secs = Some(v);
+    }
 
     tracing::info!(
         overlap_score_weight = cfg.overlap_score_weight,
@@ -561,6 +567,7 @@ fn kv_router_config_from_env() -> KvRouterConfig {
         router_replica_sync = cfg.router_replica_sync,
         router_track_active_blocks = cfg.router_track_active_blocks,
         router_track_output_blocks = cfg.router_track_output_blocks,
+        router_dp_stale_selection_secs = ?cfg.router_dp_stale_selection_secs,
         "KvRouterConfig initialized (DYN_* env overrides applied)"
     );
 

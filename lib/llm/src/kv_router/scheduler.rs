@@ -4,6 +4,7 @@
 use super::KvRouterConfig;
 use super::RouterConfigOverride;
 use super::WorkerSelector;
+use super::metrics::ROUTER_DP_HEALTH_METRICS;
 use super::protocols::{
     ActiveLoad, DpRank, OverlapScores, WorkerId, WorkerSelectionResult, WorkerWithDpRank,
 };
@@ -81,6 +82,7 @@ pub struct SchedulingRequest {
     pub allowed_worker_ids: Option<HashSet<WorkerId>>,
     /// Optional set of worker + dp-rank pairs that are temporarily saturated and must be skipped.
     pub disallowed_workers: Option<HashSet<WorkerWithDpRank>>,
+    pub worker_type: &'static str,
     resp_tx: Option<tokio::sync::oneshot::Sender<Result<SchedulingResponse, KvSchedulerError>>>,
 }
 
@@ -299,6 +301,7 @@ impl KvScheduler {
             priority_jump,
             allowed_worker_ids,
             disallowed_workers: None,
+            worker_type: self.worker_type(),
             resp_tx: Some(resp_tx),
         };
 
@@ -556,15 +559,46 @@ impl WorkerSelector for DefaultWorkerSelector {
         if worker_logits.is_empty() {
             return Err(KvSchedulerError::NoEndpoints);
         }
+        ROUTER_DP_HEALTH_METRICS.observe_selection_snapshot(
+            workers,
+            request.allowed_worker_ids.as_ref(),
+            &worker_logits,
+            request.worker_type,
+        );
 
-        // Use softmax sampling to select worker(s)
-        // Use override if provided, otherwise use default config
         let temperature = request
             .router_config_override
             .as_ref()
             .and_then(|cfg| cfg.router_temperature)
             .unwrap_or(self.kv_router_config.router_temperature);
-        let candidates = softmax_sample(&worker_logits, temperature);
+        let candidates = if let Some(stale_secs) = self
+            .kv_router_config
+            .router_dp_stale_selection_secs
+            .filter(|secs| *secs > 0)
+        {
+            let stale_workers = ROUTER_DP_HEALTH_METRICS.stale_workers(
+                worker_logits.keys(),
+                request.worker_type,
+                stale_secs,
+            );
+            if !stale_workers.is_empty() && stale_workers.len() < worker_logits.len() {
+                let stale_logits: HashMap<_, _> = stale_workers
+                    .iter()
+                    .filter_map(|worker| worker_logits.get(worker).map(|logit| (*worker, *logit)))
+                    .collect();
+                tracing::info!(
+                    stale_secs,
+                    stale_candidates = stale_logits.len(),
+                    total_candidates = worker_logits.len(),
+                    "Prioritizing stale eligible worker/DP candidates"
+                );
+                softmax_sample(&stale_logits, temperature)
+            } else {
+                softmax_sample(&worker_logits, temperature)
+            }
+        } else {
+            softmax_sample(&worker_logits, temperature)
+        };
 
         // If multiple candidates (tied), use tree size as tie-breaker
         // If tree sizes are also equal, use random selection to avoid bias
@@ -588,6 +622,7 @@ impl WorkerSelector for DefaultWorkerSelector {
         };
 
         let best_logit = worker_logits[&best_worker];
+        ROUTER_DP_HEALTH_METRICS.observe_selected(best_worker, request.worker_type);
 
         let best_overlap = *overlaps.get(&best_worker).unwrap_or(&0);
 

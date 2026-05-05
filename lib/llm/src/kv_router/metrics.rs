@@ -38,7 +38,8 @@
 //!
 //! See also: `docs/observability/metrics.md` (Router Metrics section).
 
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 use std::time::Duration;
 
 use dynamo_runtime::component::Component;
@@ -52,9 +53,12 @@ fn router_metric(suffix: &str) -> String {
     format!("{}{}", router_request::METRIC_PREFIX, suffix)
 }
 use dynamo_runtime::traits::DistributedRuntimeProvider;
-use prometheus::{HistogramOpts, IntGaugeVec, Opts};
+use prometheus::{GaugeVec, HistogramOpts, IntCounterVec, IntGaugeVec, Opts};
 
 use crate::http::service::metrics::generate_log_buckets;
+use crate::local_model::runtime_config::ModelRuntimeConfig;
+
+use super::protocols::{WorkerId, WorkerWithDpRank};
 
 /// Exponential buckets for routing overhead histograms:
 /// from 0.0001 ms (0.1 µs) to ~13.1 ms, factor 2, 18 steps.
@@ -143,10 +147,242 @@ pub static ROUTER_QUEUE_PENDING_REQUESTS: LazyLock<IntGaugeVec> = LazyLock::new(
     .expect("Failed to create router_pending_requests gauge")
 });
 
+pub static ROUTER_RUNTIME_CONFIG_WORKERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            format!("{}_router_runtime_config_workers", name_prefix::FRONTEND),
+            "Worker counts observed by KV router runtime-config discovery",
+        ),
+        &["source"],
+    )
+    .expect("Failed to create router_runtime_config_workers gauge")
+});
+
+pub static ROUTER_RUNTIME_CONFIG_DIVERGENCE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            format!("{}_router_runtime_config_divergence", name_prefix::FRONTEND),
+            "Whether KV router Endpoint and EndpointModels discovery disagree",
+        ),
+        &["direction"],
+    )
+    .expect("Failed to create router_runtime_config_divergence gauge")
+});
+
+pub struct RouterDpHealthMetrics {
+    pub eligible: IntGaugeVec,
+    pub last_eligible_unix_seconds: IntGaugeVec,
+    pub selected_total: IntCounterVec,
+    pub last_selected_unix_seconds: IntGaugeVec,
+    pub candidate_logit: GaugeVec,
+}
+
+static ROUTER_DP_LAST_SELECTED: LazyLock<RwLock<HashMap<(WorkerWithDpRank, String), i64>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static ROUTER_DP_FIRST_ELIGIBLE: LazyLock<RwLock<HashMap<(WorkerWithDpRank, String), i64>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+impl RouterDpHealthMetrics {
+    pub fn observe_selection_snapshot(
+        &self,
+        workers: &HashMap<WorkerId, ModelRuntimeConfig>,
+        allowed_worker_ids: Option<&HashSet<WorkerId>>,
+        candidate_logits: &HashMap<WorkerWithDpRank, f64>,
+        worker_type: &str,
+    ) {
+        let now = current_unix_seconds();
+        let mut first_eligible = ROUTER_DP_FIRST_ELIGIBLE.write().ok();
+        for (worker_id, config) in workers {
+            if allowed_worker_ids.is_some_and(|ids| !ids.contains(worker_id)) {
+                continue;
+            }
+
+            for dp_rank in config.data_parallel_start_rank
+                ..config.data_parallel_start_rank + config.data_parallel_size
+            {
+                let worker = WorkerWithDpRank::new(*worker_id, dp_rank);
+                let worker_id = worker.worker_id.to_string();
+                let dp_rank = worker.dp_rank.to_string();
+                let labels = &[worker_id.as_str(), dp_rank.as_str(), worker_type];
+                if let Some(logit) = candidate_logits.get(&worker) {
+                    self.eligible.with_label_values(labels).set(1);
+                    self.last_eligible_unix_seconds
+                        .with_label_values(labels)
+                        .set(now);
+                    self.candidate_logit.with_label_values(labels).set(*logit);
+                    if let Some(first_eligible) = first_eligible.as_mut() {
+                        first_eligible
+                            .entry((worker, worker_type.to_string()))
+                            .or_insert(now);
+                    }
+                } else {
+                    self.eligible.with_label_values(labels).set(0);
+                    if let Some(first_eligible) = first_eligible.as_mut() {
+                        first_eligible.remove(&(worker, worker_type.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn observe_selected(&self, worker: WorkerWithDpRank, worker_type: &str) {
+        let worker_id = worker.worker_id.to_string();
+        let dp_rank = worker.dp_rank.to_string();
+        let labels = &[worker_id.as_str(), dp_rank.as_str(), worker_type];
+        let now = current_unix_seconds();
+        self.selected_total.with_label_values(labels).inc();
+        self.last_selected_unix_seconds
+            .with_label_values(labels)
+            .set(now);
+        if let Ok(mut last_selected) = ROUTER_DP_LAST_SELECTED.write() {
+            last_selected.insert((worker, worker_type.to_string()), now);
+        }
+    }
+
+    pub fn stale_workers<'a>(
+        &self,
+        workers: impl Iterator<Item = &'a WorkerWithDpRank>,
+        worker_type: &'static str,
+        stale_secs: u64,
+    ) -> Vec<WorkerWithDpRank> {
+        let now = current_unix_seconds();
+        let Ok(last_selected) = ROUTER_DP_LAST_SELECTED.read() else {
+            return Vec::new();
+        };
+        let Ok(first_eligible) = ROUTER_DP_FIRST_ELIGIBLE.read() else {
+            return Vec::new();
+        };
+        workers
+            .filter(|worker| {
+                let key = (**worker, worker_type.to_string());
+                if let Some(last) = last_selected.get(&key) {
+                    return now.saturating_sub(*last) >= stale_secs as i64;
+                }
+                first_eligible
+                    .get(&key)
+                    .is_some_and(|first| now.saturating_sub(*first) >= stale_secs as i64)
+            })
+            .copied()
+            .collect()
+    }
+
+    pub fn remove(&self, worker_id: u64, dp_rank: u32, worker_type: &str) {
+        let worker_id_str = worker_id.to_string();
+        let dp_rank_str = dp_rank.to_string();
+        let labels = &[worker_id_str.as_str(), dp_rank_str.as_str(), worker_type];
+        let _ = self.eligible.remove_label_values(labels);
+        let _ = self.last_eligible_unix_seconds.remove_label_values(labels);
+        let _ = self.selected_total.remove_label_values(labels);
+        let _ = self.last_selected_unix_seconds.remove_label_values(labels);
+        let _ = self.candidate_logit.remove_label_values(labels);
+        if let Ok(mut last_selected) = ROUTER_DP_LAST_SELECTED.write() {
+            last_selected.remove(&(
+                WorkerWithDpRank::new(worker_id, dp_rank),
+                worker_type.to_string(),
+            ));
+        }
+        if let Ok(mut first_eligible) = ROUTER_DP_FIRST_ELIGIBLE.write() {
+            first_eligible.remove(&(
+                WorkerWithDpRank::new(worker_id, dp_rank),
+                worker_type.to_string(),
+            ));
+        }
+    }
+}
+
+fn current_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+pub static ROUTER_DP_HEALTH_METRICS: LazyLock<RouterDpHealthMetrics> =
+    LazyLock::new(|| RouterDpHealthMetrics {
+        eligible: IntGaugeVec::new(
+            Opts::new(
+                format!("{}_router_worker_dp_eligible", name_prefix::FRONTEND),
+                "Worker/DP pairs eligible for KV router selection",
+            ),
+            &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+        )
+        .expect("Failed to create router_worker_dp_eligible gauge"),
+        last_eligible_unix_seconds: IntGaugeVec::new(
+            Opts::new(
+                format!(
+                    "{}_router_worker_dp_last_eligible_unix_seconds",
+                    name_prefix::FRONTEND
+                ),
+                "Unix timestamp when a worker/DP pair was last eligible for KV router selection",
+            ),
+            &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+        )
+        .expect("Failed to create router_worker_dp_last_eligible_unix_seconds gauge"),
+        selected_total: IntCounterVec::new(
+            Opts::new(
+                format!("{}_router_worker_dp_selected_total", name_prefix::FRONTEND),
+                "Total KV router selections by worker/DP pair",
+            ),
+            &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+        )
+        .expect("Failed to create router_worker_dp_selected_total counter"),
+        last_selected_unix_seconds: IntGaugeVec::new(
+            Opts::new(
+                format!(
+                    "{}_router_worker_dp_last_selected_unix_seconds",
+                    name_prefix::FRONTEND
+                ),
+                "Unix timestamp when a worker/DP pair was last selected by the KV router",
+            ),
+            &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+        )
+        .expect("Failed to create router_worker_dp_last_selected_unix_seconds gauge"),
+        candidate_logit: GaugeVec::new(
+            Opts::new(
+                format!("{}_router_worker_dp_candidate_logit", name_prefix::FRONTEND),
+                "Latest KV router candidate logit by worker/DP pair; lower is preferred",
+            ),
+            &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+        )
+        .expect("Failed to create router_worker_dp_candidate_logit gauge"),
+    });
+
+pub fn observe_runtime_config_discovery(
+    endpoint_workers: usize,
+    model_card_workers: usize,
+    joined_workers: usize,
+    endpoint_only_workers: usize,
+    model_card_only_workers: usize,
+) {
+    ROUTER_RUNTIME_CONFIG_WORKERS
+        .with_label_values(&["endpoint"])
+        .set(endpoint_workers as i64);
+    ROUTER_RUNTIME_CONFIG_WORKERS
+        .with_label_values(&["model_card"])
+        .set(model_card_workers as i64);
+    ROUTER_RUNTIME_CONFIG_WORKERS
+        .with_label_values(&["joined"])
+        .set(joined_workers as i64);
+    ROUTER_RUNTIME_CONFIG_DIVERGENCE
+        .with_label_values(&["endpoint_only"])
+        .set(endpoint_only_workers as i64);
+    ROUTER_RUNTIME_CONFIG_DIVERGENCE
+        .with_label_values(&["model_card_only"])
+        .set(model_card_only_workers as i64);
+}
+
 pub fn register_router_queue_metrics(
     registry: &prometheus::Registry,
 ) -> Result<(), prometheus::Error> {
     registry.register(Box::new(ROUTER_QUEUE_PENDING_REQUESTS.clone()))?;
+    registry.register(Box::new(ROUTER_RUNTIME_CONFIG_WORKERS.clone()))?;
+    registry.register(Box::new(ROUTER_RUNTIME_CONFIG_DIVERGENCE.clone()))?;
+    let dp = &*ROUTER_DP_HEALTH_METRICS;
+    registry.register(Box::new(dp.eligible.clone()))?;
+    registry.register(Box::new(dp.last_eligible_unix_seconds.clone()))?;
+    registry.register(Box::new(dp.selected_total.clone()))?;
+    registry.register(Box::new(dp.last_selected_unix_seconds.clone()))?;
+    registry.register(Box::new(dp.candidate_logit.clone()))?;
     Ok(())
 }
 
