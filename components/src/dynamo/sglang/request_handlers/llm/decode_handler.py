@@ -256,13 +256,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         *,
         health_check: bool = False,
         dp_rank: int | None = None,
-    ) -> tuple[bool, int | None, int | None, str | None]:
+    ) -> tuple[bool, int | None, int | None, str | None, str | None]:
         limit = self.max_total_requests
         if limit is None:
-            return True, None, None, None
+            return True, None, None, None, None
 
         expired: list[_RequestAdmission] = []
-        reject_result: tuple[bool, int | None, int | None, str | None] | None = None
+        reject_result: tuple[bool, int | None, int | None, str | None, str | None] | None = None
         async with self._request_admission_lock:
             now = time.monotonic()
             expired = self._reap_expired_request_slots_locked(now)
@@ -300,6 +300,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     self._active_request_admissions,
                     limit,
                     None,
+                    None,
                 )
             if reject_result is None:
                 current_total = len(self._request_admissions)
@@ -321,7 +322,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         current_dp_total,
                         per_dp_limit,
                     )
-                    reject_result = (False, current_dp_total, per_dp_limit, None)
+                    reject_result = (
+                        False,
+                        current_dp_total,
+                        per_dp_limit,
+                        None,
+                        "dp",
+                    )
                 elif current_total >= limit:
                     unhealthy_reason = (
                         self._stale_full_unhealthy_reason_locked(now)
@@ -334,7 +341,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         current_total,
                         limit,
                     )
-                    reject_result = (False, current_total, limit, unhealthy_reason)
+                    reject_result = (
+                        False,
+                        current_total,
+                        limit,
+                        unhealthy_reason,
+                        "worker",
+                    )
                 else:
                     self._request_admissions[request_id] = _RequestAdmission(
                         context_id=request_id,
@@ -365,7 +378,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             self._abort_reaped_request_slot(admission)
         if reject_result is not None:
             return reject_result
-        return True, current_total + 1, limit, None
+        return True, current_total + 1, limit, None, None
 
     async def _release_request_slot_reservation(
         self, request_id: str | None = None
@@ -410,6 +423,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         *,
         current_total_requests: int | None = None,
         total_request_limit: int | None = None,
+        request_limit_scope: str | None = None,
     ) -> dict[str, Any]:
         extra_args: dict[str, Any] = {
             "dynamo_error_type": cls.SERVICE_OVERLOADED_ERROR_TYPE,
@@ -419,6 +433,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             extra_args["worker_total_requests"] = current_total_requests
         if total_request_limit is not None:
             extra_args["worker_total_request_limit"] = total_request_limit
+        if request_limit_scope is not None:
+            extra_args["worker_request_limit_scope"] = request_limit_scope
         return extra_args
 
     @classmethod
@@ -428,6 +444,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         *,
         current_total_requests: int | None = None,
         total_request_limit: int | None = None,
+        request_limit_scope: str | None = None,
     ) -> dict[str, Any]:
         return {
             "finish_reason": {"error": message},
@@ -436,6 +453,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 message,
                 current_total_requests=current_total_requests,
                 total_request_limit=total_request_limit,
+                request_limit_scope=request_limit_scope,
             ),
         }
 
@@ -448,6 +466,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         *,
         current_total_requests: int | None = None,
         total_request_limit: int | None = None,
+        request_limit_scope: str | None = None,
     ) -> dict[str, Any]:
         return {
             "id": request_id,
@@ -466,6 +485,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 message,
                 current_total_requests=current_total_requests,
                 total_request_limit=total_request_limit,
+                request_limit_scope=request_limit_scope,
             ),
         }
 
@@ -966,6 +986,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             current_total_requests,
             total_request_limit,
             unhealthy_reason,
+            request_limit_scope,
         ) = (
             await self._try_reserve_request_slot(
                 context.id(),
@@ -989,12 +1010,14 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     self.config.server_args.served_model_name,
                     current_total_requests=current_total_requests,
                     total_request_limit=total_request_limit,
+                    request_limit_scope=request_limit_scope,
                 )
             else:
                 yield self._build_token_overload_response(
                     message,
                     current_total_requests=current_total_requests,
                     total_request_limit=total_request_limit,
+                    request_limit_scope=request_limit_scope,
                 )
             return
 

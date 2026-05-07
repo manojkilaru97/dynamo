@@ -94,6 +94,26 @@ impl WorkerRequestLoads {
         true
     }
 
+    pub fn mark_dp_saturated(&self, worker: WorkerWithDpRank, total_slots: u64) -> bool {
+        if total_slots == 0 {
+            return false;
+        }
+
+        let mut inner = self.inner.write().unwrap();
+        let now = Instant::now();
+        self.prune_expired_locked(&mut inner, now);
+        inner.entry(worker.worker_id).or_default().insert(
+            worker.dp_rank,
+            DpRequestLoad {
+                active: total_slots,
+                waiting: 0,
+                total_slots: Some(total_slots),
+                observed_at: now,
+            },
+        );
+        true
+    }
+
     pub fn total_requests_and_cap(&self, worker_id: WorkerId) -> Option<(u64, Option<u64>)> {
         let mut inner = self.inner.write().unwrap();
         self.prune_expired_locked(&mut inner, Instant::now());
@@ -234,10 +254,7 @@ impl SchedulerQueue {
     pub async fn enqueue(&self, request: SchedulingRequest) {
         if self.request_must_wait(&request) {
             let mut request = request;
-            // `disallowed_workers` records worker/DPs that rejected one immediate
-            // routing attempt. Once the request is parked, those bans must not
-            // survive into a later scheduling pass after capacity has changed.
-            request.disallowed_workers = None;
+            self.clear_exhausted_disallowed_workers(&mut request);
             if let Some(limit) = self.current_pending_limit(request.allowed_worker_ids.as_ref()) {
                 let pending = self.pending_count();
                 if pending >= limit {
@@ -291,11 +308,9 @@ impl SchedulerQueue {
             }
 
             if self.request_must_wait(&entry.request) {
-                let mut entry = entry;
-                // Same reasoning as enqueue(): waiting is a fresh queue state,
-                // not a continuation of the last rejected DP attempt.
-                entry.request.disallowed_workers = None;
                 let mut heap = self.pending.lock().await;
+                let mut entry = entry;
+                self.clear_exhausted_disallowed_workers(&mut entry.request);
                 heap.push(entry);
                 self.pending_count.fetch_add(1, AtomicOrdering::Relaxed);
                 break;
@@ -351,11 +366,7 @@ impl SchedulerQueue {
             Ok(s) => s,
             Err(e) => {
                 if matches!(e, super::scheduler::KvSchedulerError::NoEndpoints) {
-                    // `disallowed_workers` records worker/DPs that rejected this specific
-                    // immediate routing attempt. Once a request is parked in the queue, those
-                    // DP bans must not become permanent; otherwise a request that once tried
-                    // every full DP can never route after capacity frees up.
-                    request.disallowed_workers = None;
+                    self.clear_exhausted_disallowed_workers(&mut request);
                     let entry = if let Some((effective_offset, enqueued_at)) = queue_metadata {
                         QueueEntry {
                             effective_offset,
@@ -544,6 +555,32 @@ impl SchedulerQueue {
         (eligible_workers > 0).then_some(per_worker_limit.saturating_mul(eligible_workers))
     }
 
+    fn eligible_worker_dps(
+        &self,
+        allowed: Option<&HashSet<WorkerId>>,
+    ) -> HashSet<WorkerWithDpRank> {
+        let configs = self.workers_with_configs.borrow();
+        configs
+            .iter()
+            .filter(|(worker_id, _config)| allowed.is_none_or(|ids| ids.contains(worker_id)))
+            .flat_map(|(&worker_id, config)| {
+                let dp_start = config.data_parallel_start_rank;
+                let dp_end = dp_start + config.data_parallel_size;
+                (dp_start..dp_end).map(move |dp_rank| WorkerWithDpRank::new(worker_id, dp_rank))
+            })
+            .collect()
+    }
+
+    fn clear_exhausted_disallowed_workers(&self, request: &mut SchedulingRequest) {
+        let Some(disallowed) = request.disallowed_workers.as_ref() else {
+            return;
+        };
+        let eligible = self.eligible_worker_dps(request.allowed_worker_ids.as_ref());
+        if disallowed_exhausts_eligible_workers(disallowed, &eligible) {
+            request.disallowed_workers = None;
+        }
+    }
+
     fn is_expired(&self, entry: &QueueEntry) -> bool {
         if let Some(deadline) = entry.queue_deadline {
             return Instant::now() >= deadline;
@@ -597,6 +634,13 @@ impl SchedulerQueue {
             }));
         }
     }
+}
+
+fn disallowed_exhausts_eligible_workers(
+    disallowed: &HashSet<WorkerWithDpRank>,
+    eligible: &HashSet<WorkerWithDpRank>,
+) -> bool {
+    !eligible.is_empty() && eligible.iter().all(|worker| disallowed.contains(worker))
 }
 
 #[cfg(test)]
@@ -680,5 +724,36 @@ mod tests {
         loads.update_from_active_load(&active_load(7, 0, 8, 0, Some(8)));
 
         assert_eq!(loads.total_requests_and_cap(7), None);
+    }
+
+    #[test]
+    fn disallowed_workers_are_preserved_until_all_eligible_dps_are_exhausted() {
+        let eligible = HashSet::from([
+            WorkerWithDpRank::new(7, 0),
+            WorkerWithDpRank::new(7, 1),
+            WorkerWithDpRank::new(8, 0),
+        ]);
+        let partial_disallowed =
+            HashSet::from([WorkerWithDpRank::new(7, 1), WorkerWithDpRank::new(99, 0)]);
+        assert!(!disallowed_exhausts_eligible_workers(
+            &partial_disallowed,
+            &eligible
+        ));
+
+        let all_disallowed = HashSet::from([
+            WorkerWithDpRank::new(7, 0),
+            WorkerWithDpRank::new(7, 1),
+            WorkerWithDpRank::new(8, 0),
+            WorkerWithDpRank::new(99, 0),
+        ]);
+        assert!(disallowed_exhausts_eligible_workers(
+            &all_disallowed,
+            &eligible
+        ));
+
+        assert!(!disallowed_exhausts_eligible_workers(
+            &all_disallowed,
+            &HashSet::new()
+        ));
     }
 }

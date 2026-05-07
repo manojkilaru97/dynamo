@@ -364,6 +364,10 @@ impl KvRouter {
         self.scheduler.pending_count()
     }
 
+    pub fn mark_worker_dp_saturated(&self, worker: WorkerWithDpRank, total_slots: u64) -> bool {
+        self.scheduler.mark_worker_dp_saturated(worker, total_slots)
+    }
+
     /// Give these tokens, find the worker with the best match in it's KV cache.
     /// Returns the best worker (with dp_rank) and overlap amount in number of blocks.
     /// Now also takes optional context_id for request tracking.

@@ -62,6 +62,24 @@ fn is_service_overloaded_output(item: &Annotated<LLMEngineOutput>) -> bool {
         .is_some_and(LLMEngineOutput::is_service_overloaded)
 }
 
+fn service_overload_request_limit(item: &Annotated<LLMEngineOutput>) -> Option<u64> {
+    item.data
+        .as_ref()?
+        .extra_args
+        .as_ref()?
+        .get("worker_total_request_limit")?
+        .as_u64()
+}
+
+fn service_overload_request_limit_scope(item: &Annotated<LLMEngineOutput>) -> Option<&str> {
+    item.data
+        .as_ref()?
+        .extra_args
+        .as_ref()?
+        .get("worker_request_limit_scope")?
+        .as_str()
+}
+
 fn is_service_overloaded_error(error: &Error) -> bool {
     error
         .downcast_ref::<dynamo_runtime::pipeline::PipelineError>()
@@ -575,6 +593,22 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             };
 
             if is_service_overloaded_output(&first_item) {
+                let worker = WorkerWithDpRank::new(instance_id, dp_rank);
+                let limit_scope = service_overload_request_limit_scope(&first_item);
+                if let Some(limit) = service_overload_request_limit(&first_item)
+                    && limit_scope != Some("worker")
+                {
+                    if chooser.mark_worker_dp_saturated(worker, limit) {
+                        tracing::debug!(
+                            request_id = %context_id,
+                            worker_id = instance_id,
+                            dp_rank = dp_rank,
+                            request_limit = limit,
+                            request_limit_scope = limit_scope.unwrap_or("unknown"),
+                            "Marked worker/DP saturated after backend local-limit reject"
+                        );
+                    }
+                }
                 tracing::info!(
                     request_id = %context_id,
                     worker_id = instance_id,
@@ -591,7 +625,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                         context_id
                     );
                 }
-                attempted_worker_dps.insert(WorkerWithDpRank::new(instance_id, dp_rank));
+                if limit_scope == Some("worker") {
+                    attempted_workers.insert(instance_id);
+                } else {
+                    attempted_worker_dps.insert(WorkerWithDpRank::new(instance_id, dp_rank));
+                }
                 if Instant::now() >= overload_deadline {
                     return Err(Error::new(
                         dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(format!(
@@ -757,8 +795,15 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
 
 #[cfg(test)]
 mod tests {
-    use super::is_service_overloaded_error;
+    use super::{
+        is_service_overloaded_error, service_overload_request_limit,
+        service_overload_request_limit_scope,
+    };
     use dynamo_runtime::pipeline::PipelineError;
+    use dynamo_runtime::protocols::annotated::Annotated;
+    use serde_json::json;
+
+    use crate::protocols::common::llm_backend::LLMEngineOutput;
 
     #[test]
     fn retries_instance_unavailable_like_overload() {
@@ -768,5 +813,20 @@ mod tests {
         .into();
 
         assert!(is_service_overloaded_error(&error));
+    }
+
+    #[test]
+    fn extracts_service_overload_request_limit() {
+        let mut output = LLMEngineOutput::overloaded("full".to_string());
+        output.extra_args = Some(json!({
+            "dynamo_error_type": "service_overloaded",
+            "worker_total_requests": 8,
+            "worker_total_request_limit": 8,
+            "worker_request_limit_scope": "dp",
+        }));
+        let item = Annotated::from_data(output);
+
+        assert_eq!(service_overload_request_limit(&item), Some(8));
+        assert_eq!(service_overload_request_limit_scope(&item), Some("dp"));
     }
 }

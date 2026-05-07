@@ -274,6 +274,10 @@ impl KvScheduler {
         self.request_loads.clone()
     }
 
+    pub fn mark_worker_dp_saturated(&self, worker: WorkerWithDpRank, total_slots: u64) -> bool {
+        self.request_loads.mark_dp_saturated(worker, total_slots)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn schedule(
         &self,
@@ -577,7 +581,9 @@ impl WorkerSelector for DefaultWorkerSelector {
             .as_ref()
             .and_then(|cfg| cfg.router_temperature)
             .unwrap_or(self.kv_router_config.router_temperature);
-        let candidates = if let Some(stale_secs) = self
+        let disallowed_worker_dps = disallowed_workers.map_or(0, HashSet::len);
+        let allowed_worker_ids = allowed_ids.map_or(workers.len(), HashSet::len);
+        let (candidates, selection_path) = if let Some(stale_secs) = self
             .kv_router_config
             .router_dp_stale_selection_secs
             .filter(|secs| *secs > 0)
@@ -596,12 +602,12 @@ impl WorkerSelector for DefaultWorkerSelector {
                     total_candidates = worker_logits.len(),
                     "Prioritizing oldest stale eligible worker/DP candidates"
                 );
-                softmax_sample(&stale_logits, 0.0)
+                (softmax_sample(&stale_logits, 0.0), "stale_dp")
             } else {
-                softmax_sample(&worker_logits, temperature)
+                (softmax_sample(&worker_logits, temperature), "softmax")
             }
         } else {
-            softmax_sample(&worker_logits, temperature)
+            (softmax_sample(&worker_logits, temperature), "softmax")
         };
 
         // If multiple candidates (tied), use tree size as tie-breaker
@@ -645,6 +651,16 @@ impl WorkerSelector for DefaultWorkerSelector {
             .unwrap_or(0);
 
         tracing::info!(
+            worker_id = best_worker.worker_id,
+            dp_rank = best_worker.dp_rank,
+            selected_logit = best_logit,
+            cached_blocks = best_overlap,
+            tree_size,
+            candidate_count = worker_logits.len(),
+            disallowed_worker_dps,
+            allowed_worker_ids,
+            temperature,
+            selection_path,
             "Selected worker: worker_id={} dp_rank={:?}, logit: {:.3}, cached blocks: {}, tree size: {}{}",
             best_worker.worker_id,
             best_worker.dp_rank,
@@ -760,5 +776,64 @@ mod tests {
             result[0], worker20,
             "Should handle negative logits correctly"
         );
+    }
+
+    #[test]
+    fn selector_skips_disallowed_dp_rank() {
+        let selector = DefaultWorkerSelector::new(Some(KvRouterConfig {
+            router_temperature: 0.0,
+            ..Default::default()
+        }));
+        let mut workers = HashMap::new();
+        workers.insert(
+            7,
+            ModelRuntimeConfig {
+                data_parallel_size: 4,
+                ..Default::default()
+            },
+        );
+
+        let saturated = WorkerWithDpRank::new(7, 1);
+        let expected = WorkerWithDpRank::new(7, 2);
+        let mut request = SchedulingRequest {
+            maybe_request_id: Some("request-1".to_string()),
+            token_seq: None,
+            isl_tokens: 16,
+            overlaps: OverlapScores::new(),
+            decode_blocks: HashMap::new(),
+            prefill_tokens: HashMap::new(),
+            router_config_override: None,
+            update_states: true,
+            lora_name: None,
+            priority_jump: 0.0,
+            allowed_worker_ids: None,
+            disallowed_workers: Some(HashSet::from([saturated])),
+            queue_deadline: None,
+            worker_type: "decode",
+            resp_tx: None,
+        };
+
+        request
+            .prefill_tokens
+            .insert(WorkerWithDpRank::new(7, 0), 12);
+        request.prefill_tokens.insert(saturated, 0);
+        request.prefill_tokens.insert(expected, 1);
+        request
+            .prefill_tokens
+            .insert(WorkerWithDpRank::new(7, 3), 12);
+        request
+            .decode_blocks
+            .insert(WorkerWithDpRank::new(7, 0), 12);
+        request.decode_blocks.insert(saturated, 0);
+        request.decode_blocks.insert(expected, 1);
+        request
+            .decode_blocks
+            .insert(WorkerWithDpRank::new(7, 3), 12);
+
+        let selection = selector
+            .select_worker(&workers, &request, 16)
+            .expect("selector should choose a non-saturated DP");
+
+        assert_eq!(selection.worker, expected);
     }
 }

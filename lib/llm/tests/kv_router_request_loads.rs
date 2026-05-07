@@ -1,4 +1,5 @@
 use dynamo_llm::kv_router::protocols::ActiveLoad;
+use dynamo_llm::kv_router::protocols::WorkerWithDpRank;
 use dynamo_llm::kv_router::queue::WorkerRequestLoads;
 use std::time::Duration;
 
@@ -93,5 +94,40 @@ fn stale_request_loads_do_not_poison_capacity() {
 
     assert!(loads.update_from_active_load(&active_load(7, 0, 8, 0, Some(8))));
 
+    assert_eq!(loads.total_requests_and_cap(7), None);
+}
+
+#[test]
+fn local_dp_reject_marks_rank_saturated_immediately() {
+    let loads = WorkerRequestLoads::default();
+    let worker = WorkerWithDpRank::new(7, 1);
+
+    assert!(loads.mark_dp_saturated(worker, 8));
+
+    assert_eq!(loads.dp_requests_and_cap(worker), Some((8, Some(8))));
+    assert_eq!(loads.total_requests_and_cap(7), Some((8, Some(8))));
+}
+
+#[test]
+fn active_load_clears_synthetic_local_dp_reject_saturation() {
+    let loads = WorkerRequestLoads::default();
+    let worker = WorkerWithDpRank::new(7, 1);
+
+    assert!(loads.mark_dp_saturated(worker, 8));
+    assert_eq!(loads.dp_requests_and_cap(worker), Some((8, Some(8))));
+
+    assert!(loads.update_from_active_load(&active_load(7, 1, 2, 1, Some(8))));
+    assert_eq!(loads.dp_requests_and_cap(worker), Some((3, Some(8))));
+    assert_eq!(loads.total_requests_and_cap(7), Some((3, Some(8))));
+}
+
+#[test]
+fn invalid_local_dp_reject_cap_is_ignored() {
+    let loads = WorkerRequestLoads::default();
+    let worker = WorkerWithDpRank::new(7, 1);
+
+    assert!(!loads.mark_dp_saturated(worker, 0));
+
+    assert_eq!(loads.dp_requests_and_cap(worker), None);
     assert_eq!(loads.total_requests_and_cap(7), None);
 }
