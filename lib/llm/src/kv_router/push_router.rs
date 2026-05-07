@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use dynamo_runtime::{
@@ -225,6 +229,9 @@ impl KvPushRouter {
         phase: RequestPhase,
         is_query_only: bool,
         allowed_worker_ids_override: Option<HashSet<u64>>,
+        disallowed_workers_override: Option<HashSet<WorkerWithDpRank>>,
+        honor_preselected_worker: bool,
+        queue_deadline: Option<Instant>,
     ) -> Result<WorkerSelection, Error> {
         let routing = request.routing.as_ref();
         let lora_name = routing.and_then(|r| r.lora_name.clone());
@@ -236,14 +243,18 @@ impl KvPushRouter {
         let (routing_token_ids, block_mm_infos) = request.block_mm_routing_info();
 
         // Get pre-selected worker based on phase, with backend_instance_id as fallback
-        let preselected_id = match phase {
-            RequestPhase::Prefill => {
-                routing.and_then(|r| r.prefill_worker_id.or(r.backend_instance_id))
+        let preselected_id = if honor_preselected_worker {
+            match phase {
+                RequestPhase::Prefill => {
+                    routing.and_then(|r| r.prefill_worker_id.or(r.backend_instance_id))
+                }
+                RequestPhase::Decode => {
+                    routing.and_then(|r| r.decode_worker_id.or(r.backend_instance_id))
+                }
+                RequestPhase::Aggregated => routing.and_then(|r| r.backend_instance_id),
             }
-            RequestPhase::Decode => {
-                routing.and_then(|r| r.decode_worker_id.or(r.backend_instance_id))
-            }
-            RequestPhase::Aggregated => routing.and_then(|r| r.backend_instance_id),
+        } else {
+            None
         };
 
         let Some(id) = preselected_id else {
@@ -258,6 +269,8 @@ impl KvPushRouter {
                     lora_name,
                     priority_jump,
                     allowed_worker_ids,
+                    disallowed_workers_override,
+                    queue_deadline,
                 )
                 .await?;
 
@@ -380,7 +393,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
 
         if is_query_only {
             let selection = self
-                .select_worker(&context_id, &request, phase, true, None)
+                .select_worker(&context_id, &request, phase, true, None, None, true, None)
                 .instrument(tracing::info_span!("kv_router.select_worker"))
                 .await?;
             let WorkerSelection {
@@ -430,6 +443,16 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             .map(HashSet::len)
             .unwrap_or_else(|| all_worker_ids.len());
         let mut attempted_workers = HashSet::new();
+        let mut attempted_worker_dps: HashSet<WorkerWithDpRank> = HashSet::new();
+        let overload_wait_started = Instant::now();
+        let overload_max_wait = self
+            .chooser
+            .kv_router_config()
+            .router_max_queue_wait_ms
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_millis(30_000));
+        let overload_deadline = overload_wait_started + overload_max_wait;
+        let overload_retry_sleep = Duration::from_millis(50);
 
         let (selection, mut response_stream, first_item, stream_context) = loop {
             let allowed_worker_ids = retry_allowed_workers(
@@ -439,6 +462,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             );
 
             if allowed_worker_ids.as_ref().is_some_and(HashSet::is_empty) {
+                if overload_wait_started.elapsed() < overload_max_wait {
+                    tokio::time::sleep(overload_retry_sleep).await;
+                    attempted_workers.clear();
+                    continue;
+                }
                 return Err(Error::new(
                     dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(format!(
                         "All workers reached the local total request limit for request {context_id}"
@@ -446,16 +474,37 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                 ));
             }
 
-            let selection = self
+            let selection_result = self
                 .select_worker(
                     &context_id,
                     &request_template,
                     phase,
                     false,
                     allowed_worker_ids.clone(),
+                    if attempted_worker_dps.is_empty() {
+                        None
+                    } else {
+                        Some(attempted_worker_dps.clone())
+                    },
+                    attempted_workers.is_empty() && attempted_worker_dps.is_empty(),
+                    Some(overload_deadline),
                 )
                 .instrument(tracing::info_span!("kv_router.select_worker"))
-                .await?;
+                .await;
+            let selection = match selection_result {
+                Ok(selection) => selection,
+                Err(error)
+                    if is_service_overloaded_error(&error) && !attempted_worker_dps.is_empty() =>
+                {
+                    if overload_wait_started.elapsed() >= overload_max_wait {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(overload_retry_sleep).await;
+                    attempted_worker_dps.clear();
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
 
             let WorkerSelection {
                 instance_id,
@@ -497,6 +546,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                     }
                     attempted_workers.insert(instance_id);
                     if attempted_workers.len() >= candidate_pool_size.max(1) {
+                        if overload_wait_started.elapsed() < overload_max_wait {
+                            tokio::time::sleep(overload_retry_sleep).await;
+                            attempted_workers.clear();
+                            continue;
+                        }
                         return Err(Error::new(
                             dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(format!(
                                 "All workers reached the local total request limit for request {context_id}"
@@ -527,18 +581,18 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                     dp_rank = dp_rank,
                     "Worker rejected request due to local total request limit; retrying another worker"
                 );
-                while let Ok(Some(_)) =
-                    tokio::time::timeout(Duration::from_millis(100), response_stream.next()).await
-                {
-                }
+                // A worker-local overload response is terminal for this attempt.
+                // Do not drain the rejected stream: some backends keep it open long
+                // enough to stall the router and prevent the actual retry.
+                drop(response_stream);
                 if let Err(free_error) = chooser.free(&context_id).await {
                     tracing::warn!(
                         "Failed to free request {} after worker-local overload: {free_error}",
                         context_id
                     );
                 }
-                attempted_workers.insert(instance_id);
-                if attempted_workers.len() >= candidate_pool_size.max(1) {
+                attempted_worker_dps.insert(WorkerWithDpRank::new(instance_id, dp_rank));
+                if Instant::now() >= overload_deadline {
                     return Err(Error::new(
                         dynamo_runtime::pipeline::PipelineError::ServiceOverloaded(format!(
                             "All workers reached the local total request limit for request {context_id}"

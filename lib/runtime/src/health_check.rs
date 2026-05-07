@@ -53,6 +53,10 @@ fn should_keep_endpoint_ready_after_failure(
         .unwrap_or(false)
 }
 
+fn is_hard_worker_unhealthy_failure(failure: &str) -> bool {
+    failure.contains("Dynamo SGLang worker unhealthy")
+}
+
 async fn consume_health_check_stream<S, T>(mut response_stream: S) -> anyhow::Result<usize>
 where
     S: futures::Stream<Item = T> + Unpin,
@@ -127,6 +131,18 @@ impl HealthCheckManager {
     fn mark_endpoint_not_ready_if_stale(&self, endpoint_subject: &str, failure: &str) {
         let now = Instant::now();
         let last_success = self.last_success(endpoint_subject);
+
+        if is_hard_worker_unhealthy_failure(failure) {
+            warn!(
+                "Marking {} as not ready after hard worker unhealthy signal. Failure: {}",
+                endpoint_subject, failure
+            );
+            self.drt
+                .system_health()
+                .lock()
+                .set_endpoint_health_status(endpoint_subject, HealthStatus::NotReady);
+            return;
+        }
 
         if should_keep_endpoint_ready_after_failure(last_success, now, self.config.success_ttl) {
             if let Some(last_success) = last_success {
@@ -844,6 +860,51 @@ mod integration_tests {
 
         let manager = HealthCheckManager::new(drt.clone(), HealthCheckConfig::default());
         manager.mark_endpoint_not_ready_if_stale(endpoint, "forced test failure");
+
+        let status = drt
+            .system_health()
+            .lock()
+            .get_endpoint_health_status(endpoint);
+        assert_eq!(status, Some(HealthStatus::NotReady));
+    }
+
+    #[tokio::test]
+    async fn test_hard_worker_unhealthy_marks_not_ready_despite_recent_success() {
+        let drt = create_test_drt_async().await;
+
+        let endpoint = "test.endpoint.hard-unhealthy";
+        let payload = serde_json::json!({
+            "prompt": "test",
+            "_health_check": true
+        });
+
+        drt.system_health().lock().register_health_check_target(
+            endpoint,
+            crate::component::Instance {
+                component: "test_component".to_string(),
+                endpoint: "test_endpoint_hard_unhealthy".to_string(),
+                namespace: "test_namespace".to_string(),
+                instance_id: 1003,
+                transport: crate::component::TransportType::Nats(endpoint.to_string()),
+            },
+            payload,
+        );
+
+        drt.system_health()
+            .lock()
+            .set_endpoint_health_status(endpoint, HealthStatus::Ready);
+        drt.system_health()
+            .lock()
+            .record_health_check_success(endpoint);
+        drt.system_health()
+            .lock()
+            .record_endpoint_request_result(endpoint, true);
+
+        let manager = HealthCheckManager::new(drt.clone(), HealthCheckConfig::default());
+        manager.mark_endpoint_not_ready_if_stale(
+            endpoint,
+            "Dynamo SGLang worker unhealthy: local request slots are full (32/32)",
+        );
 
         let status = drt
             .system_health()

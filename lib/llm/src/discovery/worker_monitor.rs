@@ -40,6 +40,9 @@ fn cleanup_worker_metrics(worker_id: u64, dp_ranks: &[u32], worker_type: &str) {
         let labels = &[worker_id_str.as_str(), dp_rank_str.as_str(), worker_type];
         let _ = m.active_decode_blocks.remove_label_values(labels);
         let _ = m.active_prefill_tokens.remove_label_values(labels);
+        let _ = m.request_active_slots.remove_label_values(labels);
+        let _ = m.num_requests_waiting.remove_label_values(labels);
+        let _ = m.request_total_slots.remove_label_values(labels);
         let _ = WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.remove_label_values(labels);
         let _ = WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.remove_label_values(labels);
         let _ = WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.remove_label_values(labels);
@@ -523,6 +526,9 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                             WORKER_TYPE_DECODE,
                             active_load.active_decode_blocks.unwrap_or(0) as usize,
                             active_load.active_prefill_tokens.unwrap_or(0) as usize,
+                            active_load.request_active_slots,
+                            active_load.num_requests_waiting,
+                            active_load.request_total_slots,
                         );
 
                         // Load thresholds dynamically - allows runtime updates

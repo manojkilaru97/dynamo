@@ -215,6 +215,7 @@ impl WorkerQueryClient {
             worker_id,
             start_event_id,
             end_event_id,
+            allow_tree_dump: false,
         };
         let mut stream = router
             .direct(SingleIn::new(request), worker_id)
@@ -320,6 +321,18 @@ impl WorkerQueryClient {
                 tracing::warn!(
                     "Requested range [{requested_start:?}, {requested_end:?}] is newer than \
                      available (newest: {newest_available}) for worker {worker_id} dp_rank {dp_rank}"
+                );
+                return Ok(0);
+            }
+            WorkerKvQueryResponse::TooOld {
+                requested_start,
+                requested_end,
+                oldest_available,
+            } => {
+                tracing::warn!(
+                    "Requested range [{requested_start:?}, {requested_end:?}] is older than \
+                     available (oldest: {oldest_available:?}) for worker {worker_id} dp_rank {dp_rank}; \
+                     skipping tree-dump recovery and continuing with cold KV routing"
                 );
                 return Ok(0);
             }
@@ -430,7 +443,11 @@ impl AsyncEngine<SingleIn<WorkerKvQueryRequest>, ManyOut<WorkerKvQueryResponse>,
 
         let response = self
             .local_indexer
-            .get_events_in_id_range(request.start_event_id, request.end_event_id)
+            .get_events_in_id_range(
+                request.start_event_id,
+                request.end_event_id,
+                request.allow_tree_dump,
+            )
             .await;
 
         Ok(ResponseStream::new(
@@ -477,6 +494,7 @@ mod tests {
             worker_id,
             start_event_id: Some(1),
             end_event_id: Some(1),
+            allow_tree_dump: false,
         };
 
         let mut stream = engine

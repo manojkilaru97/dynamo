@@ -101,10 +101,16 @@ pub struct WorkerKvQueryRequest {
     /// The worker ID of the worker to query.
     pub worker_id: WorkerId,
 
-    /// Start event ID (inclusive). If `None`, dumps entire tree.
+    /// Start event ID (inclusive). If `None`, a full tree dump is returned only
+    /// when `allow_tree_dump` is true.
     pub start_event_id: Option<u64>,
     /// End event ID (inclusive). If `None`, returns up to newest available.
     pub end_event_id: Option<u64>,
+    /// Full tree dumps are memory-expensive and must be explicitly requested.
+    /// Frontend gap recovery should keep this false and fall back to cold KV
+    /// routing when the worker's ring buffer cannot satisfy the range.
+    #[serde(default)]
+    pub allow_tree_dump: bool,
 }
 
 /// Response from a worker's local KV indexer.
@@ -119,6 +125,12 @@ pub enum WorkerKvQueryResponse {
         requested_start: Option<u64>,
         requested_end: Option<u64>,
         newest_available: u64,
+    },
+    /// Requested range is older than buffered worker data and full tree dump is disabled.
+    TooOld {
+        requested_start: Option<u64>,
+        requested_end: Option<u64>,
+        oldest_available: Option<u64>,
     },
     /// Invalid range: end_id < start_id
     InvalidRange { start_id: u64, end_id: u64 },
@@ -1107,8 +1119,9 @@ impl LocalKvIndexer {
     ///
     /// ### Arguments
     ///
-    /// * `start_id` - Starting event ID (inclusive). If `None`, dumps entire tree.
+    /// * `start_id` - Starting event ID (inclusive). If `None`, dumps entire tree only when allowed.
     /// * `end_id` - Ending event ID (inclusive). If `None`, returns up to newest available.
+    /// * `allow_tree_dump` - Enables full tree dump fallback for legacy/debug callers.
     ///
     /// ### Returns
     ///
@@ -1120,6 +1133,7 @@ impl LocalKvIndexer {
         &self,
         start_id: Option<u64>,
         end_id: Option<u64>,
+        allow_tree_dump: bool,
     ) -> WorkerKvQueryResponse {
         // Validate range if both specified
         if let (Some(s), Some(e)) = (start_id, end_id)
@@ -1147,6 +1161,14 @@ impl LocalKvIndexer {
 
         // If no start_id specified, dump entire tree
         if start_id.is_none() {
+            if !allow_tree_dump {
+                tracing::warn!("No start_id specified and tree dump disabled");
+                return WorkerKvQueryResponse::TooOld {
+                    requested_start: None,
+                    requested_end: end_id,
+                    oldest_available: first_id,
+                };
+            }
             tracing::debug!("No start_id specified, dumping entire tree");
             let events = self.dump_events().await.unwrap_or_default();
             return WorkerKvQueryResponse::TreeDump(events);
@@ -1157,6 +1179,14 @@ impl LocalKvIndexer {
 
         // Check for empty buffer
         let Some(first_buffered) = first_id else {
+            if !allow_tree_dump {
+                tracing::warn!(start_id, end_id, "Buffer empty and tree dump disabled");
+                return WorkerKvQueryResponse::TooOld {
+                    requested_start: Some(start_id),
+                    requested_end: Some(end_id),
+                    oldest_available: None,
+                };
+            }
             tracing::debug!("Buffer empty, dumping entire tree");
             let events = self.dump_events().await.unwrap_or_default();
             return WorkerKvQueryResponse::TreeDump(events);
@@ -1179,6 +1209,18 @@ impl LocalKvIndexer {
 
         // Check if start_id is too old (before buffer) -> tree dump
         if start_id < first_buffered {
+            if !allow_tree_dump {
+                tracing::warn!(
+                    start_id,
+                    first_buffered,
+                    "Requested start_id is older than buffer and tree dump disabled"
+                );
+                return WorkerKvQueryResponse::TooOld {
+                    requested_start: Some(start_id),
+                    requested_end: Some(end_id),
+                    oldest_available: Some(first_buffered),
+                };
+            }
             tracing::info!(
                 start_id,
                 first_buffered,
@@ -3733,24 +3775,32 @@ mod tests {
 
         // Test get_events_in_id_range (buffer queries)
         // Range is [start, end] inclusive
-        let result = indexer.get_events_in_id_range(Some(2), Some(4)).await;
+        let result = indexer
+            .get_events_in_id_range(Some(2), Some(4), false)
+            .await;
         let ids = get_ids(extract_events(result));
         assert_eq!(ids, vec![2, 3, 4]); // inclusive range [2, 4]
 
-        let result = indexer.get_events_in_id_range(Some(2), Some(6)).await;
+        let result = indexer
+            .get_events_in_id_range(Some(2), Some(6), false)
+            .await;
         let ids = get_ids(extract_events(result));
         assert_eq!(ids, vec![2, 3, 4, 5]); // clamp end to buffer max
 
         // start_id=0 is before buffer (first is 1), so should trigger tree dump
-        let result = indexer.get_events_in_id_range(Some(0), Some(4)).await;
+        let result = indexer.get_events_in_id_range(Some(0), Some(4), true).await;
         assert!(matches!(result, WorkerKvQueryResponse::TreeDump(_)));
 
-        let result = indexer.get_events_in_id_range(Some(3), Some(3)).await;
+        let result = indexer
+            .get_events_in_id_range(Some(3), Some(3), false)
+            .await;
         let ids = get_ids(extract_events(result));
         assert_eq!(ids, vec![3]); // single element when start == end
 
         // Invalid range: end < start
-        let result = indexer.get_events_in_id_range(Some(5), Some(2)).await;
+        let result = indexer
+            .get_events_in_id_range(Some(5), Some(2), false)
+            .await;
         assert!(matches!(result, WorkerKvQueryResponse::InvalidRange { .. }));
     }
 
@@ -3811,26 +3861,68 @@ mod tests {
         assert_eq!(get_ids(buffer_events), vec![10, 11, 12, 13, 14]);
 
         // Buffer path tests
-        let result = indexer.get_events_in_id_range(Some(11), None).await;
+        let result = indexer.get_events_in_id_range(Some(11), None, false).await;
         assert_eq!(get_ids(extract_events(result)), vec![11, 12, 13, 14]);
 
-        let result = indexer.get_events_in_id_range(Some(10), Some(14)).await;
+        let result = indexer
+            .get_events_in_id_range(Some(10), Some(14), false)
+            .await;
         assert_eq!(get_ids(extract_events(result)), vec![10, 11, 12, 13, 14]);
 
         // Tree dump path tests
-        let result = indexer.get_events_in_id_range(None, None).await;
+        let result = indexer.get_events_in_id_range(None, None, true).await;
         assert!(matches!(result, WorkerKvQueryResponse::TreeDump(_)));
         assert_eq!(extract_events(result).len(), 10);
 
-        let result = indexer.get_events_in_id_range(Some(7), None).await;
+        let result = indexer.get_events_in_id_range(Some(7), None, true).await;
         assert!(matches!(result, WorkerKvQueryResponse::TreeDump(_)));
 
+        // Production frontend recovery must not request unbounded tree dumps.
+        let result = indexer.get_events_in_id_range(None, None, false).await;
+        assert!(matches!(
+            result,
+            WorkerKvQueryResponse::TooOld {
+                requested_start: None,
+                requested_end: None,
+                oldest_available: Some(10)
+            }
+        ));
+
+        let result = indexer.get_events_in_id_range(Some(7), None, false).await;
+        assert!(matches!(
+            result,
+            WorkerKvQueryResponse::TooOld {
+                requested_start: Some(7),
+                requested_end: Some(14),
+                oldest_available: Some(10)
+            }
+        ));
+
         // Edge cases
-        let result = indexer.get_events_in_id_range(Some(15), Some(10)).await;
+        let result = indexer
+            .get_events_in_id_range(Some(15), Some(10), false)
+            .await;
         assert!(matches!(result, WorkerKvQueryResponse::InvalidRange { .. }));
 
-        let result = indexer.get_events_in_id_range(Some(100), Some(200)).await;
+        let result = indexer
+            .get_events_in_id_range(Some(100), Some(200), false)
+            .await;
         assert!(matches!(result, WorkerKvQueryResponse::TooNew { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_local_indexer_refuses_tree_dump_when_buffer_empty_and_disabled() {
+        let indexer = make_local_indexer_with_events(&[]);
+
+        let result = indexer.get_events_in_id_range(Some(1), None, false).await;
+        assert!(matches!(
+            result,
+            WorkerKvQueryResponse::TooOld {
+                requested_start: Some(1),
+                requested_end: Some(1),
+                oldest_available: None
+            }
+        ));
     }
 
     #[tokio::test]

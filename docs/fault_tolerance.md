@@ -23,8 +23,10 @@ admission-control behavior changes.
 | Env var | Scope | Current intent |
 | --- | --- | --- |
 | `DYN_ROUTER_MAX_PENDING_PER_WORKER` | Frontend / KV router | Caps router-side per-worker pending dispatch. This is wired for SGLang and vLLM. |
-| `DYN_REQUEST_MAX_TOTAL_REQUESTS` | Worker backend | Caps backend accepted requests per worker process. vLLM already supported this; SGLang support was added after the Qwen rebase. |
+| `DYN_REQUEST_MAX_TOTAL_REQUESTS` | Worker backend | Caps backend accepted requests per worker process. For SGLang this is a per-replica total, not multiplied by DP. |
+| `DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP` | Worker backend | Optional SGLang per-DP admission cap. Defaults to `DYN_REQUEST_MAX_TOTAL_REQUESTS / dp_size`. |
 | `DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS` | Worker backend | Cancels pathological long-running requests after the configured wall-clock limit. |
+| `DYN_REQUEST_SLOT_LEASE_SECS` | Worker backend | Overrides the SGLang worker admission-slot fail-safe lease. Defaults to `DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS`, then 600s. |
 | `DYN_ROUTER_MAX_QUEUE_WAIT_MS` | Frontend / KV router | Maximum time a routed request can wait in the frontend/router queue before timing out. |
 | `DYN_HEALTH_CHECK_*` | Runtime health | Controls canary generation cadence, timeout, stale window, and readiness behavior. |
 | `DYN_REAL_TRAFFIC_HEALTH_*` | Runtime health | Lets recent real traffic keep readiness healthy even if canary checks are stale or noisy. |
@@ -38,9 +40,18 @@ is already at the limit, it should reject new work with Dynamo error type
 candidate worker. If all workers reject, the request stays bounded by router queue
 timeout / client timeout instead of creating unbounded worker-local `Waiting`.
 
-For SGLang, the default worker limit is derived from `max_running_requests * dp_size`
-when `DYN_REQUEST_MAX_TOTAL_REQUESTS` is unset. Set the env var explicitly in prod
-when we need a stricter cap than SGLang's server default.
+For SGLang, the default worker limit is derived from `--max-running-requests` as a
+per-replica total when `DYN_REQUEST_MAX_TOTAL_REQUESTS` is unset. Set the env var
+explicitly in prod when we need a stricter cap than SGLang's server default.
+
+SGLang ActiveLoad now exposes backend scheduler truth through frontend gauges:
+
+- `dynamo_frontend_worker_request_active_slots`
+- `dynamo_frontend_worker_num_requests_waiting`
+- `dynamo_frontend_worker_request_total_slots`
+
+All three include `worker_id`, `dp_rank`, and `worker_type` labels. Use them to
+reconcile frontend/router accounting against backend running + queued state.
 
 ## Canary Health
 

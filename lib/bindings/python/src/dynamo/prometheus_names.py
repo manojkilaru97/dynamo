@@ -97,6 +97,15 @@ class frontend_service:
     # Active prefill tokens per worker
     # Gauge metric tracking current queued prefill tokens for each worker
     WORKER_ACTIVE_PREFILL_TOKENS = "worker_active_prefill_tokens"
+    # Active backend request slots per worker
+    # Gauge metric tracking current scheduler-active requests for each worker
+    WORKER_REQUEST_ACTIVE_SLOTS = "worker_request_active_slots"
+    # Backend requests waiting per worker
+    # Gauge metric tracking current scheduler-queued requests for each worker
+    WORKER_NUM_REQUESTS_WAITING = "worker_num_requests_waiting"
+    # Backend request slot capacity per worker
+    # Gauge metric tracking current scheduler request capacity for each worker
+    WORKER_REQUEST_TOTAL_SLOTS = "worker_request_total_slots"
     # Last observed time to first token per worker (in seconds)
     # Gauge metric tracking the most recent TTFT for each worker
     WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS = "worker_last_time_to_first_token_seconds"

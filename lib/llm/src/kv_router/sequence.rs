@@ -62,6 +62,9 @@ impl SequencePublisher for RuntimeSequencePublisher {
             worker_type,
             blocks,
             tokens,
+            None,
+            None,
+            None,
         );
     }
 }

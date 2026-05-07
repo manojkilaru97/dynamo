@@ -373,14 +373,21 @@ where
                 m.response_bytes.inc_by(resp_bytes.len() as u64);
             }
             if (publisher.send(resp_bytes.into()).await).is_err() {
-                tracing::error!(
-                    "Failed to publish complete final for stream {}",
-                    context.id()
-                );
-                if let Some(m) = self.metrics() {
-                    m.error_counter
-                        .with_label_values(&[work_handler::error_types::PUBLISH_FINAL])
-                        .inc();
+                if context.is_stopped() {
+                    tracing::warn!(
+                        "Skipped complete final publish for stream {} (client cancelled)",
+                        context.id()
+                    );
+                } else {
+                    tracing::error!(
+                        "Failed to publish complete final for stream {}",
+                        context.id()
+                    );
+                    if let Some(m) = self.metrics() {
+                        m.error_counter
+                            .with_label_values(&[work_handler::error_types::PUBLISH_FINAL])
+                            .inc();
+                    }
                 }
                 if !publisher.network_failed() && !context.is_stopped() {
                     return Err(PipelineError::Generic(format!(

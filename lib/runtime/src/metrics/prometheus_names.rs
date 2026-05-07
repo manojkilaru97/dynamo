@@ -232,6 +232,18 @@ pub mod frontend_service {
     /// Gauge metric tracking current queued prefill tokens for each worker
     pub const WORKER_ACTIVE_PREFILL_TOKENS: &str = "worker_active_prefill_tokens";
 
+    /// Active backend request slots per worker
+    /// Gauge metric tracking current scheduler-active requests for each worker
+    pub const WORKER_REQUEST_ACTIVE_SLOTS: &str = "worker_request_active_slots";
+
+    /// Backend requests waiting per worker
+    /// Gauge metric tracking current scheduler-queued requests for each worker
+    pub const WORKER_NUM_REQUESTS_WAITING: &str = "worker_num_requests_waiting";
+
+    /// Backend request slot capacity per worker
+    /// Gauge metric tracking current scheduler request capacity for each worker
+    pub const WORKER_REQUEST_TOTAL_SLOTS: &str = "worker_request_total_slots";
+
     /// Last observed time to first token per worker (in seconds)
     /// Gauge metric tracking the most recent TTFT for each worker
     pub const WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS: &str =

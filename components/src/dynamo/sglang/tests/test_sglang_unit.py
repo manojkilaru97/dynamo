@@ -3,10 +3,13 @@
 
 """Unit tests for SGLang backend components."""
 
+import asyncio
 import json
 import re
 import sys
+from types import SimpleNamespace
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 import pytest
 import yaml
@@ -32,6 +35,51 @@ pytestmark = [
 # Create SGLang-specific CLI args fixture
 # This will use monkeypatch to write to argv
 mock_sglang_cli = make_cli_args_fixture("dynamo.sglang")
+
+
+class _AbortRecorder:
+    def __init__(self):
+        self.aborted = []
+
+    def abort_request(self, rid, abort_all=False):
+        self.aborted.append((rid, abort_all))
+
+
+def _make_decode_handler_for_slot_tests(limit=2, lease_secs=600.0):
+    handler = object.__new__(DecodeWorkerHandler)
+    recorder = _AbortRecorder()
+    handler.max_total_requests = limit
+    handler.max_total_requests_per_dp = max(1, limit // 2)
+    handler.request_slot_lease_secs = lease_secs
+    handler._request_admission_lock = asyncio.Lock()
+    handler._active_request_admissions = 0
+    handler._active_request_admissions_high_water = 0
+    handler._request_admissions = {}
+    handler._request_admission_dp_counts = {}
+    handler._request_slots_reaped_total = 0
+    handler.stale_full_unhealthy_secs = 60.0
+    handler._last_stream_progress_at = 0.0
+    handler.engine = SimpleNamespace(tokenizer_manager=recorder)
+    handler.config = SimpleNamespace(
+        server_args=SimpleNamespace(served_model_name="test-model")
+    )
+    return handler, recorder
+
+
+class _FakeContext:
+    def __init__(self, context_id="ctx"):
+        self._id = context_id
+
+    def id(self):
+        return self._id
+
+    def is_stopped(self):
+        return False
+
+
+@asynccontextmanager
+async def _noop_cancellation_monitor(*_args, **_kwargs):
+    yield
 
 
 @pytest.mark.asyncio
@@ -331,6 +379,7 @@ def test_openai_sampling_params_preserve_sglang_controls():
             "min_p": 0.0,
             "seed": 1,
             "max_tokens": 65536,
+            "ignore_eos": True,
         }
     )
 
@@ -343,6 +392,7 @@ def test_openai_sampling_params_preserve_sglang_controls():
         "top_k": 20,
         "min_p": 0.0,
         "max_new_tokens": 65536,
+        "ignore_eos": True,
     }
 
 
@@ -376,6 +426,222 @@ def test_preprocessed_sampling_params_preserve_sglang_controls():
         "max_new_tokens": 65536,
         "ignore_eos": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_slots_track_release_by_context():
+    handler, recorder = _make_decode_handler_for_slot_tests(limit=2)
+
+    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+        "ctx-1", "rid-1"
+    )
+    assert (reserved, active, limit) == (True, 1, 2)
+    assert reason is None
+
+    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+        "ctx-2", "rid-2"
+    )
+    assert (reserved, active, limit) == (True, 2, 2)
+    assert reason is None
+
+    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+        "ctx-3", "rid-3"
+    )
+    assert (reserved, active, limit) == (False, 2, 2)
+    assert reason is None
+
+    await handler._release_request_slot_reservation("ctx-1")
+    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+        "ctx-3", "rid-3"
+    )
+    assert (reserved, active, limit) == (True, 2, 2)
+    assert reason is None
+    assert set(handler._request_admissions) == {"ctx-2", "ctx-3"}
+    assert recorder.aborted == []
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_slots_release_on_cancel_or_error():
+    handler, _ = _make_decode_handler_for_slot_tests(limit=1)
+
+    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+        "ctx-1", "rid-1"
+    )
+    assert (reserved, active, limit) == (True, 1, 1)
+    assert reason is None
+
+    await handler._release_request_slot_reservation("ctx-1")
+
+    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+        "ctx-2", "rid-2"
+    )
+    assert (reserved, active, limit) == (True, 1, 1)
+    assert reason is None
+    assert set(handler._request_admissions) == {"ctx-2"}
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_duplicate_context_is_idempotent():
+    handler, _ = _make_decode_handler_for_slot_tests(limit=4)
+
+    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+        "ctx-1", "rid-1", dp_rank=0
+    )
+    assert (reserved, active, limit, reason) == (True, 1, 4, None)
+    assert handler._request_admission_dp_counts == {0: 1}
+
+    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+        "ctx-1", "rid-1b", dp_rank=0
+    )
+
+    assert (reserved, active, limit, reason) == (True, 1, 4, None)
+    assert len(handler._request_admissions) == 1
+    assert handler._request_admissions["ctx-1"].sglang_request_id == "rid-1b"
+    assert handler._request_admission_dp_counts == {0: 1}
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_duplicate_context_moves_dp_count():
+    handler, _ = _make_decode_handler_for_slot_tests(limit=4)
+
+    await handler._try_reserve_request_slot("ctx-1", "rid-1", dp_rank=0)
+    await handler._try_reserve_request_slot("ctx-1", "rid-1", dp_rank=1)
+
+    assert len(handler._request_admissions) == 1
+    assert handler._request_admissions["ctx-1"].dp_rank == 1
+    assert handler._request_admission_dp_counts == {1: 1}
+
+    await handler._release_request_slot_reservation("ctx-1")
+
+    assert handler._request_admissions == {}
+    assert handler._request_admission_dp_counts == {}
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_slots_reap_and_abort_stale_slots():
+    handler, recorder = _make_decode_handler_for_slot_tests(limit=1, lease_secs=10.0)
+
+    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+        "ctx-old", "rid-old"
+    )
+    assert (reserved, active, limit) == (True, 1, 1)
+    assert reason is None
+    handler._request_admissions["ctx-old"].created_at -= 11.0
+
+    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+        "ctx-new", "rid-new"
+    )
+
+    assert (reserved, active, limit) == (False, 1, 1)
+    assert reason is None
+    assert set(handler._request_admissions) == {"ctx-old"}
+    assert handler._request_slots_reaped_total == 0
+    assert recorder.aborted == []
+
+    handler._request_admissions["ctx-old"].last_progress_at -= 11.0
+
+    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+        "ctx-new", "rid-new"
+    )
+
+    assert (reserved, active, limit) == (True, 1, 1)
+    assert reason is None
+    assert set(handler._request_admissions) == {"ctx-new"}
+    assert handler._request_slots_reaped_total == 1
+    assert recorder.aborted == [("rid-old", False)]
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_health_check_fails_when_full_and_progress_stale():
+    handler, _ = _make_decode_handler_for_slot_tests(limit=1, lease_secs=600.0)
+    handler.stale_full_unhealthy_secs = 60.0
+
+    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+        "ctx-old", "rid-old"
+    )
+    assert (reserved, active, limit, reason) == (True, 1, 1, None)
+    handler._last_stream_progress_at -= 61.0
+
+    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+        "ctx-health", "rid-health", health_check=True
+    )
+
+    assert (reserved, active, limit) == (False, 1, 1)
+    assert reason is not None
+    assert "worker unhealthy" in reason
+
+
+def test_sglang_health_check_payload_is_marked():
+    from dynamo.sglang.health_check import SglangHealthCheckPayload
+
+    payload = SglangHealthCheckPayload().to_dict()
+
+    assert DecodeWorkerHandler._is_health_check_request(payload)
+
+
+@pytest.mark.asyncio
+async def test_process_token_stream_tolerates_missing_final_usage_metadata():
+    handler, _ = _make_decode_handler_for_slot_tests(limit=1)
+    handler._cancellation_monitor = _noop_cancellation_monitor
+    context = _FakeContext("ctx-usage")
+    await handler._try_reserve_request_slot("ctx-usage", "rid-usage")
+
+    async def stream():
+        yield {
+            "meta_info": {
+                "id": "rid-usage",
+                "finish_reason": {"type": "stop"},
+            },
+            "output_ids": [1, 2, 3],
+        }
+
+    released = False
+
+    async def release_once():
+        nonlocal released
+        released = True
+
+    chunks = []
+    async for chunk in handler._process_token_stream(stream(), context, release_once):
+        chunks.append(chunk)
+        assert released is True
+
+    assert chunks == [{"finish_reason": "stop", "token_ids": [1, 2, 3]}]
+    assert released is True
+
+
+@pytest.mark.asyncio
+async def test_process_text_stream_releases_slot_before_final_chunk():
+    handler, _ = _make_decode_handler_for_slot_tests(limit=1)
+    handler._cancellation_monitor = _noop_cancellation_monitor
+    context = _FakeContext("ctx-text")
+    await handler._try_reserve_request_slot("ctx-text", "rid-text")
+
+    async def stream():
+        yield {
+            "index": 0,
+            "text": "done",
+            "meta_info": {
+                "id": "rid-text",
+                "finish_reason": {"type": "stop"},
+            },
+        }
+
+    released_before_yield = False
+
+    async def release_once():
+        nonlocal released_before_yield
+        released_before_yield = True
+
+    chunks = []
+    async for chunk in handler._process_text_stream(
+        stream(), context, release_once
+    ):
+        chunks.append(chunk)
+        assert released_before_yield is True
+
+    assert chunks[0]["choices"][0]["finish_reason"] == "stop"
+    assert chunks[0]["choices"][0]["delta"]["content"] == "done"
 
 
 @pytest.mark.asyncio

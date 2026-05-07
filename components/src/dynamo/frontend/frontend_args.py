@@ -385,7 +385,7 @@ class FrontendArgGroup(ArgGroup):
             g,
             flag_name="--router-max-pending-per-worker",
             env_var="DYN_ROUTER_MAX_PENDING_PER_WORKER",
-            default=8,
+            default=None,
             help=(
                 "KV Router: maximum number of scheduler-queued requests per eligible "
                 "worker before rejecting new requests. Set empty/None to disable."
@@ -396,7 +396,7 @@ class FrontendArgGroup(ArgGroup):
             g,
             flag_name="--router-max-queue-wait-ms",
             env_var="DYN_ROUTER_MAX_QUEUE_WAIT_MS",
-            default=300000,
+            default=None,
             help=(
                 "KV Router: maximum time in milliseconds a request may wait in the "
                 "scheduler queue before being failed."

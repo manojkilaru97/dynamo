@@ -204,6 +204,10 @@ class DynamoSglangPublisher:
         return parsed if parsed > 0 else None
 
     def _request_total_slots_per_dp(self) -> Optional[int]:
+        per_dp_slots = self._positive_int_env("DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP")
+        if per_dp_slots is not None:
+            return per_dp_slots
+
         total_slots = self._positive_int_env("DYN_REQUEST_MAX_TOTAL_REQUESTS")
         if total_slots is None:
             return None

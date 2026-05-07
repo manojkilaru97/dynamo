@@ -7,6 +7,8 @@ sglang-specific health check configuration.
 This module defines the default health check payload for sglang backends.
 """
 
+from __future__ import annotations
+
 import logging
 from typing import Optional
 
@@ -74,7 +76,7 @@ class SglangHealthCheckPayload(HealthCheckPayload):
                 "top_k": -1,
             },
             "eos_token_ids": [],
-            "annotations": [],
+            "annotations": [{"dynamo_health_check": True}],
         }
 
         if use_text_input:

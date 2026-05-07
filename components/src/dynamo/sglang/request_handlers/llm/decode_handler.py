@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -18,6 +19,15 @@ from dynamo.common.utils.engine_response import normalize_finish_reason
 from dynamo.sglang.args import Config
 from dynamo.sglang.publisher import DynamoSglangPublisher
 from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
+
+
+@dataclass
+class _RequestAdmission:
+    context_id: str
+    created_at: float
+    last_progress_at: float
+    sglang_request_id: Optional[str] = None
+    dp_rank: Optional[int] = None
 
 
 class DecodeWorkerHandler(BaseWorkerHandler):
@@ -63,10 +73,17 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             logging.info("Decode worker handler initialized (aggregated mode)")
         self.max_total_requests = self._get_positive_int_env(
             "DYN_REQUEST_MAX_TOTAL_REQUESTS"
-        ) or self._get_default_max_total_requests()
+        )
+        self.max_total_requests_per_dp = self._get_default_max_total_requests_per_dp()
+        self.request_slot_lease_secs = self._get_request_slot_lease_secs()
+        self.stale_full_unhealthy_secs = self._get_stale_full_unhealthy_secs()
         self._request_admission_lock = asyncio.Lock()
         self._active_request_admissions = 0
         self._active_request_admissions_high_water = 0
+        self._request_admissions: dict[str, _RequestAdmission] = {}
+        self._request_admission_dp_counts: dict[int, int] = {}
+        self._request_slots_reaped_total = 0
+        self._last_stream_progress_at = time.monotonic()
 
     @staticmethod
     def _get_positive_int_env(name: str) -> Optional[int]:
@@ -82,58 +99,309 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             return None
         return parsed
 
-    def _get_default_max_total_requests(self) -> Optional[int]:
-        max_running_requests = getattr(
-            self.config.server_args, "max_running_requests", None
-        )
-        if max_running_requests in (None, ""):
+    def _get_default_max_total_requests_per_dp(self) -> Optional[int]:
+        configured = self._get_positive_int_env("DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP")
+        if configured is not None:
+            return configured
+
+        return None
+
+    @classmethod
+    def _get_positive_float_env(cls, name: str) -> Optional[float]:
+        value = os.environ.get(name)
+        if value in (None, ""):
             return None
         try:
-            total_limit = int(max_running_requests)
-        except (TypeError, ValueError):
+            parsed = float(value)
+        except ValueError:
+            logging.warning("Ignoring invalid %s=%r", name, value)
+            return None
+        if parsed <= 0:
+            return None
+        return parsed
+
+    @classmethod
+    def _get_request_slot_lease_secs(cls) -> Optional[float]:
+        configured = cls._get_positive_float_env("DYN_REQUEST_SLOT_LEASE_SECS")
+        if configured is not None:
+            return configured
+
+        configured = cls._get_positive_float_env(
+            "DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS"
+        )
+        if configured is not None:
+            return configured
+
+        # Admission slots are a protection mechanism, so they also need a
+        # finite lease. Without this, one wedged async stream can leave a worker
+        # permanently stuck at "local total request limit: N/N".
+        return 600.0
+
+    @classmethod
+    def _get_stale_full_unhealthy_secs(cls) -> Optional[float]:
+        configured = cls._get_positive_float_env(
+            "DYN_SGLANG_STALE_FULL_UNHEALTHY_SECS"
+        )
+        if configured is not None:
+            return configured
+        return 60.0
+
+    @staticmethod
+    def _is_health_check_request(request: Dict[str, Any]) -> bool:
+        annotations = request.get("annotations") or []
+        if not isinstance(annotations, list):
+            return False
+        return any(
+            isinstance(annotation, dict)
+            and annotation.get("dynamo_health_check") is True
+            for annotation in annotations
+        )
+
+    def _stale_full_unhealthy_reason_locked(self, now: float) -> str | None:
+        limit = self.max_total_requests
+        stale_after = self.stale_full_unhealthy_secs
+        if limit is None or stale_after is None:
+            return None
+
+        active = len(self._request_admissions)
+        if active < limit:
+            return None
+
+        progress_age = now - self._last_stream_progress_at
+        if progress_age < stale_after:
+            return None
+
+        oldest_age = max(
+            (now - admission.created_at for admission in self._request_admissions.values()),
+            default=0.0,
+        )
+        return (
+            "Dynamo SGLang worker unhealthy: local request slots are full "
+            f"({active}/{limit}) and no SGLang stream progress for "
+            f"{progress_age:.1f}s (oldest_slot_age={oldest_age:.1f}s)"
+        )
+
+    def _reap_expired_request_slots_locked(
+        self, now: float
+    ) -> list[_RequestAdmission]:
+        lease_secs = self.request_slot_lease_secs
+        if lease_secs is None:
+            return []
+
+        expired: list[_RequestAdmission] = []
+        for context_id, admission in list(self._request_admissions.items()):
+            if now - admission.last_progress_at < lease_secs:
+                continue
+            expired.append(admission)
+            self._request_admissions.pop(context_id, None)
+
+        if expired:
+            for admission in expired:
+                if admission.dp_rank is not None:
+                    current = self._request_admission_dp_counts.get(admission.dp_rank, 0)
+                    if current <= 1:
+                        self._request_admission_dp_counts.pop(admission.dp_rank, None)
+                    else:
+                        self._request_admission_dp_counts[admission.dp_rank] = current - 1
+            self._request_slots_reaped_total += len(expired)
+            self._active_request_admissions = len(self._request_admissions)
+            oldest_age = max(now - admission.created_at for admission in expired)
+            longest_idle = max(now - admission.last_progress_at for admission in expired)
             logging.warning(
-                "Ignoring invalid SGLang max_running_requests=%r",
-                max_running_requests,
+                "Reaped %s stale SGLang admission slot(s); active=%s/%s "
+                "oldest_age=%.1fs longest_idle=%.1fs lease=%.1fs reaped_total=%s",
+                len(expired),
+                self._active_request_admissions,
+                self.max_total_requests,
+                oldest_age,
+                longest_idle,
+                lease_secs,
+                self._request_slots_reaped_total,
             )
-            return None
-        if total_limit <= 0:
-            return None
-        # SGLang treats --max-running-requests as the per-replica total and
-        # divides it by dp_size internally. Do not multiply by dp_size here.
-        return total_limit
+        return expired
+
+    def _abort_reaped_request_slot(self, admission: _RequestAdmission) -> None:
+        request_id = admission.sglang_request_id
+        if not request_id:
+            return
+        tokenizer_manager = getattr(self.engine, "tokenizer_manager", None)
+        if tokenizer_manager is None:
+            logging.warning(
+                "Cannot abort stale SGLang request %s for context %s: "
+                "tokenizer_manager missing",
+                request_id,
+                admission.context_id,
+            )
+            return
+        try:
+            tokenizer_manager.abort_request(rid=request_id, abort_all=False)
+            logging.warning(
+                "Aborted stale SGLang request %s for context %s after %.1fs",
+                request_id,
+                admission.context_id,
+                time.monotonic() - admission.created_at,
+            )
+        except Exception as exc:
+            logging.warning(
+                "Failed to abort stale SGLang request %s for context %s: %s",
+                request_id,
+                admission.context_id,
+                exc,
+            )
 
     async def _try_reserve_request_slot(
-        self, request_id: str
-    ) -> tuple[bool, int | None, int | None]:
+        self,
+        request_id: str,
+        sglang_request_id: str | None = None,
+        *,
+        health_check: bool = False,
+        dp_rank: int | None = None,
+    ) -> tuple[bool, int | None, int | None, str | None]:
         limit = self.max_total_requests
         if limit is None:
-            return True, None, None
+            return True, None, None, None
 
+        expired: list[_RequestAdmission] = []
+        reject_result: tuple[bool, int | None, int | None, str | None] | None = None
         async with self._request_admission_lock:
-            current_total = self._active_request_admissions
-            if current_total >= limit:
-                logging.info(
-                    "Rejecting request %s due to local total request limit: %s/%s",
-                    request_id,
-                    current_total,
-                    limit,
-                )
-                return False, current_total, limit
-
-            self._active_request_admissions += 1
-            if self._active_request_admissions > self._active_request_admissions_high_water:
-                self._active_request_admissions_high_water = self._active_request_admissions
-                logging.info(
-                    "Worker local total request slots in use: %s/%s",
+            now = time.monotonic()
+            expired = self._reap_expired_request_slots_locked(now)
+            existing = self._request_admissions.get(request_id)
+            if existing is not None:
+                if sglang_request_id:
+                    existing.sglang_request_id = sglang_request_id
+                existing.last_progress_at = now
+                if existing.dp_rank != dp_rank:
+                    old_dp_rank = existing.dp_rank
+                    if old_dp_rank is not None:
+                        current = self._request_admission_dp_counts.get(
+                            old_dp_rank, 0
+                        )
+                        if current <= 1:
+                            self._request_admission_dp_counts.pop(
+                                old_dp_rank, None
+                            )
+                        else:
+                            self._request_admission_dp_counts[old_dp_rank] = current - 1
+                    existing.dp_rank = dp_rank
+                    if dp_rank is not None:
+                        self._request_admission_dp_counts[dp_rank] = (
+                            self._request_admission_dp_counts.get(dp_rank, 0) + 1
+                        )
+                    logging.warning(
+                        "Duplicate SGLang admission for request %s moved from DP %s to DP %s",
+                        request_id,
+                        old_dp_rank,
+                        dp_rank,
+                    )
+                self._active_request_admissions = len(self._request_admissions)
+                reject_result = (
+                    True,
                     self._active_request_admissions,
                     limit,
+                    None,
                 )
-            return True, current_total + 1, limit
+            if reject_result is None:
+                current_total = len(self._request_admissions)
+                per_dp_limit = self.max_total_requests_per_dp
+                current_dp_total = (
+                    self._request_admission_dp_counts.get(dp_rank, 0)
+                    if dp_rank is not None
+                    else 0
+                )
+                if (
+                    dp_rank is not None
+                    and per_dp_limit is not None
+                    and current_dp_total >= per_dp_limit
+                ):
+                    logging.info(
+                        "Rejecting request %s due to local DP request limit: dp_rank=%s %s/%s",
+                        request_id,
+                        dp_rank,
+                        current_dp_total,
+                        per_dp_limit,
+                    )
+                    reject_result = (False, current_dp_total, per_dp_limit, None)
+                elif current_total >= limit:
+                    unhealthy_reason = (
+                        self._stale_full_unhealthy_reason_locked(now)
+                        if health_check
+                        else None
+                    )
+                    logging.info(
+                        "Rejecting request %s due to local total request limit: %s/%s",
+                        request_id,
+                        current_total,
+                        limit,
+                    )
+                    reject_result = (False, current_total, limit, unhealthy_reason)
+                else:
+                    self._request_admissions[request_id] = _RequestAdmission(
+                        context_id=request_id,
+                        created_at=now,
+                        last_progress_at=now,
+                        sglang_request_id=sglang_request_id,
+                        dp_rank=dp_rank,
+                    )
+                    if dp_rank is not None:
+                        self._request_admission_dp_counts[dp_rank] = (
+                            current_dp_total + 1
+                        )
+                    self._active_request_admissions = len(self._request_admissions)
+                    if (
+                        self._active_request_admissions
+                        > self._active_request_admissions_high_water
+                    ):
+                        self._active_request_admissions_high_water = (
+                            self._active_request_admissions
+                        )
+                        logging.info(
+                            "Worker local total request slots in use: %s/%s",
+                            self._active_request_admissions,
+                            limit,
+                        )
 
-    async def _release_request_slot_reservation(self) -> None:
+        for admission in expired:
+            self._abort_reaped_request_slot(admission)
+        if reject_result is not None:
+            return reject_result
+        return True, current_total + 1, limit, None
+
+    async def _release_request_slot_reservation(
+        self, request_id: str | None = None
+    ) -> None:
         async with self._request_admission_lock:
-            if self._active_request_admissions > 0:
-                self._active_request_admissions -= 1
+            admission = None
+            if request_id is not None:
+                admission = self._request_admissions.pop(request_id, None)
+            elif self._request_admissions:
+                admission = self._request_admissions.pop(next(iter(self._request_admissions)))
+            if admission is not None and admission.dp_rank is not None:
+                current = self._request_admission_dp_counts.get(admission.dp_rank, 0)
+                if current <= 1:
+                    self._request_admission_dp_counts.pop(admission.dp_rank, None)
+                else:
+                    self._request_admission_dp_counts[admission.dp_rank] = current - 1
+            self._active_request_admissions = len(self._request_admissions)
+
+    async def _record_request_slot_sglang_id(
+        self, context_id: str, sglang_request_id: str
+    ) -> None:
+        async with self._request_admission_lock:
+            admission = self._request_admissions.get(context_id)
+            if admission is not None:
+                admission.sglang_request_id = sglang_request_id
+                now = time.monotonic()
+                admission.last_progress_at = now
+                self._last_stream_progress_at = now
+
+    async def _touch_request_slot(self, context_id: str) -> None:
+        async with self._request_admission_lock:
+            admission = self._request_admissions.get(context_id)
+            if admission is not None:
+                now = time.monotonic()
+                admission.last_progress_at = now
+                self._last_stream_progress_at = now
 
     @classmethod
     def _build_overload_extra_args(
@@ -646,6 +914,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 "top_k": request.get("top_k"),
                 "min_p": request.get("min_p"),
                 "max_new_tokens": request.get("max_tokens"),
+                "ignore_eos": request.get("ignore_eos"),
             }
             param_mapping.update(
                 self._guided_to_sglang_params(request.get("guided_decoding"))
@@ -685,11 +954,30 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             self.config.server_args, "enable_return_routed_experts", False
         )
         priority = (request.get("routing") or {}).get("priority")
+        routing = request.get("routing") or {}
+        dp_rank = routing.get("dp_rank")
+        try:
+            dp_rank = int(dp_rank) if dp_rank is not None else None
+        except (TypeError, ValueError):
+            dp_rank = None
 
-        reserved, current_total_requests, total_request_limit = (
-            await self._try_reserve_request_slot(context.id())
+        (
+            reserved,
+            current_total_requests,
+            total_request_limit,
+            unhealthy_reason,
+        ) = (
+            await self._try_reserve_request_slot(
+                context.id(),
+                trace_id,
+                health_check=self._is_health_check_request(request),
+                dp_rank=dp_rank,
+            )
         )
         if not reserved:
+            if unhealthy_reason:
+                logging.error(unhealthy_reason)
+                raise RuntimeError(unhealthy_reason)
             message = (
                 f"Worker local total request limit reached "
                 f"({current_total_requests}/{total_request_limit})"
@@ -717,7 +1005,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             if slot_released:
                 return
             slot_released = True
-            await self._release_request_slot_reservation()
+            await self._release_request_slot_reservation(context.id())
 
         try:
             if self.serving_mode == DisaggregationMode.DECODE:
@@ -740,10 +1028,6 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     self._get_trace_header(context) if self.enable_trace else None
                 )
 
-                # Extract dp_rank from routing info (set by KV router)
-                routing = request.get("routing") or {}
-                dp_rank = routing.get("dp_rank")
-
                 decode = await self.engine.async_generate(
                     **input_param,
                     sampling_params=sampling_params,
@@ -760,7 +1044,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
                 if not self.use_sglang_text_io:
                     async for out in self._process_token_stream(
-                        decode, context, release_request_slot_once
+                        decode,
+                        context,
+                        release_request_slot_once,
                     ):
                         yield out
                 else:
@@ -789,10 +1075,6 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     self._get_trace_header(context) if self.enable_trace else None
                 )
 
-                # Extract dp_rank from routing info (set by KV router)
-                routing = request.get("routing") or {}
-                dp_rank = routing.get("dp_rank")
-
                 agg = await self.engine.async_generate(
                     **input_param,
                     image_data=image_data,
@@ -806,7 +1088,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 )
                 if not self.use_sglang_text_io:
                     async for out in self._process_token_stream(
-                        agg, context, release_request_slot_once
+                        agg,
+                        context,
+                        release_request_slot_once,
                     ):
                         yield out
                 else:
@@ -848,14 +1132,19 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     sglang_request_id = meta_info.get("id")
                     if sglang_request_id:
                         request_id_future.set_result(sglang_request_id)
+                        await self._record_request_slot_sglang_id(
+                            context.id(), sglang_request_id
+                        )
                         logging.debug(f"New SGLang Request ID: {sglang_request_id}")
+                await self._touch_request_slot(context.id())
 
                 # Check cancellation before yielding to allow proper cleanup.
                 # This lets SGLang proceed to the second token generation, which will
                 # async context switch and allow the abort monitor to signal cancellation.
                 # The loop should exit by itself when context.is_stopped() returns True.
                 out = {}
-                finish_reason = res["meta_info"]["finish_reason"]
+                meta_info = res.get("meta_info", {})
+                finish_reason = meta_info.get("finish_reason")
                 if finish_reason:
                     out["finish_reason"] = normalize_finish_reason(
                         finish_reason["type"]
@@ -872,7 +1161,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
                 # Pass through disjoint token segments directly
                 out["token_ids"] = output_ids
-                routed_experts = res["meta_info"].get("routed_experts")
+                routed_experts = meta_info.get("routed_experts")
                 if routed_experts is not None:
                     # Base64-encode tensor bytes to match sglang's output format.
                     routed_experts = pybase64.b64encode(
@@ -881,18 +1170,22 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     # Internal transport field consumed by frontend nvext mapping.
                     out["disaggregated_params"] = {"routed_experts": routed_experts}
                 if finish_reason:
-                    input_tokens = res["meta_info"]["prompt_tokens"]
-                    completion_tokens = res["meta_info"]["completion_tokens"]
-                    cached_tokens = res["meta_info"]["cached_tokens"]
-                    prefill_prompt_tokens_details = None
-                    if cached_tokens is not None and cached_tokens > 0:
-                        prefill_prompt_tokens_details = {"cached_tokens": cached_tokens}
-                    out["completion_usage"] = {
-                        "prompt_tokens": input_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": input_tokens + completion_tokens,
-                        "prompt_tokens_details": prefill_prompt_tokens_details,
-                    }
+                    input_tokens = meta_info.get("prompt_tokens")
+                    completion_tokens = meta_info.get("completion_tokens")
+                    if input_tokens is not None and completion_tokens is not None:
+                        cached_tokens = meta_info.get("cached_tokens")
+                        prefill_prompt_tokens_details = None
+                        if cached_tokens is not None and cached_tokens > 0:
+                            prefill_prompt_tokens_details = {
+                                "cached_tokens": cached_tokens
+                            }
+                        out["completion_usage"] = {
+                            "prompt_tokens": input_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": input_tokens + completion_tokens,
+                            "prompt_tokens_details": prefill_prompt_tokens_details,
+                        }
+                    await release_request_slot_once()
                 if not context.is_stopped():
                     yield out
 
@@ -926,7 +1219,11 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     sglang_request_id = meta_info.get("id")
                     if sglang_request_id:
                         request_id_future.set_result(sglang_request_id)
+                        await self._record_request_slot_sglang_id(
+                            context.id(), sglang_request_id
+                        )
                         logging.debug(f"New SGLang Request ID: {sglang_request_id}")
+                await self._touch_request_slot(context.id())
 
                 # Check cancellation before yielding to allow proper cleanup.
                 # This lets SGLang proceed to the second token generation, which will
@@ -974,6 +1271,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         routed_experts.numpy().tobytes()
                     ).decode("utf-8")
                     response["nvext"] = {"routed_experts": routed_experts}
+                if finish_reason:
+                    await release_request_slot_once()
                 if not context.is_stopped():
                     yield response
                 count = next_count

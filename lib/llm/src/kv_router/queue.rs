@@ -22,33 +22,81 @@ struct DpRequestLoad {
     active: u64,
     waiting: u64,
     total_slots: Option<u64>,
+    observed_at: Instant,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WorkerRequestLoads {
     inner: RwLock<HashMap<WorkerId, HashMap<u32, DpRequestLoad>>>,
+    ttl: Option<Duration>,
+}
+
+impl Default for WorkerRequestLoads {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl WorkerRequestLoads {
+    pub fn new(ttl: Option<Duration>) -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    fn prune_expired_locked(
+        &self,
+        inner: &mut HashMap<WorkerId, HashMap<u32, DpRequestLoad>>,
+        now: Instant,
+    ) {
+        let Some(ttl) = self.ttl else {
+            return;
+        };
+        if ttl.is_zero() {
+            inner.clear();
+            return;
+        }
+
+        let mut removed = 0usize;
+        inner.retain(|_, dp_loads| {
+            let before = dp_loads.len();
+            dp_loads.retain(|_, load| now.duration_since(load.observed_at) <= ttl);
+            removed += before.saturating_sub(dp_loads.len());
+            !dp_loads.is_empty()
+        });
+        if removed > 0 {
+            tracing::warn!(
+                removed,
+                ttl_ms = ttl.as_millis() as u64,
+                "Pruned stale router request-load entries"
+            );
+        }
+    }
+
     pub fn update_from_active_load(&self, load: &ActiveLoad) -> bool {
         let Some(active) = load.request_active_slots else {
             return false;
         };
         let waiting = load.num_requests_waiting.unwrap_or(0);
         let mut inner = self.inner.write().unwrap();
+        let now = Instant::now();
+        self.prune_expired_locked(&mut inner, now);
         inner.entry(load.worker_id).or_default().insert(
             load.dp_rank,
             DpRequestLoad {
                 active,
                 waiting,
                 total_slots: load.request_total_slots,
+                observed_at: now,
             },
         );
         true
     }
 
     pub fn total_requests_and_cap(&self, worker_id: WorkerId) -> Option<(u64, Option<u64>)> {
-        let inner = self.inner.read().unwrap();
+        let mut inner = self.inner.write().unwrap();
+        self.prune_expired_locked(&mut inner, Instant::now());
         let dp_loads = inner.get(&worker_id)?;
         let mut total = 0u64;
         let mut cap = None;
@@ -68,7 +116,8 @@ impl WorkerRequestLoads {
     }
 
     pub fn dp_requests_and_cap(&self, worker: WorkerWithDpRank) -> Option<(u64, Option<u64>)> {
-        let inner = self.inner.read().unwrap();
+        let mut inner = self.inner.write().unwrap();
+        self.prune_expired_locked(&mut inner, Instant::now());
         let load = inner.get(&worker.worker_id)?.get(&worker.dp_rank)?;
         Some((load.active.saturating_add(load.waiting), load.total_slots))
     }
@@ -80,6 +129,7 @@ struct QueueEntry {
     effective_offset: Duration,
     request: SchedulingRequest,
     enqueued_at: Instant,
+    queue_deadline: Option<Instant>,
 }
 
 impl Eq for QueueEntry {}
@@ -112,8 +162,7 @@ pub struct SchedulerQueue {
     pending_count: AtomicUsize,
     slots: Arc<ActiveSequencesMulti>,
     workers_with_configs: RuntimeConfigWatch,
-    /// Cached threshold fraction; None disables token-threshold queueing, but request-slot
-    /// saturation still applies when workers publish max_num_seqs.
+    /// Cached threshold fraction; None disables token-threshold queueing.
     threshold_frac: Option<f64>,
     /// Maximum number of queued requests to allow per eligible worker.
     max_pending_per_worker: Option<usize>,
@@ -173,6 +222,7 @@ impl SchedulerQueue {
         let effective_offset = arrival_offset.saturating_sub(jump);
         QueueEntry {
             effective_offset,
+            queue_deadline: request.queue_deadline,
             request,
             enqueued_at: Instant::now(),
         }
@@ -183,10 +233,14 @@ impl SchedulerQueue {
     /// Otherwise park in the pending heap, subject to the configured queue bound.
     pub async fn enqueue(&self, request: SchedulingRequest) {
         if self.request_must_wait(&request) {
+            let mut request = request;
+            // `disallowed_workers` records worker/DPs that rejected one immediate
+            // routing attempt. Once the request is parked, those bans must not
+            // survive into a later scheduling pass after capacity has changed.
+            request.disallowed_workers = None;
             if let Some(limit) = self.current_pending_limit(request.allowed_worker_ids.as_ref()) {
                 let pending = self.pending_count();
                 if pending >= limit {
-                    let mut request = request;
                     request.respond(Err(super::scheduler::KvSchedulerError::QueueFull {
                         pending,
                         limit,
@@ -202,7 +256,7 @@ impl SchedulerQueue {
             return;
         }
 
-        self.schedule(request).await;
+        self.schedule(request, None).await;
     }
 
     /// Called on prefill_complete/free. Drains pending requests while workers have capacity.
@@ -237,6 +291,10 @@ impl SchedulerQueue {
             }
 
             if self.request_must_wait(&entry.request) {
+                let mut entry = entry;
+                // Same reasoning as enqueue(): waiting is a fresh queue state,
+                // not a continuation of the last rejected DP attempt.
+                entry.request.disallowed_workers = None;
                 let mut heap = self.pending.lock().await;
                 heap.push(entry);
                 self.pending_count.fetch_add(1, AtomicOrdering::Relaxed);
@@ -244,19 +302,36 @@ impl SchedulerQueue {
             }
 
             tracing::debug!("scheduling request from pending queue");
-            self.schedule(entry.request).await;
+            self.schedule(
+                entry.request,
+                Some((entry.effective_offset, entry.enqueued_at)),
+            )
+            .await;
         }
     }
 
     /// Run the full scheduling pipeline for a single request:
     /// compute potential load → select worker → respond → book via add_request.
-    async fn schedule(&self, mut request: SchedulingRequest) {
+    async fn schedule(
+        &self,
+        mut request: SchedulingRequest,
+        queue_metadata: Option<(Duration, Instant)>,
+    ) {
+        if self.request_is_expired(&request) {
+            request.respond(Err(super::scheduler::KvSchedulerError::QueueWaitTimeout {
+                waited_ms: self.expiration_limit_ms(),
+                limit_ms: self.expiration_limit_ms(),
+            }));
+            return;
+        }
+
         let saturated_workers = self.saturated_workers(request.allowed_worker_ids.as_ref());
-        request.disallowed_workers = if saturated_workers.is_empty() {
-            None
-        } else {
-            Some(saturated_workers)
-        };
+        if !saturated_workers.is_empty() {
+            request
+                .disallowed_workers
+                .get_or_insert_with(HashSet::new)
+                .extend(saturated_workers);
+        }
 
         let (decode_blocks, prefill_tokens) = self.slots.potential_blocks_and_tokens(
             request.token_seq.clone(),
@@ -275,23 +350,72 @@ impl SchedulerQueue {
         let selection = match selection {
             Ok(s) => s,
             Err(e) => {
+                if matches!(e, super::scheduler::KvSchedulerError::NoEndpoints) {
+                    // `disallowed_workers` records worker/DPs that rejected this specific
+                    // immediate routing attempt. Once a request is parked in the queue, those
+                    // DP bans must not become permanent; otherwise a request that once tried
+                    // every full DP can never route after capacity frees up.
+                    request.disallowed_workers = None;
+                    let entry = if let Some((effective_offset, enqueued_at)) = queue_metadata {
+                        QueueEntry {
+                            effective_offset,
+                            enqueued_at,
+                            queue_deadline: request.queue_deadline,
+                            request,
+                        }
+                    } else {
+                        if let Some(limit) =
+                            self.current_pending_limit(request.allowed_worker_ids.as_ref())
+                        {
+                            let pending = self.pending_count();
+                            if pending >= limit {
+                                let mut request = request;
+                                request.respond(Err(
+                                    super::scheduler::KvSchedulerError::QueueFull {
+                                        pending,
+                                        limit,
+                                    },
+                                ));
+                                return;
+                            }
+                        }
+                        self.make_entry(request)
+                    };
+
+                    if self.is_expired(&entry) {
+                        self.fail_expired(vec![(
+                            entry.request,
+                            self.max_queue_wait
+                                .expect("expired entry requires max_queue_wait")
+                                .as_millis() as u64,
+                        )]);
+                    } else {
+                        tracing::debug!("no eligible workers available, requeueing request");
+                        self.pending.lock().await.push(entry);
+                        self.pending_count.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    return;
+                }
                 tracing::warn!("scheduling failed: {e}");
                 request.respond(Err(e));
                 return;
             }
         };
 
-        request.respond(Ok(SchedulingResponse {
-            best_worker: selection.worker,
-            overlap_blocks: selection.overlap_blocks,
-        }));
-
         if !request.update_states {
+            request.respond(Ok(SchedulingResponse {
+                best_worker: selection.worker,
+                overlap_blocks: selection.overlap_blocks,
+            }));
             return;
         }
 
-        let Some(request_id) = request.maybe_request_id else {
+        let Some(request_id) = request.maybe_request_id.clone() else {
             tracing::error!("No request_id provided to add_request to the slot tracker");
+            request.respond(Ok(SchedulingResponse {
+                best_worker: selection.worker,
+                overlap_blocks: selection.overlap_blocks,
+            }));
             return;
         };
 
@@ -299,7 +423,7 @@ impl SchedulerQueue {
             .slots
             .add_request(SequenceRequest {
                 request_id: request_id.clone(),
-                token_sequence: request.token_seq,
+                token_sequence: request.token_seq.take(),
                 isl: request.isl_tokens,
                 overlap: selection.overlap_blocks,
                 expected_output_tokens: None,
@@ -310,6 +434,11 @@ impl SchedulerQueue {
         {
             tracing::warn!("Failed to add request {request_id}: {e}");
         }
+
+        request.respond(Ok(SchedulingResponse {
+            best_worker: selection.worker,
+            overlap_blocks: selection.overlap_blocks,
+        }));
     }
 
     /// Number of requests currently parked in the pending queue (lock-free).
@@ -321,11 +450,10 @@ impl SchedulerQueue {
         self.all_workers_busy(request.allowed_worker_ids.as_ref())
     }
 
-    /// Check if all eligible workers are busy based on max_num_seqs or token threshold.
+    /// Check if all eligible workers are busy based on token threshold.
     /// Returns true only if ALL eligible workers exceed capacity.
     fn all_workers_busy(&self, allowed: Option<&HashSet<WorkerId>>) -> bool {
         let active_tokens = self.slots.active_tokens();
-        let active_requests = self.slots.active_requests();
         let configs = self.workers_with_configs.borrow();
 
         let mut checked_any = false;
@@ -342,7 +470,7 @@ impl SchedulerQueue {
             for dp_rank in dp_start..dp_start + dp_size {
                 checked_any = true;
                 let worker = WorkerWithDpRank::new(worker_id, dp_rank);
-                if !self.worker_is_saturated(worker, config, &active_tokens, &active_requests) {
+                if !self.worker_is_saturated(worker, config, &active_tokens) {
                     return false;
                 }
             }
@@ -352,7 +480,6 @@ impl SchedulerQueue {
 
     fn saturated_workers(&self, allowed: Option<&HashSet<WorkerId>>) -> HashSet<WorkerWithDpRank> {
         let active_tokens = self.slots.active_tokens();
-        let active_requests = self.slots.active_requests();
         let configs = self.workers_with_configs.borrow();
         let mut saturated = HashSet::new();
 
@@ -367,7 +494,7 @@ impl SchedulerQueue {
             let dp_start = config.data_parallel_start_rank;
             for dp_rank in dp_start..dp_start + dp_size {
                 let worker = WorkerWithDpRank::new(worker_id, dp_rank);
-                if self.worker_is_saturated(worker, config, &active_tokens, &active_requests) {
+                if self.worker_is_saturated(worker, config, &active_tokens) {
                     saturated.insert(worker);
                 }
             }
@@ -381,26 +508,12 @@ impl SchedulerQueue {
         worker: WorkerWithDpRank,
         config: &crate::local_model::runtime_config::ModelRuntimeConfig,
         active_tokens: &HashMap<WorkerWithDpRank, usize>,
-        active_requests: &HashMap<WorkerWithDpRank, usize>,
     ) -> bool {
         if let Some((dp_requests, Some(dp_cap))) = self.request_loads.dp_requests_and_cap(worker)
             && dp_cap > 0
             && dp_requests >= dp_cap
         {
             return true;
-        }
-
-        if let Some(max_num_seqs) = config.max_num_seqs {
-            if let Some((total_requests, request_cap)) =
-                self.request_loads.total_requests_and_cap(worker.worker_id)
-            {
-                return total_requests >= request_cap.unwrap_or(max_num_seqs);
-            }
-
-            let active = active_requests.get(&worker).copied().unwrap_or(0) as u64;
-            if active >= max_num_seqs {
-                return true;
-            }
         }
 
         let Some(threshold) = self.threshold_frac else {
@@ -432,10 +545,25 @@ impl SchedulerQueue {
     }
 
     fn is_expired(&self, entry: &QueueEntry) -> bool {
+        if let Some(deadline) = entry.queue_deadline {
+            return Instant::now() >= deadline;
+        }
         let Some(limit) = self.max_queue_wait else {
             return false;
         };
         entry.enqueued_at.elapsed() >= limit
+    }
+
+    fn request_is_expired(&self, request: &SchedulingRequest) -> bool {
+        request
+            .queue_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn expiration_limit_ms(&self) -> u64 {
+        self.max_queue_wait
+            .map(|limit| limit.as_millis() as u64)
+            .unwrap_or_default()
     }
 
     fn refresh_pending_locked(
@@ -542,6 +670,15 @@ mod tests {
         };
 
         assert!(!loads.update_from_active_load(&legacy_load));
+        assert_eq!(loads.total_requests_and_cap(7), None);
+    }
+
+    #[test]
+    fn worker_request_loads_prune_stale_entries() {
+        let loads = WorkerRequestLoads::new(Some(Duration::ZERO));
+
+        loads.update_from_active_load(&active_load(7, 0, 8, 0, Some(8)));
+
         assert_eq!(loads.total_requests_and_cap(7), None);
     }
 }

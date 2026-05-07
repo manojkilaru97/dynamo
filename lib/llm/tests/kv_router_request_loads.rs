@@ -1,5 +1,6 @@
 use dynamo_llm::kv_router::protocols::ActiveLoad;
 use dynamo_llm::kv_router::queue::WorkerRequestLoads;
+use std::time::Duration;
 
 fn active_load(
     worker_id: u64,
@@ -23,8 +24,8 @@ fn active_load(
 fn sglang_request_counts_sum_running_and_waiting_across_dp_ranks() {
     let loads = WorkerRequestLoads::default();
 
-    assert!(loads.update_from_active_load(&active_load(7, 0, 3, 2, Some(16))));
-    assert!(loads.update_from_active_load(&active_load(7, 1, 4, 1, Some(16))));
+    assert!(loads.update_from_active_load(&active_load(7, 0, 3, 2, Some(8))));
+    assert!(loads.update_from_active_load(&active_load(7, 1, 4, 1, Some(8))));
 
     assert_eq!(loads.total_requests_and_cap(7), Some((10, Some(16))));
 }
@@ -41,14 +42,14 @@ fn sglang_request_counts_decrease_when_scheduler_reports_lower_load() {
 }
 
 #[test]
-fn sglang_request_cap_is_worker_level_not_dp_multiplied() {
+fn sglang_request_cap_sums_published_per_dp_caps() {
     let loads = WorkerRequestLoads::default();
 
-    loads.update_from_active_load(&active_load(7, 0, 8, 0, Some(16)));
-    loads.update_from_active_load(&active_load(7, 1, 8, 0, Some(16)));
+    loads.update_from_active_load(&active_load(7, 0, 8, 0, Some(8)));
+    loads.update_from_active_load(&active_load(7, 1, 8, 0, Some(8)));
     assert_eq!(loads.total_requests_and_cap(7), Some((16, Some(16))));
 
-    loads.update_from_active_load(&active_load(7, 1, 7, 0, Some(16)));
+    loads.update_from_active_load(&active_load(7, 1, 7, 0, Some(8)));
     assert_eq!(loads.total_requests_and_cap(7), Some((15, Some(16))));
 }
 
@@ -83,5 +84,14 @@ fn legacy_kv_metrics_do_not_poison_request_capacity() {
     };
 
     assert!(!loads.update_from_active_load(&legacy_load));
+    assert_eq!(loads.total_requests_and_cap(7), None);
+}
+
+#[test]
+fn stale_request_loads_do_not_poison_capacity() {
+    let loads = WorkerRequestLoads::new(Some(Duration::ZERO));
+
+    assert!(loads.update_from_active_load(&active_load(7, 0, 8, 0, Some(8))));
+
     assert_eq!(loads.total_requests_and_cap(7), None);
 }

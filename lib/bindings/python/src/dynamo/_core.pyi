@@ -986,9 +986,9 @@ class KvRouterConfig:
         router_ttl_secs: float = 120.0,
         router_max_tree_size: int = 1048576,
         router_prune_target_ratio: float = 0.8,
-        router_queue_threshold: Optional[float] = 2.0,
-        router_max_pending_per_worker: Optional[int] = 8,
-        router_max_queue_wait_ms: Optional[int] = 30000,
+        router_queue_threshold: Optional[float] = None,
+        router_max_pending_per_worker: Optional[int] = None,
+        router_max_queue_wait_ms: Optional[int] = None,
         router_event_threads: int = 4,
     ) -> None:
         """
@@ -1014,14 +1014,13 @@ class KvRouterConfig:
             router_ttl_secs: TTL for blocks in seconds when not using KV events (default: 120.0)
             router_max_tree_size: Maximum tree size before pruning (default: 1048576, which is 2^20)
             router_prune_target_ratio: Target size ratio after pruning (default: 0.8)
-            router_queue_threshold: Queue threshold fraction for prefill token capacity (default: 2.0).
+            router_queue_threshold: Queue threshold fraction for prefill token capacity (default: None).
                 Requests are queued if all eligible workers exceed this fraction of
                 max_num_batched_tokens. Set to None to disable token-threshold queueing.
-                Request-slot saturation via max_num_seqs still applies.
             router_max_pending_per_worker: Maximum scheduler-queued requests per eligible worker
-                before rejecting new requests (default: 8).
+                before rejecting new requests (default: None).
             router_max_queue_wait_ms: Maximum time in milliseconds a request may wait in the
-                scheduler queue before being failed (default: 30000).
+                scheduler queue before being failed (default: None).
             router_event_threads: Number of event processing threads (default: 4).
                 When > 1, uses a concurrent radix tree with a thread pool.
         """

@@ -82,11 +82,11 @@ pub struct KvRouterConfig {
 
     // Maximum number of pending scheduler-queue requests to allow per eligible worker.
     // Once the derived global pending limit is reached, new requests are rejected early.
-    // Default: 8.
+    // Default: None (disabled).
     pub router_max_pending_per_worker: Option<usize>,
 
     // Maximum time a request may remain in the scheduler queue before it is failed.
-    // Default: 30000ms.
+    // Default: None (disabled).
     pub router_max_queue_wait_ms: Option<u64>,
 
     // If set, an eligible worker/DP that has not been selected for this many
@@ -117,9 +117,9 @@ impl Default for KvRouterConfig {
             router_ttl_secs: 120.0,
             router_max_tree_size: 2usize.pow(20), // 2^20 = 1048576, matches PruneConfig::default()
             router_prune_target_ratio: 0.8,
-            router_queue_threshold: Some(2.0),
-            router_max_pending_per_worker: Some(8),
-            router_max_queue_wait_ms: Some(30_000),
+            router_queue_threshold: None,
+            router_max_pending_per_worker: None,
+            router_max_queue_wait_ms: None,
             router_dp_stale_selection_secs: None,
             router_event_threads: 4,
         }

@@ -75,6 +75,9 @@ fn overhead_buckets() -> Vec<f64> {
 pub struct WorkerLoadMetrics {
     pub active_decode_blocks: IntGaugeVec,
     pub active_prefill_tokens: IntGaugeVec,
+    pub request_active_slots: IntGaugeVec,
+    pub num_requests_waiting: IntGaugeVec,
+    pub request_total_slots: IntGaugeVec,
 }
 
 impl WorkerLoadMetrics {
@@ -85,6 +88,9 @@ impl WorkerLoadMetrics {
         worker_type: &str,
         active_blocks: usize,
         active_tokens: usize,
+        request_active_slots: Option<u64>,
+        num_requests_waiting: Option<u64>,
+        request_total_slots: Option<u64>,
     ) {
         let worker_id_str = worker_id.to_string();
         let dp_rank_str = dp_rank.to_string();
@@ -95,6 +101,21 @@ impl WorkerLoadMetrics {
         self.active_prefill_tokens
             .with_label_values(labels)
             .set(active_tokens as i64);
+        if let Some(active) = request_active_slots {
+            self.request_active_slots
+                .with_label_values(labels)
+                .set(active as i64);
+        }
+        if let Some(waiting) = num_requests_waiting {
+            self.num_requests_waiting
+                .with_label_values(labels)
+                .set(waiting as i64);
+        }
+        if let Some(total) = request_total_slots {
+            self.request_total_slots
+                .with_label_values(labels)
+                .set(total as i64);
+        }
     }
 }
 
@@ -123,6 +144,42 @@ pub static WORKER_LOAD_METRICS: LazyLock<WorkerLoadMetrics> = LazyLock::new(|| W
         &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
     )
     .expect("Failed to create worker_active_prefill_tokens gauge"),
+    request_active_slots: IntGaugeVec::new(
+        Opts::new(
+            format!(
+                "{}_{}",
+                name_prefix::FRONTEND,
+                frontend_service::WORKER_REQUEST_ACTIVE_SLOTS
+            ),
+            "Active backend request slots per worker",
+        ),
+        &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+    )
+    .expect("Failed to create worker_request_active_slots gauge"),
+    num_requests_waiting: IntGaugeVec::new(
+        Opts::new(
+            format!(
+                "{}_{}",
+                name_prefix::FRONTEND,
+                frontend_service::WORKER_NUM_REQUESTS_WAITING
+            ),
+            "Backend requests waiting in the worker scheduler queue",
+        ),
+        &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+    )
+    .expect("Failed to create worker_num_requests_waiting gauge"),
+    request_total_slots: IntGaugeVec::new(
+        Opts::new(
+            format!(
+                "{}_{}",
+                name_prefix::FRONTEND,
+                frontend_service::WORKER_REQUEST_TOTAL_SLOTS
+            ),
+            "Backend request slot capacity per worker",
+        ),
+        &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+    )
+    .expect("Failed to create worker_request_total_slots gauge"),
 });
 
 /// Register the worker load gauges with the given Prometheus registry.
@@ -133,6 +190,9 @@ pub fn register_worker_load_metrics(
     let m = &*WORKER_LOAD_METRICS;
     registry.register(Box::new(m.active_decode_blocks.clone()))?;
     registry.register(Box::new(m.active_prefill_tokens.clone()))?;
+    registry.register(Box::new(m.request_active_slots.clone()))?;
+    registry.register(Box::new(m.num_requests_waiting.clone()))?;
+    registry.register(Box::new(m.request_total_slots.clone()))?;
     Ok(())
 }
 
@@ -239,7 +299,7 @@ impl RouterDpHealthMetrics {
         }
     }
 
-    pub fn stale_workers<'a>(
+    pub fn oldest_stale_workers<'a>(
         &self,
         workers: impl Iterator<Item = &'a WorkerWithDpRank>,
         worker_type: &'static str,
@@ -252,18 +312,97 @@ impl RouterDpHealthMetrics {
         let Ok(first_eligible) = ROUTER_DP_FIRST_ELIGIBLE.read() else {
             return Vec::new();
         };
-        workers
-            .filter(|worker| {
-                let key = (**worker, worker_type.to_string());
-                if let Some(last) = last_selected.get(&key) {
-                    return now.saturating_sub(*last) >= stale_secs as i64;
+        let mut max_age = None;
+        let mut stale_workers = Vec::new();
+        for worker in workers {
+            let key = (*worker, worker_type.to_string());
+            let age = if let Some(last) = last_selected.get(&key) {
+                now.saturating_sub(*last)
+            } else if let Some(first) = first_eligible.get(&key) {
+                now.saturating_sub(*first)
+            } else {
+                continue;
+            };
+            if age < stale_secs as i64 {
+                continue;
+            }
+
+            match max_age {
+                Some(current) if age < current => {}
+                Some(current) if age == current => stale_workers.push(*worker),
+                _ => {
+                    max_age = Some(age);
+                    stale_workers.clear();
+                    stale_workers.push(*worker);
                 }
-                first_eligible
-                    .get(&key)
-                    .is_some_and(|first| now.saturating_sub(*first) >= stale_secs as i64)
-            })
-            .copied()
-            .collect()
+            }
+        }
+        stale_workers
+    }
+
+    #[cfg(test)]
+    pub fn oldest_stale_workers_at<'a>(
+        workers: impl Iterator<Item = &'a WorkerWithDpRank>,
+        worker_type: &'static str,
+        stale_secs: u64,
+        now: i64,
+    ) -> Vec<WorkerWithDpRank> {
+        let Ok(last_selected) = ROUTER_DP_LAST_SELECTED.read() else {
+            return Vec::new();
+        };
+        let Ok(first_eligible) = ROUTER_DP_FIRST_ELIGIBLE.read() else {
+            return Vec::new();
+        };
+        let mut max_age = None;
+        let mut stale_workers = Vec::new();
+        for worker in workers {
+            let key = (*worker, worker_type.to_string());
+            let age = if let Some(last) = last_selected.get(&key) {
+                now.saturating_sub(*last)
+            } else if let Some(first) = first_eligible.get(&key) {
+                now.saturating_sub(*first)
+            } else {
+                continue;
+            };
+            if age < stale_secs as i64 {
+                continue;
+            }
+
+            match max_age {
+                Some(current) if age < current => {}
+                Some(current) if age == current => stale_workers.push(*worker),
+                _ => {
+                    max_age = Some(age);
+                    stale_workers.clear();
+                    stale_workers.push(*worker);
+                }
+            }
+        }
+        stale_workers
+    }
+
+    #[cfg(test)]
+    pub fn clear_stale_tracking_for_test() {
+        if let Ok(mut last_selected) = ROUTER_DP_LAST_SELECTED.write() {
+            last_selected.clear();
+        }
+        if let Ok(mut first_eligible) = ROUTER_DP_FIRST_ELIGIBLE.write() {
+            first_eligible.clear();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn mark_first_eligible_for_test(worker: WorkerWithDpRank, worker_type: &str, at: i64) {
+        if let Ok(mut first_eligible) = ROUTER_DP_FIRST_ELIGIBLE.write() {
+            first_eligible.insert((worker, worker_type.to_string()), at);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn mark_last_selected_for_test(worker: WorkerWithDpRank, worker_type: &str, at: i64) {
+        if let Ok(mut last_selected) = ROUTER_DP_LAST_SELECTED.write() {
+            last_selected.insert((worker, worker_type.to_string()), at);
+        }
     }
 
     pub fn remove(&self, worker_id: u64, dp_rank: u32, worker_type: &str) {
@@ -655,6 +794,42 @@ mod tests {
                 &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
             )
             .unwrap(),
+            request_active_slots: IntGaugeVec::new(
+                Opts::new(
+                    format!(
+                        "{}_{}",
+                        name_prefix::FRONTEND,
+                        frontend_service::WORKER_REQUEST_ACTIVE_SLOTS
+                    ),
+                    "Active backend request slots per worker",
+                ),
+                &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+            )
+            .unwrap(),
+            num_requests_waiting: IntGaugeVec::new(
+                Opts::new(
+                    format!(
+                        "{}_{}",
+                        name_prefix::FRONTEND,
+                        frontend_service::WORKER_NUM_REQUESTS_WAITING
+                    ),
+                    "Backend requests waiting in the worker scheduler queue",
+                ),
+                &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+            )
+            .unwrap(),
+            request_total_slots: IntGaugeVec::new(
+                Opts::new(
+                    format!(
+                        "{}_{}",
+                        name_prefix::FRONTEND,
+                        frontend_service::WORKER_REQUEST_TOTAL_SLOTS
+                    ),
+                    "Backend request slot capacity per worker",
+                ),
+                &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+            )
+            .unwrap(),
         };
         registry
             .register(Box::new(metrics.active_decode_blocks.clone()))
@@ -662,8 +837,17 @@ mod tests {
         registry
             .register(Box::new(metrics.active_prefill_tokens.clone()))
             .unwrap();
+        registry
+            .register(Box::new(metrics.request_active_slots.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.num_requests_waiting.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.request_total_slots.clone()))
+            .unwrap();
 
-        metrics.observe(123, 0, "decode", 42, 100);
+        metrics.observe(123, 0, "decode", 42, 100, Some(7), Some(3), Some(8));
 
         let output = gather_pef(&registry);
         let expected = "\
@@ -673,11 +857,61 @@ dynamo_frontend_worker_active_decode_blocks{dp_rank=\"0\",worker_id=\"123\",work
 # HELP dynamo_frontend_worker_active_prefill_tokens Active prefill tokens queued per worker
 # TYPE dynamo_frontend_worker_active_prefill_tokens gauge
 dynamo_frontend_worker_active_prefill_tokens{dp_rank=\"0\",worker_id=\"123\",worker_type=\"decode\"} 100
+# HELP dynamo_frontend_worker_num_requests_waiting Backend requests waiting in the worker scheduler queue
+# TYPE dynamo_frontend_worker_num_requests_waiting gauge
+dynamo_frontend_worker_num_requests_waiting{dp_rank=\"0\",worker_id=\"123\",worker_type=\"decode\"} 3
+# HELP dynamo_frontend_worker_request_active_slots Active backend request slots per worker
+# TYPE dynamo_frontend_worker_request_active_slots gauge
+dynamo_frontend_worker_request_active_slots{dp_rank=\"0\",worker_id=\"123\",worker_type=\"decode\"} 7
+# HELP dynamo_frontend_worker_request_total_slots Backend request slot capacity per worker
+# TYPE dynamo_frontend_worker_request_total_slots gauge
+dynamo_frontend_worker_request_total_slots{dp_rank=\"0\",worker_id=\"123\",worker_type=\"decode\"} 8
 ";
         assert_eq!(
             output, expected,
             "\nActual PEF:\n{output}\nExpected PEF:\n{expected}"
         );
+    }
+
+    #[test]
+    fn router_dp_stale_selection_returns_oldest_candidates() {
+        RouterDpHealthMetrics::clear_stale_tracking_for_test();
+
+        let worker_0 = WorkerWithDpRank::new(7, 0);
+        let worker_1 = WorkerWithDpRank::new(7, 1);
+        let worker_2 = WorkerWithDpRank::new(7, 2);
+        RouterDpHealthMetrics::mark_first_eligible_for_test(worker_0, "decode", 0);
+        RouterDpHealthMetrics::mark_first_eligible_for_test(worker_1, "decode", 20);
+        RouterDpHealthMetrics::mark_first_eligible_for_test(worker_2, "decode", 0);
+        RouterDpHealthMetrics::mark_last_selected_for_test(worker_2, "decode", 90);
+
+        let workers = [worker_0, worker_1, worker_2];
+        let stale =
+            RouterDpHealthMetrics::oldest_stale_workers_at(workers.iter(), "decode", 100, 200);
+
+        assert_eq!(stale, vec![worker_0]);
+        RouterDpHealthMetrics::clear_stale_tracking_for_test();
+    }
+
+    #[test]
+    fn router_dp_stale_selection_includes_tied_oldest_never_selected_candidates() {
+        RouterDpHealthMetrics::clear_stale_tracking_for_test();
+
+        let worker_0 = WorkerWithDpRank::new(7, 0);
+        let worker_1 = WorkerWithDpRank::new(7, 1);
+        let worker_2 = WorkerWithDpRank::new(7, 2);
+        RouterDpHealthMetrics::mark_first_eligible_for_test(worker_0, "decode", 0);
+        RouterDpHealthMetrics::mark_first_eligible_for_test(worker_1, "decode", 0);
+        RouterDpHealthMetrics::mark_first_eligible_for_test(worker_2, "decode", 120);
+
+        let workers = [worker_0, worker_1, worker_2];
+        let stale =
+            RouterDpHealthMetrics::oldest_stale_workers_at(workers.iter(), "decode", 100, 200);
+
+        assert_eq!(stale.len(), 2);
+        assert!(stale.contains(&worker_0));
+        assert!(stale.contains(&worker_1));
+        RouterDpHealthMetrics::clear_stale_tracking_for_test();
     }
 
     #[test]

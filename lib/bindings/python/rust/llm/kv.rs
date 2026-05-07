@@ -944,6 +944,8 @@ impl KvRouter {
                     lora_name,
                     0.0,
                     None, // allowed_worker_ids: pass via RoutingHints in PreprocessedRequest path
+                    None, // disallowed_workers: only used for retrying worker-local overload
+                    None, // queue_deadline: only used by retrying push-router requests
                 )
                 .await
                 .map_err(to_pyerr)?;

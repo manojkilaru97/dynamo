@@ -22,7 +22,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const ROUTER_QUEUE_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(feature = "bench")]
@@ -82,6 +82,9 @@ pub struct SchedulingRequest {
     pub allowed_worker_ids: Option<HashSet<WorkerId>>,
     /// Optional set of worker + dp-rank pairs that are temporarily saturated and must be skipped.
     pub disallowed_workers: Option<HashSet<WorkerWithDpRank>>,
+    /// Absolute deadline for this scheduling attempt. Used by retrying routers so
+    /// worker-local overload retries cannot reset the request's queue budget.
+    pub queue_deadline: Option<Instant>,
     pub worker_type: &'static str,
     resp_tx: Option<tokio::sync::oneshot::Sender<Result<SchedulingResponse, KvSchedulerError>>>,
 }
@@ -171,7 +174,7 @@ impl KvScheduler {
         let (request_tx, request_rx) = tokio::sync::mpsc::channel::<SchedulingRequest>(1024);
         let scheduler_cancel_token = component.drt().primary_token();
 
-        let request_loads = Arc::new(WorkerRequestLoads::default());
+        let request_loads = Arc::new(WorkerRequestLoads::new(Some(Duration::from_secs(30))));
         let queue = Arc::new(SchedulerQueue::new(
             slots.clone(),
             workers_with_configs.clone(),
@@ -283,6 +286,8 @@ impl KvScheduler {
         lora_name: Option<String>,
         priority_jump: f64,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
+        disallowed_workers: Option<HashSet<WorkerWithDpRank>>,
+        queue_deadline: Option<Instant>,
     ) -> Result<SchedulingResponse, KvSchedulerError> {
         #[cfg(feature = "bench")]
         let start = Instant::now();
@@ -300,7 +305,8 @@ impl KvScheduler {
             lora_name,
             priority_jump,
             allowed_worker_ids,
-            disallowed_workers: None,
+            disallowed_workers,
+            queue_deadline,
             worker_type: self.worker_type(),
             resp_tx: Some(resp_tx),
         };
@@ -576,23 +582,21 @@ impl WorkerSelector for DefaultWorkerSelector {
             .router_dp_stale_selection_secs
             .filter(|secs| *secs > 0)
         {
-            let stale_workers = ROUTER_DP_HEALTH_METRICS.stale_workers(
+            let stale_workers = ROUTER_DP_HEALTH_METRICS.oldest_stale_workers(
                 worker_logits.keys(),
                 request.worker_type,
                 stale_secs,
             );
-            if !stale_workers.is_empty() && stale_workers.len() < worker_logits.len() {
-                let stale_logits: HashMap<_, _> = stale_workers
-                    .iter()
-                    .filter_map(|worker| worker_logits.get(worker).map(|logit| (*worker, *logit)))
-                    .collect();
+            if !stale_workers.is_empty() {
+                let stale_logits: HashMap<_, _> =
+                    stale_workers.iter().map(|worker| (*worker, 0.0)).collect();
                 tracing::info!(
                     stale_secs,
                     stale_candidates = stale_logits.len(),
                     total_candidates = worker_logits.len(),
-                    "Prioritizing stale eligible worker/DP candidates"
+                    "Prioritizing oldest stale eligible worker/DP candidates"
                 );
-                softmax_sample(&stale_logits, temperature)
+                softmax_sample(&stale_logits, 0.0)
             } else {
                 softmax_sample(&worker_logits, temperature)
             }

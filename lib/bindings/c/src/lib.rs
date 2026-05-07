@@ -494,6 +494,8 @@ impl RouterHandles {
                 None,
                 0.0,
                 allowed_worker_ids,
+                None,
+                None,
             )
             .await
             .map_err(|e| {

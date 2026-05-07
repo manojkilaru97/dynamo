@@ -2162,7 +2162,7 @@ mod tests_startup_helpers {
         // Here we simulate that by querying for events after event_id=1.
         let last_known_id = 1u64; // Router only received event_1
         let response = local_indexer_1
-            .get_events_in_id_range(Some(last_known_id + 1), None)
+            .get_events_in_id_range(Some(last_known_id + 1), None, false)
             .await;
         let missed_events = match response {
             crate::kv_router::indexer::WorkerKvQueryResponse::Events(e) => e,

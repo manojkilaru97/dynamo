@@ -347,6 +347,9 @@ def parse_frontend_metric_containers(
 _WORKER_METRIC_NAMES = {
     "active_prefill_tokens": f"{prometheus_names.name_prefix.FRONTEND}_{prometheus_names.frontend_service.WORKER_ACTIVE_PREFILL_TOKENS}",
     "active_decode_blocks": f"{prometheus_names.name_prefix.FRONTEND}_{prometheus_names.frontend_service.WORKER_ACTIVE_DECODE_BLOCKS}",
+    "request_active_slots": f"{prometheus_names.name_prefix.FRONTEND}_{prometheus_names.frontend_service.WORKER_REQUEST_ACTIVE_SLOTS}",
+    "num_requests_waiting": f"{prometheus_names.name_prefix.FRONTEND}_{prometheus_names.frontend_service.WORKER_NUM_REQUESTS_WAITING}",
+    "request_total_slots": f"{prometheus_names.name_prefix.FRONTEND}_{prometheus_names.frontend_service.WORKER_REQUEST_TOTAL_SLOTS}",
     "last_ttft": f"{prometheus_names.name_prefix.FRONTEND}_{prometheus_names.frontend_service.WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS}",
     "last_isl": f"{prometheus_names.name_prefix.FRONTEND}_{prometheus_names.frontend_service.WORKER_LAST_INPUT_SEQUENCE_TOKENS}",
     "last_itl": f"{prometheus_names.name_prefix.FRONTEND}_{prometheus_names.frontend_service.WORKER_LAST_INTER_TOKEN_LATENCY_SECONDS}",

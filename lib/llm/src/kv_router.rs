@@ -380,6 +380,8 @@ impl KvRouter {
         lora_name: Option<String>,
         priority_jump: f64,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
+        disallowed_workers: Option<HashSet<WorkerWithDpRank>>,
+        queue_deadline: Option<Instant>,
     ) -> anyhow::Result<(WorkerWithDpRank, u32)> {
         let start = Instant::now();
 
@@ -429,6 +431,8 @@ impl KvRouter {
                 lora_name,
                 priority_jump,
                 allowed_worker_ids,
+                disallowed_workers,
+                queue_deadline,
             )
             .instrument(tracing::info_span!("kv_router.schedule"))
             .await
@@ -596,6 +600,8 @@ impl AsyncEngine<SingleIn<RouterRequest>, ManyOut<Annotated<RouterResponse>>, Er
                         true,
                         None,
                         0.0,
+                        None,
+                        None,
                         None,
                     )
                     .await?;
