@@ -25,6 +25,14 @@ struct DpRequestLoad {
     observed_at: Instant,
 }
 
+struct SaturationSnapshot {
+    saturated_workers: HashSet<WorkerWithDpRank>,
+    request_load_saturated: usize,
+    token_saturated: usize,
+    eligible_workers: usize,
+    request_load_fail_open: bool,
+}
+
 #[derive(Debug)]
 pub struct WorkerRequestLoads {
     inner: RwLock<HashMap<WorkerId, HashMap<u32, DpRequestLoad>>>,
@@ -340,12 +348,30 @@ impl SchedulerQueue {
             return;
         }
 
-        let saturated_workers = self.saturated_workers(request.allowed_worker_ids.as_ref());
-        if !saturated_workers.is_empty() {
-            request
-                .disallowed_workers
-                .get_or_insert_with(HashSet::new)
-                .extend(saturated_workers);
+        let persistent_disallowed_workers = request.disallowed_workers.clone();
+        let saturation = self.saturation_snapshot(
+            request.allowed_worker_ids.as_ref(),
+            persistent_disallowed_workers.as_ref(),
+        );
+        request.disallowed_workers = merged_disallowed_workers_for_selection(
+            persistent_disallowed_workers.as_ref(),
+            saturation.saturated_workers,
+        );
+        let persistent_disallowed_count = persistent_disallowed_workers
+            .as_ref()
+            .map_or(0, HashSet::len);
+        let merged_disallowed_count = request.disallowed_workers.as_ref().map_or(0, HashSet::len);
+        if merged_disallowed_count > 0 || saturation.request_load_saturated > 0 {
+            tracing::info!(
+                request_id = request.maybe_request_id.as_deref().unwrap_or_default(),
+                persistent_disallowed_worker_dps = persistent_disallowed_count,
+                request_load_saturated_worker_dps = saturation.request_load_saturated,
+                token_saturated_worker_dps = saturation.token_saturated,
+                merged_disallowed_worker_dps = merged_disallowed_count,
+                eligible_worker_dps = saturation.eligible_workers,
+                request_load_fail_open = saturation.request_load_fail_open,
+                "Router DP exclusion snapshot before worker selection"
+            );
         }
 
         let (decode_blocks, prefill_tokens) = self.slots.potential_blocks_and_tokens(
@@ -361,6 +387,7 @@ impl SchedulerQueue {
             self.selector
                 .select_worker(&workers, &request, self.block_size)
         };
+        request.disallowed_workers = persistent_disallowed_workers;
 
         let selection = match selection {
             Ok(s) => s,
@@ -489,10 +516,18 @@ impl SchedulerQueue {
         checked_any
     }
 
-    fn saturated_workers(&self, allowed: Option<&HashSet<WorkerId>>) -> HashSet<WorkerWithDpRank> {
+    fn saturation_snapshot(
+        &self,
+        allowed: Option<&HashSet<WorkerId>>,
+        persistent_disallowed: Option<&HashSet<WorkerWithDpRank>>,
+    ) -> SaturationSnapshot {
         let active_tokens = self.slots.active_tokens();
         let configs = self.workers_with_configs.borrow();
-        let mut saturated = HashSet::new();
+        let mut token_saturated_workers = HashSet::new();
+        let mut request_load_saturated_workers = HashSet::new();
+        let mut request_load_saturated = 0usize;
+        let mut token_saturated = 0usize;
+        let mut eligible_workers = 0usize;
 
         for (&worker_id, config) in configs.iter() {
             if let Some(ids) = allowed
@@ -504,14 +539,54 @@ impl SchedulerQueue {
             let dp_size = config.data_parallel_size;
             let dp_start = config.data_parallel_start_rank;
             for dp_rank in dp_start..dp_start + dp_size {
+                eligible_workers += 1;
                 let worker = WorkerWithDpRank::new(worker_id, dp_rank);
-                if self.worker_is_saturated(worker, config, &active_tokens) {
-                    saturated.insert(worker);
+                if self.worker_request_load_saturated(worker) {
+                    request_load_saturated += 1;
+                    request_load_saturated_workers.insert(worker);
+                }
+                if self.worker_token_saturated(worker, config, &active_tokens) {
+                    token_saturated += 1;
+                    token_saturated_workers.insert(worker);
                 }
             }
         }
 
-        saturated
+        let request_load_fail_open = request_load_saturation_collapses_candidates(
+            eligible_workers,
+            persistent_disallowed,
+            &token_saturated_workers,
+            &request_load_saturated_workers,
+        );
+        let mut saturated = token_saturated_workers;
+        if request_load_fail_open {
+            tracing::warn!(
+                eligible_worker_dps = eligible_workers,
+                request_load_saturated_worker_dps = request_load_saturated,
+                token_saturated_worker_dps = token_saturated,
+                "Ignoring router request-load saturation because it would collapse worker/DP candidates"
+            );
+        } else {
+            saturated.extend(request_load_saturated_workers);
+        }
+
+        SaturationSnapshot {
+            saturated_workers: saturated,
+            request_load_saturated,
+            token_saturated,
+            eligible_workers,
+            request_load_fail_open,
+        }
+    }
+
+    fn worker_request_load_saturated(&self, worker: WorkerWithDpRank) -> bool {
+        if let Some((dp_requests, Some(dp_cap))) = self.request_loads.dp_requests_and_cap(worker)
+            && dp_cap > 0
+            && dp_requests >= dp_cap
+        {
+            return true;
+        }
+        false
     }
 
     fn worker_is_saturated(
@@ -520,13 +595,15 @@ impl SchedulerQueue {
         config: &crate::local_model::runtime_config::ModelRuntimeConfig,
         active_tokens: &HashMap<WorkerWithDpRank, usize>,
     ) -> bool {
-        if let Some((dp_requests, Some(dp_cap))) = self.request_loads.dp_requests_and_cap(worker)
-            && dp_cap > 0
-            && dp_requests >= dp_cap
-        {
-            return true;
-        }
+        self.worker_token_saturated(worker, config, active_tokens)
+    }
 
+    fn worker_token_saturated(
+        &self,
+        worker: WorkerWithDpRank,
+        config: &crate::local_model::runtime_config::ModelRuntimeConfig,
+        active_tokens: &HashMap<WorkerWithDpRank, usize>,
+    ) -> bool {
         let Some(threshold) = self.threshold_frac else {
             return false;
         };
@@ -643,6 +720,37 @@ fn disallowed_exhausts_eligible_workers(
     !eligible.is_empty() && eligible.iter().all(|worker| disallowed.contains(worker))
 }
 
+fn merged_disallowed_workers_for_selection(
+    persistent: Option<&HashSet<WorkerWithDpRank>>,
+    saturated: HashSet<WorkerWithDpRank>,
+) -> Option<HashSet<WorkerWithDpRank>> {
+    if persistent.is_none() && saturated.is_empty() {
+        return None;
+    }
+
+    let mut merged = persistent.cloned().unwrap_or_default();
+    merged.extend(saturated);
+    Some(merged)
+}
+
+fn request_load_saturation_collapses_candidates(
+    eligible_workers: usize,
+    persistent_disallowed: Option<&HashSet<WorkerWithDpRank>>,
+    token_saturated: &HashSet<WorkerWithDpRank>,
+    request_load_saturated: &HashSet<WorkerWithDpRank>,
+) -> bool {
+    if eligible_workers == 0 || request_load_saturated.is_empty() {
+        return false;
+    }
+
+    let mut merged = persistent_disallowed.cloned().unwrap_or_default();
+    merged.extend(token_saturated);
+    merged.extend(request_load_saturated);
+    let remaining = eligible_workers.saturating_sub(merged.len());
+    let min_remaining = (eligible_workers / 2).max(1);
+    remaining < min_remaining
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,6 +862,72 @@ mod tests {
         assert!(!disallowed_exhausts_eligible_workers(
             &all_disallowed,
             &HashSet::new()
+        ));
+    }
+
+    #[test]
+    fn transient_saturation_does_not_mutate_persistent_retry_exclusions() {
+        let persistent = HashSet::from([WorkerWithDpRank::new(7, 1)]);
+        let saturated = HashSet::from([WorkerWithDpRank::new(7, 2), WorkerWithDpRank::new(8, 0)]);
+
+        let merged = merged_disallowed_workers_for_selection(Some(&persistent), saturated)
+            .expect("selection should see merged exclusions");
+
+        assert!(merged.contains(&WorkerWithDpRank::new(7, 1)));
+        assert!(merged.contains(&WorkerWithDpRank::new(7, 2)));
+        assert!(merged.contains(&WorkerWithDpRank::new(8, 0)));
+        assert_eq!(persistent, HashSet::from([WorkerWithDpRank::new(7, 1)]));
+    }
+
+    #[test]
+    fn request_load_saturation_fails_open_only_when_it_collapses_candidates() {
+        let token_saturated = HashSet::new();
+        let request_load_saturated = HashSet::from([
+            WorkerWithDpRank::new(7, 0),
+            WorkerWithDpRank::new(7, 1),
+            WorkerWithDpRank::new(7, 2),
+            WorkerWithDpRank::new(7, 3),
+            WorkerWithDpRank::new(8, 0),
+            WorkerWithDpRank::new(8, 1),
+            WorkerWithDpRank::new(8, 2),
+            WorkerWithDpRank::new(8, 3),
+            WorkerWithDpRank::new(9, 0),
+        ]);
+
+        assert!(request_load_saturation_collapses_candidates(
+            16,
+            None,
+            &token_saturated,
+            &request_load_saturated
+        ));
+
+        let request_load_saturated = HashSet::from([
+            WorkerWithDpRank::new(7, 0),
+            WorkerWithDpRank::new(7, 1),
+            WorkerWithDpRank::new(7, 2),
+            WorkerWithDpRank::new(7, 3),
+        ]);
+
+        assert!(!request_load_saturation_collapses_candidates(
+            16,
+            None,
+            &token_saturated,
+            &request_load_saturated
+        ));
+
+        let persistent_disallowed = HashSet::from([
+            WorkerWithDpRank::new(10, 0),
+            WorkerWithDpRank::new(10, 1),
+            WorkerWithDpRank::new(10, 2),
+            WorkerWithDpRank::new(10, 3),
+            WorkerWithDpRank::new(11, 0),
+        ]);
+
+        assert!(request_load_saturation_collapses_candidates(
+            16,
+            Some(&persistent_disallowed),
+            &token_saturated,
+            &request_load_saturated
         ));
     }
 }
