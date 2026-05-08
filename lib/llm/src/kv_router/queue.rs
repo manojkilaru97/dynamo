@@ -31,6 +31,7 @@ struct SaturationSnapshot {
     token_saturated: usize,
     eligible_workers: usize,
     request_load_fail_open: bool,
+    token_saturation_fail_open: bool,
 }
 
 #[derive(Debug)]
@@ -370,6 +371,7 @@ impl SchedulerQueue {
                 merged_disallowed_worker_dps = merged_disallowed_count,
                 eligible_worker_dps = saturation.eligible_workers,
                 request_load_fail_open = saturation.request_load_fail_open,
+                token_saturation_fail_open = saturation.token_saturation_fail_open,
                 "Router DP exclusion snapshot before worker selection"
             );
         }
@@ -552,13 +554,29 @@ impl SchedulerQueue {
             }
         }
 
-        let request_load_fail_open = request_load_saturation_collapses_candidates(
+        let token_saturation_fail_open = saturation_collapses_candidates(
             eligible_workers,
             persistent_disallowed,
+            &HashSet::new(),
             &token_saturated_workers,
+        );
+        let mut saturated = if token_saturation_fail_open {
+            tracing::warn!(
+                eligible_worker_dps = eligible_workers,
+                token_saturated_worker_dps = token_saturated,
+                "Ignoring router token saturation because it would collapse worker/DP candidates"
+            );
+            HashSet::new()
+        } else {
+            token_saturated_workers
+        };
+
+        let request_load_fail_open = saturation_collapses_candidates(
+            eligible_workers,
+            persistent_disallowed,
+            &saturated,
             &request_load_saturated_workers,
         );
-        let mut saturated = token_saturated_workers;
         if request_load_fail_open {
             tracing::warn!(
                 eligible_worker_dps = eligible_workers,
@@ -576,6 +594,7 @@ impl SchedulerQueue {
             token_saturated,
             eligible_workers,
             request_load_fail_open,
+            token_saturation_fail_open,
         }
     }
 
@@ -733,19 +752,19 @@ fn merged_disallowed_workers_for_selection(
     Some(merged)
 }
 
-fn request_load_saturation_collapses_candidates(
+fn saturation_collapses_candidates(
     eligible_workers: usize,
     persistent_disallowed: Option<&HashSet<WorkerWithDpRank>>,
-    token_saturated: &HashSet<WorkerWithDpRank>,
-    request_load_saturated: &HashSet<WorkerWithDpRank>,
+    already_saturated: &HashSet<WorkerWithDpRank>,
+    new_saturation: &HashSet<WorkerWithDpRank>,
 ) -> bool {
-    if eligible_workers == 0 || request_load_saturated.is_empty() {
+    if eligible_workers == 0 || new_saturation.is_empty() {
         return false;
     }
 
     let mut merged = persistent_disallowed.cloned().unwrap_or_default();
-    merged.extend(token_saturated);
-    merged.extend(request_load_saturated);
+    merged.extend(already_saturated);
+    merged.extend(new_saturation);
     let remaining = eligible_workers.saturating_sub(merged.len());
     let min_remaining = (eligible_workers / 2).max(1);
     remaining < min_remaining
@@ -880,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn request_load_saturation_fails_open_only_when_it_collapses_candidates() {
+    fn saturation_fails_open_only_when_it_collapses_candidates() {
         let token_saturated = HashSet::new();
         let request_load_saturated = HashSet::from([
             WorkerWithDpRank::new(7, 0),
@@ -894,7 +913,7 @@ mod tests {
             WorkerWithDpRank::new(9, 0),
         ]);
 
-        assert!(request_load_saturation_collapses_candidates(
+        assert!(saturation_collapses_candidates(
             16,
             None,
             &token_saturated,
@@ -908,7 +927,7 @@ mod tests {
             WorkerWithDpRank::new(7, 3),
         ]);
 
-        assert!(!request_load_saturation_collapses_candidates(
+        assert!(!saturation_collapses_candidates(
             16,
             None,
             &token_saturated,
@@ -923,11 +942,30 @@ mod tests {
             WorkerWithDpRank::new(11, 0),
         ]);
 
-        assert!(request_load_saturation_collapses_candidates(
+        assert!(saturation_collapses_candidates(
             16,
             Some(&persistent_disallowed),
             &token_saturated,
             &request_load_saturated
+        ));
+
+        let token_saturated = HashSet::from([
+            WorkerWithDpRank::new(7, 0),
+            WorkerWithDpRank::new(7, 1),
+            WorkerWithDpRank::new(7, 2),
+            WorkerWithDpRank::new(7, 3),
+            WorkerWithDpRank::new(8, 0),
+            WorkerWithDpRank::new(8, 1),
+            WorkerWithDpRank::new(8, 2),
+            WorkerWithDpRank::new(8, 3),
+            WorkerWithDpRank::new(9, 0),
+        ]);
+
+        assert!(saturation_collapses_candidates(
+            16,
+            None,
+            &HashSet::new(),
+            &token_saturated
         ));
     }
 }
