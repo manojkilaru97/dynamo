@@ -1223,7 +1223,77 @@ impl JailedStream {
             return required.is_empty();
         }
 
-        value.keys().any(|key| properties.contains_key(key))
+        let mut matched_property = false;
+        for (key, property_value) in value {
+            let Some(property_schema) = properties.get(key) else {
+                if schema_obj
+                    .get("additionalProperties")
+                    .is_some_and(|additional| additional == false)
+                {
+                    return false;
+                }
+                continue;
+            };
+            matched_property = true;
+            if !Self::value_matches_json_schema_type(property_value, property_schema) {
+                return false;
+            }
+        }
+
+        matched_property || required.is_empty()
+    }
+
+    fn value_matches_json_schema_type(
+        value: &serde_json::Value,
+        schema: &serde_json::Value,
+    ) -> bool {
+        let Some(schema_obj) = schema.as_object() else {
+            return true;
+        };
+
+        let schema_type = schema_obj.get("type").and_then(|kind| kind.as_str());
+        match schema_type {
+            Some("string") => value.is_string(),
+            Some("integer") => value.as_i64().is_some() || value.as_u64().is_some(),
+            Some("number") => value.is_number(),
+            Some("boolean") => value.is_boolean(),
+            Some("array") => {
+                let Some(items) = value.as_array() else {
+                    return false;
+                };
+                let Some(item_schema) = schema_obj.get("items") else {
+                    return true;
+                };
+                items
+                    .iter()
+                    .all(|item| Self::value_matches_json_schema_type(item, item_schema))
+            }
+            Some("object") | None => {
+                let Some(object) = value.as_object() else {
+                    return schema_type.is_none();
+                };
+                let Some(properties) = schema_obj.get("properties").and_then(|v| v.as_object())
+                else {
+                    return true;
+                };
+                for (key, nested_value) in object {
+                    let Some(nested_schema) = properties.get(key) else {
+                        if schema_obj
+                            .get("additionalProperties")
+                            .is_some_and(|additional| additional == false)
+                        {
+                            return false;
+                        }
+                        continue;
+                    };
+                    if !Self::value_matches_json_schema_type(nested_value, nested_schema) {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => true,
+        }
     }
 
     /// Check if accumulated content should end jail

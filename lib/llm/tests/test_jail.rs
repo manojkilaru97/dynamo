@@ -2121,6 +2121,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_immediate_named_tool_rejects_schema_shaped_arguments() {
+        use dynamo_parsers::tool_calling::ToolDefinition;
+
+        let schema_shaped_args = r#"{"filters":{"properties":{"date_range":{"type":"string"},"tags":{"items":{"type":"string"},"type":"array"}},"type":"object"},"options":{"properties":{"ascending":{"type":"boolean"},"limit":{"type":"integer"},"offset":{"type":"integer"}},"type":"object"},"query":{"type":"string"}}"#;
+        let real_args = r#"{"query":"report","options":{"limit":10,"offset":0,"ascending":true}}"#;
+        let chunks = vec![
+            create_mock_response_chunk(schema_shaped_args.to_string(), 0),
+            create_mock_response_chunk(real_args.to_string(), 0),
+        ];
+
+        let tool_defs = vec![ToolDefinition {
+            name: "search_documents".to_string(),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "filters": {
+                        "type": "object",
+                        "properties": {
+                            "date_range": {"type": "string"},
+                            "tags": {"type": "array", "items": {"type": "string"}}
+                        }
+                    },
+                    "options": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {"type": "integer"},
+                            "offset": {"type": "integer"},
+                            "ascending": {"type": "boolean"}
+                        }
+                    }
+                },
+                "required": ["query"]
+            })),
+        }];
+
+        let input_stream = stream::iter(chunks);
+        let jail = JailedStream::builder()
+            .tool_choice_named("search_documents".to_string())
+            .tool_definitions(tool_defs)
+            .build();
+
+        let results: Vec<_> = jail.apply_with_finish_reason(input_stream).collect().await;
+        let tool_results: Vec<_> = results
+            .iter()
+            .filter(|result| {
+                result
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.choices.first())
+                    .and_then(|choice| choice.delta.tool_calls.as_ref())
+                    .is_some_and(|tool_calls| !tool_calls.is_empty())
+            })
+            .collect();
+
+        assert_eq!(tool_results.len(), 1, "Should emit only the real tool call");
+        test_utils::assert_tool_call(
+            tool_results[0],
+            "search_documents",
+            serde_json::json!({
+                "query": "report",
+                "options": {"limit": 10, "offset": 0, "ascending": true}
+            }),
+        );
+    }
+
+    #[tokio::test]
     async fn test_jailed_stream_xml_parser_config_tokens_auto_population() {
         // Tests that parser config tokens are auto-populated when using `.tool_call_parser()`.
         // This verifies the jail system reads `tool_call_start_token` and `tool_call_end_token`
