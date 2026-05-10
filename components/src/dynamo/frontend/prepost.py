@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -74,6 +75,15 @@ def _materialize_assistant_tool_calls(
     return normalized
 
 
+def _uses_forced_tool_choice(tool_choice: Any) -> bool:
+    if tool_choice == "required":
+        return True
+    if isinstance(tool_choice, dict):
+        function = tool_choice.get("function")
+        return isinstance(function, dict) and bool(function.get("name"))
+    return bool(getattr(getattr(tool_choice, "function", None), "name", None))
+
+
 def _prepare_request(
     request: dict[str, Any] | ChatCompletionRequest,
     *,
@@ -100,6 +110,11 @@ def _prepare_request(
             not hasattr(tool, "model_dump") for tool in request_for_sampling.tools
         ):
             request_for_sampling = ChatCompletionRequest.model_validate(request)
+        elif request_for_sampling.response_format or request_for_sampling.structured_outputs:
+            # Validation materializes response_format into structured_outputs.
+            # Without this, guided decoding constraints can be lost before the
+            # backend sees the request.
+            request_for_sampling = ChatCompletionRequest.model_validate(request)
     else:
         request_for_sampling = ChatCompletionRequest.model_validate(request)
 
@@ -125,6 +140,14 @@ def _prepare_request(
         else None
     )
     chat_template_kwargs = dict(request_for_sampling.chat_template_kwargs or {})
+    if request_for_sampling.tools and _uses_forced_tool_choice(
+        request_for_sampling.tool_choice
+    ):
+        # Required/named tool_choice is enforced by guided JSON. Letting the
+        # template enter thinking mode can spend the stream entirely on
+        # reasoning before the JSON handoff, so force immediate tool JSON.
+        chat_template_kwargs["thinking"] = False
+        chat_template_kwargs["enable_thinking"] = False
     chat_template_kwargs["reasoning_effort"] = request_for_sampling.reasoning_effort
 
     # Mistral warns that tokenize=False is unsafe for chat templates.
@@ -185,7 +208,6 @@ async def preprocess_chat_request(
     )
 
     _, engine_prompt = await renderer.render_messages_async(messages, chat_params)
-
     if "prompt_token_ids" in engine_prompt:
         tokens = list(engine_prompt["prompt_token_ids"])
     else:
@@ -216,9 +238,15 @@ class StreamingPostProcessor:
         tool_parser: ToolParser | None,
         reasoning_parser_class: type[ReasoningParser] | None,
         chat_template_kwargs: dict[str, Any],
+        guided_tool_choice: Any | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.request_for_sampling = request_for_sampling
+        self.guided_tool_choice = (
+            request_for_sampling.tool_choice
+            if guided_tool_choice is None
+            else guided_tool_choice
+        )
         self.sampling_params = sampling_params
         self.tool_parser = tool_parser
         self.reasoning_parser = (
@@ -246,6 +274,7 @@ class StreamingPostProcessor:
         # this correctly, so we accumulate text here and fall back to the
         # non-streaming extract_tool_calls() once the buffer is complete.
         self._tool_text_buffer: str | None = None
+        self._guided_tool_choice_buffer: str = ""
 
     @staticmethod
     def _merge_tool_call(
@@ -288,6 +317,57 @@ class StreamingPostProcessor:
         )
 
     @staticmethod
+    def _tool_choice_function_name(tool_choice: Any) -> str | None:
+        if isinstance(tool_choice, dict):
+            function = tool_choice.get("function")
+            if isinstance(function, dict):
+                name = function.get("name")
+                return name if isinstance(name, str) and name else None
+        name = getattr(getattr(tool_choice, "function", None), "name", None)
+        return name if isinstance(name, str) and name else None
+
+    @staticmethod
+    def _tool_name(tool: Any) -> str | None:
+        function = getattr(tool, "function", None)
+        name = getattr(function, "name", None)
+        if isinstance(name, str) and name:
+            return name
+        if isinstance(tool, dict):
+            function = tool.get("function")
+            if isinstance(function, dict):
+                name = function.get("name")
+                return name if isinstance(name, str) and name else None
+        return None
+
+    def _infer_guided_tool_choice(self) -> Any | None:
+        structured_outputs = self.request_for_sampling.structured_outputs
+        if not structured_outputs or not self.request_for_sampling.tools:
+            return None
+
+        json_schema = getattr(structured_outputs, "json", None)
+        if not isinstance(json_schema, dict):
+            return None
+        if json_schema.get("type") == "array":
+            return "required"
+
+        tools = list(self.request_for_sampling.tools or [])
+        if len(tools) == 1:
+            name = self._tool_name(tools[0])
+            if name:
+                return {"type": "function", "function": {"name": name}}
+        return None
+
+    def _uses_guided_tool_choice_json(self) -> bool:
+        tool_choice = self.guided_tool_choice or self._infer_guided_tool_choice()
+        return (
+            tool_choice == "required"
+            or (
+                not isinstance(tool_choice, str)
+                and self._tool_choice_function_name(tool_choice)
+            )
+        )
+
+    @staticmethod
     def _compose_delta_message(
         reasoning: str | None, content: str | None
     ) -> DeltaMessage | None:
@@ -322,6 +402,76 @@ class StreamingPostProcessor:
             return self._compose_delta_message(saved_reasoning, None)
 
         return self._compose_delta_message(saved_reasoning, extracted.content or None)
+
+    @staticmethod
+    def _json_arguments(arguments: Any) -> str:
+        if isinstance(arguments, str):
+            return arguments
+        return json.dumps(
+            arguments if arguments is not None else {},
+            separators=(",", ":"),
+        )
+
+    def _guided_tool_choice_to_delta(self, text: str) -> DeltaMessage | None:
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+
+        tool_choice = self.guided_tool_choice or self._infer_guided_tool_choice()
+        tool_calls: list[DeltaToolCall] = []
+
+        if tool_choice == "required":
+            if not isinstance(value, list):
+                return None
+            for index, item in enumerate(value):
+                if not isinstance(item, dict):
+                    return None
+                name = item.get("name")
+                arguments = item.get("parameters", item.get("arguments"))
+                if not isinstance(name, str) or not name:
+                    return None
+                tool_calls.append(
+                    DeltaToolCall(
+                        index=index,
+                        type="function",
+                        id=make_tool_call_id(),
+                        function=DeltaFunctionCall(
+                            name=name,
+                            arguments=self._json_arguments(arguments),
+                        ),
+                    )
+                )
+        else:
+            name = self._tool_choice_function_name(tool_choice)
+            if not isinstance(name, str) or not name:
+                return None
+            tool_calls.append(
+                DeltaToolCall(
+                    index=0,
+                    type="function",
+                    id=make_tool_call_id(),
+                    function=DeltaFunctionCall(
+                        name=name,
+                        arguments=self._json_arguments(value),
+                    ),
+                )
+            )
+
+        return DeltaMessage(tool_calls=tool_calls)
+
+    def _buffer_guided_tool_choice_content(
+        self, delta_message: DeltaMessage, output: Any
+    ) -> DeltaMessage | None:
+        self._guided_tool_choice_buffer += delta_message.content or ""
+        if output.finish_reason:
+            buffered_text = self._guided_tool_choice_buffer
+            self._guided_tool_choice_buffer = ""
+            parsed_delta = self._guided_tool_choice_to_delta(buffered_text)
+            if parsed_delta is not None:
+                return parsed_delta
+            return DeltaMessage(content=buffered_text)
+        return self._compose_delta_message(delta_message.reasoning, None)
 
     def _extract_tool_calls_streaming(
         self,
@@ -482,20 +632,34 @@ class StreamingPostProcessor:
                 delta_message
                 and delta_message.content
                 and not delta_message.reasoning
-                and self._should_parse_tools()
+                and (self._uses_guided_tool_choice_json() or self._should_parse_tools())
             ):
                 # Reasoning parser returned content (not reasoning).
                 # The model may have skipped reasoning and gone straight
                 # to tool calls (e.g. Mistral [TOOL_CALLS] without
                 # [THINK]...[/THINK]).  Let the tool parser decide.
-                delta_message = self._extract_tool_calls_streaming(
-                    current_text=current_text,
-                    delta_text=delta_text,
-                    current_token_ids=current_token_ids,
-                    delta_token_ids=delta_token_ids,
-                )
+                if self._uses_guided_tool_choice_json():
+                    delta_message = self._buffer_guided_tool_choice_content(
+                        delta_message, output
+                    )
+                else:
+                    delta_message = self._extract_tool_calls_streaming(
+                        current_text=current_text,
+                        delta_text=delta_text,
+                        current_token_ids=current_token_ids,
+                        delta_token_ids=delta_token_ids,
+                    )
         else:
-            if self._should_parse_tools():
+            if (
+                self._uses_guided_tool_choice_json()
+                and delta_message
+                and delta_message.content
+                and not delta_message.reasoning
+            ):
+                delta_message = self._buffer_guided_tool_choice_content(
+                    delta_message, output
+                )
+            elif self._should_parse_tools():
                 no_prev_reasoning = (
                     delta_message
                     and delta_message.content
@@ -508,6 +672,18 @@ class StreamingPostProcessor:
                         current_token_ids=current_token_ids,
                         delta_token_ids=delta_token_ids,
                     )
+
+        if (
+            self._uses_guided_tool_choice_json()
+            and output.finish_reason
+            and self._guided_tool_choice_buffer
+            and (delta_message is None or not delta_message.content)
+        ):
+            buffered_text = self._guided_tool_choice_buffer
+            self._guided_tool_choice_buffer = ""
+            delta_message = self._guided_tool_choice_to_delta(buffered_text)
+            if delta_message is None:
+                delta_message = DeltaMessage(content=buffered_text)
 
         choice = None
         if delta_message is None:

@@ -7,6 +7,10 @@ use dynamo_protocols::types::{ChatCompletionTool, ChatCompletionToolChoiceOption
 use serde_json::{Value, json};
 use thiserror::Error;
 
+const DEFAULT_TOOL_STRING_MAX_LENGTH: usize = 1024;
+const DEFAULT_TOOL_ARRAY_MAX_ITEMS: usize = 16;
+const DEFAULT_REQUIRED_TOOL_CALL_MAX_ITEMS: usize = 8;
+
 /// Errors that can occur when deriving JSON schemas for tool_choice requests.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ToolChoiceError {
@@ -54,10 +58,77 @@ fn find_tool<'a>(tools: &'a [ChatCompletionTool], name: &str) -> Option<&'a Chat
 }
 
 fn clone_parameters(function: &FunctionObject) -> Value {
-    function
+    let mut schema = function
         .parameters
         .clone()
-        .unwrap_or_else(|| json!({"type": "object", "properties": {}}))
+        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+    cap_tool_schema(&mut schema, None);
+    schema
+}
+
+fn cap_tool_schema(value: &mut Value, field_name: Option<&str>) {
+    let Value::Object(obj) = value else {
+        return;
+    };
+
+    if obj.get("type").and_then(Value::as_str) == Some("string")
+        && !obj.contains_key("maxLength")
+        && !obj.contains_key("enum")
+        && !obj.contains_key("const")
+    {
+        obj.insert(
+            "maxLength".to_string(),
+            json!(tool_string_budget(field_name)),
+        );
+    }
+
+    if obj.get("type").and_then(Value::as_str) == Some("array") && !obj.contains_key("maxItems") {
+        obj.insert("maxItems".to_string(), json!(DEFAULT_TOOL_ARRAY_MAX_ITEMS));
+    }
+
+    if obj.get("type").and_then(Value::as_str) == Some("object")
+        && !obj.contains_key("additionalProperties")
+    {
+        obj.insert("additionalProperties".to_string(), json!(false));
+    }
+
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(Value::Array(values)) = obj.get_mut(key) {
+            for nested in values {
+                cap_tool_schema(nested, field_name);
+            }
+        }
+    }
+
+    if let Some(Value::Object(properties)) = obj.get_mut("properties") {
+        for (name, nested) in properties {
+            cap_tool_schema(nested, Some(name.as_str()));
+        }
+    }
+
+    if let Some(items) = obj.get_mut("items") {
+        cap_tool_schema(items, field_name);
+    }
+
+    if let Some(additional) = obj.get_mut("additionalProperties") {
+        cap_tool_schema(additional, field_name);
+    }
+
+    if let Some(Value::Object(defs)) = obj.get_mut("$defs") {
+        for nested in defs.values_mut() {
+            cap_tool_schema(nested, None);
+        }
+    }
+}
+
+fn tool_string_budget(field_name: Option<&str>) -> usize {
+    match field_name.unwrap_or_default() {
+        "body" | "content" | "message" => 8192,
+        "query" | "sql" | "expression" => 4096,
+        "subject" | "title" => 512,
+        "to" | "from" | "email" => 320,
+        _ => DEFAULT_TOOL_STRING_MAX_LENGTH,
+    }
 }
 
 /// Builds a JSON Schema for `tool_choice=required` that enforces an array of tool calls.
@@ -141,6 +212,7 @@ fn build_required_schema(tools: &[ChatCompletionTool]) -> Result<Value, ToolChoi
     let mut result = json!({
         "type": "array",
         "minItems": 1,
+        "maxItems": DEFAULT_REQUIRED_TOOL_CALL_MAX_ITEMS,
         "items": {
             "type": "object",
             "anyOf": any_of,
@@ -321,8 +393,9 @@ mod tests {
             schema.unwrap(),
             json!({
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
-                    "location": {"type": "string"},
+                    "location": {"type": "string", "maxLength": DEFAULT_TOOL_STRING_MAX_LENGTH},
                     "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
                 },
                 "required": ["location", "unit"],
@@ -342,6 +415,7 @@ mod tests {
         let schema = schema.expect("required schema");
         assert_eq!(schema["type"], "array");
         assert_eq!(schema["minItems"], 1);
+        assert_eq!(schema["maxItems"], DEFAULT_REQUIRED_TOOL_CALL_MAX_ITEMS);
         assert!(schema["items"]["anyOf"].is_array());
 
         let any_of = schema["items"]["anyOf"].as_array().unwrap();
@@ -349,6 +423,53 @@ mod tests {
         assert_eq!(
             any_of[0]["properties"]["name"],
             json!({"type": "string", "enum": ["add_numbers"]})
+        );
+    }
+
+    #[test]
+    fn tool_schema_caps_unbounded_strings_arrays_and_objects() {
+        let tool = ChatCompletionTool {
+            r#type: ChatCompletionToolType::Function,
+            function: FunctionObject {
+                name: "send_message".to_string(),
+                description: None,
+                parameters: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "body": {"type": "string"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "metadata": {"type": "object"}
+                    }
+                })),
+                strict: None,
+            },
+        };
+        let tool_choice = ChatCompletionToolChoiceOption::Named(
+            dynamo_protocols::types::ChatCompletionNamedToolChoice {
+                r#type: ChatCompletionToolType::Function,
+                function: dynamo_protocols::types::FunctionName {
+                    name: "send_message".to_string(),
+                },
+            },
+        );
+
+        let schema = get_json_schema_from_tools(Some(&tool_choice), Some(&[tool]))
+            .expect("schema")
+            .expect("named schema");
+
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["body"]["maxLength"], 8192);
+        assert_eq!(
+            schema["properties"]["tags"]["maxItems"],
+            DEFAULT_TOOL_ARRAY_MAX_ITEMS
+        );
+        assert_eq!(
+            schema["properties"]["tags"]["items"]["maxLength"],
+            DEFAULT_TOOL_STRING_MAX_LENGTH
+        );
+        assert_eq!(
+            schema["properties"]["metadata"]["additionalProperties"],
+            false
         );
     }
 

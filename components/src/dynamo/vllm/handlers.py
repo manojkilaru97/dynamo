@@ -72,6 +72,133 @@ configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 
 
+def _normalize_json_schema_for_xgrammar(schema: Any) -> Any:
+    if isinstance(schema, list):
+        return [_normalize_json_schema_for_xgrammar(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    normalized = {
+        key: _normalize_json_schema_for_xgrammar(value)
+        for key, value in schema.items()
+    }
+    required = normalized.get("required")
+    properties = normalized.get("properties")
+
+    if properties is None and isinstance(required, list):
+        schema_keywords = {
+            "$schema",
+            "$defs",
+            "additionalProperties",
+            "allOf",
+            "anyOf",
+            "description",
+            "enum",
+            "format",
+            "items",
+            "maxItems",
+            "maxLength",
+            "maximum",
+            "minItems",
+            "minLength",
+            "minimum",
+            "not",
+            "oneOf",
+            "pattern",
+            "properties",
+            "required",
+            "title",
+            "type",
+        }
+        inferred_properties = {
+            key: value
+            for key, value in normalized.items()
+            if key not in schema_keywords and isinstance(value, dict)
+        }
+        if inferred_properties:
+            for key in inferred_properties:
+                normalized.pop(key, None)
+            normalized["type"] = normalized.get("type") or "object"
+            normalized["properties"] = inferred_properties
+            properties = inferred_properties
+
+    if isinstance(required, list):
+        if not isinstance(properties, dict):
+            properties = {}
+            normalized["properties"] = properties
+        for key in required:
+            if isinstance(key, str) and key not in properties:
+                properties[key] = {"type": "string", "minLength": 1}
+
+    for combinator in ("oneOf", "anyOf"):
+        branches = normalized.get(combinator)
+        if isinstance(branches, list):
+            repaired_branches = []
+            for branch in branches:
+                if isinstance(branch, dict):
+                    branch_properties = branch.get("properties")
+                    branch_required = branch.get("required")
+                    if (
+                        branch_required is None
+                        and isinstance(branch_properties, dict)
+                        and branch_properties
+                    ):
+                        branch = {
+                            **branch,
+                            "required": list(branch_properties.keys()),
+                        }
+                repaired_branches.append(branch)
+            normalized[combinator] = repaired_branches
+
+    if normalized.get("type") == "string":
+        if normalized.get("format") == "":
+            normalized.pop("format", None)
+        if "pattern" in normalized and any(
+            key in normalized for key in ("minLength", "maxLength", "format")
+        ):
+            normalized.pop("pattern", None)
+
+    return normalized
+
+
+def _normalize_guided_decoding(guided_decoding: Dict[str, Any]) -> Dict[str, Any]:
+    if "json" not in guided_decoding:
+        return guided_decoding
+
+    guided_decoding = dict(guided_decoding)
+    json_schema = guided_decoding.get("json")
+    if json_schema is False:
+        guided_decoding.pop("json", None)
+        guided_decoding["regex"] = "a" * 4096
+        guided_decoding["_dynamo_false_schema"] = True
+    else:
+        guided_decoding["json"] = _normalize_json_schema_for_xgrammar(json_schema)
+    return guided_decoding
+
+
+def _cap_guided_decoding_tokens(
+    request: Dict[str, Any],
+    sampling_params: SamplingParams,
+) -> None:
+    if not isinstance(
+        request.get("sampling_options", {}).get("guided_decoding"), dict
+    ):
+        return
+    if sampling_params.structured_outputs is None:
+        return
+
+    max_tokens = int(os.environ.get("DYN_GUIDED_DECODING_MAX_TOKENS", "65536"))
+    if request["sampling_options"]["guided_decoding"].get("_dynamo_false_schema"):
+        max_tokens = 1
+    if sampling_params.max_tokens is None or sampling_params.max_tokens > max_tokens:
+        logger.info(
+            "Capping guided decoding max_tokens from %s to %s",
+            sampling_params.max_tokens,
+            max_tokens,
+        )
+        sampling_params.max_tokens = max_tokens
+
+
 class _DeferredAbort:
     """Defers engine_client.abort(request_id) until the first engine output.
 
@@ -303,17 +430,38 @@ def build_sampling_params(
     sampling_params = SamplingParams(**default_sampling_params)
     sampling_params.detokenize = False
 
-    # Handle guided_decoding - convert to StructuredOutputsParams
     sampling_options = request.get("sampling_options", {})
+    # Handle guided_decoding - convert to StructuredOutputsParams.
+    # Dynamo frontend sends structured_outputs through this internal field so
+    # vLLM can enforce forced/required tool choice and structured outputs in
+    # the grammar backend instead of relying on the text parser.
     guided_decoding = sampling_options.get("guided_decoding")
     if guided_decoding is not None and isinstance(guided_decoding, dict):
+        guided_decoding = _normalize_guided_decoding(guided_decoding)
+        sampling_options["guided_decoding"] = guided_decoding
+        json_object = guided_decoding.get("json_object")
+        if json_object is False:
+            json_object = None
         sampling_params.structured_outputs = StructuredOutputsParams(
             json=guided_decoding.get("json"),
             regex=guided_decoding.get("regex"),
             choice=guided_decoding.get("choice"),
             grammar=guided_decoding.get("grammar"),
+            json_object=json_object,
+            disable_fallback=guided_decoding.get("disable_fallback", False),
+            disable_any_whitespace=guided_decoding.get(
+                "disable_any_whitespace", False
+            ),
+            disable_additional_properties=guided_decoding.get(
+                "disable_additional_properties", False
+            ),
             whitespace_pattern=guided_decoding.get("whitespace_pattern"),
+            structural_tag=guided_decoding.get("structural_tag"),
         )
+        if sampling_params.structured_outputs is not None:
+            sampling_params.structured_outputs._backend = "xgrammar"
+            sampling_params.structured_outputs._backend_was_auto = True
+        sampling_params.skip_reading_prefix_cache = True
 
     # Apply remaining sampling_options
     for key, value in sampling_options.items():
@@ -381,6 +529,8 @@ def build_sampling_params(
         # Ensure at least 1 token generation by default when possible
         dynamic_default = max(1, model_max_len - input_length)
         sampling_params.max_tokens = dynamic_default
+
+    _cap_guided_decoding_tokens(request, sampling_params)
 
     return sampling_params
 

@@ -68,6 +68,164 @@ def map_finish_reason(raw_reason: str | None) -> FinishReason | None:
     return mapped
 
 
+def _structured_outputs_to_guided_decoding(structured_outputs: Any) -> dict[str, Any]:
+    guided: dict[str, Any] = {}
+    for attr, key in (
+        ("json", "json"),
+        ("regex", "regex"),
+        ("choice", "choice"),
+        ("grammar", "grammar"),
+        ("json_object", "json_object"),
+        ("structural_tag", "structural_tag"),
+        ("disable_fallback", "disable_fallback"),
+        ("disable_any_whitespace", "disable_any_whitespace"),
+        ("disable_additional_properties", "disable_additional_properties"),
+        ("whitespace_pattern", "whitespace_pattern"),
+    ):
+        value = getattr(structured_outputs, attr, None)
+        if value is not None and value is not False:
+            guided[key] = value
+    return guided
+
+
+def _normalize_json_schema_for_xgrammar(schema: Any) -> Any:
+    if isinstance(schema, list):
+        return [_normalize_json_schema_for_xgrammar(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    normalized = {
+        key: _normalize_json_schema_for_xgrammar(value)
+        for key, value in schema.items()
+    }
+    required = normalized.get("required")
+    properties = normalized.get("properties")
+
+    # Some clients send a property bag like {"host": {...}, "port": {...},
+    # "required": [...]}. Convert that to standard JSON Schema object form
+    # before handing it to xgrammar.
+    if properties is None and isinstance(required, list):
+        schema_keywords = {
+            "$schema",
+            "$defs",
+            "additionalProperties",
+            "allOf",
+            "anyOf",
+            "description",
+            "enum",
+            "format",
+            "items",
+            "maxItems",
+            "maxLength",
+            "maximum",
+            "minItems",
+            "minLength",
+            "minimum",
+            "not",
+            "oneOf",
+            "pattern",
+            "properties",
+            "required",
+            "title",
+            "type",
+        }
+        inferred_properties = {
+            key: value
+            for key, value in normalized.items()
+            if key not in schema_keywords and isinstance(value, dict)
+        }
+        if inferred_properties:
+            for key in inferred_properties:
+                normalized.pop(key, None)
+            normalized["type"] = normalized.get("type") or "object"
+            normalized["properties"] = inferred_properties
+            properties = inferred_properties
+
+    if isinstance(required, list):
+        if not isinstance(properties, dict):
+            properties = {}
+            normalized["properties"] = properties
+        for key in required:
+            if isinstance(key, str) and key not in properties:
+                properties[key] = {"type": "string", "minLength": 1}
+
+    for combinator in ("oneOf", "anyOf"):
+        branches = normalized.get(combinator)
+        if isinstance(branches, list):
+            repaired_branches = []
+            for branch in branches:
+                if isinstance(branch, dict):
+                    branch_properties = branch.get("properties")
+                    branch_required = branch.get("required")
+                    if (
+                        branch_required is None
+                        and isinstance(branch_properties, dict)
+                        and branch_properties
+                    ):
+                        branch = {
+                            **branch,
+                            "required": list(branch_properties.keys()),
+                        }
+                repaired_branches.append(branch)
+            normalized[combinator] = repaired_branches
+
+    if normalized.get("type") == "string":
+        if normalized.get("format") == "":
+            normalized.pop("format", None)
+        if "pattern" in normalized and any(
+            key in normalized for key in ("minLength", "maxLength", "format")
+        ):
+            # xgrammar can ignore length constraints when a pattern is present.
+            # Prefer length bounds because overlong strings cannot be repaired
+            # after generation.
+            normalized.pop("pattern", None)
+
+    return normalized
+
+
+def _tighten_json_guided_decoding(
+    guided_decoding: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if guided_decoding is None:
+        return None
+
+    if "json" in guided_decoding:
+        json_schema = guided_decoding.get("json")
+        if json_schema is False:
+            guided_decoding = dict(guided_decoding)
+            guided_decoding.pop("json", None)
+            guided_decoding["regex"] = "a" * 4096
+            guided_decoding["_dynamo_false_schema"] = True
+        else:
+            guided_decoding = dict(guided_decoding)
+            guided_decoding["json"] = _normalize_json_schema_for_xgrammar(json_schema)
+
+    if (
+        (guided_decoding.get("json") is not None or guided_decoding.get("json_object"))
+        and "disable_any_whitespace" not in guided_decoding
+        and "whitespace_pattern" not in guided_decoding
+    ):
+        guided_decoding = dict(guided_decoding)
+        guided_decoding["disable_any_whitespace"] = True
+
+    return guided_decoding
+
+
+def _attach_guided_decoding(
+    dynamo_preproc: dict[str, Any],
+    sampling_params: SamplingParams,
+) -> None:
+    structured_outputs = getattr(sampling_params, "structured_outputs", None)
+    if structured_outputs is None:
+        return
+
+    guided = _tighten_json_guided_decoding(
+        _structured_outputs_to_guided_decoding(structured_outputs)
+    )
+    if guided:
+        dynamo_preproc["sampling_options"]["guided_decoding"] = guided
+
+
 class VllmProcessor:
     def __init__(
         self,
@@ -270,7 +428,11 @@ class VllmProcessor:
             "eos_token_ids": self._get_eos_token_ids(),
             "annotations": [],
             "routing": request.get("routing"),
+            "request_for_sampling": {
+                "tool_choice": request_for_sampling.tool_choice,
+            },
         }
+        _attach_guided_decoding(dynamo_preproc, sp)
 
         # Forward multimodal URLs so the backend handler can load the media.
         mm_data = extract_mm_urls(request.get("messages") or [])
@@ -291,6 +453,7 @@ class VllmProcessor:
             tool_parser=tool_parser,
             reasoning_parser_class=self.reasoning_parser_class,
             chat_template_kwargs=chat_template_kwargs,
+            guided_tool_choice=request.get("tool_choice"),
         )
 
         async for item in self._generate_and_stream(

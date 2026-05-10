@@ -13,7 +13,7 @@ use axum::{
     body::Body,
     extract::State,
     http::Request,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -23,6 +23,7 @@ use axum::{
 };
 use base64::Engine as _;
 use bytes::Bytes;
+use dynamo_protocols::types::ChatCompletionToolChoiceOption;
 use dynamo_runtime::config::environment_names::llm as env_llm;
 use dynamo_runtime::{
     pipeline::{AsyncEngineContextProvider, Context},
@@ -69,6 +70,50 @@ pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
 
 const VALIDATION_PREFIX: &str = "Validation: ";
+
+fn disable_thinking_for_guided_outputs(request: &mut NvCreateChatCompletionRequest) {
+    let has_tools = request
+        .inner
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty());
+    let forced_tool_choice = matches!(
+        request.inner.tool_choice,
+        Some(ChatCompletionToolChoiceOption::Required)
+            | Some(ChatCompletionToolChoiceOption::Named(_))
+    );
+    let tools_may_be_used = has_tools
+        && !matches!(
+            request.inner.tool_choice,
+            Some(ChatCompletionToolChoiceOption::None)
+        );
+    let has_structured_outputs = request.structured_outputs.as_ref().is_some_and(|params| {
+        params.json.is_some()
+            || params.regex.is_some()
+            || params.choice.is_some()
+            || params.grammar.is_some()
+            || params.json_object == Some(true)
+            || params.structural_tag.is_some()
+    });
+    let has_response_format_constraint = request.inner.response_format.as_ref().is_some_and(|fmt| {
+        !matches!(fmt, dynamo_protocols::types::ResponseFormat::Text)
+    });
+    let has_common_guided_constraint = request.common.guided_json.is_some()
+        || request.common.guided_regex.is_some()
+        || request.common.guided_choice.is_some()
+        || request.common.guided_grammar.is_some();
+
+    if tools_may_be_used
+        || (has_tools && forced_tool_choice)
+        || has_structured_outputs
+        || has_response_format_constraint
+        || has_common_guided_constraint
+    {
+        let args = request.chat_template_args.get_or_insert_with(HashMap::new);
+        args.insert("enable_thinking".to_string(), serde_json::Value::Bool(false));
+        args.insert("thinking".to_string(), serde_json::Value::Bool(false));
+    }
+}
 
 // Default axum max body limit without configuring is 2MB: https://docs.rs/axum/latest/axum/extract/struct.DefaultBodyLimit.html
 /// Default body limit in bytes (45MB) to support 500k+ token payloads.
@@ -563,7 +608,12 @@ async fn completions_single(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        Ok(response)
     } else {
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
@@ -742,7 +792,12 @@ async fn completions_batch(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        Ok(response)
     } else {
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
@@ -1171,6 +1226,7 @@ async fn chat_completions(
             request.inner.max_completion_tokens = Some(template.max_completion_tokens);
         }
     }
+    disable_thinking_for_guided_outputs(&mut request);
 
     // Capture the resolved model after template application for metrics and engine lookup
     // todo - make the protocols be optional for model name
@@ -1325,7 +1381,12 @@ async fn chat_completions(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        Ok(response)
     } else {
         // Check first event for backend errors before aggregating (non-streaming only)
         let stream_with_check =
@@ -1758,7 +1819,12 @@ async fn responses(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        Ok(response)
     } else {
         // Non-streaming path: aggregate stream into single response
 

@@ -485,6 +485,7 @@ pub struct JailedStream {
     /// when a tool_call_parser is active and the parser-aware MarkerBased path is used).
     named_tool_name: Option<String>,
     tool_definitions: Option<Vec<dynamo_parsers::tool_calling::ToolDefinition>>,
+    single_object_argument_overrides: HashMap<String, serde_json::Value>,
     emission_mode: EmissionMode,
     marker_matcher: MarkerMatcher,
     jail_mode: JailMode,
@@ -555,6 +556,7 @@ impl JailedStream {
 
                     // Process each choice independently using the new architecture
                     for choice in &chat_response.inner.choices {
+                        let starts_jailed = matches!(self.jail_mode, JailMode::Immediate { .. });
                         if let Some(ref content) = choice.delta.content {
                             // Jailing only applies to text content
                             let text_content = match content {
@@ -563,7 +565,6 @@ impl JailedStream {
                             };
 
                             if let Some(text) = text_content {
-                                let starts_jailed = matches!(self.jail_mode, JailMode::Immediate { .. });
                                 let choice_state = choice_states.get_or_create_state(choice.index, starts_jailed);
 
                                 if let Some(reasoning_content) = &choice.delta.reasoning_content {
@@ -599,12 +600,28 @@ impl JailedStream {
                             // Handle choices without content (e.g., final chunks with finish_reason)
                             // Only filter out if this choice was ever jailed and lacks role
                             // (to avoid aggregator issues with deltas missing role after unjail)
-                            let choice_state = choice_states.get_or_create_state(choice.index, false);
+                            let choice_state = choice_states.get_or_create_state(choice.index, starts_jailed);
+                            if choice.finish_reason.is_some() {
+                                choice_state.stream_finish_reason = choice.finish_reason;
+                            }
+                            if let Some(reasoning_content) = &choice.delta.reasoning_content {
+                                let pending = choice_state
+                                    .pending_reasoning_content
+                                    .get_or_insert_with(String::new);
+                                pending.push_str(reasoning_content);
+                            }
                             let was_ever_jailed = !choice_state.accumulated_content.is_empty() || choice_state.is_jailed;
 
-                            let should_emit = choice.delta.role.is_some()
-                                || choice.delta.tool_calls.is_some()
-                                || !was_ever_jailed; // Always pass through if never jailed
+                            let should_emit = if starts_jailed
+                                && was_ever_jailed
+                                && choice.delta.tool_calls.is_none()
+                            {
+                                false
+                            } else {
+                                choice.delta.role.is_some()
+                                    || choice.delta.tool_calls.is_some()
+                                    || !was_ever_jailed
+                            }; // Always pass through if never jailed
 
                             if should_emit {
                                 let pass_through_choice = ChatChoiceStream {
@@ -996,16 +1013,30 @@ impl JailedStream {
         json_content: &str,
         format: &ToolChoiceFormat,
     ) -> anyhow::Result<Vec<ChatCompletionMessageToolCallChunk>> {
-        let parsed = serde_json::from_str::<serde_json::Value>(json_content)?;
+        let (parsed, _parsed_json) = match serde_json::from_str::<serde_json::Value>(json_content) {
+            Ok(parsed) => (parsed, json_content.to_string()),
+            Err(err) => {
+                let repaired = Self::escape_json_string_control_chars(json_content);
+                let parsed = serde_json::from_str::<serde_json::Value>(&repaired).map_err(|_| err)?;
+                (parsed, repaired)
+            }
+        };
 
         match format {
             ToolChoiceFormat::SingleObject { tool_name } => {
                 // For named tool choice: JSON is the parameters object
                 if parsed.is_object() {
+                    let mut parsed = parsed;
+                    if let Some(object) = parsed.as_object_mut() {
+                        for (key, value) in &self.single_object_argument_overrides {
+                            object.insert(key.clone(), value.clone());
+                        }
+                    }
+                    let parsed_json = serde_json::to_string(&parsed)?;
                     Ok(vec![Self::create_tool_call_chunk(
                         0,
                         tool_name.clone(),
-                        json_content.to_string(),
+                        parsed_json,
                     )])
                 } else {
                     Ok(vec![])
@@ -1030,6 +1061,48 @@ impl JailedStream {
                 }
             }
         }
+    }
+
+    fn escape_json_string_control_chars(json_content: &str) -> String {
+        let mut repaired = String::with_capacity(json_content.len());
+        let mut in_string = false;
+        let mut escaped = false;
+
+        for ch in json_content.chars() {
+            if escaped {
+                repaired.push(ch);
+                escaped = false;
+                continue;
+            }
+
+            if in_string {
+                match ch {
+                    '\\' => {
+                        repaired.push(ch);
+                        escaped = true;
+                    }
+                    '"' => {
+                        repaired.push(ch);
+                        in_string = false;
+                    }
+                    '\n' => repaired.push_str("\\n"),
+                    '\r' => repaired.push_str("\\r"),
+                    '\t' => repaired.push_str("\\t"),
+                    ch if ch.is_control() => {
+                        use std::fmt::Write;
+                        let _ = write!(repaired, "\\u{:04x}", ch as u32);
+                    }
+                    _ => repaired.push(ch),
+                }
+            } else {
+                if ch == '"' {
+                    in_string = true;
+                }
+                repaired.push(ch);
+            }
+        }
+
+        repaired
     }
 
     /// Check if accumulated content contains complete tool calls that can be parsed
@@ -1092,8 +1165,11 @@ impl JailedStream {
                                         // tool_choice mode: apply specific finish_reason logic
                                         match format {
                                             ToolChoiceFormat::SingleObject { .. } => {
-                                                // Named tool choice: keep Stop
-                                                // (already Stop, no change needed)
+                                                // Named tool choice still represents a completed
+                                                // function call once the jail emitted tool calls.
+                                                if has_tool_calls {
+                                                    choice.finish_reason = Some(FinishReason::ToolCalls);
+                                                }
                                             }
                                             ToolChoiceFormat::ArrayOfTools => {
                                                 // Required tool choice: change to ToolCalls
@@ -1125,6 +1201,7 @@ pub struct JailedStreamBuilder {
     /// when a tool_call_parser is active and the parser-aware MarkerBased path is used).
     named_tool_name: Option<String>,
     tool_definitions: Option<Vec<dynamo_parsers::tool_calling::ToolDefinition>>,
+    single_object_argument_overrides: HashMap<String, serde_json::Value>,
     emission_mode: EmissionMode,
     jail_mode: JailMode,
 }
@@ -1138,6 +1215,7 @@ impl JailedStreamBuilder {
             tool_call_parser: None,
             named_tool_name: None,
             tool_definitions: None,
+            single_object_argument_overrides: HashMap::new(),
             emission_mode: EmissionMode::default(),
             jail_mode: JailMode::MarkerBased,
         }
@@ -1195,6 +1273,15 @@ impl JailedStreamBuilder {
         tools: Vec<dynamo_parsers::tool_calling::ToolDefinition>,
     ) -> Self {
         self.tool_definitions = Some(tools);
+        self
+    }
+
+    /// Override named tool arguments extracted from explicit user wording.
+    pub fn single_object_argument_overrides(
+        mut self,
+        overrides: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        self.single_object_argument_overrides = overrides;
         self
     }
 
@@ -1310,6 +1397,7 @@ impl JailedStreamBuilder {
             tool_call_parser: self.tool_call_parser,
             named_tool_name: self.named_tool_name,
             tool_definitions: self.tool_definitions,
+            single_object_argument_overrides: self.single_object_argument_overrides,
             emission_mode: self.emission_mode,
             marker_matcher,
             jail_mode: self.jail_mode,

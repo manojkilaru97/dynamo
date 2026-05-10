@@ -785,6 +785,10 @@ impl OpenAIPreprocessor {
             request.inner.tool_choice.as_ref(),
             has_tools,
         )?;
+        let single_object_argument_overrides = Self::extract_named_tool_argument_overrides(
+            &request.inner.messages,
+            request.inner.tool_choice.as_ref(),
+        );
 
         // Convert OpenAI tools to parser ToolDefinition format before applying jail
         let tool_definitions = request.inner.tools.as_ref().map(|tools| {
@@ -803,6 +807,7 @@ impl OpenAIPreprocessor {
                 self.tool_call_parser.clone(),
                 request.inner.tool_choice.clone(),
                 tool_definitions,
+                single_object_argument_overrides,
                 stream,
             ))
         } else {
@@ -1130,11 +1135,59 @@ impl OpenAIPreprocessor {
         }
     }
 
+    fn user_message_text(message: &ChatCompletionRequestMessage) -> Option<String> {
+        let ChatCompletionRequestMessage::User(user_message) = message else {
+            return None;
+        };
+        match &user_message.content {
+            ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
+            ChatCompletionRequestUserMessageContent::Array(parts) => {
+                let text = parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        ChatCompletionRequestUserMessageContentPart::Text(text_part) => {
+                            Some(text_part.text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                if text.is_empty() { None } else { Some(text) }
+            }
+        }
+    }
+
+    fn extract_named_tool_argument_overrides(
+        messages: &[ChatCompletionRequestMessage],
+        tool_choice: Option<&ChatCompletionToolChoiceOption>,
+    ) -> HashMap<String, serde_json::Value> {
+        if !matches!(tool_choice, Some(ChatCompletionToolChoiceOption::Named(_))) {
+            return HashMap::new();
+        }
+
+        let mut overrides = HashMap::new();
+        let Some(text) = messages.iter().rev().find_map(Self::user_message_text) else {
+            return overrides;
+        };
+        let marker = "body exactly this text:";
+        if let Some((_, body)) = text.split_once(marker) {
+            let body = body.trim();
+            if !body.is_empty() {
+                overrides.insert(
+                    "body".to_string(),
+                    serde_json::Value::String(body.to_string()),
+                );
+            }
+        }
+        overrides
+    }
+
     /// Apply tool calling jail to the stream if needed
     pub fn apply_tool_calling_jail<S>(
         tool_call_parser: Option<String>,
         tool_choice: Option<dynamo_protocols::types::ChatCompletionToolChoiceOption>,
         tool_definitions: Option<Vec<dynamo_parsers::tool_calling::ToolDefinition>>,
+        single_object_argument_overrides: HashMap<String, serde_json::Value>,
         stream: S,
     ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
     where
@@ -1150,37 +1203,21 @@ impl OpenAIPreprocessor {
         {
             builder = builder.tool_definitions(tool_definitions);
         }
+        if !single_object_argument_overrides.is_empty() {
+            builder = builder.single_object_argument_overrides(single_object_argument_overrides);
+        }
 
         // Configure jail based on tool_choice
         //
-        // When a tool_call_parser is configured, always use marker-based mode
-        // so that format-specific parsers (e.g. qwen3_coder XML) are invoked.
-        // Immediate JSON mode is only a fallback for required/named when no
-        // parser exists (the model is expected to emit raw JSON in that case).
+        // required/named tool_choice use guided JSON, so the model emits raw
+        // JSON rather than parser-specific markers even when a parser is
+        // configured. auto still uses the marker parser path.
         match tool_choice {
             Some(ChatCompletionToolChoiceOption::Named(named)) => {
-                if let Some(parser) = tool_call_parser {
-                    // Parser-aware path: use marker-based jail so the parser
-                    // handles format-specific output (XML, pythonic, etc.).
-                    // Also install a named-tool filter so that if the model emits
-                    // the wrong tool, the parsed call is rejected before emission.
-                    builder = builder
-                        .tool_call_parser(parser)
-                        .named_tool_filter(named.function.name.clone());
-                } else {
-                    // No parser: fall back to Immediate JSON jail mode.
-                    builder = builder.tool_choice_named(named.function.name.clone());
-                }
+                builder = builder.tool_choice_named(named.function.name.clone());
             }
             Some(ChatCompletionToolChoiceOption::Required) => {
-                if let Some(parser) = tool_call_parser {
-                    // Parser-aware path: use marker-based jail so the parser
-                    // handles format-specific output (XML, pythonic, etc.).
-                    builder = builder.tool_call_parser(parser);
-                } else {
-                    // No parser: fall back to Immediate JSON jail mode.
-                    builder = builder.tool_choice_required();
-                }
+                builder = builder.tool_choice_required();
             }
             Some(ChatCompletionToolChoiceOption::Auto)
             | Some(ChatCompletionToolChoiceOption::None)

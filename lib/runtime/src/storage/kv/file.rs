@@ -126,7 +126,8 @@ impl Store for FileStore {
         ttl: Option<Duration>,
     ) -> Result<Self::Bucket, StoreError> {
         let p = self.root.join(bucket_name);
-        if let Some(dir) = self.active_dirs.lock().get(&p) {
+        let mut active_dirs = self.active_dirs.lock();
+        if let Some(dir) = active_dirs.get(&p) {
             return Ok(dir.clone());
         };
 
@@ -142,7 +143,7 @@ impl Store for FileStore {
             fs::create_dir_all(&p).map_err(to_fs_err)?;
         }
         let dir = Directory::new(self.root.clone(), p.clone(), ttl.unwrap_or(DEFAULT_TTL));
-        self.active_dirs.lock().insert(p, dir.clone());
+        active_dirs.insert(p, dir.clone());
         Ok(dir)
     }
 
