@@ -428,6 +428,32 @@ def test_preprocessed_sampling_params_preserve_sglang_controls():
     }
 
 
+def test_openai_response_format_becomes_guided_json_schema():
+    handler = object.__new__(DecodeWorkerHandler)
+
+    params = handler._build_sampling_params(
+        {
+            "messages": [{"role": "user", "content": "Return JSON."}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ticket",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"summary": {"type": "string"}},
+                        "required": ["summary"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        }
+    )
+
+    schema = json.loads(params["json_schema"])
+    assert schema["properties"]["summary"]["maxLength"] == 4096
+    assert schema["required"] == ["summary"]
+
+
 @pytest.mark.asyncio
 async def test_worker_admission_slots_track_release_by_context():
     handler, recorder = _make_decode_handler_for_slot_tests(limit=2)

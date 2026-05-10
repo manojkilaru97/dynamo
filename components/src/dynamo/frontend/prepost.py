@@ -80,6 +80,7 @@ def _prepare_request(
     *,
     tokenizer: TokenizerLike,
     tool_parser_class: type[ToolParser] | None,
+    reasoning_parser_class: type[ReasoningParser] | None = None,
 ) -> tuple[ChatCompletionRequest, ToolParser | None, dict[str, Any], Any, ChatParams]:
     """Validate request and build arguments for template rendering.
 
@@ -98,6 +99,11 @@ def _prepare_request(
         if request_for_sampling.tools and any(
             not hasattr(tool, "model_dump") for tool in request_for_sampling.tools
         ):
+            request_for_sampling = ChatCompletionRequest.model_validate(request)
+        elif request_for_sampling.response_format or request_for_sampling.structured_outputs:
+            # Validation materializes response_format into structured_outputs.
+            # Without this, SGLang receives no guided-decoding constraint and
+            # can free-run on structured-output requests.
             request_for_sampling = ChatCompletionRequest.model_validate(request)
     else:
         request_for_sampling = ChatCompletionRequest.model_validate(request)

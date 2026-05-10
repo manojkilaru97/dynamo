@@ -36,7 +36,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
     SERVICE_OVERLOADED_ERROR_TYPE = "service_overloaded"
     THINK_START = "<think>"
     THINK_END = "</think>"
-    DEFAULT_XGRAMMAR_MAX_STRING_LENGTH = 4096
+    DEFAULT_XGRAMMAR_MAX_STRING_LENGTH = int(
+        os.getenv("DYN_XGRAMMAR_DEFAULT_MAX_STRING_LENGTH", "4096")
+    )
     DEFAULT_XGRAMMAR_MAX_ARRAY_ITEMS = 64
     DEFAULT_XGRAMMAR_MAX_OBJECT_PROPERTIES = 64
     DEFAULT_XGRAMMAR_MAX_REASONING_CHARS = 8192
@@ -780,6 +782,44 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
         return params
 
+    @classmethod
+    def _openai_structured_request_to_guided(cls, request: Dict[str, Any]) -> Dict[str, Any]:
+        structured_outputs = request.get("structured_outputs")
+        if isinstance(structured_outputs, dict):
+            guided = {
+                key: value
+                for key, value in structured_outputs.items()
+                if key
+                in {
+                    "choice",
+                    "grammar",
+                    "json",
+                    "json_object",
+                    "regex",
+                    "structural_tag",
+                }
+                and value is not None
+                and value is not False
+            }
+            if guided:
+                return guided
+
+        response_format = request.get("response_format")
+        if not isinstance(response_format, dict):
+            return {}
+
+        response_type = response_format.get("type")
+        if response_type == "json_object":
+            return {"json_object": True}
+        if response_type != "json_schema":
+            return {}
+
+        json_schema = response_format.get("json_schema") or {}
+        schema = json_schema.get("schema")
+        if schema is None:
+            return {}
+        return {"json": schema}
+
     @staticmethod
     def _validate_ebnf_grammar(grammar: Any) -> None:
         if not isinstance(grammar, str):
@@ -925,6 +965,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             )
         else:
             # OpenAI request format
+            guided_decoding = request.get("guided_decoding")
+            if guided_decoding is None:
+                guided_decoding = self._openai_structured_request_to_guided(request)
             param_mapping = {
                 "presence_penalty": request.get("presence_penalty"),
                 "frequency_penalty": request.get("frequency_penalty"),
@@ -936,9 +979,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 "max_new_tokens": request.get("max_tokens"),
                 "ignore_eos": request.get("ignore_eos"),
             }
-            param_mapping.update(
-                self._guided_to_sglang_params(request.get("guided_decoding"))
-            )
+            param_mapping.update(self._guided_to_sglang_params(guided_decoding))
 
         sampling_params = {k: v for k, v in param_mapping.items() if v is not None}
         if os.environ.get("DYN_SGLANG_LOG_SAMPLING_PARAMS") == "1":

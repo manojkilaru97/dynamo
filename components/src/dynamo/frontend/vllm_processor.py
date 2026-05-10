@@ -79,6 +79,39 @@ def map_finish_reason(raw_reason: str | None) -> FinishReason | None:
     return mapped
 
 
+def _structured_outputs_to_guided_decoding(structured_outputs: Any) -> dict[str, Any]:
+    guided: dict[str, Any] = {}
+    for attr, key in (
+        ("json", "json"),
+        ("regex", "regex"),
+        ("choice", "choice"),
+        ("grammar", "grammar"),
+        ("json_object", "json_object"),
+        ("structural_tag", "structural_tag"),
+        ("disable_fallback", "disable_fallback"),
+        ("disable_any_whitespace", "disable_any_whitespace"),
+        ("disable_additional_properties", "disable_additional_properties"),
+        ("whitespace_pattern", "whitespace_pattern"),
+    ):
+        value = getattr(structured_outputs, attr, None)
+        if value is not None and value is not False:
+            guided[key] = value
+    return guided
+
+
+def _attach_guided_decoding(
+    dynamo_preproc: dict[str, Any],
+    sampling_params: SamplingParams,
+) -> None:
+    structured_outputs = getattr(sampling_params, "structured_outputs", None)
+    if structured_outputs is None:
+        return
+
+    guided = _structured_outputs_to_guided_decoding(structured_outputs)
+    if guided:
+        dynamo_preproc["sampling_options"]["guided_decoding"] = guided
+
+
 # --- Worker process globals (initialized once per process by _init_worker) ---
 _w_input_processor: InputProcessor | None = None
 _w_tokenizer: Any = None
@@ -255,6 +288,7 @@ def _preprocess_worker(
         else [],
         "annotations": [],
     }
+    _attach_guided_decoding(dynamo_preproc, sp)
 
     return PreprocessWorkerResult(
         dynamo_preproc=dynamo_preproc,
@@ -494,6 +528,7 @@ class VllmProcessor:
             else [],
             "annotations": [],
         }
+        _attach_guided_decoding(dynamo_preproc, sp)
 
         post = StreamingPostProcessor(
             tokenizer=self.tokenizer,
