@@ -1452,17 +1452,39 @@ fn load_config() -> LoggingConfig {
 }
 
 #[derive(Serialize)]
-struct JsonLog<'a> {
+struct JsonLog {
     time: String,
     level: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    file: Option<&'a str>,
+    file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     line: Option<u32>,
     target: String,
     message: serde_json::Value,
     #[serde(flatten)]
     fields: BTreeMap<String, serde_json::Value>,
+}
+
+fn sanitize_source_path(path: Option<&str>) -> Option<String> {
+    let path = path?;
+
+    if let Some((_, suffix)) = path.split_once("/ds/dynamo/") {
+        return Some(format!("ds/dynamo/{suffix}"));
+    }
+
+    if let Some((_, suffix)) = path.split_once("/cargo/registry/src/") {
+        let mut parts = suffix.splitn(2, '/');
+        let _registry_hash = parts.next();
+        if let Some(crate_path) = parts.next() {
+            return Some(format!("cargo/registry/{crate_path}"));
+        }
+    }
+
+    if path.starts_with('/') {
+        return path.rsplit('/').next().map(str::to_string);
+    }
+
+    Some(path.to_string())
 }
 
 struct TimeFormatter {
@@ -1680,7 +1702,7 @@ where
         let log = JsonLog {
             level: metadata.level().to_string(),
             time,
-            file: metadata.file(),
+            file: sanitize_source_path(metadata.file()),
             line: metadata.line(),
             target: target_override.unwrap_or_else(|| metadata.target().to_string()),
             message,
@@ -2344,6 +2366,27 @@ pub mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn test_sanitize_source_path_removes_user_home_prefixes() {
+        assert_eq!(
+            sanitize_source_path(Some(
+                "/home/scratch.mkilaru_gpu/mistral/ds/dynamo/lib/runtime/src/system_status_server.rs"
+            )),
+            Some("ds/dynamo/lib/runtime/src/system_status_server.rs".to_string())
+        );
+        assert_eq!(
+            sanitize_source_path(Some(
+                "/home/scratch.mkilaru_gpu/home/arm-tools/rust/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tower-http-0.6.8/src/trace/on_failure.rs"
+            )),
+            Some("cargo/registry/tower-http-0.6.8/src/trace/on_failure.rs".to_string())
+        );
+        assert_eq!(
+            sanitize_source_path(Some("/private/build/path/generated.rs")),
+            Some("generated.rs".to_string())
+        );
+        assert_eq!(sanitize_source_path(None), None);
     }
 
     #[test]
