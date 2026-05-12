@@ -1865,6 +1865,45 @@ mod tests {
         assert_eq!(content[2]["text"], " now.");
     }
 
+    #[test]
+    fn test_resolve_nvcf_asset_refs_with_legacy_headers_and_uuid_asset_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let asset_id = "39f4fec2-8d55-474c-acdc-cd9387602149";
+        std::fs::write(temp_dir.path().join(asset_id), b"test-image").unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "NVCF-ASSET-DIR",
+            axum::http::HeaderValue::from_str(temp_dir.path().to_str().unwrap()).unwrap(),
+        );
+        headers.insert(
+            "NVCF-FUNCTION-ASSET-IDS",
+            axum::http::HeaderValue::from_static("39f4fec2-8d55-474c-acdc-cd9387602149"),
+        );
+
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "user",
+                "content": format!(
+                    "Look <img src=\"data:image/jpeg;asset_id,'{}'\"/> here.",
+                    asset_id
+                )
+            }]
+        }))
+        .unwrap();
+
+        resolve_nvcf_asset_refs_in_chat_request(&mut request, &headers).unwrap();
+
+        let value = serde_json::to_value(&request).unwrap();
+        let content = value["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[1]["type"], "image_url");
+        let url = content[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/jpeg;base64,"));
+        assert!(!url.contains("asset_id"));
+        assert!(!serde_json::to_string(&request).unwrap().contains(asset_id));
+    }
+
     fn http_error_from_engine(code: u16) -> Result<(), anyhow::Error> {
         Err(HttpError {
             code,
