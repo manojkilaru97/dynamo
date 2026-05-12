@@ -3,6 +3,7 @@
 
 use std::{
     collections::HashSet,
+    path::Path,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -20,13 +21,16 @@ use axum::{
     },
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose};
 use dynamo_runtime::config::environment_names::llm as env_llm;
 use dynamo_runtime::{
     pipeline::{AsyncEngineContextProvider, Context},
     protocols::annotated::AnnotationsProvider,
 };
 use futures::{StreamExt, stream};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use super::{
     RouteDoc,
@@ -124,6 +128,22 @@ impl ErrorMessage {
     pub fn internal_server_error(msg: &str) -> ErrorResponse {
         tracing::error!("Internal server error: {msg}");
         let code = StatusCode::INTERNAL_SERVER_ERROR;
+        let error_type = map_error_code_to_error_type(code);
+        (
+            code,
+            Json(ErrorMessage {
+                message: msg.to_string(),
+                error_type,
+                code: code.as_u16(),
+            }),
+        )
+    }
+
+    /// Bad Request
+    /// Return this error when the client request is invalid.
+    pub fn bad_request(msg: &str) -> ErrorResponse {
+        tracing::warn!("Bad request: {msg}");
+        let code = StatusCode::BAD_REQUEST;
         let error_type = map_error_code_to_error_type(code);
         (
             code,
@@ -271,6 +291,253 @@ fn get_or_create_request_id(primary: Option<&str>, headers: &HeaderMap) -> Strin
     };
 
     uuid.to_string()
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn normalize_asset_id(value: &str) -> String {
+    let mut out = value.trim().trim_matches(',').trim().to_string();
+    loop {
+        let bytes = out.as_bytes();
+        if out.len() >= 2
+            && ((bytes[0] == b'\'' && bytes[out.len() - 1] == b'\'')
+                || (bytes[0] == b'"' && bytes[out.len() - 1] == b'"'))
+        {
+            out = out[1..out.len() - 1].trim().to_string();
+        } else {
+            return out;
+        }
+    }
+}
+
+fn resolve_nvcf_asset_data_url(
+    data_url: &str,
+    asset_root: &Path,
+    allowed_ids: &HashSet<String>,
+) -> Result<Option<String>, String> {
+    let data_url_re =
+        Regex::new(r"^data:(?P<mime>(?:image|video|audio)/[^;]+);asset_id,(?P<asset_id>.+)$")
+            .expect("valid NVCF asset_id regex");
+    let Some(captures) = data_url_re.captures(data_url) else {
+        return Ok(None);
+    };
+
+    let mime = captures
+        .name("mime")
+        .map(|m| m.as_str())
+        .ok_or_else(|| "Missing asset MIME type".to_string())?;
+    let asset_id = normalize_asset_id(
+        captures
+            .name("asset_id")
+            .map(|m| m.as_str())
+            .ok_or_else(|| "Missing asset id".to_string())?,
+    );
+
+    if !allowed_ids.contains(&asset_id) {
+        return Err(format!(
+            "Asset id '{asset_id}' is not listed in NVCF asset references"
+        ));
+    }
+
+    let file_path = asset_root.join(&asset_id);
+    let canonical_file = file_path.canonicalize().map_err(|err| {
+        format!(
+            "NVCF asset file not found for asset id '{asset_id}' at {}: {err}",
+            file_path.display()
+        )
+    })?;
+    if canonical_file != asset_root && !canonical_file.starts_with(asset_root) {
+        return Err(format!(
+            "Asset id '{asset_id}' resolves outside the NVCF asset directory"
+        ));
+    }
+
+    let raw = std::fs::read(&canonical_file).map_err(|err| {
+        format!(
+            "Failed to read NVCF asset file for asset id '{asset_id}' at {}: {err}",
+            canonical_file.display()
+        )
+    })?;
+    let encoded = general_purpose::STANDARD.encode(raw);
+    Ok(Some(format!("data:{mime};base64,{encoded}")))
+}
+
+fn media_part_for_asset_url(
+    src: &str,
+    asset_root: &Path,
+    allowed_ids: &HashSet<String>,
+) -> Result<Option<Value>, String> {
+    let Some(resolved_url) = resolve_nvcf_asset_data_url(src, asset_root, allowed_ids)? else {
+        return Ok(None);
+    };
+
+    if src.starts_with("data:image/") {
+        Ok(Some(json!({
+            "type": "image_url",
+            "image_url": {"url": resolved_url}
+        })))
+    } else if src.starts_with("data:video/") {
+        Ok(Some(json!({
+            "type": "video_url",
+            "video_url": {"url": resolved_url}
+        })))
+    } else if src.starts_with("data:audio/") {
+        Ok(Some(json!({
+            "type": "audio_url",
+            "audio_url": {"url": resolved_url}
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
+fn resolve_nvcf_asset_refs_in_content(
+    content: &mut Value,
+    asset_root: &Path,
+    allowed_ids: &HashSet<String>,
+) -> Result<(), String> {
+    if let Some(parts) = content.as_array_mut() {
+        for part in parts.iter_mut() {
+            let Some(part_obj) = part.as_object_mut() else {
+                continue;
+            };
+            for field in ["image_url", "video_url", "audio_url"] {
+                let Some(url_obj) = part_obj.get_mut(field) else {
+                    continue;
+                };
+                if let Some(url) = url_obj.get("url").and_then(Value::as_str) {
+                    if let Some(resolved_url) =
+                        resolve_nvcf_asset_data_url(url, asset_root, allowed_ids)?
+                    {
+                        *url_obj = json!({ "url": resolved_url });
+                    }
+                } else if let Some(url) = url_obj.as_str() {
+                    if let Some(resolved_url) =
+                        resolve_nvcf_asset_data_url(url, asset_root, allowed_ids)?
+                    {
+                        *url_obj = json!({ "url": resolved_url });
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let Some(text) = content.as_str() else {
+        return Ok(());
+    };
+    if !text.contains(";asset_id,") {
+        return Ok(());
+    }
+
+    let tag_re = Regex::new(
+        r#"(?is)<(?P<tag>img|video|audio)\s+[^>]*src\s*=\s*(?:"(?P<src_d>[^"]+)"|'(?P<src_s>[^']+)')[^>]*>"#,
+    )
+    .expect("valid media tag regex");
+    let mut parts = Vec::new();
+    let mut offset = 0;
+    let mut transformed = false;
+
+    for captures in tag_re.captures_iter(text) {
+        let Some(full_match) = captures.get(0) else {
+            continue;
+        };
+        if full_match.start() > offset {
+            let prefix = &text[offset..full_match.start()];
+            if !prefix.is_empty() {
+                parts.push(json!({ "type": "text", "text": prefix }));
+            }
+        }
+
+        let src = captures
+            .name("src_d")
+            .or_else(|| captures.name("src_s"))
+            .map(|m| m.as_str())
+            .unwrap_or_default();
+        if let Some(media_part) = media_part_for_asset_url(src, asset_root, allowed_ids)? {
+            parts.push(media_part);
+            transformed = true;
+        } else {
+            parts.push(json!({ "type": "text", "text": full_match.as_str() }));
+        }
+        offset = full_match.end();
+    }
+
+    if transformed {
+        if offset < text.len() {
+            let tail = &text[offset..];
+            if !tail.is_empty() {
+                parts.push(json!({ "type": "text", "text": tail }));
+            }
+        }
+        *content = Value::Array(parts);
+    }
+
+    Ok(())
+}
+
+fn resolve_nvcf_asset_refs_in_chat_request(
+    request: &mut NvCreateChatCompletionRequest,
+    headers: &HeaderMap,
+) -> Result<(), String> {
+    let Some(asset_dir) = header_str(headers, &["NVCF-INPUT-ASSET-DIR", "NVCF-ASSET-DIR"]) else {
+        return Ok(());
+    };
+    let Some(allowed_ids_hdr) = header_str(
+        headers,
+        &["NVCF-INPUT-ASSET-REFERENCES", "NVCF-FUNCTION-ASSET-IDS"],
+    ) else {
+        return Ok(());
+    };
+
+    let asset_root = Path::new(asset_dir)
+        .canonicalize()
+        .map_err(|err| format!("Invalid NVCF asset directory '{asset_dir}': {err}"))?;
+    if !asset_root.is_dir() {
+        return Err(format!(
+            "Invalid NVCF asset directory '{}': not a directory",
+            asset_root.display()
+        ));
+    }
+
+    let allowed_ids: HashSet<String> = allowed_ids_hdr
+        .split(',')
+        .map(normalize_asset_id)
+        .filter(|id| !id.is_empty())
+        .collect();
+    if allowed_ids.is_empty() {
+        return Ok(());
+    }
+
+    let unsupported_fields = request.unsupported_fields.clone();
+    let mut value = serde_json::to_value(&*request)
+        .map_err(|err| format!("Failed to serialize chat request for asset resolution: {err}"))?;
+    let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+
+    for message in messages.iter_mut() {
+        if let Some(content) = message.get_mut("content") {
+            resolve_nvcf_asset_refs_in_content(content, &asset_root, &allowed_ids)?;
+        }
+    }
+
+    let mut resolved_request: NvCreateChatCompletionRequest = serde_json::from_value(value)
+        .map_err(|err| {
+            format!("Failed to deserialize chat request after asset resolution: {err}")
+        })?;
+    resolved_request.unsupported_fields = unsupported_fields;
+    *request = resolved_request;
+
+    Ok(())
 }
 
 /// OpenAI Completions Request Handler
@@ -701,10 +968,14 @@ async fn embeddings(
 async fn handler_chat_completions(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(request): Json<NvCreateChatCompletionRequest>,
+    Json(mut request): Json<NvCreateChatCompletionRequest>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
+
+    resolve_nvcf_asset_refs_in_chat_request(&mut request, &headers).map_err(|err| {
+        ErrorMessage::bad_request(&format!("Failed to resolve NVCF asset references: {err}"))
+    })?;
 
     // create the context for the request
     let request_id = get_or_create_request_id(request.inner.user.as_deref(), &headers);
@@ -1516,6 +1787,83 @@ mod tests {
     };
 
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
+
+    fn asset_headers(asset_dir: &Path, asset_ids: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "NVCF-INPUT-ASSET-DIR",
+            axum::http::HeaderValue::from_str(asset_dir.to_str().unwrap()).unwrap(),
+        );
+        headers.insert(
+            "NVCF-INPUT-ASSET-REFERENCES",
+            axum::http::HeaderValue::from_str(asset_ids).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn test_resolve_nvcf_asset_refs_in_structured_image_part() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("dog.jpg"), b"test-image").unwrap();
+
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;asset_id,dog.jpg"}
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        resolve_nvcf_asset_refs_in_chat_request(
+            &mut request,
+            &asset_headers(temp_dir.path(), "dog.jpg"),
+        )
+        .unwrap();
+
+        let value = serde_json::to_value(&request).unwrap();
+        let url = value["messages"][0]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap();
+        assert!(url.starts_with("data:image/jpeg;base64,"));
+        assert!(!url.contains("asset_id"));
+    }
+
+    #[test]
+    fn test_resolve_nvcf_asset_refs_in_html_video_tag_with_quoted_asset_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("clip.mp4"), b"test-video").unwrap();
+
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "user",
+                "content": "Analyze <video src=\"data:video/mp4;asset_id,'clip.mp4'\"/> now."
+            }]
+        }))
+        .unwrap();
+
+        resolve_nvcf_asset_refs_in_chat_request(
+            &mut request,
+            &asset_headers(temp_dir.path(), "clip.mp4"),
+        )
+        .unwrap();
+
+        let value = serde_json::to_value(&request).unwrap();
+        let content = value["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "video_url");
+        let url = content[1]["video_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:video/mp4;base64,"));
+        assert!(!url.contains("asset_id"));
+        assert_eq!(content[2]["text"], " now.");
+    }
 
     fn http_error_from_engine(code: u16) -> Result<(), anyhow::Error> {
         Err(HttpError {
