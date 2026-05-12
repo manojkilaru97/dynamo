@@ -6,6 +6,7 @@
 //! The following environment variables are used to configure the NATS client:
 //!
 //! - `NATS_SERVER`: the NATS server address
+//! - `DYN_NATS_REQUEST_TIMEOUT_SECS`: request/reply timeout in seconds
 //!
 //! For authentication, the following environment variables are used and prioritized in the following order:
 //!
@@ -32,6 +33,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::fs::File as TokioFile;
 use tokio::io::AsyncRead;
 use tokio::time;
@@ -312,7 +314,7 @@ impl ClientOptions {
     pub async fn connect(self) -> Result<Client> {
         self.validate()?;
 
-        let client = match self.auth {
+        let mut client = match self.auth {
             NatsAuth::UserPass(username, password) => {
                 async_nats::ConnectOptions::with_user_and_password(username, password)
             }
@@ -322,6 +324,20 @@ impl ClientOptions {
                 async_nats::ConnectOptions::with_credentials_file(path).await?
             }
         };
+        if let Ok(value) = std::env::var(env_nats::DYN_NATS_REQUEST_TIMEOUT_SECS) {
+            match value.parse::<u64>() {
+                Ok(timeout_secs) if timeout_secs > 0 => {
+                    client = client.request_timeout(Some(Duration::from_secs(timeout_secs)));
+                }
+                _ => {
+                    tracing::warn!(
+                        env_var = env_nats::DYN_NATS_REQUEST_TIMEOUT_SECS,
+                        value,
+                        "Ignoring invalid NATS request timeout"
+                    );
+                }
+            }
+        }
 
         let (client, _) = build_in_runtime(
             async move {
