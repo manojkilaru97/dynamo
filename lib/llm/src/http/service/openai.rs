@@ -4,7 +4,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
-    path::Path,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -610,89 +609,6 @@ fn redact_multimodal_payload_for_logging(value: &serde_json::Value) -> serde_jso
         }
         serde_json::Value::String(s) => redact_string_for_payload_log(s),
         _ => value.clone(),
-    }
-}
-
-fn header_value_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok())
-}
-
-fn resolve_nvcf_asset_url(url: &str, headers: &HeaderMap) -> Result<String, ErrorResponse> {
-    let Some((prefix, asset_id)) = url.split_once(";asset_id,") else {
-        return Ok(url.to_string());
-    };
-    let Some(mime) = prefix.strip_prefix("data:") else {
-        return Ok(url.to_string());
-    };
-    if !(mime.starts_with("image/") || mime.starts_with("video/") || mime.starts_with("audio/")) {
-        return Ok(url.to_string());
-    }
-
-    let asset_dir = header_value_str(headers, "nvcf-input-asset-dir")
-        .or_else(|| header_value_str(headers, "nvcf-asset-dir"))
-        .ok_or_else(|| ErrorMessage::bad_request_from_message("Missing NVCF asset directory"))?;
-    let allowed_ids = header_value_str(headers, "nvcf-input-asset-references")
-        .or_else(|| header_value_str(headers, "nvcf-function-asset-ids"))
-        .ok_or_else(|| ErrorMessage::bad_request_from_message("Missing NVCF asset references"))?;
-
-    let asset_id = asset_id.trim().trim_start_matches('/');
-    let allowed = allowed_ids
-        .split(',')
-        .map(|item| item.trim().trim_start_matches('/'))
-        .any(|item| item == asset_id);
-    if !allowed {
-        return Err(ErrorMessage::bad_request_from_message(format!(
-            "Asset id '{asset_id}' not permitted by NVCF asset references"
-        )));
-    }
-
-    let asset_root = Path::new(asset_dir).canonicalize().map_err(|err| {
-        ErrorMessage::bad_request_from_message(format!("Invalid NVCF asset directory: {err}"))
-    })?;
-    let file_path = asset_root.join(asset_id).canonicalize().map_err(|err| {
-        ErrorMessage::bad_request_from_message(format!("Invalid NVCF asset id '{asset_id}': {err}"))
-    })?;
-    if file_path.strip_prefix(&asset_root).is_err() {
-        return Err(ErrorMessage::bad_request_from_message(
-            "Asset path escapes NVCF asset directory",
-        ));
-    }
-
-    let bytes = std::fs::read(&file_path).map_err(|err| {
-        ErrorMessage::bad_request_from_message(format!(
-            "Failed to read NVCF asset '{asset_id}': {err}"
-        ))
-    })?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Ok(format!("data:{mime};base64,{encoded}"))
-}
-
-fn resolve_nvcf_asset_refs_for_backend(
-    value: &serde_json::Value,
-    headers: &HeaderMap,
-) -> Result<serde_json::Value, ErrorResponse> {
-    match value {
-        serde_json::Value::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(resolve_nvcf_asset_refs_for_backend(item, headers)?);
-            }
-            Ok(serde_json::Value::Array(out))
-        }
-        serde_json::Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (key, child) in map {
-                out.insert(
-                    key.clone(),
-                    resolve_nvcf_asset_refs_for_backend(child, headers)?,
-                );
-            }
-            Ok(serde_json::Value::Object(out))
-        }
-        serde_json::Value::String(s) if s.contains(";asset_id,") => Ok(serde_json::Value::String(
-            resolve_nvcf_asset_url(s, headers)?,
-        )),
-        _ => Ok(value.clone()),
     }
 }
 
@@ -1876,18 +1792,7 @@ async fn handler_chat_completions(
         payload_value.clone(),
     );
 
-    let mut backend_payload_value = resolve_nvcf_asset_refs_for_backend(&payload_value, &headers)
-        .map_err(|err_response| {
-        emit_openai_response_log(
-            &request_id,
-            &raw_model,
-            "chat_completions",
-            streaming,
-            err_response.0.as_u16(),
-            error_response_payload(&err_response),
-        );
-        err_response
-    })?;
+    let mut backend_payload_value = payload_value.clone();
     normalize_chat_compat_payload(&mut backend_payload_value);
 
     let mut request: NvCreateChatCompletionRequest = serde_json::from_value(backend_payload_value)
@@ -2775,20 +2680,7 @@ async fn handler_responses(
         request_json.clone(),
     );
 
-    let backend_request_json = resolve_nvcf_asset_refs_for_backend(&request_json, &headers)
-        .map_err(|err_response| {
-            emit_openai_response_log(
-                &request_id,
-                &raw_model,
-                "responses",
-                streaming,
-                err_response.0.as_u16(),
-                error_response_payload(&err_response),
-            );
-            err_response
-        })?;
-
-    let normalized_request_json = normalize_responses_request_json(backend_request_json);
+    let normalized_request_json = normalize_responses_request_json(request_json);
     let mut request: NvCreateResponse =
         serde_json::from_value(normalized_request_json).map_err(|err| {
             let err_response = ErrorMessage::bad_request_from_message(format!(
