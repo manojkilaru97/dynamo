@@ -149,6 +149,25 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         return 60.0
 
     @staticmethod
+    def _extract_multimodal_urls(
+        request: Dict[str, Any], key: str
+    ) -> Optional[list[Any]]:
+        """Extract frontend-provided multimodal URL payloads for SGLang."""
+        items = (request.get("multi_modal_data") or {}).get(key)
+        if not items:
+            return None
+        urls: list[Any] = []
+        for item in items:
+            if isinstance(item, str):
+                urls.append(item)
+            elif isinstance(item, dict):
+                for item_key in ("Url", "url", "Decoded", "decoded"):
+                    if item_key in item:
+                        urls.append(item[item_key])
+                        break
+        return urls or None
+
+    @staticmethod
     def _is_health_check_request(request: Dict[str, Any]) -> bool:
         annotations = request.get("annotations") or []
         if not isinstance(annotations, list):
@@ -1122,18 +1141,11 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     ):
                         yield out
             else:
-                # Extract image URLs for multimodal requests. SGLang's mm_data_processor
-                # handles loading/preprocessing, and the scheduler does vision encoding.
-                image_data = None
-                image_items = request.get("multi_modal_data", {}).get("image_url")
-                if image_items:
-                    image_data = []
-                    for item in image_items:
-                        if isinstance(item, str):
-                            image_data.append(item)
-                        elif isinstance(item, dict) and "Url" in item:
-                            image_data.append(item["Url"])
-                    image_data = image_data or None
+                # Pass frontend-extracted multimodal URLs through to SGLang.
+                # SGLang's mm_data_processor handles loading/preprocessing, and
+                # the scheduler performs the vision/video encoding.
+                image_data = self._extract_multimodal_urls(request, "image_url")
+                video_data = self._extract_multimodal_urls(request, "video_url")
 
                 trace_header = (
                     self._get_trace_header(context) if self.enable_trace else None
@@ -1142,6 +1154,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 agg = await self.engine.async_generate(
                     **input_param,
                     image_data=image_data,
+                    video_data=video_data,
                     sampling_params=sampling_params,
                     stream=True,
                     return_routed_experts=return_routed_experts,

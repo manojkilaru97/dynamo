@@ -66,6 +66,50 @@ def _make_decode_handler_for_slot_tests(limit=2, lease_secs=600.0):
     return handler, recorder
 
 
+def test_extract_multimodal_urls_supports_image_and_video_frontend_shapes():
+    request = {
+        "multi_modal_data": {
+            "image_url": [
+                {"Url": "file:///images/dog.jpg"},
+                {"url": "data:image/jpeg;base64,abc"},
+                {"Decoded": b"decoded-image"},
+                "https://example.com/cat.png",
+            ],
+            "video_url": [
+                {"Url": "file:///videos/sample.mp4"},
+                {"decoded": b"decoded-video"},
+                "data:video/mp4;base64,xyz",
+            ],
+        }
+    }
+
+    assert DecodeWorkerHandler._extract_multimodal_urls(
+        request, "image_url"
+    ) == [
+        "file:///images/dog.jpg",
+        "data:image/jpeg;base64,abc",
+        b"decoded-image",
+        "https://example.com/cat.png",
+    ]
+    assert DecodeWorkerHandler._extract_multimodal_urls(
+        request, "video_url"
+    ) == [
+        "file:///videos/sample.mp4",
+        b"decoded-video",
+        "data:video/mp4;base64,xyz",
+    ]
+
+
+def test_extract_multimodal_urls_returns_none_for_missing_or_empty_data():
+    assert DecodeWorkerHandler._extract_multimodal_urls({}, "video_url") is None
+    assert (
+        DecodeWorkerHandler._extract_multimodal_urls(
+            {"multi_modal_data": {"video_url": []}}, "video_url"
+        )
+        is None
+    )
+
+
 class _FakeContext:
     def __init__(self, context_id="ctx"):
         self._id = context_id
