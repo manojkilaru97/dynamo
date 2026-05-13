@@ -28,15 +28,18 @@ struct DpRequestLoad {
 struct SaturationSnapshot {
     saturated_workers: HashSet<WorkerWithDpRank>,
     request_load_saturated: usize,
+    request_load_stale: usize,
     token_saturated: usize,
     eligible_workers: usize,
     request_load_fail_open: bool,
+    request_load_stale_fail_open: bool,
     token_saturation_fail_open: bool,
 }
 
 #[derive(Debug)]
 pub struct WorkerRequestLoads {
     inner: RwLock<HashMap<WorkerId, HashMap<u32, DpRequestLoad>>>,
+    stale: RwLock<HashMap<WorkerWithDpRank, Instant>>,
     ttl: Option<Duration>,
 }
 
@@ -50,6 +53,7 @@ impl WorkerRequestLoads {
     pub fn new(ttl: Option<Duration>) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            stale: RwLock::new(HashMap::new()),
             ttl,
         }
     }
@@ -63,18 +67,37 @@ impl WorkerRequestLoads {
             return;
         };
         if ttl.is_zero() {
+            if let Ok(mut stale) = self.stale.write() {
+                for (worker_id, dp_loads) in inner.iter() {
+                    for dp_rank in dp_loads.keys() {
+                        stale.insert(WorkerWithDpRank::new(*worker_id, *dp_rank), now);
+                    }
+                }
+            }
             inner.clear();
             return;
         }
 
         let mut removed = 0usize;
-        inner.retain(|_, dp_loads| {
+        let mut newly_stale = Vec::new();
+        inner.retain(|worker_id, dp_loads| {
             let before = dp_loads.len();
-            dp_loads.retain(|_, load| now.duration_since(load.observed_at) <= ttl);
+            dp_loads.retain(|dp_rank, load| {
+                let fresh = now.duration_since(load.observed_at) <= ttl;
+                if !fresh {
+                    newly_stale.push(WorkerWithDpRank::new(*worker_id, *dp_rank));
+                }
+                fresh
+            });
             removed += before.saturating_sub(dp_loads.len());
             !dp_loads.is_empty()
         });
         if removed > 0 {
+            if let Ok(mut stale) = self.stale.write() {
+                for worker in newly_stale {
+                    stale.insert(worker, now);
+                }
+            }
             tracing::warn!(
                 removed,
                 ttl_ms = ttl.as_millis() as u64,
@@ -100,6 +123,9 @@ impl WorkerRequestLoads {
                 observed_at: now,
             },
         );
+        if let Ok(mut stale) = self.stale.write() {
+            stale.remove(&WorkerWithDpRank::new(load.worker_id, load.dp_rank));
+        }
         true
     }
 
@@ -120,6 +146,9 @@ impl WorkerRequestLoads {
                 observed_at: now,
             },
         );
+        if let Ok(mut stale) = self.stale.write() {
+            stale.remove(&worker);
+        }
         true
     }
 
@@ -149,6 +178,22 @@ impl WorkerRequestLoads {
         self.prune_expired_locked(&mut inner, Instant::now());
         let load = inner.get(&worker.worker_id)?.get(&worker.dp_rank)?;
         Some((load.active.saturating_add(load.waiting), load.total_slots))
+    }
+
+    pub fn stale_worker_dps(
+        &self,
+        workers: impl Iterator<Item = WorkerWithDpRank>,
+    ) -> HashSet<WorkerWithDpRank> {
+        let now = Instant::now();
+        if let Ok(mut inner) = self.inner.write() {
+            self.prune_expired_locked(&mut inner, now);
+        }
+        let Ok(stale) = self.stale.read() else {
+            return HashSet::new();
+        };
+        workers
+            .filter(|worker| stale.contains_key(worker))
+            .collect()
     }
 }
 
@@ -362,15 +407,20 @@ impl SchedulerQueue {
             .as_ref()
             .map_or(0, HashSet::len);
         let merged_disallowed_count = request.disallowed_workers.as_ref().map_or(0, HashSet::len);
-        if merged_disallowed_count > 0 || saturation.request_load_saturated > 0 {
+        if merged_disallowed_count > 0
+            || saturation.request_load_saturated > 0
+            || saturation.request_load_stale > 0
+        {
             tracing::info!(
                 request_id = request.maybe_request_id.as_deref().unwrap_or_default(),
                 persistent_disallowed_worker_dps = persistent_disallowed_count,
                 request_load_saturated_worker_dps = saturation.request_load_saturated,
+                stale_request_load_worker_dps = saturation.request_load_stale,
                 token_saturated_worker_dps = saturation.token_saturated,
                 merged_disallowed_worker_dps = merged_disallowed_count,
                 eligible_worker_dps = saturation.eligible_workers,
                 request_load_fail_open = saturation.request_load_fail_open,
+                request_load_stale_fail_open = saturation.request_load_stale_fail_open,
                 token_saturation_fail_open = saturation.token_saturation_fail_open,
                 "Router DP exclusion snapshot before worker selection"
             );
@@ -530,6 +580,7 @@ impl SchedulerQueue {
         let mut request_load_saturated = 0usize;
         let mut token_saturated = 0usize;
         let mut eligible_workers = 0usize;
+        let mut eligible_worker_dps = Vec::new();
 
         for (&worker_id, config) in configs.iter() {
             if let Some(ids) = allowed
@@ -543,6 +594,7 @@ impl SchedulerQueue {
             for dp_rank in dp_start..dp_start + dp_size {
                 eligible_workers += 1;
                 let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+                eligible_worker_dps.push(worker);
                 if self.worker_request_load_saturated(worker) {
                     request_load_saturated += 1;
                     request_load_saturated_workers.insert(worker);
@@ -571,6 +623,27 @@ impl SchedulerQueue {
             token_saturated_workers
         };
 
+        let request_load_stale_workers = self
+            .request_loads
+            .stale_worker_dps(eligible_worker_dps.iter().copied());
+        let request_load_stale = request_load_stale_workers.len();
+        let request_load_stale_fail_open = saturation_collapses_candidates(
+            eligible_workers,
+            persistent_disallowed,
+            &saturated,
+            &request_load_stale_workers,
+        );
+        if request_load_stale_fail_open {
+            tracing::warn!(
+                eligible_worker_dps = eligible_workers,
+                stale_request_load_worker_dps = request_load_stale,
+                token_saturated_worker_dps = token_saturated,
+                "Ignoring stale router request-load exclusions because they would collapse worker/DP candidates"
+            );
+        } else {
+            saturated.extend(request_load_stale_workers);
+        }
+
         let request_load_fail_open = saturation_collapses_candidates(
             eligible_workers,
             persistent_disallowed,
@@ -591,9 +664,11 @@ impl SchedulerQueue {
         SaturationSnapshot {
             saturated_workers: saturated,
             request_load_saturated,
+            request_load_stale,
             token_saturated,
             eligible_workers,
             request_load_fail_open,
+            request_load_stale_fail_open,
             token_saturation_fail_open,
         }
     }
@@ -842,6 +917,30 @@ mod tests {
 
         assert!(!loads.update_from_active_load(&legacy_load));
         assert_eq!(loads.total_requests_and_cap(7), None);
+        assert!(
+            loads
+                .stale_worker_dps([WorkerWithDpRank::new(7, 0)].into_iter())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fresh_request_load_clears_stale_worker_dp() {
+        let loads = WorkerRequestLoads::new(Some(Duration::ZERO));
+        let worker = WorkerWithDpRank::new(7, 0);
+
+        assert!(loads.update_from_active_load(&active_load(7, 0, 8, 0, Some(8))));
+        assert_eq!(loads.total_requests_and_cap(7), None);
+        assert_eq!(
+            loads.stale_worker_dps([worker].into_iter()),
+            HashSet::from([worker])
+        );
+
+        let loads = WorkerRequestLoads::new(Some(Duration::from_secs(30)));
+        assert!(loads.mark_dp_saturated(worker, 8));
+        assert!(loads.stale_worker_dps([worker].into_iter()).is_empty());
+        assert!(loads.update_from_active_load(&active_load(7, 0, 1, 0, Some(8))));
+        assert!(loads.stale_worker_dps([worker].into_iter()).is_empty());
     }
 
     #[test]
@@ -851,6 +950,10 @@ mod tests {
         loads.update_from_active_load(&active_load(7, 0, 8, 0, Some(8)));
 
         assert_eq!(loads.total_requests_and_cap(7), None);
+        assert_eq!(
+            loads.stale_worker_dps([WorkerWithDpRank::new(7, 0)].into_iter()),
+            HashSet::from([WorkerWithDpRank::new(7, 0)])
+        );
     }
 
     #[test]

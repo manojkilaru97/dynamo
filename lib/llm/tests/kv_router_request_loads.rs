@@ -91,10 +91,34 @@ fn legacy_kv_metrics_do_not_poison_request_capacity() {
 #[test]
 fn stale_request_loads_do_not_poison_capacity() {
     let loads = WorkerRequestLoads::new(Some(Duration::ZERO));
+    let worker = WorkerWithDpRank::new(7, 0);
 
     assert!(loads.update_from_active_load(&active_load(7, 0, 8, 0, Some(8))));
 
     assert_eq!(loads.total_requests_and_cap(7), None);
+    assert_eq!(
+        loads.stale_worker_dps([worker].into_iter()),
+        std::collections::HashSet::from([worker])
+    );
+}
+
+#[test]
+fn fresh_request_load_clears_stale_worker_dp() {
+    let loads = WorkerRequestLoads::new(Some(Duration::ZERO));
+    let worker = WorkerWithDpRank::new(7, 0);
+
+    assert!(loads.update_from_active_load(&active_load(7, 0, 8, 0, Some(8))));
+    assert_eq!(loads.total_requests_and_cap(7), None);
+    assert_eq!(
+        loads.stale_worker_dps([worker].into_iter()),
+        std::collections::HashSet::from([worker])
+    );
+
+    let loads = WorkerRequestLoads::new(Some(Duration::from_secs(30)));
+    assert!(loads.mark_dp_saturated(worker, 8));
+    assert!(loads.stale_worker_dps([worker].into_iter()).is_empty());
+    assert!(loads.update_from_active_load(&active_load(7, 0, 2, 1, Some(8))));
+    assert!(loads.stale_worker_dps([worker].into_iter()).is_empty());
 }
 
 #[test]

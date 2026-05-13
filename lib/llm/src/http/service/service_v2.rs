@@ -36,6 +36,30 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
+const DYN_SSE_KEEP_ALIVE_SECS: &str = "DYN_SSE_KEEP_ALIVE_SECS";
+
+fn parse_sse_keep_alive(value: Option<String>) -> Option<Duration> {
+    let value = value?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    match trimmed.parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(error) => {
+            tracing::warn!(
+                env = DYN_SSE_KEEP_ALIVE_SECS,
+                value = trimmed,
+                %error,
+                "Ignoring invalid SSE keepalive interval"
+            );
+            None
+        }
+    }
+}
+
 /// HTTP service shared state
 pub struct State {
     metrics: Arc<Metrics>,
@@ -164,9 +188,8 @@ impl State {
         env_is_truthy("DYN_ENABLE_STREAMING_REASONING_DISPATCH")
     }
 
-    // TODO
     pub fn sse_keep_alive(&self) -> Option<Duration> {
-        None
+        parse_sse_keep_alive(var(DYN_SSE_KEEP_ALIVE_SECS).ok())
     }
 }
 
@@ -637,6 +660,22 @@ mod tests {
     use serial_test::serial;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn test_parse_sse_keep_alive() {
+        assert_eq!(parse_sse_keep_alive(None), None);
+        assert_eq!(parse_sse_keep_alive(Some("".to_string())), None);
+        assert_eq!(parse_sse_keep_alive(Some("0".to_string())), None);
+        assert_eq!(
+            parse_sse_keep_alive(Some("15".to_string())),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            parse_sse_keep_alive(Some(" 20 ".to_string())),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(parse_sse_keep_alive(Some("bad".to_string())), None);
+    }
 
     #[tokio::test]
     #[serial]
