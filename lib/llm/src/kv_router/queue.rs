@@ -40,6 +40,8 @@ struct SaturationSnapshot {
 pub struct WorkerRequestLoads {
     inner: RwLock<HashMap<WorkerId, HashMap<u32, DpRequestLoad>>>,
     stale: RwLock<HashMap<WorkerWithDpRank, Instant>>,
+    router_inflight_by_worker: RwLock<HashMap<WorkerWithDpRank, u64>>,
+    router_inflight_by_request: RwLock<HashMap<String, WorkerWithDpRank>>,
     ttl: Option<Duration>,
 }
 
@@ -54,6 +56,8 @@ impl WorkerRequestLoads {
         Self {
             inner: RwLock::new(HashMap::new()),
             stale: RwLock::new(HashMap::new()),
+            router_inflight_by_worker: RwLock::new(HashMap::new()),
+            router_inflight_by_request: RwLock::new(HashMap::new()),
             ttl,
         }
     }
@@ -159,8 +163,10 @@ impl WorkerRequestLoads {
         let mut total = 0u64;
         let mut cap = None;
 
-        for load in dp_loads.values() {
-            total = total.saturating_add(load.active.saturating_add(load.waiting));
+        for (dp_rank, load) in dp_loads {
+            let published = load.active.saturating_add(load.waiting);
+            let worker = WorkerWithDpRank::new(worker_id, *dp_rank);
+            total = total.saturating_add(self.effective_dp_requests(worker, published));
             if let Some(total_slots) = load.total_slots
                 && total_slots > 0
             {
@@ -177,7 +183,58 @@ impl WorkerRequestLoads {
         let mut inner = self.inner.write().unwrap();
         self.prune_expired_locked(&mut inner, Instant::now());
         let load = inner.get(&worker.worker_id)?.get(&worker.dp_rank)?;
-        Some((load.active.saturating_add(load.waiting), load.total_slots))
+        let published = load.active.saturating_add(load.waiting);
+        Some((
+            self.effective_dp_requests(worker, published),
+            load.total_slots,
+        ))
+    }
+
+    fn router_inflight_count(&self, worker: WorkerWithDpRank) -> u64 {
+        self.router_inflight_by_worker
+            .read()
+            .map(|counts| counts.get(&worker).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    fn effective_dp_requests(&self, worker: WorkerWithDpRank, published: u64) -> u64 {
+        published.max(self.router_inflight_count(worker))
+    }
+
+    pub fn reserve_router_inflight(&self, request_id: &str, worker: WorkerWithDpRank) {
+        if request_id.is_empty() {
+            return;
+        }
+
+        let old_worker = {
+            let mut by_request = self.router_inflight_by_request.write().unwrap();
+            by_request.insert(request_id.to_string(), worker)
+        };
+
+        let mut by_worker = self.router_inflight_by_worker.write().unwrap();
+        if let Some(old_worker) = old_worker {
+            if old_worker == worker {
+                return;
+            }
+            decrement_worker_count(&mut by_worker, old_worker);
+        }
+        *by_worker.entry(worker).or_insert(0) += 1;
+    }
+
+    pub fn release_router_inflight(&self, request_id: &str) {
+        let worker = {
+            let mut by_request = self.router_inflight_by_request.write().unwrap();
+            by_request.remove(request_id)
+        };
+        if let Some(worker) = worker
+            && let Ok(mut by_worker) = self.router_inflight_by_worker.write()
+        {
+            decrement_worker_count(&mut by_worker, worker);
+        }
+    }
+
+    pub fn router_inflight_for_test(&self, worker: WorkerWithDpRank) -> u64 {
+        self.router_inflight_count(worker)
     }
 
     pub fn stale_worker_dps(
@@ -524,6 +581,8 @@ impl SchedulerQueue {
         {
             tracing::warn!("Failed to add request {request_id}: {e}");
         }
+        self.request_loads
+            .reserve_router_inflight(&request_id, selection.worker);
 
         request.respond(Ok(SchedulingResponse {
             best_worker: selection.worker,
@@ -537,12 +596,13 @@ impl SchedulerQueue {
     }
 
     fn request_must_wait(&self, request: &SchedulingRequest) -> bool {
-        self.all_workers_busy(request.allowed_worker_ids.as_ref())
+        self.all_workers_unavailable(request.allowed_worker_ids.as_ref())
     }
 
-    /// Check if all eligible workers are busy based on token threshold.
-    /// Returns true only if ALL eligible workers exceed capacity.
-    fn all_workers_busy(&self, allowed: Option<&HashSet<WorkerId>>) -> bool {
+    /// Check if all eligible worker/DPs are unavailable.
+    /// Request-slot saturation and stale request-load data are hard signals;
+    /// token saturation is a softer capacity signal.
+    fn all_workers_unavailable(&self, allowed: Option<&HashSet<WorkerId>>) -> bool {
         let active_tokens = self.slots.active_tokens();
         let configs = self.workers_with_configs.borrow();
 
@@ -560,7 +620,7 @@ impl SchedulerQueue {
             for dp_rank in dp_start..dp_start + dp_size {
                 checked_any = true;
                 let worker = WorkerWithDpRank::new(worker_id, dp_rank);
-                if !self.worker_is_saturated(worker, config, &active_tokens) {
+                if !self.worker_unavailable(worker, config, &active_tokens) {
                     return false;
                 }
             }
@@ -627,39 +687,11 @@ impl SchedulerQueue {
             .request_loads
             .stale_worker_dps(eligible_worker_dps.iter().copied());
         let request_load_stale = request_load_stale_workers.len();
-        let request_load_stale_fail_open = saturation_collapses_candidates(
-            eligible_workers,
-            persistent_disallowed,
-            &saturated,
-            &request_load_stale_workers,
-        );
-        if request_load_stale_fail_open {
-            tracing::warn!(
-                eligible_worker_dps = eligible_workers,
-                stale_request_load_worker_dps = request_load_stale,
-                token_saturated_worker_dps = token_saturated,
-                "Ignoring stale router request-load exclusions because they would collapse worker/DP candidates"
-            );
-        } else {
-            saturated.extend(request_load_stale_workers);
-        }
+        let request_load_stale_fail_open = false;
+        saturated.extend(request_load_stale_workers);
 
-        let request_load_fail_open = saturation_collapses_candidates(
-            eligible_workers,
-            persistent_disallowed,
-            &saturated,
-            &request_load_saturated_workers,
-        );
-        if request_load_fail_open {
-            tracing::warn!(
-                eligible_worker_dps = eligible_workers,
-                request_load_saturated_worker_dps = request_load_saturated,
-                token_saturated_worker_dps = token_saturated,
-                "Ignoring router request-load saturation because it would collapse worker/DP candidates"
-            );
-        } else {
-            saturated.extend(request_load_saturated_workers);
-        }
+        let request_load_fail_open = false;
+        saturated.extend(request_load_saturated_workers);
 
         SaturationSnapshot {
             saturated_workers: saturated,
@@ -683,13 +715,21 @@ impl SchedulerQueue {
         false
     }
 
-    fn worker_is_saturated(
+    fn worker_request_load_stale(&self, worker: WorkerWithDpRank) -> bool {
+        self.request_loads
+            .stale_worker_dps([worker].into_iter())
+            .contains(&worker)
+    }
+
+    fn worker_unavailable(
         &self,
         worker: WorkerWithDpRank,
         config: &crate::local_model::runtime_config::ModelRuntimeConfig,
         active_tokens: &HashMap<WorkerWithDpRank, usize>,
     ) -> bool {
-        self.worker_token_saturated(worker, config, active_tokens)
+        self.worker_request_load_saturated(worker)
+            || self.worker_request_load_stale(worker)
+            || self.worker_token_saturated(worker, config, active_tokens)
     }
 
     fn worker_token_saturated(
@@ -827,6 +867,16 @@ fn merged_disallowed_workers_for_selection(
     Some(merged)
 }
 
+fn decrement_worker_count(counts: &mut HashMap<WorkerWithDpRank, u64>, worker: WorkerWithDpRank) {
+    match counts.get_mut(&worker) {
+        Some(count) if *count > 1 => *count -= 1,
+        Some(_) => {
+            counts.remove(&worker);
+        }
+        None => {}
+    }
+}
+
 fn saturation_collapses_candidates(
     eligible_workers: usize,
     persistent_disallowed: Option<&HashSet<WorkerWithDpRank>>,
@@ -890,6 +940,56 @@ mod tests {
 
         loads.update_from_active_load(&active_load(7, 0, 2, 1, Some(16)));
         assert_eq!(loads.total_requests_and_cap(7), Some((3, Some(16))));
+    }
+
+    #[test]
+    fn worker_request_loads_use_router_inflight_when_published_load_lags() {
+        let loads = WorkerRequestLoads::default();
+        let worker = WorkerWithDpRank::new(7, 0);
+
+        loads.update_from_active_load(&active_load(7, 0, 1, 0, Some(4)));
+        loads.reserve_router_inflight("r1", worker);
+        loads.reserve_router_inflight("r2", worker);
+        loads.reserve_router_inflight("r3", worker);
+        loads.reserve_router_inflight("r4", worker);
+
+        assert_eq!(loads.router_inflight_for_test(worker), 4);
+        assert_eq!(loads.dp_requests_and_cap(worker), Some((4, Some(4))));
+    }
+
+    #[test]
+    fn worker_request_loads_release_router_inflight() {
+        let loads = WorkerRequestLoads::default();
+        let worker = WorkerWithDpRank::new(7, 0);
+
+        loads.update_from_active_load(&active_load(7, 0, 0, 0, Some(4)));
+        loads.reserve_router_inflight("r1", worker);
+        loads.reserve_router_inflight("r2", worker);
+        loads.release_router_inflight("r1");
+
+        assert_eq!(loads.router_inflight_for_test(worker), 1);
+        assert_eq!(loads.dp_requests_and_cap(worker), Some((1, Some(4))));
+
+        loads.release_router_inflight("r2");
+        assert_eq!(loads.router_inflight_for_test(worker), 0);
+        assert_eq!(loads.dp_requests_and_cap(worker), Some((0, Some(4))));
+    }
+
+    #[test]
+    fn worker_request_loads_move_router_inflight_when_request_is_reselected() {
+        let loads = WorkerRequestLoads::default();
+        let old_worker = WorkerWithDpRank::new(7, 0);
+        let new_worker = WorkerWithDpRank::new(8, 1);
+
+        loads.update_from_active_load(&active_load(7, 0, 0, 0, Some(4)));
+        loads.update_from_active_load(&active_load(8, 1, 0, 0, Some(4)));
+        loads.reserve_router_inflight("r1", old_worker);
+        loads.reserve_router_inflight("r1", new_worker);
+
+        assert_eq!(loads.router_inflight_for_test(old_worker), 0);
+        assert_eq!(loads.router_inflight_for_test(new_worker), 1);
+        assert_eq!(loads.dp_requests_and_cap(old_worker), Some((0, Some(4))));
+        assert_eq!(loads.dp_requests_and_cap(new_worker), Some((1, Some(4))));
     }
 
     #[test]

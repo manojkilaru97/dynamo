@@ -353,6 +353,7 @@ impl KvScheduler {
     }
 
     pub async fn free(&self, request_id: &str) -> Result<(), SequenceError> {
+        self.request_loads.release_router_inflight(request_id);
         self.slots.free(&request_id.to_string()).await?;
         self.queue.update().await;
         Ok(())

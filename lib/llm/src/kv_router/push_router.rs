@@ -521,7 +521,15 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                     attempted_worker_dps.clear();
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if let Err(free_error) = chooser.free(&context_id).await {
+                        tracing::warn!(
+                            "Failed to free request {} after routing error: {free_error}",
+                            context_id
+                        );
+                    }
+                    return Err(error);
+                }
             };
 
             let WorkerSelection {

@@ -84,6 +84,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         self._active_request_admissions_high_water = 0
         self._request_admissions: dict[str, _RequestAdmission] = {}
         self._request_admission_dp_counts: dict[int, int] = {}
+        self._request_admission_dp_high_water: dict[int, int] = {}
         self._request_slots_reaped_total = 0
         self._last_stream_progress_at = time.monotonic()
 
@@ -230,7 +231,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             longest_idle = max(now - admission.last_progress_at for admission in expired)
             logging.warning(
                 "Reaped %s stale SGLang admission slot(s); active=%s/%s "
-                "oldest_age=%.1fs longest_idle=%.1fs lease=%.1fs reaped_total=%s",
+                "oldest_age=%.1fs longest_idle=%.1fs lease=%.1fs "
+                "reaped_total=%s dp_counts=%s",
                 len(expired),
                 self._active_request_admissions,
                 self.max_total_requests,
@@ -238,8 +240,15 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 longest_idle,
                 lease_secs,
                 self._request_slots_reaped_total,
+                self._format_request_admission_dp_counts_locked(),
             )
         return expired
+
+    def _format_request_admission_dp_counts_locked(self) -> dict[int, int]:
+        return {
+            dp_rank: self._request_admission_dp_counts[dp_rank]
+            for dp_rank in sorted(self._request_admission_dp_counts)
+        }
 
     def _abort_reaped_request_slot(self, admission: _RequestAdmission) -> None:
         request_id = admission.sglang_request_id
@@ -395,6 +404,23 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         self._request_admission_dp_counts[dp_rank] = (
                             current_dp_total + 1
                         )
+                        if (
+                            self._request_admission_dp_counts[dp_rank]
+                            > self._request_admission_dp_high_water.get(dp_rank, 0)
+                        ):
+                            self._request_admission_dp_high_water[dp_rank] = (
+                                self._request_admission_dp_counts[dp_rank]
+                            )
+                            logging.info(
+                                "Worker local DP request slots in use: "
+                                "dp_rank=%s %s/%s total=%s/%s dp_counts=%s",
+                                dp_rank,
+                                self._request_admission_dp_counts[dp_rank],
+                                self.max_total_requests_per_dp,
+                                self._active_request_admissions,
+                                limit,
+                                self._format_request_admission_dp_counts_locked(),
+                            )
                     self._active_request_admissions = len(self._request_admissions)
                     if (
                         self._active_request_admissions
@@ -404,9 +430,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                             self._active_request_admissions
                         )
                         logging.info(
-                            "Worker local total request slots in use: %s/%s",
+                            "Worker local total request slots in use: %s/%s dp_counts=%s",
                             self._active_request_admissions,
                             limit,
+                            self._format_request_admission_dp_counts_locked(),
                         )
 
         for admission in expired:
