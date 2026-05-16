@@ -502,30 +502,34 @@ def test_openai_response_format_becomes_guided_json_schema():
 async def test_worker_admission_slots_track_release_by_context():
     handler, recorder = _make_decode_handler_for_slot_tests(limit=2)
 
-    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
         "ctx-1", "rid-1"
     )
     assert (reserved, active, limit) == (True, 1, 2)
     assert reason is None
+    assert scope is None
 
-    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
         "ctx-2", "rid-2"
     )
     assert (reserved, active, limit) == (True, 2, 2)
     assert reason is None
+    assert scope is None
 
-    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
         "ctx-3", "rid-3"
     )
     assert (reserved, active, limit) == (False, 2, 2)
     assert reason is None
+    assert scope == "worker"
 
     await handler._release_request_slot_reservation("ctx-1")
-    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
         "ctx-3", "rid-3"
     )
     assert (reserved, active, limit) == (True, 2, 2)
     assert reason is None
+    assert scope is None
     assert set(handler._request_admissions) == {"ctx-2", "ctx-3"}
     assert recorder.aborted == []
 
@@ -534,19 +538,21 @@ async def test_worker_admission_slots_track_release_by_context():
 async def test_worker_admission_slots_release_on_cancel_or_error():
     handler, _ = _make_decode_handler_for_slot_tests(limit=1)
 
-    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
         "ctx-1", "rid-1"
     )
     assert (reserved, active, limit) == (True, 1, 1)
     assert reason is None
+    assert scope is None
 
     await handler._release_request_slot_reservation("ctx-1")
 
-    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
         "ctx-2", "rid-2"
     )
     assert (reserved, active, limit) == (True, 1, 1)
     assert reason is None
+    assert scope is None
     assert set(handler._request_admissions) == {"ctx-2"}
 
 
@@ -554,17 +560,17 @@ async def test_worker_admission_slots_release_on_cancel_or_error():
 async def test_worker_admission_duplicate_context_is_idempotent():
     handler, _ = _make_decode_handler_for_slot_tests(limit=4)
 
-    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
         "ctx-1", "rid-1", dp_rank=0
     )
-    assert (reserved, active, limit, reason) == (True, 1, 4, None)
+    assert (reserved, active, limit, reason, scope) == (True, 1, 4, None, None)
     assert handler._request_admission_dp_counts == {0: 1}
 
-    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
         "ctx-1", "rid-1b", dp_rank=0
     )
 
-    assert (reserved, active, limit, reason) == (True, 1, 4, None)
+    assert (reserved, active, limit, reason, scope) == (True, 1, 4, None, None)
     assert len(handler._request_admissions) == 1
     assert handler._request_admissions["ctx-1"].sglang_request_id == "rid-1b"
     assert handler._request_admission_dp_counts == {0: 1}
@@ -591,31 +597,34 @@ async def test_worker_admission_duplicate_context_moves_dp_count():
 async def test_worker_admission_slots_reap_and_abort_stale_slots():
     handler, recorder = _make_decode_handler_for_slot_tests(limit=1, lease_secs=10.0)
 
-    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
         "ctx-old", "rid-old"
     )
     assert (reserved, active, limit) == (True, 1, 1)
     assert reason is None
+    assert scope is None
     handler._request_admissions["ctx-old"].created_at -= 11.0
 
-    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
         "ctx-new", "rid-new"
     )
 
     assert (reserved, active, limit) == (False, 1, 1)
     assert reason is None
+    assert scope == "worker"
     assert set(handler._request_admissions) == {"ctx-old"}
     assert handler._request_slots_reaped_total == 0
     assert recorder.aborted == []
 
     handler._request_admissions["ctx-old"].last_progress_at -= 11.0
 
-    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
         "ctx-new", "rid-new"
     )
 
     assert (reserved, active, limit) == (True, 1, 1)
     assert reason is None
+    assert scope is None
     assert set(handler._request_admissions) == {"ctx-new"}
     assert handler._request_slots_reaped_total == 1
     assert recorder.aborted == [("rid-old", False)]
@@ -626,19 +635,41 @@ async def test_worker_admission_health_check_fails_when_full_and_progress_stale(
     handler, _ = _make_decode_handler_for_slot_tests(limit=1, lease_secs=600.0)
     handler.stale_full_unhealthy_secs = 60.0
 
-    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
         "ctx-old", "rid-old"
     )
-    assert (reserved, active, limit, reason) == (True, 1, 1, None)
+    assert (reserved, active, limit, reason, scope) == (True, 1, 1, None, None)
     handler._last_stream_progress_at -= 61.0
 
-    reserved, active, limit, reason = await handler._try_reserve_request_slot(
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
         "ctx-health", "rid-health", health_check=True
     )
 
     assert (reserved, active, limit) == (False, 1, 1)
     assert reason is not None
+    assert scope == "worker"
     assert "worker unhealthy" in reason
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_health_check_fails_after_reaping_stale_slots():
+    handler, recorder = _make_decode_handler_for_slot_tests(limit=4, lease_secs=10.0)
+
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
+        "ctx-old", "rid-old"
+    )
+    assert (reserved, active, limit, reason, scope) == (True, 1, 4, None, None)
+    handler._request_admissions["ctx-old"].last_progress_at -= 11.0
+
+    reserved, active, limit, reason, scope = await handler._try_reserve_request_slot(
+        "ctx-health", "rid-health", health_check=True
+    )
+
+    assert (reserved, active, limit) == (False, 0, 4)
+    assert reason is not None
+    assert "reaped 1 stale admission slot" in reason
+    assert scope == "worker"
+    assert recorder.aborted == [("rid-old", False)]
 
 
 def test_sglang_health_check_payload_is_marked():

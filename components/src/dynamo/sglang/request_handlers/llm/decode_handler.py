@@ -287,8 +287,22 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         async with self._request_admission_lock:
             now = time.monotonic()
             expired = self._reap_expired_request_slots_locked(now)
+            if health_check and expired:
+                current_total = len(self._request_admissions)
+                unhealthy_reason = (
+                    "Dynamo SGLang worker unhealthy: health check reaped "
+                    f"{len(expired)} stale admission slot(s) "
+                    f"(active={current_total}/{limit}, lease={self.request_slot_lease_secs}s)"
+                )
+                reject_result = (
+                    False,
+                    current_total,
+                    limit,
+                    unhealthy_reason,
+                    "worker",
+                )
             existing = self._request_admissions.get(request_id)
-            if existing is not None:
+            if reject_result is None and existing is not None:
                 if sglang_request_id:
                     existing.sglang_request_id = sglang_request_id
                 existing.last_progress_at = now

@@ -177,9 +177,7 @@ impl HealthCheckManager {
             )
         };
 
-        if matches!(real_traffic_status, HealthStatus::Ready)
-            && (matches!(current_status, HealthStatus::Ready) || has_recent_real_success)
-        {
+        if matches!(real_traffic_status, HealthStatus::Ready) && has_recent_real_success {
             self.drt
                 .system_health()
                 .lock()
@@ -857,6 +855,42 @@ mod integration_tests {
                 .lock()
                 .record_endpoint_request_result(endpoint, false);
         }
+
+        let manager = HealthCheckManager::new(drt.clone(), HealthCheckConfig::default());
+        manager.mark_endpoint_not_ready_if_stale(endpoint, "forced test failure");
+
+        let status = drt
+            .system_health()
+            .lock()
+            .get_endpoint_health_status(endpoint);
+        assert_eq!(status, Some(HealthStatus::NotReady));
+    }
+
+    #[tokio::test]
+    async fn test_stale_canary_marks_not_ready_without_recent_real_success() {
+        let drt = create_test_drt_async().await;
+
+        let endpoint = "test.endpoint.no-recent-success";
+        let payload = serde_json::json!({
+            "prompt": "test",
+            "_health_check": true
+        });
+
+        drt.system_health().lock().register_health_check_target(
+            endpoint,
+            crate::component::Instance {
+                component: "test_component".to_string(),
+                endpoint: "test_endpoint_no_recent_success".to_string(),
+                namespace: "test_namespace".to_string(),
+                instance_id: 1004,
+                transport: crate::component::TransportType::Nats(endpoint.to_string()),
+            },
+            payload,
+        );
+
+        drt.system_health()
+            .lock()
+            .set_endpoint_health_status(endpoint, HealthStatus::Ready);
 
         let manager = HealthCheckManager::new(drt.clone(), HealthCheckConfig::default());
         manager.mark_endpoint_not_ready_if_stale(endpoint, "forced test failure");
