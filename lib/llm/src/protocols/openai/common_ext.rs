@@ -5,6 +5,25 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
 
+/// OpenAI-compatible structured output parameters.
+#[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone, Default)]
+pub struct StructuredOutputsParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<serde_json::Value>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<Vec<String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_object: Option<bool>,
+}
+
 /// Common extensions for OpenAI API requests that are not part of the standard OpenAI spec
 /// but are commonly needed across different request types.
 #[derive(ToSchema, Serialize, Deserialize, Builder, Validate, Debug, Clone, Default)]
@@ -206,6 +225,7 @@ mod tests {
             guided_decoding_backend: None,
             guided_whitespace_pattern: None,
             skip_special_tokens: None,
+            ..Default::default()
         };
         assert!(common_ext.validate().is_ok());
     }

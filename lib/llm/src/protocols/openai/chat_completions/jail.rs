@@ -555,18 +555,31 @@ impl JailedStream {
 
                     // Process each choice independently using the new architecture
                     for choice in &chat_response.inner.choices {
-                        if let Some(ref content) = choice.delta.content {
-                            // Jailing only applies to text content
-                            let text_content = match content {
+                        let content_text = choice.delta.content.as_ref().and_then(|content| {
+                            match content {
                                 dynamo_protocols::types::ChatCompletionMessageContent::Text(text) => Some(text.as_str()),
                                 dynamo_protocols::types::ChatCompletionMessageContent::Parts(_) => None,
-                            };
+                            }
+                        });
+                        let reasoning_as_tool_choice_text =
+                            content_text.is_none()
+                                && matches!(self.jail_mode, JailMode::Immediate { .. })
+                                && choice.delta.reasoning_content.is_some();
+                        let text_content = content_text.or_else(|| {
+                            if reasoning_as_tool_choice_text {
+                                choice.delta.reasoning_content.as_deref()
+                            } else {
+                                None
+                            }
+                        });
 
-                            if let Some(text) = text_content {
+                        if let Some(text) = text_content {
                                 let starts_jailed = matches!(self.jail_mode, JailMode::Immediate { .. });
                                 let choice_state = choice_states.get_or_create_state(choice.index, starts_jailed);
 
-                                if let Some(reasoning_content) = &choice.delta.reasoning_content {
+                                if !reasoning_as_tool_choice_text
+                                    && let Some(reasoning_content) = &choice.delta.reasoning_content
+                                {
                                     let pending = choice_state
                                         .pending_reasoning_content
                                         .get_or_insert_with(String::new);
@@ -593,7 +606,6 @@ impl JailedStream {
                                     first.choice_mut().delta.reasoning_content = Some(reasoning);
                                 }
                                 all_emissions.extend(emissions);
-                            }
                             // For multimodal content, pass through unchanged (no jailing)
                         } else {
                             // Handle choices without content (e.g., final chunks with finish_reason)

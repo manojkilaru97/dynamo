@@ -77,6 +77,167 @@ use crate::protocols::common::llm_backend::EmbeddingsEngineOutput;
 pub const ANNOTATION_FORMATTED_PROMPT: &str = "formatted_prompt";
 pub const ANNOTATION_TOKEN_IDS: &str = "token_ids";
 pub const ANNOTATION_LLM_METRICS: &str = "llm_metrics";
+
+pub(crate) fn html_media_content_type(tag_name: &str) -> Option<&'static str> {
+    match tag_name.to_ascii_lowercase().as_str() {
+        "img" | "image" => Some("image_url"),
+        "video" => Some("video_url"),
+        "audio" => Some("audio_url"),
+        _ => None,
+    }
+}
+
+fn extract_src_attr(tag: &str) -> Option<&str> {
+    let lower = tag.to_ascii_lowercase();
+    let mut search = 0;
+    while let Some(rel) = lower[search..].find("src") {
+        let start = search + rel;
+        let before_ok = start == 0
+            || lower.as_bytes()[start - 1].is_ascii_whitespace()
+            || lower.as_bytes()[start - 1] == b'/';
+        let after = start + 3;
+        let after_ok = after >= lower.len()
+            || lower.as_bytes()[after].is_ascii_whitespace()
+            || lower.as_bytes()[after] == b'=';
+        if !before_ok || !after_ok {
+            search = after;
+            continue;
+        }
+
+        let mut i = after;
+        while i < tag.len() && tag.as_bytes()[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= tag.len() || tag.as_bytes()[i] != b'=' {
+            search = after;
+            continue;
+        }
+        i += 1;
+        while i < tag.len() && tag.as_bytes()[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= tag.len() || (tag.as_bytes()[i] != b'"' && tag.as_bytes()[i] != b'\'') {
+            search = after;
+            continue;
+        }
+        let quote = tag.as_bytes()[i];
+        let value_start = i + 1;
+        let value_end = tag.as_bytes()[value_start..]
+            .iter()
+            .position(|b| *b == quote)
+            .map(|pos| value_start + pos)?;
+        return Some(&tag[value_start..value_end]);
+    }
+    None
+}
+
+fn parse_html_media_tag(tag: &str) -> Option<(&'static str, &str)> {
+    let tag = tag.trim_start_matches('<').trim_end_matches('>').trim();
+    let tag = tag.strip_prefix('/').unwrap_or(tag).trim_start();
+    let tag_name_end = tag
+        .find(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
+        .unwrap_or(tag.len());
+    let content_type = html_media_content_type(&tag[..tag_name_end])?;
+    let url = extract_src_attr(tag)?;
+    if url.is_empty() {
+        return None;
+    }
+    Some((content_type, url))
+}
+
+pub(crate) fn split_html_media_tags_to_content_parts(text: &str) -> Option<Vec<serde_json::Value>> {
+    let mut parts = Vec::new();
+    let mut last = 0;
+    let mut search = 0;
+    let mut found = false;
+
+    while let Some(rel_start) = text[search..].find('<') {
+        let start = search + rel_start;
+        let Some(rel_end) = text[start..].find('>') else {
+            break;
+        };
+        let end = start + rel_end + 1;
+        let tag = &text[start..end];
+        let Some((content_type, url)) = parse_html_media_tag(tag) else {
+            search = end;
+            continue;
+        };
+
+        if start > last {
+            parts.push(serde_json::json!({"type": "text", "text": &text[last..start]}));
+        }
+        parts.push(serde_json::json!({
+            "type": content_type,
+            content_type: {"url": url},
+        }));
+        last = end;
+        search = end;
+        found = true;
+    }
+
+    if !found {
+        return None;
+    }
+    if last < text.len() {
+        parts.push(serde_json::json!({"type": "text", "text": &text[last..]}));
+    }
+    Some(parts)
+}
+
+fn collect_html_media_urls(text: &str, media_map: &mut MultimodalDataMap) {
+    if let Some(parts) = split_html_media_tags_to_content_parts(text) {
+        for part in parts {
+            let Some(content_type) = part.get("type").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(url) = part
+                .get(content_type)
+                .and_then(|v| v.get("url"))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            if matches!(content_type, "image_url" | "video_url" | "audio_url") {
+                match url::Url::parse(url) {
+                    Ok(parsed) => media_map
+                        .entry(content_type.to_string())
+                        .or_default()
+                        .push(MultimodalData::Url(parsed)),
+                    Err(err) => {
+                        tracing::warn!("Skipping invalid HTML media URL in chat content: {}", err)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn gather_html_media_urls(messages: &serde_json::Value, media_map: &mut MultimodalDataMap) {
+    let Some(messages) = messages.as_array() else {
+        return;
+    };
+    for message in messages {
+        if message.get("role").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+        match message.get("content") {
+            Some(serde_json::Value::String(text)) => collect_html_media_urls(text, media_map),
+            Some(serde_json::Value::Array(parts)) => {
+                for part in parts {
+                    let Some(text) = part
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .filter(|_| part.get("type").and_then(|v| v.as_str()) == Some("text"))
+                    else {
+                        continue;
+                    };
+                    collect_html_media_urls(text, media_map);
+                }
+            }
+            _ => {}
+        }
+    }
+}
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LLMMetricAnnotation {
     pub input_tokens: usize,
@@ -143,6 +304,7 @@ impl LLMMetricAnnotation {
 struct ReasoningState {
     stream: Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>,
     reasoning_parser: Option<Box<dyn ReasoningParser>>,
+    structured_output_as_content: bool,
 }
 
 pub struct OpenAIPreprocessor {
@@ -463,6 +625,9 @@ impl OpenAIPreprocessor {
                 }
             }
         }
+        if has_media_loader {
+            gather_html_media_urls(&serde_json::to_value(request.messages())?, &mut media_map);
+        }
 
         // Execute all fetch tasks
         if !fetch_tasks.is_empty() {
@@ -754,6 +919,7 @@ impl OpenAIPreprocessor {
                 self.runtime_config.reasoning_parser.as_deref(),
                 request.chat_template_args.as_ref(),
             );
+        let structured_output_as_content = Self::has_structured_output_constraint(request);
 
         // Reasoning Content Parsing Transformation Step
         // Current Solution:
@@ -767,6 +933,7 @@ impl OpenAIPreprocessor {
                 stream,
                 self.runtime_config.reasoning_parser.clone().unwrap(), // Safety: We already checked that parser is some, so gtg
                 prompt_injected_reasoning,
+                structured_output_as_content,
             ))
         } else {
             Box::pin(stream)
@@ -1245,6 +1412,43 @@ impl OpenAIPreprocessor {
         }
     }
 
+    fn has_structured_output_constraint(request: &NvCreateChatCompletionRequest) -> bool {
+        let response_format_constrained = request
+            .inner
+            .response_format
+            .as_ref()
+            .is_some_and(|format| !matches!(format, dynamo_protocols::types::ResponseFormat::Text));
+        let structured_outputs_constrained =
+            request.structured_outputs.as_ref().is_some_and(|params| {
+                params.json.is_some()
+                    || params.regex.is_some()
+                    || params.choice.is_some()
+                    || params.grammar.is_some()
+                    || params.json_object == Some(true)
+            });
+
+        response_format_constrained
+            || structured_outputs_constrained
+            || request.common.guided_json.is_some()
+            || request.common.guided_regex.is_some()
+            || request.common.guided_grammar.is_some()
+            || request.common.guided_choice.is_some()
+    }
+
+    fn normalize_qwen_chat_template_args(request: &mut NvCreateChatCompletionRequest) {
+        let Some(args) = request.chat_template_args.as_mut() else {
+            return;
+        };
+        if args.contains_key("enable_thinking") {
+            return;
+        }
+        if let Some(thinking) = args.get("thinking").cloned()
+            && thinking.is_boolean()
+        {
+            args.insert("enable_thinking".to_string(), thinking);
+        }
+    }
+
     // Motivation: Each transformation on the stream should be a separate step to allow for more flexibility
     // Earlier reasoning parser logic was nested under delta generation logic in choice_from_postprocessor
     // Since we have tool calling parsing as separate step, it makes sense to have reasoning parser as separate step as well
@@ -1259,6 +1463,7 @@ impl OpenAIPreprocessor {
         stream: S,
         parser_name: String,
         prompt_injected_reasoning: bool,
+        structured_output_as_content: bool,
     ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
     where
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
@@ -1275,6 +1480,7 @@ impl OpenAIPreprocessor {
         let state = ReasoningState {
             stream: Box::pin(stream),
             reasoning_parser: Some(reasoning_parser),
+            structured_output_as_content,
         };
 
         stream::unfold(state, |mut state| async move {
@@ -1284,6 +1490,18 @@ impl OpenAIPreprocessor {
                     response.map_data(|mut data| {
                         // Process all choices, not just the first one
                         for choice in data.inner.choices.iter_mut() {
+                            if state.structured_output_as_content
+                                && choice.delta.content.is_none()
+                                && let Some(reasoning) = choice.delta.reasoning_content.take()
+                            {
+                                choice.delta.content = Some(
+                                    dynamo_protocols::types::ChatCompletionMessageContent::Text(
+                                        reasoning,
+                                    ),
+                                );
+                                continue;
+                            }
+
                             // Reasoning parsing only applies to text content
                             if let Some(
                                 dynamo_protocols::types::ChatCompletionMessageContent::Text(text),
@@ -1297,6 +1515,16 @@ impl OpenAIPreprocessor {
                                     dynamo_protocols::types::ChatCompletionMessageContent::Text,
                                 );
                                 choice.delta.reasoning_content = parser_result.get_some_reasoning();
+                                if state.structured_output_as_content
+                                    && choice.delta.content.is_none()
+                                    && let Some(reasoning) = choice.delta.reasoning_content.take()
+                                {
+                                    choice.delta.content = Some(
+                                        dynamo_protocols::types::ChatCompletionMessageContent::Text(
+                                            reasoning,
+                                        ),
+                                    );
+                                }
                             }
                             // For multimodal content, pass through unchanged
                         }
@@ -1345,11 +1573,21 @@ impl
         let original_stream_flag = request.inner.stream.unwrap_or(false);
 
         // Build audit handle (None if no DYN_AUDIT_SINKS)
-        let mut audit_handle = crate::audit::handle::create_handle(&request, &request_id);
+        let audit_handle = crate::audit::handle::create_handle(&request, &request_id);
 
-        if let Some(ref mut h) = audit_handle {
-            h.set_request(std::sync::Arc::new(request.clone()));
+        if let Some(ref h) = audit_handle {
+            let headers = context
+                .clone_unique::<serde_json::Value>("http_headers")
+                .ok()
+                .map(Arc::new);
+            let raw_request = context
+                .clone_unique::<serde_json::Value>("http_raw_payload")
+                .ok()
+                .map(Arc::new);
+            h.emit_request(Arc::new(request.clone()), raw_request, headers);
         }
+
+        Self::normalize_qwen_chat_template_args(&mut request);
 
         // For non-streaming requests (stream=false), enable usage by default
         // This ensures compliance with OpenAI API spec where non-streaming responses
@@ -1405,29 +1643,11 @@ impl
         let transformed_stream =
             self.postprocessor_parsing_stream(stream, &request, prompt_injected_reasoning)?;
 
-        // Apply audit aggregation strategy.
-        // The audit branch already returns Pin<Box<...>> from scan/fold_aggregate_with_future,
-        // while the non-audit branch boxes the impl Stream from postprocessor_parsing_stream.
-        let final_stream = if let Some(mut audit) = audit_handle {
-            let (stream, agg_fut) = if audit.streaming() {
-                // Streaming: apply scan (pass-through + parallel aggregation)
-                crate::audit::stream::scan_aggregate_with_future(transformed_stream)
-            } else {
-                // Non-streaming: apply fold (collect all, then emit single chunk)
-                crate::audit::stream::fold_aggregate_with_future(transformed_stream)
-            };
-
-            // Spawn audit task
-            tokio::spawn(async move {
-                let final_resp = agg_fut.await;
-                audit.set_response(Arc::new(final_resp));
-                audit.emit();
-            });
-
-            stream
-        } else {
-            Box::pin(transformed_stream)
-        };
+        // Request payloads are captured here while the raw HTTP payload is still
+        // attached to the context. Response payloads are captured at the HTTP
+        // layer after frontend transformations (forced tool calls, finish-reason
+        // normalization) so audit logs match the exact client-visible response.
+        let final_stream = Box::pin(transformed_stream);
 
         // Step 5: Speculative next-turn prefill
         let final_stream = speculative_prefill::maybe_wrap_stream(
@@ -1594,7 +1814,7 @@ impl
 
 #[cfg(test)]
 mod strip_tests {
-    use super::OpenAIPreprocessor;
+    use super::{OpenAIPreprocessor, split_html_media_tags_to_content_parts};
 
     #[test]
     fn test_strip_inline_data_urls_replaces_data_urls() {
@@ -1647,6 +1867,19 @@ mod strip_tests {
         let mut messages = serde_json::json!([]);
         OpenAIPreprocessor::strip_inline_data_urls(&mut messages);
         assert_eq!(messages, serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_split_html_media_tags_to_content_parts() {
+        let parts = split_html_media_tags_to_content_parts(
+            "Look <img src=\"data:image/png;base64,AAA=\"/> then <video src='file:///tmp/a.mp4'/>",
+        )
+        .unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAA=");
+        assert_eq!(parts[3]["type"], "video_url");
+        assert_eq!(parts[3]["video_url"]["url"], "file:///tmp/a.mp4");
     }
 }
 

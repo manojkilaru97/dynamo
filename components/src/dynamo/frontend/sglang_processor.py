@@ -146,13 +146,13 @@ def _preprocess_worker(
         raise PreprocessError(_unsupported_n_error(n))
 
     dynamo_preproc = _build_dynamo_preproc(
-        request, pre.prompt_token_ids, model_name, eos_token_id
+        pre.request, pre.prompt_token_ids, model_name, eos_token_id
     )
 
     return SglangPreprocessWorkerResult(
         prompt_token_ids=pre.prompt_token_ids,
         dynamo_preproc=dynamo_preproc,
-        request=request,
+        request=pre.request,
     )
 
 
@@ -320,7 +320,7 @@ class SglangProcessor:
                 return
 
             dynamo_preproc = _build_dynamo_preproc(
-                request, tokens, request["model"], self.eos_token_id
+                pre.request, tokens, request["model"], self.eos_token_id
             )
         except Exception as exc:
             logger.exception("SGLang preprocessing failed for request %s", request_id)
@@ -336,10 +336,11 @@ class SglangProcessor:
             tokenizer=self.tokenizer,
             tool_call_parser=pre.tool_call_parser,
             reasoning_parser=pre.reasoning_parser,
+            request=pre.request,
         )
 
         async for item in self._generate_and_stream(
-            request_id, request, dynamo_preproc, tokens, post
+            request_id, pre.request, dynamo_preproc, tokens, post
         ):
             yield item
 
@@ -389,6 +390,7 @@ class SglangProcessor:
             tokenizer=self.tokenizer,
             tool_call_parser=tool_call_parser,
             reasoning_parser=reasoning_parser,
+            request=request,
         )
 
         async for item in self._generate_and_stream(

@@ -3,7 +3,7 @@
 
 use crate::DistributedRuntime;
 use crate::config::HealthStatus;
-use crate::engine::AsyncEngine;
+use crate::engine::{AsyncEngine, AsyncEngineContextProvider};
 use crate::pipeline::SingleIn;
 use crate::protocols::maybe_error::MaybeError;
 use futures::StreamExt;
@@ -213,78 +213,88 @@ impl HealthCheckManager {
                 )
             })?;
 
-        // Clone what we need for the spawned task
         let system_health = self.drt.system_health().clone();
         let endpoint_subject_owned = endpoint_subject.to_string();
-        let payload = payload.clone();
         let timeout = self.config.request_timeout;
 
-        // Spawn task to send health check and wait for response
-        tokio::spawn(async move {
-            let result = tokio::time::timeout(timeout, async {
-                let request = SingleIn::new(payload);
-                match engine.generate(request).await {
-                    Ok(mut response_stream) => {
-                        // Get the first response to verify endpoint is alive.
-                        // Check for errors
-                        let is_healthy = if let Some(response) = response_stream.next().await {
-                            if let Some(error) = response.err() {
-                                warn!(
-                                    "Health check error response from {}: {:?}",
-                                    endpoint_subject_owned, error
-                                );
-                                false
-                            } else {
-                                debug!("Health check successful for {}", endpoint_subject_owned);
-                                true
-                            }
-                        } else {
-                            warn!(
-                                "Health check got no response from {}",
-                                endpoint_subject_owned
-                            );
-                            false
-                        };
-
-                        tokio::spawn(async move {
-                            // We need to consume the rest of the stream to avoid warnings on the frontend.
-                            response_stream.for_each(|_| async {}).await;
-                        });
-
-                        // Update health status based on response
-                        system_health.lock().set_endpoint_health_status(
-                            &endpoint_subject_owned,
-                            if is_healthy {
-                                HealthStatus::Ready
-                            } else {
-                                HealthStatus::NotReady
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Health check request failed for {}: {}",
-                            endpoint_subject_owned, e
-                        );
-                        system_health.lock().set_endpoint_health_status(
-                            &endpoint_subject_owned,
-                            HealthStatus::NotReady,
-                        );
-                    }
-                }
-            })
-            .await;
-
-            // Handle timeout
-            if result.is_err() {
-                warn!("Health check timeout for {}", endpoint_subject_owned);
+        let request = SingleIn::new(payload.clone());
+        let mut response_stream = match tokio::time::timeout(timeout, engine.generate(request))
+            .await
+        {
+            Ok(Ok(response_stream)) => response_stream,
+            Ok(Err(e)) => {
+                error!(
+                    "Health check request failed for {}: {}",
+                    endpoint_subject_owned, e
+                );
                 system_health
                     .lock()
                     .set_endpoint_health_status(&endpoint_subject_owned, HealthStatus::NotReady);
+                return Ok(());
             }
+            Err(_) => {
+                warn!(
+                    "Health check generate call timed out before stream creation for {}",
+                    endpoint_subject_owned
+                );
+                system_health
+                    .lock()
+                    .set_endpoint_health_status(&endpoint_subject_owned, HealthStatus::NotReady);
+                return Ok(());
+            }
+        };
 
-            debug!("Health check completed for {}", endpoint_subject_owned);
-        });
+        let context = response_stream.context();
+        let is_healthy = match tokio::time::timeout(timeout, response_stream.next()).await {
+            Ok(Some(response)) => {
+                if let Some(error) = response.err() {
+                    warn!(
+                        "Health check error response from {}: {:?}",
+                        endpoint_subject_owned, error
+                    );
+                    false
+                } else {
+                    debug!("Health check successful for {}", endpoint_subject_owned);
+                    true
+                }
+            }
+            Ok(None) => {
+                warn!(
+                    "Health check got no response from {}",
+                    endpoint_subject_owned
+                );
+                false
+            }
+            Err(_) => {
+                warn!("Health check timeout for {}", endpoint_subject_owned);
+                context.kill();
+                context.stop_generating();
+                false
+            }
+        };
+
+        if is_healthy {
+            // Health requests only need the first response. Ask the backend to stop
+            // and drain briefly so a broken/slow canary cannot become permanent load.
+            context.stop_generating();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(5), async move {
+                    response_stream.for_each(|_| async {}).await;
+                })
+                .await;
+            });
+        }
+
+        system_health.lock().set_endpoint_health_status(
+            &endpoint_subject_owned,
+            if is_healthy {
+                HealthStatus::Ready
+            } else {
+                HealthStatus::NotReady
+            },
+        );
+
+        debug!("Health check completed for {}", endpoint_subject_owned);
 
         Ok(())
     }

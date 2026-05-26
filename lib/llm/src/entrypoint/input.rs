@@ -100,10 +100,7 @@ pub async fn run_input(
 ) -> anyhow::Result<()> {
     // Initialize audit bus + sink workers (off hot path; fan-out supported)
     if crate::audit::config::policy().enabled {
-        let cap: usize = std::env::var("DYN_AUDIT_CAPACITY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024);
+        let cap = crate::audit::config::policy().capacity;
         crate::audit::bus::init(cap);
         crate::audit::sink::spawn_workers_from_env().await?;
         tracing::info!(cap, "Audit initialized");

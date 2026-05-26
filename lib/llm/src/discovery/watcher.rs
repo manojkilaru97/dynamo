@@ -392,6 +392,13 @@ impl ModelWatcher {
                     "Removed WorkerSet (no remaining instances in namespace)"
                 );
             }
+            for alias in &card.aliases {
+                if alias != &model_name {
+                    self.manager.remove_worker_set(alias, &ws_key);
+                    self.manager.remove_model_if_empty(alias);
+                    self.manager.unregister_alias(alias);
+                }
+            }
 
             // If the removed component was a prefill worker, deactivate the decode-side
             // prefill router so requests fall back to aggregated mode (or fail cleanly
@@ -415,6 +422,12 @@ impl ModelWatcher {
 
         // No instances remain anywhere — remove the entire Model
         let _ = self.manager.remove_model(&model_name);
+        for alias in &card.aliases {
+            if alias != &model_name {
+                let _ = self.manager.remove_model(alias);
+                self.manager.unregister_alias(alias);
+            }
+        }
 
         if let Some(tx) = &self.model_update_tx {
             for model_type in ALL_MODEL_TYPES {
@@ -960,6 +973,20 @@ impl ModelWatcher {
         // Add the completed WorkerSet to the Model
         self.manager
             .add_worker_set(card.name(), &ws_key, worker_set);
+
+        if !card.aliases.is_empty()
+            && let Some(model) = self.manager.get_model(card.name())
+            && let Some(ws_arc) = model.get_worker_set(&ws_key)
+        {
+            for alias in &card.aliases {
+                if alias != card.name() {
+                    tracing::info!(model_name = card.name(), alias, "Registering model alias");
+                    self.manager
+                        .add_worker_set_arc(alias, &ws_key, ws_arc.clone());
+                    self.manager.register_alias(alias, card.name());
+                }
+            }
+        }
 
         Ok(())
     }

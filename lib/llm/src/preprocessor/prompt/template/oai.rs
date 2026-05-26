@@ -13,6 +13,7 @@ use crate::protocols::openai::{
 use tracing;
 
 use crate::preprocessor::prompt::{PromptInput, TextInput, TokenInput};
+use crate::preprocessor::split_html_media_tags_to_content_parts;
 
 fn may_be_fix_tool_schema(tools: serde_json::Value) -> Option<Value> {
     // No need to validate or enforce other schema checks as the basic Named function schema is already validated while creating the request.
@@ -101,6 +102,24 @@ fn convert_media_url_to_placeholder(
         .collect()
 }
 
+fn expand_html_media_tags(content_array: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut expanded = Vec::new();
+    for part in content_array {
+        let text = part
+            .get("text")
+            .and_then(|v| v.as_str())
+            .filter(|_| part.get("type").and_then(|v| v.as_str()) == Some("text"));
+        if let Some(text) = text
+            && let Some(parts) = split_html_media_tags_to_content_parts(text)
+        {
+            expanded.extend(parts);
+            continue;
+        }
+        expanded.push(part.clone());
+    }
+    expanded
+}
+
 fn may_be_fix_msg_content(messages: serde_json::Value, preserve_arrays: bool) -> Value {
     // preserve_arrays=true: strings → arrays (multimodal)
     // preserve_arrays=false: text-only arrays → strings (standard)
@@ -117,19 +136,34 @@ fn may_be_fix_msg_content(messages: serde_json::Value, preserve_arrays: bool) ->
                 Some(serde_json::Value::String(text)) if preserve_arrays => {
                     let mut modified_msg = msg.clone();
                     if let Some(msg_object) = modified_msg.as_object_mut() {
-                        let content_array = serde_json::json!([{
-                            "type": "text",
-                            "text": text
-                        }]);
-                        msg_object.insert("content".to_string(), content_array);
+                        let content_array = split_html_media_tags_to_content_parts(text)
+                            .unwrap_or_else(|| {
+                                vec![serde_json::json!({
+                                    "type": "text",
+                                    "text": text
+                                })]
+                            });
+                        let content_array = convert_media_url_to_placeholder(
+                            &content_array,
+                            DEFAULT_MEDIA_TYPE_CONVERSIONS,
+                        );
+                        msg_object.insert(
+                            "content".to_string(),
+                            serde_json::Value::Array(content_array),
+                        );
                     }
                     modified_msg
                 }
                 // Case 2: Array processing
                 Some(serde_json::Value::Array(content_array)) => {
+                    let content_array = if preserve_arrays {
+                        expand_html_media_tags(content_array)
+                    } else {
+                        content_array.clone()
+                    };
                     // First, convert any media URL parts to placeholders (e.g., image_url → image)
                     let content_array = convert_media_url_to_placeholder(
-                        content_array,
+                        &content_array,
                         DEFAULT_MEDIA_TYPE_CONVERSIONS,
                     );
 
@@ -1257,6 +1291,36 @@ NORMAL MODE
         assert_eq!(content_array.len(), 1);
         assert_eq!(content_array[0]["type"], "text");
         assert_eq!(content_array[0]["text"], "Hello, how are you?");
+    }
+
+    #[test]
+    fn test_may_be_fix_msg_content_html_media_tags_to_placeholders() {
+        let json_str = r#"{
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Describe <img src=\"data:image/png;base64,AAA=\"/> and <video src='file:///tmp/a.mp4'/>"
+                }
+            ]
+        }"#;
+
+        let request: NvCreateChatCompletionRequest = serde_json::from_str(json_str).unwrap();
+        let messages_raw = serde_json::to_value(request.messages()).unwrap();
+        let messages = serde_json::to_value(may_be_fix_msg_content(messages_raw, false)).unwrap();
+
+        assert_eq!(
+            messages[0]["content"],
+            "Describe <img src=\"data:image/png;base64,AAA=\"/> and <video src='file:///tmp/a.mp4'/>"
+        );
+
+        let messages_raw = serde_json::to_value(request.messages()).unwrap();
+        let messages = serde_json::to_value(may_be_fix_msg_content(messages_raw, true)).unwrap();
+        let content_array = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content_array[0]["type"], "text");
+        assert_eq!(content_array[1]["type"], "image");
+        assert_eq!(content_array[2]["type"], "text");
+        assert_eq!(content_array[3]["type"], "video");
     }
 
     /// Tests that arrays are preserved when preserve_arrays=true

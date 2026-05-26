@@ -78,22 +78,30 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             # DisaggPreprocessedRequest format
             inner_request = request["request"]
             sampling_params = request.get("sampling_params", {})
+            guided_decoding = request.get("guided_decoding") or inner_request.get(
+                "guided_decoding"
+            )
+            sampling_params = self._cap_guided_sampling_params(
+                sampling_params, guided_decoding
+            )
         else:
             inner_request = request
             sampling_opts = request.get("sampling_options", {})
             stop_conditions = request.get("stop_conditions", {})
+            guided_decoding = sampling_opts.get("guided_decoding")
             sampling_params = {
                 "temperature": sampling_opts.get("temperature"),
                 "top_p": sampling_opts.get("top_p"),
                 "top_k": sampling_opts.get("top_k"),
                 "max_new_tokens": stop_conditions.get("max_tokens"),
-                **self._get_guided_decoding_params(
-                    sampling_opts.get("guided_decoding")
-                ),
+                **self._get_guided_decoding_params(guided_decoding),
             }
             sampling_params = {
                 k: v for k, v in sampling_params.items() if v is not None
             }
+            sampling_params = self._cap_guided_sampling_params(
+                sampling_params, guided_decoding
+            )
 
         # Use provided bootstrap_info if available (e.g., for health checks with FAKE_BOOTSTRAP_HOST)
         # Otherwise use real bootstrap host/port from engine and generate room locally

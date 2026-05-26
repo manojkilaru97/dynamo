@@ -9,23 +9,24 @@ use dynamo_protocols::types::responses::{
     AssistantRole, FunctionCallOutput, FunctionToolCall, IncludeEnum, InputContent, InputItem,
     InputOutputMessageContent, InputParam, InputRole, InputTokenDetails, Instructions, Item,
     MessageItem, OutputItem, OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent,
-    OutputTokenDetails, PromptCacheRetention, Reasoning, ReasoningItem, Response,
-    ResponseTextParam, ResponseUsage, Role as ResponseRole, ServiceTier, Status, SummaryPart,
-    SummaryTextContent, TextResponseFormatConfiguration, Tool, ToolChoiceOptions, ToolChoiceParam,
-    Truncation,
+    OutputTokenDetails, PromptCacheRetention, Reasoning, ReasoningItem, ReasoningTextContent,
+    Response, ResponseTextParam, ResponseUsage, Role as ResponseRole, ServiceTier, Status,
+    SummaryPart, SummaryTextContent, TextResponseFormatConfiguration, Tool, ToolChoiceOptions,
+    ToolChoiceParam, Truncation,
 };
 use dynamo_protocols::types::{
     ChatCompletionMessageToolCall, ChatCompletionNamedToolChoice,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
-    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
-    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
+    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestMessageContentPartVideo,
+    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
+    ChatCompletionRequestToolMessage,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionTool, ChatCompletionToolChoiceOption, ChatCompletionToolType,
     CreateChatCompletionRequest, FunctionName, FunctionObject, FunctionType,
-    ImageDetail as ChatImageDetail, ImageUrl, ReasoningContent, ResponseFormat,
-    ServiceTier as ChatServiceTier,
+    ImageDetail as ChatImageDetail, ImageUrl, ReasoningContent, ReasoningEffort, ResponseFormat,
+    ServiceTier as ChatServiceTier, VideoUrl,
 };
 use dynamo_runtime::protocols::annotated::AnnotationsProvider;
 use serde::{Deserialize, Serialize};
@@ -124,6 +125,37 @@ pub(crate) fn patch_response_for_spec(
         serde_json::json!(frequency_penalty),
     );
     obj.insert("store".into(), serde_json::json!(store));
+    patch_reasoning_content_types_in_map(obj);
+}
+
+pub(crate) fn patch_reasoning_content_types(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(obj) => patch_reasoning_content_types_in_map(obj),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                patch_reasoning_content_types(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn patch_reasoning_content_types_in_map(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if obj.get("type").and_then(serde_json::Value::as_str) == Some("reasoning")
+        && let Some(serde_json::Value::Array(content)) = obj.get_mut("content")
+    {
+        for part in content {
+            if let serde_json::Value::Object(part_obj) = part {
+                part_obj
+                    .entry("type".to_string())
+                    .or_insert_with(|| serde_json::Value::String("reasoning_text".to_string()));
+            }
+        }
+    }
+
+    for value in obj.values_mut() {
+        patch_reasoning_content_types(value);
+    }
 }
 
 impl Serialize for NvResponse {
@@ -296,7 +328,25 @@ fn convert_input_content_to_user_content(
                     },
                 ));
             }
-            // TODO: handle InputVideo / InputAudio when upstream adds them
+            InputContent::InputVideo(video) => {
+                let url_str = video
+                    .video
+                    .as_deref()
+                    .or(video.video_url.as_deref())
+                    .ok_or_else(|| anyhow::anyhow!("input_video requires video or video_url"))?;
+                let url = url::Url::parse(url_str)
+                    .map_err(|e| anyhow::anyhow!("Invalid video URL '{}': {}", url_str, e))?;
+                chat_parts.push(ChatCompletionRequestUserMessageContentPart::VideoUrl(
+                    ChatCompletionRequestMessageContentPartVideo {
+                        video_url: VideoUrl {
+                            url,
+                            detail: Some(convert_image_detail_str(&video.detail)),
+                            uuid: None,
+                        },
+                    },
+                ));
+            }
+            // TODO: handle InputAudio when upstream adds it
             InputContent::InputFile(_) => {
                 return Err(anyhow::anyhow!("File input content is not yet supported"));
             }
@@ -698,6 +748,15 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
 
         // Map reasoning.effort to reasoning_effort
         let reasoning_effort = resp.inner.reasoning.as_ref().and_then(|r| r.effort.clone());
+        let chat_template_args =
+            if matches!(reasoning_effort.as_ref(), Some(ReasoningEffort::None)) {
+                Some(HashMap::from([(
+                    "enable_thinking".to_string(),
+                    serde_json::Value::Bool(false),
+                )]))
+            } else {
+                None
+            };
 
         // Map text.format to response_format
         let response_format = resp.inner.text.as_ref().and_then(convert_text_format);
@@ -729,8 +788,9 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
             },
             common: Default::default(),
             nvext: resp.nvext,
-            chat_template_args: None,
+            chat_template_args,
             media_io_kwargs: None,
+            structured_outputs: None,
             unsupported_fields: Default::default(),
         })
     }
@@ -914,6 +974,12 @@ pub fn chat_completion_to_response(
     let mut output = Vec::new();
 
     if let Some(choice) = choice {
+        let suppress_reasoning = params
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_ref())
+            .is_some_and(|effort| matches!(effort, ReasoningEffort::None));
+
         // Handle structured tool calls
         if let Some(tool_calls) = choice.message.tool_calls {
             for tc in &tool_calls {
@@ -930,14 +996,17 @@ pub fn chat_completion_to_response(
 
         // Map reasoning_content to a Reasoning output item
         if let Some(reasoning_text) = choice.message.reasoning_content
+            && !suppress_reasoning
             && !reasoning_text.is_empty()
         {
             output.push(OutputItem::Reasoning(ReasoningItem {
                 id: format!("rs_{}", Uuid::new_v4().simple()),
                 summary: vec![SummaryPart::SummaryText(SummaryTextContent {
-                    text: reasoning_text,
+                    text: reasoning_text.clone(),
                 })],
-                content: None,
+                content: Some(vec![ReasoningTextContent {
+                    text: reasoning_text,
+                }]),
                 encrypted_content: None,
                 status: Some(OutputStatus::Completed),
             }));
@@ -1296,6 +1365,52 @@ mod tests {
             ChatCompletionRequestMessage::User(u) => match &u.content {
                 ChatCompletionRequestUserMessageContent::Array(parts) => {
                     assert_eq!(parts.len(), 2);
+                }
+                _ => panic!("expected array content"),
+            },
+            _ => panic!("expected user message"),
+        }
+    }
+
+    #[test]
+    fn test_input_items_with_video() {
+        let req = NvCreateResponse {
+            inner: CreateResponse {
+                input: InputParam::Items(vec![InputItem::Item(Item::Message(MessageItem::Input(
+                    InputMessage {
+                        content: vec![
+                            InputContent::InputText(InputTextContent {
+                                text: "What is in this video?".into(),
+                            }),
+                            InputContent::InputVideo(
+                                dynamo_protocols::types::responses::InputVideoContent {
+                                    detail: Default::default(),
+                                    video: Some("https://example.com/dog.mp4".into()),
+                                    video_url: None,
+                                },
+                            ),
+                        ],
+                        role: InputRole::User,
+                        status: None,
+                    },
+                )))]),
+                model: Some("test-model".into()),
+                ..Default::default()
+            },
+            nvext: None,
+        };
+
+        let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        let messages = &chat_req.inner.messages;
+        assert_eq!(messages.len(), 1);
+        match &messages[0] {
+            ChatCompletionRequestMessage::User(u) => match &u.content {
+                ChatCompletionRequestUserMessageContent::Array(parts) => {
+                    assert_eq!(parts.len(), 2);
+                    assert!(matches!(
+                        parts[1],
+                        ChatCompletionRequestUserMessageContentPart::VideoUrl(_)
+                    ));
                 }
                 _ => panic!("expected array content"),
             },

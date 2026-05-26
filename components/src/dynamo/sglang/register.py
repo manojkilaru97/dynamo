@@ -58,6 +58,7 @@ async def _register_model_with_runtime_config(
             kv_cache_block_size=server_args.page_size,
             runtime_config=runtime_config,
             custom_template_path=dynamo_args.custom_jinja_template,
+            model_aliases=dynamo_args.dyn_served_model_alias or None,
         )
         logging.info("Successfully registered LLM with runtime config")
         return True

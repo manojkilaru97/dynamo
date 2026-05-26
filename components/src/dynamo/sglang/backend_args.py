@@ -65,6 +65,15 @@ class DynamoSGLangArgGroup(ArgGroup):
             choices=[m.value for m in EmbeddingTransferMode],
         )
 
+        add_argument(
+            g,
+            flag_name="--dyn-served-model-alias",
+            env_var="DYN_SGL_SERVED_MODEL_ALIASES",
+            default=[],
+            nargs="*",
+            help="Additional model names accepted by the frontend and routed to the primary served model.",
+        )
+
         add_negatable_bool_argument(
             g,
             flag_name="--embedding-worker",
@@ -117,6 +126,7 @@ class DynamoSGLangConfig(ConfigBase):
     multimodal_encode_worker: bool
     multimodal_worker: bool
     embedding_transfer_mode: EmbeddingTransferMode
+    dyn_served_model_alias: list[str] = []
     embedding_worker: bool
     image_diffusion_worker: bool
 

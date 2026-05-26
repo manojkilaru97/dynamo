@@ -55,6 +55,12 @@ pub mod logging {
         /// OTLP exporter endpoint URL for logs (defaults to traces endpoint if unset)
         pub const OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT";
 
+        /// OTLP exporter protocol for logs.
+        pub const OTEL_EXPORTER_OTLP_LOGS_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL";
+
+        /// OTLP exporter protocol fallback shared across signals.
+        pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+
         /// Service name for OTLP traces and logs
         pub const OTEL_SERVICE_NAME: &str = "OTEL_SERVICE_NAME";
     }
@@ -295,6 +301,21 @@ pub mod llm {
     /// Enable streaming reasoning dispatch (`event: reasoning_dispatch` SSE events)
     pub const DYN_ENABLE_STREAMING_REASONING_DISPATCH: &str =
         "DYN_ENABLE_STREAMING_REASONING_DISPATCH";
+
+    /// Audit/payload logging configuration.
+    pub mod audit {
+        /// Comma-separated audit sinks, e.g. "otel" or "stderr,otel".
+        pub const DYN_AUDIT_SINKS: &str = "DYN_AUDIT_SINKS";
+
+        /// Capture payloads regardless of request `store`.
+        pub const DYN_AUDIT_FORCE_LOGGING: &str = "DYN_AUDIT_FORCE_LOGGING";
+
+        /// Audit bus capacity.
+        pub const DYN_AUDIT_CAPACITY: &str = "DYN_AUDIT_CAPACITY";
+
+        /// Maximum serialized payload bytes emitted to OTEL before marker fallback.
+        pub const DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES: &str = "DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES";
+    }
 
     /// Backend stream inactivity timeout in seconds.
     ///

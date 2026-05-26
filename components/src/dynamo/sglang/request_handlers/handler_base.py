@@ -5,7 +5,6 @@ import asyncio
 import dataclasses
 import importlib
 import inspect
-import json
 import logging
 import os
 import random
@@ -42,6 +41,10 @@ from dynamo.llm.exceptions import EngineShutdown
 from dynamo.runtime import DistributedRuntime
 from dynamo.sglang._compat import NetworkAddress, get_local_ip_auto
 from dynamo.sglang.args import Config
+from dynamo.sglang.guided_decoding import (
+    cap_guided_max_new_tokens,
+    get_guided_decoding_params,
+)
 from dynamo.sglang.publisher import DynamoSglangPublisher
 
 logger = logging.getLogger(__name__)
@@ -1058,6 +1061,11 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
             "prompt" if isinstance(request_input, str) else "input_ids": request_input
         }
 
+    def _cap_guided_sampling_params(
+        self, params: Dict[str, Any], guided_decoding: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        return cap_guided_max_new_tokens(params, guided_decoding)
+
     def _session_kwargs(self, request: Dict[str, Any]) -> Dict[str, Any]:
         if not getattr(self.config.server_args, "enable_streaming_session", False):
             return {}
@@ -1075,11 +1083,7 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         guided_decoding: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Extract guided decoding params (e.g. json_schema) for SGLang sampling_params."""
-        if isinstance(guided_decoding, dict):
-            json_schema = guided_decoding.get("json")
-            if json_schema is not None:
-                return {"json_schema": json.dumps(json_schema)}
-        return {}
+        return get_guided_decoding_params(guided_decoding)
 
     @staticmethod
     def _generate_bootstrap_room() -> int:

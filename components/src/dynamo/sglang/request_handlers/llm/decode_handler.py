@@ -92,6 +92,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             # Token-based request format
             sampling_opts = request.get("sampling_options", {})
             stop_conditions = request.get("stop_conditions", {})
+            guided_decoding = sampling_opts.get("guided_decoding")
 
             param_mapping = {
                 "temperature": sampling_opts.get("temperature"),
@@ -99,21 +100,21 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 "top_k": sampling_opts.get("top_k"),
                 "max_new_tokens": stop_conditions.get("max_tokens"),
                 "ignore_eos": stop_conditions.get("ignore_eos"),
-                **self._get_guided_decoding_params(
-                    sampling_opts.get("guided_decoding")
-                ),
+                **self._get_guided_decoding_params(guided_decoding),
             }
         else:
             # OpenAI request format
+            guided_decoding = request.get("guided_decoding")
             param_mapping = {
                 "temperature": request.get("temperature"),
                 "top_p": request.get("top_p"),
                 "top_k": request.get("top_k"),
                 "max_new_tokens": request.get("max_tokens"),
-                **self._get_guided_decoding_params(request.get("guided_decoding")),
+                **self._get_guided_decoding_params(guided_decoding),
             }
 
-        return {k: v for k, v in param_mapping.items() if v is not None}
+        params = {k: v for k, v in param_mapping.items() if v is not None}
+        return self._cap_guided_sampling_params(params, guided_decoding)
 
     @staticmethod
     def _build_logprob_kwargs(request: Dict[str, Any]) -> Dict[str, Any]:
@@ -316,10 +317,14 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             )
 
             if not self.use_sglang_tokenizer:
-                async for out in self._process_token_stream(decode, context):
+                async for out in self._process_token_stream(
+                    decode, context, request_id_hint=trace_id
+                ):
                     yield out
             else:
-                async for out in self._process_text_stream(decode, context):
+                async for out in self._process_text_stream(
+                    decode, context, request_id_hint=trace_id
+                ):
                     yield out
         else:
             # Extract image/video URLs for multimodal requests. SGLang's mm_data_processor
@@ -350,16 +355,21 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 **self._priority_kwargs(priority),
             )
             if not self.use_sglang_tokenizer:
-                async for out in self._process_token_stream(agg, context):
+                async for out in self._process_token_stream(
+                    agg, context, request_id_hint=trace_id
+                ):
                     yield out
             else:
-                async for out in self._process_text_stream(agg, context):
+                async for out in self._process_text_stream(
+                    agg, context, request_id_hint=trace_id
+                ):
                     yield out
 
     async def _process_token_stream(
         self,
         stream_source: AsyncGenerator[Dict[str, Any], None],
         context: Context,
+        request_id_hint: str | None = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Process token-based stream output.
 
@@ -375,6 +385,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         """
         # Use Future pattern for request ID - will be set when first response arrives
         request_id_future: asyncio.Future[str] = asyncio.Future()
+        if request_id_hint:
+            request_id_future.set_result(request_id_hint)
         # Logprob offset: output_ids are disjoint (stream_output=True) but
         # meta_info logprobs are cumulative — track how many we've emitted.
         num_output_logprobs_so_far = 0
@@ -431,18 +443,32 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     # Internal transport field consumed by frontend nvext mapping.
                     out["disaggregated_params"] = {"routed_experts": routed_experts}
                 if finish_reason:
-                    input_tokens = res["meta_info"]["prompt_tokens"]
-                    completion_tokens = res["meta_info"]["completion_tokens"]
-                    cached_tokens = res["meta_info"]["cached_tokens"]
-                    prefill_prompt_tokens_details = None
-                    if cached_tokens is not None and cached_tokens > 0:
-                        prefill_prompt_tokens_details = {"cached_tokens": cached_tokens}
-                    out["completion_usage"] = {
-                        "prompt_tokens": input_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": input_tokens + completion_tokens,
-                        "prompt_tokens_details": prefill_prompt_tokens_details,
-                    }
+                    meta_info = res.get("meta_info", {})
+                    input_tokens = meta_info.get("prompt_tokens")
+                    completion_tokens = meta_info.get("completion_tokens")
+                    cached_tokens = meta_info.get("cached_tokens")
+                    if input_tokens is not None and completion_tokens is not None:
+                        prefill_prompt_tokens_details = None
+                        if cached_tokens is not None and cached_tokens > 0:
+                            prefill_prompt_tokens_details = {
+                                "cached_tokens": cached_tokens
+                            }
+                        out["completion_usage"] = {
+                            "prompt_tokens": input_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": input_tokens + completion_tokens,
+                            "prompt_tokens_details": prefill_prompt_tokens_details,
+                        }
+                    else:
+                        logging.warning(
+                            "SGLang final chunk missing usage fields; "
+                            "rid=%s finish_reason=%s meta_info_keys=%s",
+                            request_id_future.result()
+                            if request_id_future.done()
+                            else None,
+                            out.get("finish_reason"),
+                            sorted(meta_info.keys()),
+                        )
                 if not context.is_stopped():
                     yield out
 
@@ -450,6 +476,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         self,
         stream_source: AsyncGenerator[Dict[str, Any], None],
         context: Context,
+        request_id_hint: str | None = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Process text-based stream output in OpenAI format.
 
@@ -464,6 +491,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
         # Use Future pattern for request ID - will be set when first response arrives
         request_id_future: asyncio.Future[str] = asyncio.Future()
+        if request_id_hint:
+            request_id_future.set_result(request_id_hint)
         async with self._cancellation_monitor(request_id_future, context):
             async for res in stream_source:
                 # Extract SGLang request ID from the first response and set the future

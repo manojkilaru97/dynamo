@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,7 +12,7 @@ from sglang.srt.entrypoints.openai.protocol import Tool as SglangTool
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 
-from .utils import random_call_id
+from .utils import normalize_messages_for_multimodal, random_call_id
 
 
 @dataclass
@@ -110,6 +111,29 @@ def _normalize_prompt_token_ids(prompt_token_ids: Any) -> list[int]:
     return list(prompt_token_ids)
 
 
+def _has_structured_output_constraint(request: dict[str, Any]) -> bool:
+    structured_outputs = request.get("structured_outputs")
+    if isinstance(structured_outputs, dict) and any(
+        structured_outputs.get(key) is not None
+        for key in ("json", "regex", "choice", "grammar", "json_object")
+    ):
+        return True
+    response_format = request.get("response_format")
+    if isinstance(response_format, dict) and response_format.get("type") != "text":
+        return True
+    return any(
+        request.get(key) is not None
+        for key in (
+            "regex",
+            "ebnf",
+            "guided_json",
+            "guided_regex",
+            "guided_grammar",
+            "guided_choice",
+        )
+    )
+
+
 def preprocess_chat_request(
     request: dict[str, Any],
     *,
@@ -122,7 +146,10 @@ def preprocess_chat_request(
 
     Synchronous -- suitable for both main-process and worker-process execution.
     """
-    messages = _materialize_messages(request.get("messages", []))
+    messages = normalize_messages_for_multimodal(
+        _materialize_messages(request.get("messages", []))
+    )
+    request = {**request, "messages": messages}
 
     # Convert tools to SGLang format (done once, shared with parser creation)
     sglang_tools = convert_tools(request.get("tools"))
@@ -132,6 +159,16 @@ def preprocess_chat_request(
         "add_generation_prompt": True,
         "tokenize": True,
     }
+    request_template_kwargs = request.get("chat_template_kwargs") or request.get(
+        "chat_template_args"
+    )
+    if isinstance(request_template_kwargs, dict):
+        for key, value in request_template_kwargs.items():
+            if key not in {"add_generation_prompt", "tokenize", "tools"}:
+                template_kwargs[key] = value
+    if _has_structured_output_constraint(request):
+        template_kwargs["enable_thinking"] = False
+
     # Strip tools from template when tool_choice=none so the model doesn't
     # see them and generate raw XML tool calls in its response.
     tool_choice = request.get("tool_choice", "auto")
@@ -184,13 +221,17 @@ class SglangStreamingPostProcessor:
         tokenizer,
         tool_call_parser: FunctionCallParser | None,
         reasoning_parser: ReasoningParser | None,
+        request: dict[str, Any] | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.tool_call_parser = tool_call_parser
         self.reasoning_parser = reasoning_parser
+        self.request = request or {}
         self._fast_plain_text = tool_call_parser is None and reasoning_parser is None
 
         self._all_token_ids: list[int] = []
+        self._reasoning_buffer = ""
+        self._emitted_visible_content = False
         # Tool call accumulation.  SGLang's streaming parser returns
         # deltas (name in one chunk, argument fragments across subsequent
         # chunks).  However, when the complete tool-call JSON arrives in a
@@ -202,6 +243,57 @@ class SglangStreamingPostProcessor:
         self._tool_call_ids: dict[int, str] = {}  # tool_index -> call_id
         self._tool_call_names: dict[int, str] = {}  # tool_index -> name
         self._tool_call_args: dict[int, list[str]] = {}  # tool_index -> arg chunks
+
+    def _is_required_or_named_tool_choice(self) -> bool:
+        tool_choice = self.request.get("tool_choice", "auto")
+        return tool_choice == "required" or (
+            isinstance(tool_choice, dict)
+            and tool_choice.get("type") == "function"
+            and isinstance(tool_choice.get("function"), dict)
+        )
+
+    def _has_structured_output_constraint(self) -> bool:
+        return _has_structured_output_constraint(self.request)
+
+    def _should_recover_reasoning_output(self) -> bool:
+        return self.reasoning_parser is not None and (
+            self._is_required_or_named_tool_choice()
+            or self._has_structured_output_constraint()
+        )
+
+    def _recover_required_tool_calls_from_json(
+        self, text: str
+    ) -> list[dict[str, Any]] | None:
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if not isinstance(parsed, list):
+            return None
+
+        tool_calls: list[dict[str, Any]] = []
+        for idx, item in enumerate(parsed):
+            if not isinstance(item, dict):
+                return None
+            name = item.get("name")
+            parameters = item.get("parameters", {})
+            if not isinstance(name, str) or not name:
+                return None
+            arguments = json.dumps(parameters, ensure_ascii=False)
+            tool_calls.append(
+                {
+                    "index": idx,
+                    "id": _random_call_id(),
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                }
+            )
+        return tool_calls
 
     def _incremental_decode(self, new_token_ids: list[int]) -> str:
         """Decode new tokens with lookback window for multi-byte char boundaries.
@@ -277,9 +369,15 @@ class SglangStreamingPostProcessor:
             r_text, n_text = self.reasoning_parser.parse_stream_chunk(delta_text)
             reasoning_text = r_text or None
             normal_text = n_text or ""
+            if reasoning_text:
+                self._reasoning_buffer += reasoning_text
 
         # -- Tool call parsing (accumulate deltas) --
         content_text = normal_text
+
+        if self._has_structured_output_constraint() and reasoning_text and not content_text:
+            content_text = reasoning_text
+            reasoning_text = None
 
         if self.tool_call_parser and normal_text:
             parsed_text, tool_calls = self.tool_call_parser.parse_stream_chunk(
@@ -300,9 +398,32 @@ class SglangStreamingPostProcessor:
         delta: dict[str, Any] = {"role": "assistant"}
         has_content = False
 
+        if (
+            finish_reason
+            and self._should_recover_reasoning_output()
+            and not self._emitted_visible_content
+            and not self._tool_call_names
+            and self._reasoning_buffer.strip()
+        ):
+            recovered = self._reasoning_buffer.strip()
+            if self._is_required_or_named_tool_choice():
+                tool_calls = self._recover_required_tool_calls_from_json(recovered)
+                if tool_calls:
+                    delta["tool_calls"] = tool_calls
+                    finish_reason = "tool_calls" if finish_reason == "stop" else finish_reason
+                    has_content = True
+                    reasoning_text = None
+                    content_text = ""
+            elif self._has_structured_output_constraint():
+                delta["content"] = recovered
+                has_content = True
+                reasoning_text = None
+                content_text = ""
+
         if content_text:
             delta["content"] = content_text
             has_content = True
+            self._emitted_visible_content = True
         if reasoning_text:
             delta["reasoning_content"] = reasoning_text
             has_content = True

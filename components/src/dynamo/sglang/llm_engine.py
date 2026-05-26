@@ -9,7 +9,6 @@ and feature gap details.
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 from collections.abc import AsyncGenerator
@@ -28,6 +27,10 @@ from dynamo.common.utils.input_params import InputParamManager
 from dynamo.llm import ModelInput
 from dynamo.sglang._compat import get_scheduler_info
 from dynamo.sglang.args import parse_args
+from dynamo.sglang.guided_decoding import (
+    cap_guided_max_new_tokens,
+    get_guided_decoding_params,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -181,38 +184,32 @@ class SglangLLMEngine(LLMEngine):
         if not self._use_sglang_tokenizer:
             sampling_opts = request.get("sampling_options", {})
             stop_conditions = request.get("stop_conditions", {})
+            guided_decoding = sampling_opts.get("guided_decoding")
             param_mapping = {
                 "temperature": sampling_opts.get("temperature"),
                 "top_p": sampling_opts.get("top_p"),
                 "top_k": sampling_opts.get("top_k"),
                 "max_new_tokens": stop_conditions.get("max_tokens"),
                 "ignore_eos": stop_conditions.get("ignore_eos"),
-                **self._get_guided_decoding_params(
-                    sampling_opts.get("guided_decoding")
-                ),
+                **self._get_guided_decoding_params(guided_decoding),
             }
         else:
+            guided_decoding = request.get("guided_decoding")
             param_mapping = {
                 "temperature": request.get("temperature"),
                 "top_p": request.get("top_p"),
                 "top_k": request.get("top_k"),
                 "max_new_tokens": request.get("max_tokens"),
-                **self._get_guided_decoding_params(request.get("guided_decoding")),
+                **self._get_guided_decoding_params(guided_decoding),
             }
-        return {k: v for k, v in param_mapping.items() if v is not None}
+        params = {k: v for k, v in param_mapping.items() if v is not None}
+        return cap_guided_max_new_tokens(params, guided_decoding)
 
     @staticmethod
     def _get_guided_decoding_params(guided_decoding: object) -> dict:
-        if isinstance(guided_decoding, dict):
-            json_schema = guided_decoding.get("json")
-            if json_schema is not None:
-                return {"json_schema": json.dumps(json_schema)}
-            structural_tag = guided_decoding.get("structural_tag")
-            if structural_tag is not None:
-                if hasattr(structural_tag, "model_dump"):
-                    structural_tag = structural_tag.model_dump()
-                return {"structural_tag": json.dumps(structural_tag)}
-        return {}
+        return get_guided_decoding_params(
+            guided_decoding, include_structural_tag=True
+        )
 
     def _get_input_param(self, request: GenerateRequest) -> dict:
         assert self._input_param_manager is not None, "Engine not initialized"

@@ -375,11 +375,10 @@ impl RuntimeConfig {
             .max_blocking_threads(self.max_blocking_threads)
             .enable_all();
         if env_is_truthy(environment_names::runtime::DYN_ENABLE_POLL_HISTOGRAM) {
-            tracing::info!(
-                "Tokio poll-time histogram enabled (DYN_ENABLE_POLL_HISTOGRAM); \
-                 expect ~2× Instant::now() overhead per task poll"
+            tracing::warn!(
+                "DYN_ENABLE_POLL_HISTOGRAM requested, but this build does not expose \
+                 tokio_unstable runtime poll histogram APIs; continuing without poll histogram"
             );
-            builder.enable_metrics_poll_time_histogram();
         }
         builder.build()
     }

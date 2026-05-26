@@ -8,7 +8,7 @@ use dynamo_runtime::transports::nats;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-use super::{bus, handle::AuditRecord};
+use super::{bus, config, handle::AuditRecord, otel_sink::OtelSink};
 
 #[async_trait]
 pub trait AuditSink: Send + Sync {
@@ -67,9 +67,9 @@ impl AuditSink for NatsSink {
 }
 
 async fn parse_sinks_from_env() -> anyhow::Result<Vec<Arc<dyn AuditSink>>> {
-    let cfg = std::env::var("DYN_AUDIT_SINKS").unwrap_or_else(|_| "stderr".into());
+    let policy = config::policy();
     let mut out: Vec<Arc<dyn AuditSink>> = Vec::new();
-    for name in cfg.split(',').map(|s| s.trim().to_lowercase()) {
+    for name in &policy.sinks {
         match name.as_str() {
             "stderr" | "" => out.push(Arc::new(StderrSink)),
             "nats" => {
@@ -79,6 +79,7 @@ async fn parse_sinks_from_env() -> anyhow::Result<Vec<Arc<dyn AuditSink>>> {
                     .context("Attempting to connect NATS sink from env var DYN_AUDIT_SINKS")?;
                 out.push(Arc::new(NatsSink::new(nats_client)));
             }
+            "otel" => out.push(Arc::new(OtelSink::from_policy(policy).await?)),
             // "pg"   => out.push(Arc::new(PostgresSink::from_env())),
             other => tracing::warn!(%other, "audit: unknown sink ignored"),
         }

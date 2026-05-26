@@ -11,7 +11,7 @@ use crate::preprocessor::media::MediaDecoder;
 
 use super::{
     OpenAIOutputOptionsProvider, OpenAISamplingOptionsProvider, OpenAIStopConditionsProvider,
-    common_ext::{CommonExt, CommonExtProvider},
+    common_ext::{CommonExt, CommonExtProvider, StructuredOutputsParams},
     nvext::NvExt,
     nvext::NvExtProvider,
     tools, validate,
@@ -23,6 +23,30 @@ pub mod jail;
 
 pub use aggregator::DeltaAggregator;
 pub use delta::DeltaGenerator;
+
+fn json_object_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "minProperties": 1,
+        "maxProperties": 64,
+        "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+        },
+        "additionalProperties": {
+            "anyOf": [
+                {"type": "string", "maxLength": 4096},
+                {"type": "number"},
+                {"type": "integer"},
+                {"type": "boolean"},
+                {"type": "null"},
+                {"type": "array", "maxItems": 64},
+                {"type": "object", "maxProperties": 64}
+            ]
+        }
+    })
+}
 
 /// A request structure for creating a chat completion, extending OpenAI's
 /// `CreateChatCompletionRequest` with [`NvExt`] extensions and common fields.
@@ -58,6 +82,10 @@ pub struct NvCreateChatCompletionRequest {
     /// Example: `{"video": {"num_frames": 16}}`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_io_kwargs: Option<MediaDecoder>,
+
+    /// OpenAI-compatible structured outputs parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_outputs: Option<StructuredOutputsParams>,
 
     /// Catch-all for unsupported fields - checked during validation
     #[serde(flatten, default, skip_serializing)]
@@ -197,16 +225,23 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
             }
         }
 
-        // 2) OpenAI `response_format` (applies to assistant content, not tool calls)
+        // 2) OpenAI-compatible `structured_outputs` extension.
+        if let Some(structured_outputs) = self.structured_outputs.as_ref() {
+            if let Some(schema) = structured_outputs.json.clone() {
+                return Some(schema);
+            }
+            if structured_outputs.json_object == Some(true) {
+                return Some(json_object_schema());
+            }
+        }
+
+        // 3) OpenAI `response_format` (applies to assistant content, not tool calls)
         if let Some(response_format) = self.inner.response_format.as_ref() {
             use dynamo_protocols::types::ResponseFormat;
             match response_format {
                 ResponseFormat::Text => {}
                 ResponseFormat::JsonObject => {
-                    // Minimal JSON Schema for "any JSON object"
-                    return Some(serde_json::json!({
-                        "type": "object"
-                    }));
+                    return Some(json_object_schema());
                 }
                 ResponseFormat::JsonSchema { json_schema } => {
                     // validate_response_format ensures schema is present when type=json_schema
@@ -221,15 +256,27 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
     }
 
     fn get_guided_regex(&self) -> Option<String> {
-        self.common.guided_regex.clone()
+        self.common.guided_regex.clone().or_else(|| {
+            self.structured_outputs
+                .as_ref()
+                .and_then(|params| params.regex.clone())
+        })
     }
 
     fn get_guided_grammar(&self) -> Option<String> {
-        self.common.guided_grammar.clone()
+        self.common.guided_grammar.clone().or_else(|| {
+            self.structured_outputs
+                .as_ref()
+                .and_then(|params| params.grammar.clone())
+        })
     }
 
     fn get_guided_choice(&self) -> Option<Vec<String>> {
-        self.common.guided_choice.clone()
+        self.common.guided_choice.clone().or_else(|| {
+            self.structured_outputs
+                .as_ref()
+                .and_then(|params| params.choice.clone())
+        })
     }
 
     fn get_guided_decoding_backend(&self) -> Option<String> {
@@ -336,7 +383,13 @@ impl OpenAIOutputOptionsProvider for NvCreateChatCompletionRequest {
 /// allowing us to validate the data.
 impl ValidateRequest for NvCreateChatCompletionRequest {
     fn validate(&self) -> Result<(), anyhow::Error> {
-        validate::validate_no_unsupported_fields(&self.unsupported_fields)?;
+        // Qwen-compatible clients may send trace/budget fields that Dynamo
+        // does not enforce on this path; accept and ignore them rather than
+        // rejecting otherwise valid OpenAI-compatible requests.
+        validate::validate_no_unsupported_fields_except(
+            &self.unsupported_fields,
+            &["reasoning_budget", "request_id"],
+        )?;
         validate::validate_messages(&self.inner.messages)?;
         validate::validate_model(&self.inner.model)?;
         // none for store
@@ -354,6 +407,7 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         // none for audio
         validate::validate_presence_penalty(self.inner.presence_penalty)?;
         validate::validate_response_format(&self.inner.response_format)?;
+        validate::validate_structured_outputs(&self.structured_outputs)?;
         // none for seed
         validate::validate_service_tier(&self.inner.service_tier)?;
         validate::validate_stop(&self.inner.stop)?;

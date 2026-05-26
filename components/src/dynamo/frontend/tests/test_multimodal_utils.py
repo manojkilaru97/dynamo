@@ -3,7 +3,7 @@
 
 import pytest
 
-from dynamo.frontend.utils import extract_mm_urls
+from dynamo.frontend.utils import extract_mm_urls, normalize_messages_for_multimodal
 
 pytestmark = [
     pytest.mark.unit,
@@ -163,3 +163,63 @@ def test_handles_malformed_content_non_dict():
     ]
     result = extract_mm_urls(messages)
     assert result == {"image_url": [{"Url": "https://example.com/ok.png"}]}
+
+
+def test_extracts_html_media_tags_from_text_content():
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                'Describe this <img src="data:image/png;base64,AAA="/> and '
+                "<video src='data:video/mp4;base64,BBB='/>."
+            ),
+        }
+    ]
+    result = extract_mm_urls(messages)
+    assert result == {
+        "image_url": [{"Url": "data:image/png;base64,AAA="}],
+        "video_url": [{"Url": "data:video/mp4;base64,BBB="}],
+    }
+
+
+def test_normalizes_html_media_tags_before_tokenization():
+    messages = [
+        {
+            "role": "user",
+            "content": 'Look <image src="https://example.com/a.png"/> now',
+        }
+    ]
+    normalized = normalize_messages_for_multimodal(messages)
+    assert normalized == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Look "},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/a.png"},
+                },
+                {"type": "text", "text": " now"},
+            ],
+        }
+    ]
+
+
+def test_normalizes_html_media_tags_inside_text_part():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": 'First <video src="file:///tmp/a.mp4"/> second',
+                }
+            ],
+        }
+    ]
+    normalized = normalize_messages_for_multimodal(messages)
+    assert normalized[0]["content"] == [
+        {"type": "text", "text": "First "},
+        {"type": "video_url", "video_url": {"url": "file:///tmp/a.mp4"}},
+        {"type": "text", "text": " second"},
+    ]

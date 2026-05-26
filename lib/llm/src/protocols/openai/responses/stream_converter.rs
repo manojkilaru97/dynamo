@@ -16,10 +16,12 @@ use axum::response::sse::Event;
 use dynamo_protocols::types::responses::{
     AssistantRole, FunctionToolCall, InputTokenDetails, Instructions, OutputContent, OutputItem,
     OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent, OutputTokenDetails,
-    Response, ResponseCompletedEvent, ResponseContentPartAddedEvent, ResponseContentPartDoneEvent,
-    ResponseCreatedEvent, ResponseFailedEvent, ResponseFunctionCallArgumentsDeltaEvent,
+    ReasoningItem, ReasoningTextContent, Response, ResponseCompletedEvent,
+    ResponseContentPartAddedEvent, ResponseContentPartDoneEvent, ResponseCreatedEvent,
+    ResponseFailedEvent, ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallArgumentsDoneEvent, ResponseInProgressEvent, ResponseOutputItemAddedEvent,
-    ResponseOutputItemDoneEvent, ResponseStreamEvent, ResponseTextDeltaEvent,
+    ResponseOutputItemDoneEvent, ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent, ResponseStreamEvent, ResponseTextDeltaEvent,
     ResponseTextDoneEvent, ResponseTextParam, ResponseUsage, ServiceTier, Status,
     TextResponseFormatConfiguration, ToolChoiceOptions, ToolChoiceParam, Truncation,
 };
@@ -45,6 +47,10 @@ pub struct ResponseStreamConverter {
     message_started: bool,
     message_output_index: u32,
     accumulated_text: String,
+    reasoning_item_id: String,
+    reasoning_started: bool,
+    reasoning_output_index: u32,
+    accumulated_reasoning: String,
     // Function call tracking
     function_call_items: Vec<FunctionCallState>,
     // Output index counter
@@ -83,6 +89,10 @@ impl ResponseStreamConverter {
             message_started: false,
             message_output_index: 0,
             accumulated_text: String::new(),
+            reasoning_item_id: format!("rs_{}", Uuid::new_v4().simple()),
+            reasoning_started: false,
+            reasoning_output_index: 0,
+            accumulated_reasoning: String::new(),
             function_call_items: Vec::new(),
             next_output_index: 0,
             usage: None,
@@ -216,6 +226,44 @@ impl ResponseStreamConverter {
 
         for choice in &chunk.inner.choices {
             let delta = &choice.delta;
+
+            if let Some(reasoning) = &delta.reasoning_content
+                && !reasoning.is_empty()
+            {
+                if !self.reasoning_started {
+                    self.reasoning_started = true;
+                    self.reasoning_output_index = self.next_output_index;
+                    self.next_output_index += 1;
+
+                    let item_added = ResponseStreamEvent::ResponseOutputItemAdded(
+                        ResponseOutputItemAddedEvent {
+                            sequence_number: self.next_seq(),
+                            output_index: self.reasoning_output_index,
+                            item: OutputItem::Reasoning(ReasoningItem {
+                                id: self.reasoning_item_id.clone(),
+                                summary: vec![],
+                                content: Some(vec![]),
+                                encrypted_content: None,
+                                status: Some(OutputStatus::InProgress),
+                            }),
+                        },
+                    );
+                    events.push(self.make_sse_event(&item_added));
+                }
+
+                self.accumulated_reasoning.push_str(reasoning);
+                let reasoning_delta =
+                    ResponseStreamEvent::ResponseReasoningTextDelta(
+                        ResponseReasoningTextDeltaEvent {
+                            sequence_number: self.next_seq(),
+                            item_id: self.reasoning_item_id.clone(),
+                            output_index: self.reasoning_output_index,
+                            content_index: 0,
+                            delta: reasoning.clone(),
+                        },
+                    );
+                events.push(self.make_sse_event(&reasoning_delta));
+            }
 
             // Handle text content deltas — extract text from the enum
             let content_text = match &delta.content {
@@ -413,6 +461,34 @@ impl ResponseStreamConverter {
     pub fn emit_end_events(&mut self) -> Vec<Result<Event, anyhow::Error>> {
         let mut events = Vec::new();
 
+        if self.reasoning_started {
+            let reasoning_done =
+                ResponseStreamEvent::ResponseReasoningTextDone(ResponseReasoningTextDoneEvent {
+                    sequence_number: self.next_seq(),
+                    item_id: self.reasoning_item_id.clone(),
+                    output_index: self.reasoning_output_index,
+                    content_index: 0,
+                    text: self.accumulated_reasoning.clone(),
+                });
+            events.push(self.make_sse_event(&reasoning_done));
+
+            let item_done =
+                ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
+                    sequence_number: self.next_seq(),
+                    output_index: self.reasoning_output_index,
+                    item: OutputItem::Reasoning(ReasoningItem {
+                        id: self.reasoning_item_id.clone(),
+                        summary: vec![],
+                        content: Some(vec![ReasoningTextContent {
+                            text: self.accumulated_reasoning.clone(),
+                        }]),
+                        encrypted_content: None,
+                        status: Some(OutputStatus::Completed),
+                    }),
+                });
+            events.push(self.make_sse_event(&item_done));
+        }
+
         // Close text message if it was started
         if self.message_started {
             let text_done = ResponseStreamEvent::ResponseOutputTextDone(ResponseTextDoneEvent {
@@ -503,6 +579,17 @@ impl ResponseStreamConverter {
 
         // Build the final output vector from accumulated state
         let mut output = Vec::new();
+        if self.reasoning_started {
+            output.push(OutputItem::Reasoning(ReasoningItem {
+                id: self.reasoning_item_id.clone(),
+                summary: vec![],
+                content: Some(vec![ReasoningTextContent {
+                    text: self.accumulated_reasoning.clone(),
+                }]),
+                encrypted_content: None,
+                status: Some(OutputStatus::Completed),
+            }));
+        }
         if self.message_started {
             output.push(OutputItem::Message(OutputMessage {
                 id: self.message_item_id.clone(),
@@ -539,6 +626,62 @@ impl ResponseStreamConverter {
         events
     }
 
+    /// Return the final completed response exactly as it is serialized in the
+    /// `response.completed` event. Used by HTTP audit logging for streamed
+    /// Responses API calls.
+    pub fn completed_response_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let mut output = Vec::new();
+        if self.reasoning_started {
+            output.push(OutputItem::Reasoning(ReasoningItem {
+                id: self.reasoning_item_id.clone(),
+                summary: vec![],
+                content: Some(vec![ReasoningTextContent {
+                    text: self.accumulated_reasoning.clone(),
+                }]),
+                encrypted_content: None,
+                status: Some(OutputStatus::Completed),
+            }));
+        }
+        if self.message_started {
+            output.push(OutputItem::Message(OutputMessage {
+                id: self.message_item_id.clone(),
+                content: vec![OutputMessageContent::OutputText(OutputTextContent {
+                    text: self.accumulated_text.clone(),
+                    annotations: vec![],
+                    logprobs: Some(vec![]),
+                })],
+                role: AssistantRole::Assistant,
+                phase: None,
+                status: OutputStatus::Completed,
+            }));
+        }
+        for fc in &self.function_call_items {
+            if fc.started {
+                output.push(OutputItem::FunctionCall(FunctionToolCall {
+                    id: Some(fc.item_id.clone()),
+                    call_id: fc.call_id.clone(),
+                    namespace: None,
+                    name: fc.name.clone(),
+                    arguments: fc.accumulated_args.clone(),
+                    status: Some(OutputStatus::Completed),
+                }));
+            }
+        }
+
+        let response = self.make_response(Status::Completed, output);
+        let mut value = serde_json::to_value(response)?;
+        if let serde_json::Value::Object(ref mut obj) = value {
+            super::patch_response_for_spec(
+                obj,
+                self.params.presence_penalty.unwrap_or(0.0),
+                self.params.frequency_penalty.unwrap_or(0.0),
+                self.params.store.unwrap_or(false),
+            );
+        }
+        super::patch_reasoning_content_types(&mut value);
+        Ok(value)
+    }
+
     /// Emit error events when the stream ends due to a backend error.
     pub fn emit_error_events(&mut self) -> Vec<Result<Event, anyhow::Error>> {
         let mut events = Vec::new();
@@ -571,6 +714,7 @@ impl ResponseStreamConverter {
                 self.params.store.unwrap_or(false),
             );
         }
+        super::patch_reasoning_content_types(&mut value);
         let data = serde_json::to_string(&value)?;
         Ok(Event::default().event(event_type).data(data))
     }

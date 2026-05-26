@@ -4,6 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    path::{Component, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -14,6 +15,7 @@ use axum::{
     extract::State,
     http::Request,
     http::{HeaderMap, StatusCode},
+    http::{HeaderValue, header::CONTENT_TYPE},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -25,11 +27,12 @@ use base64::Engine as _;
 use bytes::Bytes;
 use dynamo_runtime::config::environment_names::llm as env_llm;
 use dynamo_runtime::{
+    engine::DataStream,
     pipeline::{AsyncEngineContextProvider, Context},
     protocols::annotated::AnnotationsProvider,
 };
 use futures::{StreamExt, stream};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeStruct};
 
 use super::{
     RouteDoc,
@@ -49,7 +52,7 @@ use crate::protocols::openai::{
     audios::{NvAudioSpeechResponse, NvCreateAudioSpeechRequest},
     chat_completions::{
         NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
-        NvCreateChatCompletionStreamResponse,
+        NvCreateChatCompletionStreamResponse, jail::JailedStream,
     },
     completions::{NvCreateCompletionRequest, NvCreateCompletionResponse},
     embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse},
@@ -60,15 +63,228 @@ use crate::protocols::openai::{
 use crate::protocols::unified::UnifiedRequest;
 use crate::request_template::RequestTemplate;
 use crate::types::Annotated;
+use dynamo_protocols::types::ChatCompletionToolChoiceOption;
 use dynamo_runtime::logging::get_distributed_tracing_context;
 use tracing::Instrument;
 
 pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
+pub const X_REQUEST_ID_HEADER: &str = "x-request-id";
+const NVCF_INPUT_ASSET_DIR_HEADER: &str = "nvcf-input-asset-dir";
+const NVCF_INPUT_ASSET_REFERENCES_HEADER: &str = "nvcf-input-asset-references";
+const AUDIT_HTTP_HEADERS_KEY: &str = "http_headers";
+const AUDIT_RAW_PAYLOAD_KEY: &str = "http_raw_payload";
 
 /// Dynamo Annotation for the request ID
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
 
 const VALIDATION_PREFIX: &str = "Validation: ";
+
+fn configured_max_output_tokens() -> Option<u32> {
+    std::env::var("DYN_MAX_OUTPUT_LEN")
+        .or_else(|_| std::env::var("DYN_MAX_OUTPUT_TOKENS"))
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn cap_token_field(value: &mut Option<u32>, cap: u32) {
+    if value.is_some_and(|v| v > cap) {
+        *value = Some(cap);
+    }
+}
+
+fn apply_chat_max_output_cap(request: &mut NvCreateChatCompletionRequest) {
+    let Some(cap) = configured_max_output_tokens() else {
+        return;
+    };
+    cap_token_field(&mut request.inner.max_tokens, cap);
+    cap_token_field(&mut request.inner.max_completion_tokens, cap);
+}
+
+fn apply_responses_max_output_cap(request: &mut NvCreateResponse) {
+    let Some(cap) = configured_max_output_tokens() else {
+        return;
+    };
+    cap_token_field(&mut request.inner.max_output_tokens, cap);
+}
+
+fn normalize_reasoning_effort_aliases(raw_request: &mut serde_json::Value) {
+    if raw_request.get("reasoning_effort").and_then(|v| v.as_str()) == Some("max")
+        && let Some(obj) = raw_request.as_object_mut()
+    {
+        obj.insert(
+            "reasoning_effort".to_string(),
+            serde_json::Value::String("xhigh".to_string()),
+        );
+    }
+
+    if let Some(reasoning) = raw_request
+        .get_mut("reasoning")
+        .and_then(|v| v.as_object_mut())
+        && reasoning.get("effort").and_then(|v| v.as_str()) == Some("max")
+    {
+        reasoning.insert(
+            "effort".to_string(),
+            serde_json::Value::String("xhigh".to_string()),
+        );
+    }
+}
+
+fn bad_request_error(message: impl Into<String>) -> ErrorResponse {
+    let code = StatusCode::BAD_REQUEST;
+    (
+        code,
+        Json(ErrorMessage {
+            message: message.into(),
+            error_type: map_error_code_to_error_type(code),
+            code: code.as_u16(),
+        }),
+    )
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn nvcf_asset_references(headers: &HeaderMap) -> HashSet<String> {
+    header_value(headers, NVCF_INPUT_ASSET_REFERENCES_HEADER)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn validate_asset_id(asset_id: &str) -> Result<(), ErrorResponse> {
+    let path = PathBuf::from(asset_id);
+    if asset_id.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(bad_request_error(format!(
+            "Invalid NVCF asset reference: {asset_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn nvcf_asset_file_url(
+    asset_dir: &str,
+    allowed_assets: &HashSet<String>,
+    asset_id: &str,
+) -> Result<String, ErrorResponse> {
+    validate_asset_id(asset_id)?;
+    if !allowed_assets.is_empty() && !allowed_assets.contains(asset_id) {
+        return Err(bad_request_error(format!(
+            "NVCF asset reference was not declared: {asset_id}"
+        )));
+    }
+
+    let asset_dir_path = PathBuf::from(asset_dir).canonicalize().map_err(|_| {
+        bad_request_error(format!(
+            "NVCF asset directory must exist and be absolute: {asset_dir}"
+        ))
+    })?;
+    let path = asset_dir_path.join(asset_id).canonicalize().map_err(|_| {
+        bad_request_error(format!("NVCF asset reference was not found: {asset_id}"))
+    })?;
+    if !path.starts_with(&asset_dir_path) {
+        return Err(bad_request_error(format!(
+            "Invalid NVCF asset reference: {asset_id}"
+        )));
+    }
+    url::Url::from_file_path(&path)
+        .map(|url| url.to_string())
+        .map_err(|_| {
+            bad_request_error(format!(
+                "NVCF asset directory must be absolute: {asset_dir}"
+            ))
+        })
+}
+
+fn rewrite_nvcf_asset_refs_in_text(
+    text: &str,
+    asset_dir: &str,
+    allowed_assets: &HashSet<String>,
+) -> Result<Option<String>, ErrorResponse> {
+    let mut output = String::new();
+    let mut search = 0;
+    let mut last = 0;
+    let mut changed = false;
+    let marker = ";asset_id,";
+
+    while let Some(relative_start) = text[search..].find("data:") {
+        let start = search + relative_start;
+        let url_end = text[start..]
+            .find(|c: char| c == '"' || c == '\'' || c == '<' || c == '>' || c.is_whitespace())
+            .map_or(text.len(), |relative_end| start + relative_end);
+        let candidate = &text[start..url_end];
+
+        if let Some(marker_start) = candidate.find(marker) {
+            let asset_id = &candidate[marker_start + marker.len()..];
+            let file_url = nvcf_asset_file_url(asset_dir, allowed_assets, asset_id)?;
+            output.push_str(&text[last..start]);
+            output.push_str(&file_url);
+            last = url_end;
+            changed = true;
+        }
+        search = url_end.max(start + "data:".len());
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+
+    output.push_str(&text[last..]);
+    Ok(Some(output))
+}
+
+fn rewrite_nvcf_asset_refs_value(
+    value: &mut serde_json::Value,
+    asset_dir: &str,
+    allowed_assets: &HashSet<String>,
+) -> Result<(), ErrorResponse> {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(rewritten) =
+                rewrite_nvcf_asset_refs_in_text(text, asset_dir, allowed_assets)?
+            {
+                *text = rewritten;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rewrite_nvcf_asset_refs_value(item, asset_dir, allowed_assets)?;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                rewrite_nvcf_asset_refs_value(item, asset_dir, allowed_assets)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn rewrite_nvcf_asset_refs(
+    raw_request: &mut serde_json::Value,
+    headers: &HeaderMap,
+) -> Result<(), ErrorResponse> {
+    let Some(asset_dir) = header_value(headers, NVCF_INPUT_ASSET_DIR_HEADER) else {
+        return Ok(());
+    };
+    let allowed_assets = nvcf_asset_references(headers);
+    rewrite_nvcf_asset_refs_value(raw_request, &asset_dir, &allowed_assets)
+}
 
 // Default axum max body limit without configuring is 2MB: https://docs.rs/axum/latest/axum/extract/struct.DefaultBodyLimit.html
 /// Default body limit in bytes (45MB) to support 500k+ token payloads.
@@ -83,12 +299,38 @@ pub(super) fn get_body_limit() -> usize {
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Deserialize, Debug)]
 pub(crate) struct ErrorMessage {
     message: String,
     #[serde(rename = "type")]
     error_type: String,
     code: u16,
+}
+
+impl Serialize for ErrorMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct ErrorBody<'a> {
+            message: &'a str,
+            #[serde(rename = "type")]
+            error_type: &'a str,
+            code: u16,
+        }
+
+        let mut state = serializer.serialize_struct("OpenAIError", 1)?;
+        state.serialize_field(
+            "error",
+            &ErrorBody {
+                message: &self.message,
+                error_type: &self.error_type,
+                code: self.code,
+            },
+        )?;
+        state.end()
+    }
 }
 
 fn map_error_code_to_error_type(code: StatusCode) -> String {
@@ -330,8 +572,7 @@ pub async fn smart_json_error_middleware(request: Request<Body>, next: Next) -> 
 ///
 /// The canonical request ID is set by `make_inference_request_span()` and stored
 /// in the `DistributedTraceContext` via `DistributedTraceIdLayer`. This function
-/// retrieves it, falling back to a validated `x-dynamo-request-id` header value
-/// (deprecated, DEP #7812) or a new UUID.
+/// retrieves it, falling back to client correlation headers or a new UUID.
 ///
 /// **Deprecation (DEP #7812):** The `x-dynamo-request-id` header is deprecated.
 /// Clients should rely on server-generated request IDs instead of supplying their own.
@@ -366,6 +607,41 @@ pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
         None
     };
 
+    // If an explicit internal request id was not supplied, honor x-request-id
+    // for gateway/client correlation. This keeps OpenAI response ids and audit
+    // payload logs joinable by the same request id users see in headers.
+    let validated_x_request_id = if validated_header.is_none() {
+        headers
+            .get(X_REQUEST_ID_HEADER)
+            .and_then(|raw| match raw.to_str() {
+                Ok(value) => {
+                    let value = value.trim();
+                    if !value.is_empty()
+                        && value.len() <= 512
+                        && !value.chars().any(char::is_control)
+                    {
+                        Some(value.to_string())
+                    } else {
+                        tracing::warn!(
+                            "{} header must be non-empty, <=512 bytes, and contain no control characters",
+                            X_REQUEST_ID_HEADER
+                        );
+                        None
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!("{} header must be a valid UTF-8 string", X_REQUEST_ID_HEADER);
+                    None
+                }
+            })
+    } else {
+        None
+    };
+
+    if let Some(request_id) = validated_x_request_id {
+        return request_id;
+    }
+
     // Prefer trace context (set by make_inference_request_span via DistributedTraceIdLayer)
     if let Some(trace_context) = get_distributed_tracing_context()
         && let Some(request_id) = trace_context.request_id
@@ -375,6 +651,87 @@ pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
 
     // Fallback: use validated header for backwards compat, or generate new UUID
     validated_header.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn audit_headers_from_header_map(headers: &HeaderMap) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (name, value) in headers.iter() {
+        let value = match value.to_str() {
+            Ok(value) => serde_json::Value::String(value.to_string()),
+            Err(_) => serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(value.as_bytes()),
+            ),
+        };
+        out.insert(name.as_str().to_string(), value);
+    }
+    serde_json::Value::Object(out)
+}
+
+fn raw_chat_error_payload(err_response: &ErrorResponse) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": err_response.1.message.clone(),
+            "type": err_response.1.error_type.clone(),
+            "code": err_response.1.code,
+        }
+    })
+}
+
+fn emit_raw_chat_error_audit(
+    request_id: &str,
+    raw_request: &serde_json::Value,
+    headers: &HeaderMap,
+    err_response: &ErrorResponse,
+) {
+    let model = raw_request
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let requested_streaming = raw_request
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    crate::audit::handle::emit_raw_request_response(
+        request_id,
+        model,
+        requested_streaming,
+        Some(Arc::new(raw_request.clone())),
+        Some(Arc::new(audit_headers_from_header_map(headers))),
+        Arc::new(raw_chat_error_payload(err_response)),
+    );
+}
+
+fn emit_chat_validation_error_audit(
+    request: &Context<NvCreateChatCompletionRequest>,
+    err_response: &ErrorResponse,
+) {
+    let Some(handle) = crate::audit::handle::create_handle(request.content(), request.id()) else {
+        return;
+    };
+    let headers = request
+        .clone_unique::<serde_json::Value>(AUDIT_HTTP_HEADERS_KEY)
+        .ok()
+        .map(Arc::new);
+    let raw_request = request
+        .clone_unique::<serde_json::Value>(AUDIT_RAW_PAYLOAD_KEY)
+        .ok()
+        .map(Arc::new);
+    handle.emit_request(Arc::new(request.content().clone()), raw_request, headers);
+    handle.emit_raw_response(Arc::new(raw_chat_error_payload(err_response)));
+}
+
+fn audit_request_id_from_raw(
+    raw_request: Option<&Arc<serde_json::Value>>,
+    fallback: &str,
+) -> String {
+    raw_request
+        .and_then(|request| request.get("request_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|request_id| !request_id.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 /// OpenAI Completions Request Handler
@@ -403,7 +760,11 @@ async fn handler_completions(
         endpoint: Endpoint::Completions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = Context::with_id(request, request_id);
+    let mut request = Context::with_id(request, request_id);
+    request.insert_unique(
+        AUDIT_HTTP_HEADERS_KEY,
+        audit_headers_from_header_map(&headers),
+    );
     let context = request.context();
 
     // create the connection handles
@@ -465,7 +826,7 @@ async fn completions(
 #[tracing::instrument(skip_all)]
 async fn completions_single(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
 ) -> Result<Response, ErrorResponse> {
     let request_id = request.id().to_string();
@@ -475,7 +836,9 @@ async fn completions_single(
 
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
-    let model = request.inner.model.clone();
+    let requested_model = request.inner.model.clone();
+    let model = state.manager().resolve_canonical_name(&requested_model);
+    request.inner.model = model.clone();
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -563,7 +926,12 @@ async fn completions_single(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        Ok(response)
     } else {
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
@@ -606,7 +974,7 @@ async fn completions_single(
 #[tracing::instrument(skip_all)]
 async fn completions_batch(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
     batch_size: usize,
     n: u8,
@@ -616,7 +984,8 @@ async fn completions_batch(
 
     let request_id = request.id().to_string();
     let streaming = request.inner.stream.unwrap_or(false);
-    let model = request.inner.model.clone();
+    let model = state.manager().resolve_canonical_name(&request.inner.model);
+    request.inner.model = model.clone();
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -742,7 +1111,12 @@ async fn completions_batch(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        Ok(response)
     } else {
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
@@ -791,7 +1165,7 @@ async fn embeddings(
     check_ready(&state)?;
 
     let request_id = get_or_create_request_id(&headers);
-    let request = Context::with_id(request, request_id);
+    let mut request = Context::with_id(request, request_id);
     let request_id = request.id().to_string();
 
     // Embeddings are typically not streamed, so we default to non-streaming
@@ -799,28 +1173,29 @@ async fn embeddings(
 
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
-    let model = &request.inner.model;
+    let model = state.manager().resolve_canonical_name(&request.inner.model);
+    request.inner.model = model.clone();
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight = state.metrics_clone().create_inflight_guard(
-        model,
+        &model,
         Endpoint::Embeddings,
         streaming,
         &request_id,
     );
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(model);
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
     // todo - error handling should be more robust
-    let engine = state.manager().get_embeddings_engine(model).map_err(|e| {
+    let engine = state.manager().get_embeddings_engine(&model).map_err(|e| {
         let err_response = ErrorMessage::from_model_error(&e);
         inflight.mark_error(extract_error_type_from_response(&err_response));
         err_response
     })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(model);
-    let model_name = model.to_string();
+    let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    let model_name = model.clone();
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
@@ -868,22 +1243,43 @@ async fn embeddings(
 async fn handler_chat_completions(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(mut request): Json<NvCreateChatCompletionRequest>,
+    Json(mut raw_request): Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
+    let request_id = get_or_create_request_id(&headers);
+    normalize_reasoning_effort_aliases(&mut raw_request);
+    rewrite_nvcf_asset_refs(&mut raw_request, &headers)?;
+    let mut request: NvCreateChatCompletionRequest = serde_json::from_value(raw_request.clone())
+        .map_err(|err| {
+            let err_response = (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorMessage {
+                    message: err.to_string(),
+                    error_type: map_error_code_to_error_type(StatusCode::BAD_REQUEST),
+                    code: StatusCode::BAD_REQUEST.as_u16(),
+                }),
+            );
+            emit_raw_chat_error_audit(&request_id, &raw_request, &headers, &err_response);
+            err_response
+        })?;
+
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
     // create the context for the request
-    let request_id = get_or_create_request_id(&headers);
     let streaming = request.inner.stream.unwrap_or(false);
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone(),
         endpoint: Endpoint::ChatCompletions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = Context::with_id(request, request_id);
+    let mut request = Context::with_id(request, request_id);
+    request.insert_unique(
+        AUDIT_HTTP_HEADERS_KEY,
+        audit_headers_from_header_map(&headers),
+    );
+    request.insert_unique(AUDIT_RAW_PAYLOAD_KEY, raw_request);
     let context = request.context();
 
     // create the connection handles
@@ -1171,12 +1567,15 @@ async fn chat_completions(
             request.inner.max_completion_tokens = Some(template.max_completion_tokens);
         }
     }
+    apply_chat_max_output_cap(&mut request);
 
     // Capture the resolved model after template application for metrics and engine lookup
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
     // todo - determine the proper error code for when a request model is not present
-    let model = request.inner.model.clone();
+    let requested_model = request.inner.model.clone();
+    let model = state.manager().resolve_canonical_name(&requested_model);
+    request.inner.model = model.clone();
 
     tracing::trace!("Received chat completions request: {:?}", request.content());
 
@@ -1193,26 +1592,39 @@ async fn chat_completions(
     // then a field was used that is unsupported. We will log an error message
     // and early return a 501 NOT_IMPLEMENTED status code. Otherwise, proceeed.
     if let Err(err_response) = validate_chat_completion_unsupported_fields(&request) {
+        emit_chat_validation_error_audit(&request, &err_response);
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
     }
 
     // Handle required fields like messages shouldn't be empty.
     if let Err(err_response) = validate_chat_completion_required_fields(&request) {
+        emit_chat_validation_error_audit(&request, &err_response);
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
     }
 
     // Validate stream_options is only used when streaming (NVBug 5662680)
     if let Err(err_response) = validate_chat_completion_stream_options(&request) {
+        emit_chat_validation_error_audit(&request, &err_response);
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
     }
 
     // Handle Rest of Validation Errors
     if let Err(err_response) = validate_chat_completion_fields_generic(&request) {
+        emit_chat_validation_error_audit(&request, &err_response);
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
+    }
+
+    if let Ok(raw_request) = request.clone_unique::<serde_json::Value>(AUDIT_RAW_PAYLOAD_KEY) {
+        state.metrics_clone().record_chat_request_shape(
+            &model,
+            Endpoint::ChatCompletions,
+            streaming,
+            &raw_request,
+        );
     }
 
     // Create HTTP queue guard after template resolution so labels are correct
@@ -1232,6 +1644,8 @@ async fn chat_completions(
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     let annotations = request.annotations();
+    let tool_choice_jail = tool_choice_jail_for_request(&request);
+    let http_audit_handle = crate::audit::handle::create_handle(request.content(), &request_id);
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
@@ -1264,11 +1678,29 @@ async fn chat_completions(
 
     // apply any annotations to the front of the stream
     let stream = stream::iter(annotations).chain(stream);
+    let stream: DataStream<Annotated<NvCreateChatCompletionStreamResponse>> =
+        if let Some(jail) = tool_choice_jail {
+            Box::pin(jail.apply_with_finish_reason(stream))
+        } else {
+            Box::pin(stream)
+        };
+    let stream = ensure_tool_call_finish_reason(stream);
 
     // todo - tap the stream and propagate request level metrics
     // note - we might do this as part of the post processing set to make it more generic
 
     if streaming {
+        let stream = if let Some(audit) = http_audit_handle {
+            let (stream, agg_fut) = crate::audit::stream::scan_aggregate_with_future(stream);
+            tokio::spawn(async move {
+                let final_resp = agg_fut.await;
+                audit.emit_response(Arc::new(final_resp));
+            });
+            stream
+        } else {
+            stream
+        };
+
         // For streaming responses, we return HTTP 200 immediately without checking for errors.
         // Once HTTP 200 OK is sent, we cannot change the status code, so any backend errors
         // must be delivered as SSE events with `event: error` in the stream (handled by
@@ -1325,7 +1757,12 @@ async fn chat_completions(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        Ok(response)
     } else {
         // Check first event for backend errors before aggregating (non-streaming only)
         let stream_with_check =
@@ -1365,6 +1802,9 @@ async fn chat_completions(
                 })?;
 
         inflight_guard.mark_ok();
+        if let Some(audit) = http_audit_handle {
+            audit.emit_response(Arc::new(response.clone()));
+        }
         // If the engine context was killed (client disconnect), the response was
         // assembled but never delivered. Override to cancelled.
         if ctx.is_killed() {
@@ -1372,6 +1812,95 @@ async fn chat_completions(
         }
         Ok(Json(response).into_response())
     }
+}
+
+fn tool_choice_jail_for_request(request: &NvCreateChatCompletionRequest) -> Option<JailedStream> {
+    match request.inner.tool_choice.as_ref()? {
+        ChatCompletionToolChoiceOption::Required => {
+            Some(JailedStream::builder().tool_choice_required().build())
+        }
+        ChatCompletionToolChoiceOption::Named(named) => Some(
+            JailedStream::builder()
+                .tool_choice_named(named.function.name.clone())
+                .build(),
+        ),
+        ChatCompletionToolChoiceOption::None | ChatCompletionToolChoiceOption::Auto => None,
+    }
+}
+
+fn ensure_tool_call_finish_reason(
+    stream: DataStream<Annotated<NvCreateChatCompletionStreamResponse>>,
+) -> DataStream<Annotated<NvCreateChatCompletionStreamResponse>> {
+    Box::pin(async_stream::stream! {
+        let mut choices_with_tool_calls: HashSet<u32> = HashSet::new();
+        let mut finished_choices: HashSet<u32> = HashSet::new();
+        let mut last_id = String::new();
+        let mut last_model = String::new();
+        let mut last_created = 0;
+        let mut last_service_tier = None;
+        let mut last_system_fingerprint = None;
+        tokio::pin!(stream);
+
+        while let Some(response) = stream.next().await {
+            if let Some(data) = response.data.as_ref() {
+                last_id.clone_from(&data.inner.id);
+                last_model.clone_from(&data.inner.model);
+                last_created = data.inner.created;
+                last_service_tier.clone_from(&data.inner.service_tier);
+                last_system_fingerprint.clone_from(&data.inner.system_fingerprint);
+
+                for choice in &data.inner.choices {
+                    if choice
+                        .delta
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|tool_calls| !tool_calls.is_empty())
+                    {
+                        choices_with_tool_calls.insert(choice.index);
+                    }
+                    if choice.finish_reason.is_some() {
+                        finished_choices.insert(choice.index);
+                    }
+                }
+            }
+            yield response;
+        }
+
+        for index in choices_with_tool_calls.difference(&finished_choices).copied() {
+            yield Annotated {
+                data: Some(NvCreateChatCompletionStreamResponse {
+                    inner: dynamo_protocols::types::CreateChatCompletionStreamResponse {
+                        id: last_id.clone(),
+                        choices: vec![dynamo_protocols::types::ChatChoiceStream {
+                            index,
+                            delta: dynamo_protocols::types::ChatCompletionStreamResponseDelta {
+                                content: None,
+                                function_call: None,
+                                tool_calls: None,
+                                role: None,
+                                refusal: None,
+                                reasoning_content: None,
+                            },
+                            finish_reason: Some(dynamo_protocols::types::FinishReason::ToolCalls),
+                            stop_reason: None,
+                            logprobs: None,
+                        }],
+                        created: last_created,
+                        model: last_model.clone(),
+                        service_tier: last_service_tier.clone(),
+                        system_fingerprint: last_system_fingerprint.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        usage: None,
+                    },
+                    nvext: None,
+                }),
+                id: None,
+                event: None,
+                comment: None,
+                error: None,
+            };
+        }
+    })
 }
 
 /// Checks for unsupported fields in the request.
@@ -1410,6 +1939,14 @@ pub fn validate_chat_completion_required_fields(
             code: 400,
             message: VALIDATION_PREFIX.to_string()
                 + "The 'messages' field cannot be empty. At least one message is required.",
+        }));
+    }
+
+    if inner.tool_choice.is_some() && !inner.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+        return Err(ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: VALIDATION_PREFIX.to_string()
+                + "When using `tool_choice`, `tools` must be set.",
         }));
     }
 
@@ -1484,22 +2021,43 @@ pub fn validate_completion_fields_generic(
 async fn handler_responses(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(mut request): Json<NvCreateResponse>,
+    Json(mut raw_request): Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
+    let request_id = get_or_create_request_id(&headers);
+    normalize_reasoning_effort_aliases(&mut raw_request);
+    rewrite_nvcf_asset_refs(&mut raw_request, &headers)?;
+    let mut request: NvCreateResponse =
+        serde_json::from_value(raw_request.clone()).map_err(|err| {
+            let err_response = (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorMessage {
+                    message: err.to_string(),
+                    error_type: map_error_code_to_error_type(StatusCode::BAD_REQUEST),
+                    code: StatusCode::BAD_REQUEST.as_u16(),
+                }),
+            );
+            emit_raw_chat_error_audit(&request_id, &raw_request, &headers, &err_response);
+            err_response
+        })?;
+
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
     // create the context for the request
-    let request_id = get_or_create_request_id(&headers);
     let streaming = request.inner.stream.unwrap_or(false);
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone().unwrap_or_default(),
         endpoint: Endpoint::Responses.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = Context::with_id(request, request_id);
+    let mut request = Context::with_id(request, request_id);
+    request.insert_unique(
+        AUDIT_HTTP_HEADERS_KEY,
+        audit_headers_from_header_map(&headers),
+    );
+    request.insert_unique(AUDIT_RAW_PAYLOAD_KEY, raw_request);
     let context = request.context();
 
     // create the connection handles
@@ -1556,10 +2114,30 @@ async fn responses(
     } else if request.inner.max_output_tokens.is_none() {
         request.inner.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
     }
+    apply_responses_max_output_cap(&mut request);
     tracing::trace!("Received responses request: {:?}", request.inner);
 
-    let model = request.inner.model.clone().unwrap_or_default();
+    let model = state
+        .manager()
+        .resolve_canonical_name(request.inner.model.as_deref().unwrap_or_default());
+    request.inner.model = Some(model.clone());
     let streaming = request.inner.stream.unwrap_or(false);
+    let raw_request_for_audit = request
+        .clone_unique::<serde_json::Value>(AUDIT_RAW_PAYLOAD_KEY)
+        .ok()
+        .map(Arc::new);
+    let headers_for_audit = request
+        .clone_unique::<serde_json::Value>(AUDIT_HTTP_HEADERS_KEY)
+        .ok()
+        .map(Arc::new);
+    if let Some(raw_request) = raw_request_for_audit.as_ref() {
+        state.metrics_clone().record_chat_request_shape(
+            &model,
+            Endpoint::Responses,
+            streaming,
+            raw_request.as_ref(),
+        );
+    }
 
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
@@ -1639,6 +2217,7 @@ async fn responses(
             include_usage: true,
             continuous_usage_stats: false,
         });
+    let tool_choice_jail = tool_choice_jail_for_request(&chat_request);
 
     let request = context.map(|mut _req| chat_request);
 
@@ -1671,6 +2250,13 @@ async fn responses(
 
     // Capture the context to cancel the stream if the client disconnects
     let ctx = engine_stream.context();
+    let engine_stream: DataStream<Annotated<NvCreateChatCompletionStreamResponse>> =
+        if let Some(jail) = tool_choice_jail {
+            Box::pin(jail.apply_with_finish_reason(engine_stream))
+        } else {
+            Box::pin(engine_stream)
+        };
+    let engine_stream = ensure_tool_call_finish_reason(engine_stream);
 
     if streaming {
         // For streaming responses, we return HTTP 200 immediately without checking for errors.
@@ -1694,6 +2280,11 @@ async fn responses(
         // synchronous -- no .await while lock is held. Avoids async lock overhead per token.
         let converter = std::sync::Arc::new(std::sync::Mutex::new(converter));
         let converter_end = converter.clone();
+        let raw_request_for_stream_audit = raw_request_for_audit.clone();
+        let headers_for_stream_audit = headers_for_audit.clone();
+        let request_id_for_stream_audit =
+            audit_request_id_from_raw(raw_request_for_audit.as_ref(), &request_id);
+        let model_for_stream_audit = model.clone();
 
         // Track whether the backend sent an error event during the stream.
         // Shared between event_stream (writer) and done_stream (reader).
@@ -1739,6 +2330,16 @@ async fn responses(
             let end_events = if saw_error_end.load(Ordering::Acquire) {
                 conv.emit_error_events()
             } else {
+                if let Ok(raw_response) = conv.completed_response_value() {
+                    crate::audit::handle::emit_raw_request_response(
+                        &request_id_for_stream_audit,
+                        model_for_stream_audit,
+                        true,
+                        raw_request_for_stream_audit,
+                        headers_for_stream_audit,
+                        Arc::new(raw_response),
+                    );
+                }
                 conv.emit_end_events()
             };
             stream::iter(end_events)
@@ -1758,7 +2359,12 @@ async fn responses(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        Ok(response)
     } else {
         // Non-streaming path: aggregate stream into single response
 
@@ -1814,6 +2420,19 @@ async fn responses(
         // assembled but never delivered. Override to cancelled.
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
+        }
+
+        if let Ok(raw_response) = serde_json::to_value(&response) {
+            let audit_request_id =
+                audit_request_id_from_raw(raw_request_for_audit.as_ref(), &request_id);
+            crate::audit::handle::emit_raw_request_response(
+                &audit_request_id,
+                model,
+                false,
+                raw_request_for_audit,
+                headers_for_audit,
+                Arc::new(raw_response),
+            );
         }
 
         Ok(Json(response).into_response())
@@ -2605,6 +3224,73 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_nvcf_asset_refs_for_chat_and_html_media() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let asset_path = temp_dir.path().join("dog.jpg");
+        std::fs::write(&asset_path, b"fake image").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            NVCF_INPUT_ASSET_DIR_HEADER,
+            HeaderValue::from_str(temp_dir.path().to_str().unwrap()).unwrap(),
+        );
+        headers.insert(
+            NVCF_INPUT_ASSET_REFERENCES_HEADER,
+            HeaderValue::from_static("dog.jpg"),
+        );
+        let mut raw = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;asset_id,dog.jpg"}
+                    },
+                    {
+                        "type": "text",
+                        "text": "see <img src=\"data:image/jpeg;asset_id,dog.jpg\"/>"
+                    }
+                ]
+            }]
+        });
+
+        rewrite_nvcf_asset_refs(&mut raw, &headers).unwrap();
+        let expected_url = url::Url::from_file_path(&asset_path).unwrap().to_string();
+        assert_eq!(
+            raw["messages"][0]["content"][0]["image_url"]["url"],
+            expected_url
+        );
+        assert_eq!(
+            raw["messages"][0]["content"][1]["text"],
+            format!("see <img src=\"{expected_url}\"/>")
+        );
+    }
+
+    #[test]
+    fn test_rewrite_nvcf_asset_refs_rejects_undeclared_asset() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            NVCF_INPUT_ASSET_DIR_HEADER,
+            HeaderValue::from_static("/workspace/wd/checkpoints/images"),
+        );
+        headers.insert(
+            NVCF_INPUT_ASSET_REFERENCES_HEADER,
+            HeaderValue::from_static("dog.jpg"),
+        );
+        let mut raw = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;asset_id,../secret.jpg"}
+                }]
+            }]
+        });
+
+        let err = rewrite_nvcf_asset_refs(&mut raw, &headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn test_http_error_response_from_anyhow() {
         let err = http_error_from_engine(400).unwrap_err();
         let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
@@ -2804,6 +3490,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -2836,6 +3523,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -3052,6 +3740,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
             unsupported_fields: Default::default(),
         };
 
@@ -3082,6 +3771,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -3111,6 +3801,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -3140,6 +3831,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -3171,6 +3863,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -3200,6 +3893,7 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            structured_outputs: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);

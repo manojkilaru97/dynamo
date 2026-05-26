@@ -58,6 +58,24 @@ pub type ResponseStream = std::pin::Pin<
     Box<dyn futures::Stream<Item = Result<ResponseStreamEvent, crate::error::OpenAIError>> + Send>,
 >;
 
+fn deserialize_response_text_param_option<'de, D>(
+    deserializer: D,
+) -> Result<Option<ResponseTextParam>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(mut value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if let serde_json::Value::Object(ref mut obj) = value {
+        obj.entry("format".to_string())
+            .or_insert_with(|| serde_json::json!({"type": "text"}));
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
 /// Fields on upstream `Response` that the OpenResponses spec requires as
 /// `T | null` but async-openai declares as `Option<T>` with
 /// `skip_serializing_if = Option::is_none` — meaning `None` disappears from
@@ -179,7 +197,19 @@ pub struct InputImageContent {
     pub image_url: Option<String>,
 }
 
-/// Parts of an input message: text, image, or file. Mirrors upstream
+/// Relaxed video input content. Accept both `video` and `video_url` because
+/// clients use both shapes for Responses-style video inputs.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct InputVideoContent {
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
+    pub detail: ImageDetail,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_url: Option<String>,
+}
+
+/// Parts of an input message: text, image, video, or file. Mirrors upstream
 /// `InputContent` but routes `InputImage` through the Dynamo-owned relaxed
 /// `InputImageContent` above.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -187,6 +217,7 @@ pub struct InputImageContent {
 pub enum InputContent {
     InputText(InputTextContent),
     InputImage(InputImageContent),
+    InputVideo(InputVideoContent),
     InputFile(InputFileContent),
 }
 
@@ -328,7 +359,11 @@ pub struct CreateResponse {
     pub stream_options: Option<ResponseStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_response_text_param_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub text: Option<ResponseTextParam>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoiceParam>,
@@ -388,6 +423,19 @@ mod tests {
         match content {
             InputContent::InputImage(img) => assert_eq!(img.detail, ImageDetail::Auto),
             other => panic!("expected InputImage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_video_without_detail_defaults_to_auto() {
+        let json = serde_json::json!({
+            "type": "input_video",
+            "video": "https://example.com/dog.mp4"
+        });
+        let content: InputContent = serde_json::from_value(json).unwrap();
+        match content {
+            InputContent::InputVideo(video) => assert_eq!(video.detail, ImageDetail::Auto),
+            other => panic!("expected InputVideo, got {other:?}"),
         }
     }
 

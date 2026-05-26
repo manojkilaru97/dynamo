@@ -5,7 +5,6 @@
 
 use once_cell::sync::{Lazy, OnceCell};
 use prometheus::{Counter, Gauge, Histogram, HistogramOpts, IntCounterVec, IntGaugeVec, Opts};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
@@ -275,8 +274,6 @@ pub async fn tokio_metrics_and_canary_loop(cancel: CancellationToken) {
     }
 }
 
-static PREV_BUDGET_FORCED_YIELD: AtomicU64 = AtomicU64::new(0);
-
 /// Per-worker previous samples for the monotonic _TOTAL counters.
 /// Owned by the single `tokio_metrics_and_canary_loop` task — no locks needed.
 struct PrevWorkerCounters {
@@ -307,12 +304,6 @@ fn sample_tokio_metrics(prev: &mut PrevWorkerCounters) {
     let metrics = Handle::current().metrics();
 
     TOKIO_GLOBAL_QUEUE_DEPTH.set(metrics.global_queue_depth() as f64);
-    let budget = metrics.budget_forced_yield_count();
-    let prev_budget = PREV_BUDGET_FORCED_YIELD.swap(budget, Ordering::Relaxed);
-    TOKIO_BUDGET_FORCED_YIELD_TOTAL.inc_by((budget.saturating_sub(prev_budget)) as f64);
-    TOKIO_BLOCKING_THREADS.set(metrics.num_blocking_threads() as f64);
-    TOKIO_BLOCKING_IDLE_THREADS.set(metrics.num_idle_blocking_threads() as f64);
-    TOKIO_BLOCKING_QUEUE_DEPTH.set(metrics.blocking_queue_depth() as f64);
     TOKIO_ALIVE_TASKS.set(metrics.num_alive_tasks() as f64);
 
     let num_workers = metrics.num_workers();
@@ -320,15 +311,6 @@ fn sample_tokio_metrics(prev: &mut PrevWorkerCounters) {
 
     for w in 0..num_workers {
         let worker_label = w.to_string();
-        let mean_poll = metrics.worker_mean_poll_time(w);
-
-        TOKIO_WORKER_MEAN_POLL_TIME_NS
-            .with_label_values(&[&worker_label])
-            .set(mean_poll.as_nanos() as i64);
-
-        TOKIO_WORKER_LOCAL_QUEUE_DEPTH
-            .with_label_values(&[&worker_label])
-            .set(metrics.worker_local_queue_depth(w) as i64);
 
         // Monotonically increasing totals: track deltas so we use inc_by on a Counter.
         let park = metrics.worker_park_count(w);
@@ -336,24 +318,5 @@ fn sample_tokio_metrics(prev: &mut PrevWorkerCounters) {
             .with_label_values(&[&worker_label])
             .inc_by(park.saturating_sub(prev.park[w]));
         prev.park[w] = park;
-
-        let steal = metrics.worker_steal_count(w);
-        TOKIO_WORKER_STEAL_COUNT_TOTAL
-            .with_label_values(&[&worker_label])
-            .inc_by(steal.saturating_sub(prev.steal[w]));
-        prev.steal[w] = steal;
-
-        let overflow = metrics.worker_overflow_count(w);
-        TOKIO_WORKER_OVERFLOW_COUNT_TOTAL
-            .with_label_values(&[&worker_label])
-            .inc_by(overflow.saturating_sub(prev.overflow[w]));
-        prev.overflow[w] = overflow;
-
-        // Busy ratio: total_busy_duration over 1s interval -> ratio. We don't have delta here;
-        // use mean_poll_time as proxy: if high, worker is busy. Store as 0-1000 (per mille).
-        let busy_proxy = (mean_poll.as_secs_f64() / 0.001).min(1.0); // 1ms = saturated
-        TOKIO_WORKER_BUSY_RATIO_VEC
-            .with_label_values(&[&worker_label])
-            .set((busy_proxy * 1000.0) as i64);
     }
 }
