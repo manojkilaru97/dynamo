@@ -1190,6 +1190,8 @@ class KvRouterConfig:
         router_max_tree_size: int = 1048576,
         router_prune_target_ratio: float = 0.8,
         router_queue_threshold: Optional[float] = 4.0,
+        router_max_pending_per_worker: Optional[int] = None,
+        router_max_queue_wait_ms: Optional[int] = None,
         router_event_threads: int = 4,
         router_queue_policy: str = "fcfs",
     ) -> None:

@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use tokio::sync::Mutex;
 use tokio::sync::watch;
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant};
 
 use super::policy::{FcfsPolicy, SchedulingPolicy};
 use super::prefill_load::PrefillLoadEstimator;
 use super::selector::{DefaultWorkerSelector, WorkerSelector};
-use super::types::{SchedulingRequest, SchedulingResponse, pinned_worker_config};
+use super::types::{KvSchedulerError, SchedulingRequest, SchedulingResponse, pinned_worker_config};
 use crate::protocols::{PrefillLoadHint, WorkerConfigLike, WorkerId, WorkerWithDpRank};
 use crate::sequences::{ActiveSequencesMultiWorker, SequencePublisher, SequenceRequest};
 
@@ -24,6 +24,7 @@ pub const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
 struct QueueEntry<K: Ord + Eq> {
     key: K,
     request: SchedulingRequest,
+    enqueued_at: Instant,
 }
 
 impl<K: Ord + Eq> Eq for QueueEntry<K> {}
@@ -69,6 +70,10 @@ pub struct SchedulerQueue<
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
     /// Cached threshold fraction; None means queueing is disabled.
     threshold_frac: Option<f64>,
+    /// Maximum number of queued requests per eligible worker.
+    max_pending_per_worker: Option<usize>,
+    /// Maximum time a request can wait in the queue before being failed.
+    max_queue_wait: Option<Duration>,
     /// Reference instant for computing arrival offsets.
     start_time: Instant,
     block_size: u32,
@@ -88,6 +93,8 @@ impl<
         slots: Arc<ActiveSequencesMultiWorker<P>>,
         workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
         threshold_frac: Option<f64>,
+        max_pending_per_worker: Option<usize>,
+        max_queue_wait: Option<Duration>,
         block_size: u32,
         selector: Sel,
         policy: S,
@@ -95,6 +102,15 @@ impl<
     ) -> Self {
         if let Some(frac) = threshold_frac {
             tracing::info!("Router queue enabled with threshold fraction {frac}");
+        }
+        if let Some(limit) = max_pending_per_worker {
+            tracing::info!("Router queue limited to {limit} pending requests per eligible worker");
+        }
+        if let Some(timeout) = max_queue_wait {
+            tracing::info!(
+                timeout_ms = timeout.as_millis() as u64,
+                "Router queue wait timeout enabled"
+            );
         }
         Self {
             pending: Mutex::new(BinaryHeap::new()),
@@ -104,6 +120,8 @@ impl<
             slots,
             workers_with_configs,
             threshold_frac,
+            max_pending_per_worker,
+            max_queue_wait,
             start_time: Instant::now(),
             block_size,
             selector,
@@ -167,11 +185,22 @@ impl<
             request.pinned_worker,
             decay_now,
         ) {
+            if let Some(limit) = self.current_pending_limit(request.allowed_worker_ids.as_ref()) {
+                let pending = self.pending_count();
+                if pending >= limit {
+                    request.respond(Err(KvSchedulerError::QueueFull { pending, limit }));
+                    return;
+                }
+            }
             tracing::debug!("all workers busy, queueing request");
             let arrival_offset = self.start_time.elapsed();
             let key = self.policy.enqueue_key(arrival_offset, &request);
             let isl_tokens = request.isl_tokens;
-            self.pending.lock().await.push(QueueEntry { key, request });
+            self.pending.lock().await.push(QueueEntry {
+                key,
+                request,
+                enqueued_at: Instant::now(),
+            });
             self.pending_count.fetch_add(1, AtomicOrdering::Relaxed);
             self.pending_isl_tokens
                 .fetch_add(isl_tokens, AtomicOrdering::Relaxed);
@@ -197,10 +226,17 @@ impl<
                 .map(|e| QueueEntry {
                     key: self.policy.rekey(now, &e.key, &e.request),
                     request: e.request,
+                    enqueued_at: e.enqueued_at,
                 })
                 .collect();
             *heap = BinaryHeap::from(rekeyed);
         }
+
+        let expired = {
+            let mut heap = self.pending.lock().await;
+            self.refresh_pending_locked(&mut heap)
+        };
+        self.fail_expired(expired);
 
         loop {
             let _admission = self.admission_gate.lock().await;
@@ -226,6 +262,10 @@ impl<
             self.pending_count.fetch_sub(1, AtomicOrdering::Relaxed);
             self.pending_isl_tokens
                 .fetch_sub(entry.request.isl_tokens, AtomicOrdering::Relaxed);
+            if self.is_expired(&entry) {
+                self.fail_expired(vec![(entry.request, self.expiration_limit_ms())]);
+                continue;
+            }
             tracing::debug!("scheduling request from pending queue");
             self.admit_one(entry.request, decay_now).await;
         }
@@ -397,6 +437,65 @@ impl<
         }
         checked_any
     }
+
+    fn current_pending_limit(&self, allowed: Option<&HashSet<WorkerId>>) -> Option<usize> {
+        let per_worker_limit = self.max_pending_per_worker?;
+        let configs = self.workers_with_configs.borrow();
+        let eligible_workers = configs
+            .keys()
+            .filter(|worker_id| allowed.is_none_or(|ids| ids.contains(worker_id)))
+            .count();
+        Some(per_worker_limit.saturating_mul(eligible_workers.max(1)))
+    }
+
+    fn is_expired(&self, entry: &QueueEntry<S::Key>) -> bool {
+        let Some(limit) = self.max_queue_wait else {
+            return false;
+        };
+        entry.enqueued_at.elapsed() >= limit
+    }
+
+    fn expiration_limit_ms(&self) -> u64 {
+        self.max_queue_wait
+            .map(|limit| limit.as_millis() as u64)
+            .unwrap_or_default()
+    }
+
+    fn refresh_pending_locked(
+        &self,
+        heap: &mut BinaryHeap<QueueEntry<S::Key>>,
+    ) -> Vec<(SchedulingRequest, u64)> {
+        if self.max_queue_wait.is_none() {
+            return Vec::new();
+        }
+
+        let pending = std::mem::take(heap).into_vec();
+        let mut fresh = Vec::with_capacity(pending.len());
+        let mut expired = Vec::new();
+        for entry in pending {
+            if self.is_expired(&entry) {
+                self.pending_isl_tokens
+                    .fetch_sub(entry.request.isl_tokens, AtomicOrdering::Relaxed);
+                expired.push((entry.request, self.expiration_limit_ms()));
+            } else {
+                fresh.push(entry);
+            }
+        }
+
+        *heap = BinaryHeap::from(fresh);
+        self.pending_count
+            .store(heap.len(), AtomicOrdering::Relaxed);
+        expired
+    }
+
+    fn fail_expired(&self, expired: Vec<(SchedulingRequest, u64)>) {
+        for (mut request, limit_ms) in expired {
+            request.respond(Err(KvSchedulerError::QueueWaitTimeout {
+                waited_ms: limit_ms,
+                limit_ms,
+            }));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -557,6 +656,8 @@ mod tests {
             Arc::clone(&slots),
             cfg_rx,
             threshold_frac,
+            None,
+            None,
             block_size,
             selector,
             FcfsPolicy,
@@ -572,6 +673,31 @@ mod tests {
         block_size: u32,
         isl: usize,
         threshold_frac: Option<f64>,
+        prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
+    ) -> (
+        Arc<SchedulerQueue<NoopSequencePublisher, SimpleWorkerConfig>>,
+        Arc<ActiveSequencesMultiWorker<NoopSequencePublisher>>,
+        watch::Sender<HashMap<u64, SimpleWorkerConfig>>,
+    ) {
+        make_queue_with_sender_and_limits(
+            num_workers,
+            block_size,
+            isl,
+            threshold_frac,
+            None,
+            None,
+            prefill_load_estimator,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn make_queue_with_sender_and_limits(
+        num_workers: usize,
+        block_size: u32,
+        isl: usize,
+        threshold_frac: Option<f64>,
+        max_pending_per_worker: Option<usize>,
+        max_queue_wait: Option<Duration>,
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
     ) -> (
         Arc<SchedulerQueue<NoopSequencePublisher, SimpleWorkerConfig>>,
@@ -606,6 +732,8 @@ mod tests {
             Arc::clone(&slots),
             cfg_rx,
             threshold_frac,
+            max_pending_per_worker,
+            max_queue_wait,
             block_size,
             selector,
             FcfsPolicy,
@@ -817,6 +945,78 @@ mod tests {
         queue.update().await;
 
         assert_eq!(queue.pending_count(), 0, "all requests should be drained");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_queue_pending_limit_rejects_excess() {
+        let block_size = 16;
+        let isl = 512;
+        let (queue, _slots, _cfg_tx) =
+            make_queue_with_sender_and_limits(1, block_size, isl, Some(0.0), Some(1), None, None);
+
+        let (req1, rx1) = make_request("req-1", isl);
+        queue.enqueue(req1).await;
+        let _ = rx1.await.unwrap().unwrap();
+
+        let (req2, _rx2) = make_request("req-2", isl);
+        queue.enqueue(req2).await;
+        assert_eq!(queue.pending_count(), 1);
+
+        let (req3, rx3) = make_request("req-3", isl);
+        queue.enqueue(req3).await;
+        let resp = rx3.await.expect("oneshot dropped");
+        assert!(
+            matches!(
+                resp,
+                Err(KvSchedulerError::QueueFull {
+                    pending: 1,
+                    limit: 1
+                })
+            ),
+            "expected QueueFull, got {resp:?}"
+        );
+        assert_eq!(queue.pending_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_queue_wait_timeout_expires_pending_request() {
+        let block_size = 16;
+        let isl = 512;
+        let (queue, _slots, _cfg_tx) = make_queue_with_sender_and_limits(
+            1,
+            block_size,
+            isl,
+            Some(0.0),
+            None,
+            Some(Duration::from_millis(100)),
+            None,
+        );
+
+        let (req1, rx1) = make_request("req-1", isl);
+        queue.enqueue(req1).await;
+        let _ = rx1.await.unwrap().unwrap();
+
+        let (req2, mut rx2) = make_request("req-2", isl);
+        queue.enqueue(req2).await;
+        assert_eq!(queue.pending_count(), 1);
+
+        tokio::time::advance(Duration::from_millis(101)).await;
+        queue.update().await;
+
+        let resp = rx2
+            .try_recv()
+            .expect("expired request should have been failed");
+        assert!(
+            matches!(
+                resp,
+                Err(KvSchedulerError::QueueWaitTimeout {
+                    waited_ms: 100,
+                    limit_ms: 100
+                })
+            ),
+            "expected QueueWaitTimeout, got {resp:?}"
+        );
+        assert_eq!(queue.pending_count(), 0);
     }
 
     #[tokio::test(start_paused = true)]

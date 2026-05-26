@@ -136,6 +136,10 @@ impl KvReplayRouter {
             slots,
             worker_config_rx,
             config.router_queue_threshold,
+            config.router_max_pending_per_worker,
+            config
+                .router_max_queue_wait_ms
+                .map(std::time::Duration::from_millis),
             args.block_size as u32,
             selector,
             policy,

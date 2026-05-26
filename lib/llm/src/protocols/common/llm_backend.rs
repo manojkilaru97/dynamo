@@ -10,9 +10,13 @@ use dynamo_protocols::types::CompletionUsage;
 use dynamo_protocols::types::StopReason;
 use dynamo_runtime::error::DynamoError;
 use dynamo_runtime::protocols::maybe_error::MaybeError;
+use serde_json::json;
 
 pub type TokenType = Option<String>;
 pub type LogProbs = Vec<f64>;
+
+pub const DYNAMO_ERROR_TYPE_FIELD: &str = "dynamo_error_type";
+pub const SERVICE_OVERLOADED_ERROR_TYPE: &str = "service_overloaded";
 
 /// Output type discriminator for different modalities
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -244,6 +248,22 @@ impl LLMEngineOutput {
             extra_args: None,
             completion_usage: None,
         }
+    }
+
+    pub fn overloaded(err_msg: String) -> Self {
+        let mut output = LLMEngineOutput::error(err_msg);
+        output.extra_args = Some(json!({
+            DYNAMO_ERROR_TYPE_FIELD: SERVICE_OVERLOADED_ERROR_TYPE,
+        }));
+        output
+    }
+
+    pub fn is_service_overloaded(&self) -> bool {
+        self.extra_args
+            .as_ref()
+            .and_then(|args| args.get(DYNAMO_ERROR_TYPE_FIELD))
+            .and_then(|value| value.as_str())
+            == Some(SERVICE_OVERLOADED_ERROR_TYPE)
     }
 }
 

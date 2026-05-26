@@ -31,6 +31,12 @@ pub enum KvSchedulerError {
 
     #[error("failed to initialize event publisher: {0}")]
     InitFailed(String),
+
+    #[error("scheduler queue full: pending={pending}, limit={limit}")]
+    QueueFull { pending: usize, limit: usize },
+
+    #[error("scheduler queue wait timeout after {waited_ms}ms (limit {limit_ms}ms)")]
+    QueueWaitTimeout { waited_ms: u64, limit_ms: u64 },
 }
 
 #[derive(Debug)]

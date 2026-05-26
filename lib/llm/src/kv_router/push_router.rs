@@ -8,8 +8,8 @@ use dynamo_kv_router::protocols::{TokensWithHashes, WorkerWithDpRank};
 use dynamo_runtime::{
     dynamo_nvtx_range,
     pipeline::{
-        AsyncEngine, AsyncEngineContextProvider, Error, ManyOut, PushRouter, ResponseStream,
-        SingleIn, async_trait,
+        AsyncEngine, AsyncEngineContextProvider, Error, ManyOut, PipelineError, PushRouter,
+        ResponseStream, SingleIn, async_trait,
     },
     protocols::annotated::Annotated,
 };
@@ -47,6 +47,12 @@ struct WorkerSelection {
     backend_dp_rank: Option<u32>,
     bookkeeping_dp_rank: Option<u32>,
     overlap_amount: Option<u32>,
+}
+
+fn is_service_overloaded_output(item: &Annotated<LLMEngineOutput>) -> bool {
+    item.data
+        .as_ref()
+        .is_some_and(LLMEngineOutput::is_service_overloaded)
 }
 
 fn pinned_worker_hint(
@@ -683,6 +689,19 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         // → RequestGuard::Drop fires → chooser.free() + deferred_close.execute()
         //   but record_metrics() is suppressed (no backend work was done).
         guard.dispatched = true;
+        let Some(first_item) = response_stream.next().await else {
+            guard.dispatched = false;
+            return Err(anyhow::anyhow!(
+                "Worker {instance_id} returned an empty initial response stream for request {context_id}"
+            ));
+        };
+        if is_service_overloaded_output(&first_item) {
+            guard.dispatched = false;
+            return Err(Error::new(PipelineError::ServiceOverloaded(format!(
+                "Worker {instance_id} rejected request {context_id} due to local request limit"
+            ))));
+        }
+
         let stream_context = response_stream.context();
         let context_for_monitoring = stream_context.clone();
 
@@ -690,6 +709,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             // Move guard into the stream closure. Drop fires here if the stream
             // is polled to completion, or via the outer Drop if never polled.
             let mut guard = guard;
+            let mut pending_first_item = Some(first_item);
 
             loop {
                 tokio::select! {
@@ -700,7 +720,13 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                         break;
                     }
 
-                    item = response_stream.next() => {
+                    item = async {
+                        if pending_first_item.is_some() {
+                            pending_first_item.take()
+                        } else {
+                            response_stream.next().await
+                        }
+                    } => {
                         let Some(item) = item else {
                             break;
                         };

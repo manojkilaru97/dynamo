@@ -553,6 +553,12 @@ fn kv_router_config_from_env() -> KvRouterConfig {
     fn env_f64(key: &str) -> Option<f64> {
         std::env::var(key).ok().and_then(|v| v.parse().ok())
     }
+    fn env_usize(key: &str) -> Option<usize> {
+        std::env::var(key).ok().and_then(|v| v.parse().ok())
+    }
+    fn env_u64(key: &str) -> Option<u64> {
+        std::env::var(key).ok().and_then(|v| v.parse().ok())
+    }
     fn env_bool(key: &str) -> Option<bool> {
         std::env::var(key)
             .ok()
@@ -587,6 +593,12 @@ fn kv_router_config_from_env() -> KvRouterConfig {
     if let Some(v) = env_f64("DYN_ROUTER_QUEUE_THRESHOLD") {
         cfg.router_queue_threshold = Some(v);
     }
+    if let Some(v) = env_usize("DYN_ROUTER_MAX_PENDING_PER_WORKER") {
+        cfg.router_max_pending_per_worker = Some(v);
+    }
+    if let Some(v) = env_u64("DYN_ROUTER_MAX_QUEUE_WAIT_MS") {
+        cfg.router_max_queue_wait_ms = Some(v);
+    }
 
     tracing::info!(
         overlap_score_weight = cfg.overlap_score_weight,
@@ -597,6 +609,8 @@ fn kv_router_config_from_env() -> KvRouterConfig {
         router_track_output_blocks = cfg.router_track_output_blocks,
         router_track_prefill_tokens = cfg.router_track_prefill_tokens,
         router_queue_threshold = ?cfg.router_queue_threshold,
+        router_max_pending_per_worker = ?cfg.router_max_pending_per_worker,
+        router_max_queue_wait_ms = ?cfg.router_max_queue_wait_ms,
         "KvRouterConfig initialized (DYN_* env overrides applied)"
     );
 

@@ -191,6 +191,16 @@ pub struct KvRouterConfig {
     #[validate(range(min = 0.0))]
     pub router_queue_threshold: Option<f64>,
 
+    /// Maximum number of scheduler-queued requests per eligible worker.
+    /// If None, queue depth is unbounded.
+    #[validate(range(min = 1))]
+    pub router_max_pending_per_worker: Option<usize>,
+
+    /// Maximum time in milliseconds that a request can wait in the router queue.
+    /// If None, queued requests do not expire.
+    #[validate(range(min = 1))]
+    pub router_max_queue_wait_ms: Option<u64>,
+
     /// Number of event processing threads for the KV indexer.
     /// When > 1, uses ConcurrentRadixTree with a thread pool instead of the
     /// single-threaded RadixTree. Default: 4.
@@ -235,6 +245,8 @@ impl Default for KvRouterConfig {
             router_max_tree_size: 2usize.pow(20), // 2^20 = 1048576, matches PruneConfig::default()
             router_prune_target_ratio: 0.8,
             router_queue_threshold: Some(4.0),
+            router_max_pending_per_worker: None,
+            router_max_queue_wait_ms: None,
             router_event_threads: 4,
             skip_initial_worker_wait: false,
             router_queue_policy: RouterQueuePolicy::default(),
