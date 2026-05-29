@@ -2298,6 +2298,8 @@ impl OpenAIPreprocessor {
         //   `<tool_call>` / `</tool_call>` are special tokens in Nemotron 3
         //   tokenizers, and Dynamo's Rust postprocessor parses reasoning and
         //   tools from decoded text after backend conversion.
+        // - poolside_v1: mirrors vLLM's Poolside parser adjust_request hook
+        //   so model-native tool-call markers are visible to the parser.
         matches!(
             tool_call_parser,
             Some("gemma4")
@@ -2309,6 +2311,7 @@ impl OpenAIPreprocessor {
                 | Some("nemotron_nano")
                 | Some("nemotron3")
                 | Some("nemotron_v3")
+                | Some("poolside_v1")
         ) || matches!(
             reasoning_parser,
             Some(
@@ -3542,6 +3545,12 @@ mod tests {
                 None,
                 true,
                 "nemotron_nano tool-call only → required (`<tool_call>` is a special token)",
+            ),
+            (
+                Some("poolside_v1"),
+                None,
+                true,
+                "poolside_v1 tool-call only -> required to mirror vLLM adjust_request",
             ),
             (None, None, false, "no parsers → not required"),
         ];
