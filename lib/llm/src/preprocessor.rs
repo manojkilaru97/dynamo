@@ -2261,6 +2261,10 @@ impl OpenAIPreprocessor {
                     }
                     builder = builder.tool_call_parser(parser);
                 }
+                Some(ChatCompletionToolChoiceOption::None) => {
+                    // vLLM-style tool parsers are disabled when the request
+                    // explicitly says tool_choice="none".
+                }
             }
         }
 
