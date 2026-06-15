@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -122,6 +123,73 @@ async def test_generate_streams_chunks_with_coherent_final_usage(started_engine)
     assert "finish_reason" in final
     usage = final["completion_usage"]
     assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+
+
+async def test_generate_forwards_reasoning_metadata_to_async_llm():
+    from dynamo.common.constants import DisaggregationMode
+    from dynamo.vllm.llm_engine import VllmLLMEngine
+
+    class FakeEngineClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def generate(
+            self,
+            prompt,
+            sampling_params,
+            request_id,
+            *,
+            reasoning_ended=None,
+            reasoning_parser_kwargs=None,
+        ):
+            self.calls.append(
+                {
+                    "prompt": prompt,
+                    "sampling_params": sampling_params,
+                    "request_id": request_id,
+                    "reasoning_ended": reasoning_ended,
+                    "reasoning_parser_kwargs": reasoning_parser_kwargs,
+                }
+            )
+            yield SimpleNamespace(
+                prompt_token_ids=[1, 2, 3],
+                outputs=[
+                    SimpleNamespace(index=0, token_ids=[42], finish_reason="stop")
+                ],
+                kv_transfer_params=None,
+            )
+
+    client = FakeEngineClient()
+    engine = VllmLLMEngine(object(), DisaggregationMode.AGGREGATED)
+    engine.engine_client = client
+    engine._default_sampling_params = {}
+    engine._model_max_len = 1024
+
+    chunks = []
+    async for chunk in engine.generate(
+        cast(
+            dict,
+            {
+                "token_ids": [1, 2, 3],
+                "stop_conditions": {"max_tokens": 1},
+                "sampling_options": {"temperature": 0.0},
+                "extra_args": {
+                    "reasoning_ended": True,
+                    "reasoning_parser_kwargs": {
+                        "chat_template_kwargs": {"enable_thinking": False}
+                    },
+                },
+            },
+        ),
+        cast(object, _FakeContext("reasoning-meta")),
+    ):
+        chunks.append(chunk)
+
+    assert chunks[-1]["finish_reason"] == "stop"
+    assert client.calls[0]["reasoning_ended"] is True
+    assert client.calls[0]["reasoning_parser_kwargs"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
 
 
 async def test_abort_and_cleanup_are_safe_before_start():

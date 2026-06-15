@@ -32,7 +32,11 @@ from dynamo.common.constants import DisaggregationMode
 from dynamo.llm import ModelInput
 from dynamo.vllm.args import parse_args
 
-from .handlers import build_sampling_params
+from .handlers import (
+    _engine_generate_reasoning_kwargs,
+    _request_reasoning_metadata,
+    build_sampling_params,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,8 +135,9 @@ class VllmLLMEngine(LLMEngine):
         prompt = TokensPrompt(prompt_token_ids=token_ids)
 
         # TODO: remove dict() once build_sampling_params accepts GenerateRequest
+        request_dict = dict(request)
         sampling_params = build_sampling_params(
-            dict(request), self._default_sampling_params, self._model_max_len
+            request_dict, self._default_sampling_params, self._model_max_len
         )
 
         # vLLM's KV transfer is internal to NixlConnector
@@ -173,7 +178,15 @@ class VllmLLMEngine(LLMEngine):
                 sampling_params.extra_args = {}
             sampling_params.extra_args["kv_transfer_params"] = kv_params
 
-        gen = self.engine_client.generate(prompt, sampling_params, request_id)
+        reasoning_ended, reasoning_parser_kwargs = _request_reasoning_metadata(
+            request_dict
+        )
+        reasoning_kwargs = _engine_generate_reasoning_kwargs(
+            self.engine_client, reasoning_ended, reasoning_parser_kwargs
+        )
+        gen = self.engine_client.generate(
+            prompt, sampling_params, request_id, **reasoning_kwargs
+        )
 
         is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
 

@@ -53,9 +53,9 @@ fn get_reasoning_parser_map() -> &'static HashMap<&'static str, ReasoningParserT
         map.insert("step3", ReasoningParserType::Step3);
         map.insert("mistral", ReasoningParserType::Mistral);
         map.insert("granite", ReasoningParserType::Granite);
-        map.insert("nemotron_nano", ReasoningParserType::DeepseekR1); // nemotron nano is ...</think>
-        map.insert("nemotron3", ReasoningParserType::DeepseekR1);
-        map.insert("nemotron_v3", ReasoningParserType::DeepseekR1);
+        map.insert("nemotron_nano", ReasoningParserType::NemotronV3); // nemotron nano is ...</think>
+        map.insert("nemotron3", ReasoningParserType::NemotronV3);
+        map.insert("nemotron_v3", ReasoningParserType::NemotronV3);
         map.insert("glm45", ReasoningParserType::NemotronDeci); // GLM-4.5/5 is <think>...</think>, no force_reasoning
         map.insert(
             "minimax_append_think",
@@ -147,6 +147,7 @@ pub enum ReasoningParserType {
     KimiK25,
     Mistral,
     Granite,
+    NemotronV3,
     MiniMaxAppendThink,
     /// Google Gemma 4 thinking models. Custom `<|channel>...<channel|>`
     /// delimiters with a `thought\n` role-label prefix stripped by the parser.
@@ -247,6 +248,12 @@ impl ReasoningParserType {
             },
             ReasoningParserType::Granite => ReasoningParserWrapper {
                 parser: Box::new(GraniteReasoningParser::new()),
+            },
+            ReasoningParserType::NemotronV3 => ReasoningParserWrapper {
+                parser: Box::new(
+                    BasicReasoningParser::new("<think>".into(), "</think>".into(), true, true)
+                        .with_tool_start_token("<tool_call>"),
+                ),
             },
             ReasoningParserType::MiniMaxAppendThink => ReasoningParserWrapper {
                 parser: Box::new(MiniMaxAppendThinkParser::new()),
@@ -631,6 +638,32 @@ mod tests {
             );
             assert_eq!(all_content, expected_content, "FAILED content: {desc}");
         }
+    }
+
+    #[test]
+    fn test_nemotron_v3_exits_reasoning_at_tool_call() {
+        let input = "Need the tool now<tool_call><function=get_weather></function></tool_call>";
+        let mut parser = ReasoningParserType::get_reasoning_parser_from_name("nemotron_v3");
+        let result = parser.detect_and_parse_reasoning(input, &[]);
+        assert_eq!(result.reasoning_text, "Need the tool now");
+        assert_eq!(
+            result.normal_text,
+            "<tool_call><function=get_weather></function></tool_call>"
+        );
+
+        let mut parser = ReasoningParserType::get_reasoning_parser_from_name("nemotron_v3");
+        let mut all_reasoning = String::new();
+        let mut all_content = String::new();
+        for chunk in [
+            "Need the tool now<tool",
+            "_call><function=get_weather></function>",
+        ] {
+            let result = parser.parse_reasoning_streaming_incremental(chunk, &[]);
+            all_reasoning.push_str(&result.reasoning_text);
+            all_content.push_str(&result.normal_text);
+        }
+        assert_eq!(all_reasoning, "Need the tool now");
+        assert_eq!(all_content, "<tool_call><function=get_weather></function>");
     }
 
     // P2-1: V4 production regime where the prompt ends in <think>, so the stream

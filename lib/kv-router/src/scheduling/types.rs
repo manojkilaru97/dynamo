@@ -42,6 +42,12 @@ pub enum KvSchedulerError {
 
     #[error("failed to initialize event publisher: {0}")]
     InitFailed(String),
+
+    #[error("scheduler queue full: pending={pending}, limit={limit}")]
+    QueueFull { pending: usize, limit: usize },
+
+    #[error("scheduler queue wait timeout after {waited_ms}ms (limit {limit_ms}ms)")]
+    QueueWaitTimeout { waited_ms: u64, limit_ms: u64 },
 }
 
 #[derive(Debug)]
@@ -195,14 +201,16 @@ impl SchedulingRequest {
         self.pinned_worker.is_none() && self.allowed_worker_ids.is_some()
     }
 
-    pub fn respond(&mut self, result: Result<SchedulingResponse, KvSchedulerError>) {
+    pub fn respond(&mut self, result: Result<SchedulingResponse, KvSchedulerError>) -> bool {
         let Some(tx) = self.resp_tx.take() else {
             tracing::error!("respond called multiple times on same request");
-            return;
+            return false;
         };
         if tx.send(result).is_err() {
             tracing::error!("failed to send response to requestor");
+            return false;
         }
+        true
     }
 }
 

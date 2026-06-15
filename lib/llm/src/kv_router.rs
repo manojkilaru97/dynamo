@@ -24,8 +24,8 @@ use dynamo_runtime::{
     component::{Client, Endpoint},
     discovery::DiscoveryQuery,
     pipeline::{
-        AsyncEngine, AsyncEngineContextProvider, Error, ManyOut, ResponseStream, SingleIn,
-        async_trait,
+        AsyncEngine, AsyncEngineContextProvider, Error, ManyOut, PipelineError, ResponseStream,
+        SingleIn, async_trait,
     },
     protocols::EndpointId,
     protocols::annotated::Annotated,
@@ -580,7 +580,14 @@ where
                 shared_cache_hits,
             )
             .instrument(tracing::info_span!("kv_router.schedule"))
-            .await?;
+            .await
+            .map_err(|error| match error {
+                scheduling::KvSchedulerError::QueueFull { .. }
+                | scheduling::KvSchedulerError::QueueWaitTimeout { .. } => {
+                    Error::new(PipelineError::ServiceOverloaded(error.to_string()))
+                }
+                _ => Error::new(error),
+            })?;
         let total_elapsed = start.elapsed();
 
         if let Some(m) = metrics::RoutingOverheadMetrics::get() {

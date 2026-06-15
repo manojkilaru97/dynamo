@@ -3245,6 +3245,57 @@ fahrenheit
         }
     }
 
+    #[tokio::test]
+    async fn test_tool_choice_auto_with_qwen3_coder_accepts_tool_call_marker() {
+        let xml_output = r#"<tool_call>
+<function=get_weather>
+<parameter=city>
+San Francisco
+</parameter>
+</function>
+</tool_call>"#;
+
+        let input_stream = stream::iter(vec![test_utils::create_mock_response_chunk(
+            xml_output.to_string(),
+            0,
+        )]);
+        let results: Vec<_> = OpenAIPreprocessor::apply_tool_calling_jail(
+            Some("qwen3_coder".to_string()),
+            Some(ChatCompletionToolChoiceOption::Auto),
+            None,
+            input_stream,
+        )
+        .collect()
+        .await;
+
+        let tool_call_count: usize = results
+            .iter()
+            .map(|r| {
+                r.data.as_ref().map_or(0, |d| {
+                    d.inner
+                        .choices
+                        .iter()
+                        .map(|c: &ChatChoiceStream| {
+                            c.delta.tool_calls.as_ref().map_or(0, |tc| tc.len())
+                        })
+                        .sum::<usize>()
+                })
+            })
+            .sum();
+
+        assert_eq!(tool_call_count, 1);
+        for r in &results {
+            if let Some(data) = &r.data {
+                for choice in &data.inner.choices {
+                    if let Some(content) = &choice.delta.content {
+                        let text = test_utils::extract_text(content);
+                        assert!(!text.contains("<tool_call>"));
+                    }
+                }
+            }
+        }
+    }
+
     /// Test for tool_choice=named with qwen3_coder parser and named_tool_filter.
     ///
     /// When tool_choice=named is used with a specific tool_name, the

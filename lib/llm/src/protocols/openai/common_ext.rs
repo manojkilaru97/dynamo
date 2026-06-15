@@ -5,6 +5,32 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
 
+/// vLLM-compatible structured decoding alias. These fields map onto Dynamo's
+/// guided decoding options at request normalization time.
+#[derive(ToSchema, Serialize, Deserialize, Builder, Debug, Clone, Default, PartialEq)]
+#[builder(pattern = "mutable")]
+#[builder(setter(into, strip_option), default)]
+#[builder(derive(Debug))]
+pub struct StructuredOutputs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<serde_json::Value>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_object: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<Vec<String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_tag: Option<serde_json::Value>,
+}
+
 /// Common extensions for OpenAI API requests that are not part of the standard OpenAI spec
 /// but are commonly needed across different request types.
 #[derive(ToSchema, Serialize, Deserialize, Builder, Validate, Debug, Clone, Default)]
@@ -63,6 +89,11 @@ pub struct CommonExt {
     #[builder(default, setter(strip_option))]
     pub guided_choice: Option<Vec<String>>,
 
+    /// vLLM-compatible alias for guided decoding options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub structured_outputs: Option<StructuredOutputs>,
+
     /// If specified, the backend to use for guided decoding, can be backends like xgrammar or custom guided decoding backend
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
@@ -99,6 +130,7 @@ pub trait CommonExtProvider {
     fn get_guided_regex(&self) -> Option<String>;
     fn get_guided_grammar(&self) -> Option<String>;
     fn get_guided_choice(&self) -> Option<Vec<String>>;
+    fn get_guided_structural_tag(&self) -> Option<serde_json::Value>;
     fn get_guided_decoding_backend(&self) -> Option<String>;
     #[allow(unused)] // Not used
     fn get_guided_whitespace_pattern(&self) -> Option<String>;
@@ -130,6 +162,7 @@ mod tests {
         assert_eq!(common_ext.guided_regex, None);
         assert_eq!(common_ext.guided_grammar, None);
         assert_eq!(common_ext.guided_choice, None);
+        assert_eq!(common_ext.structured_outputs, None);
         assert_eq!(common_ext.guided_decoding_backend, None);
         assert_eq!(common_ext.include_stop_str_in_output, None);
         assert_eq!(common_ext.skip_special_tokens, None);
@@ -147,6 +180,10 @@ mod tests {
             .guided_regex("regex".to_string())
             .guided_grammar("grammar".to_string())
             .guided_choice(vec!["choice1".to_string(), "choice2".to_string()])
+            .structured_outputs(StructuredOutputs {
+                json: Some(serde_json::json!({"type": "object"})),
+                ..Default::default()
+            })
             .guided_decoding_backend("backend".to_string())
             .skip_special_tokens(false)
             .build()
@@ -166,6 +203,13 @@ mod tests {
         assert_eq!(
             common_ext.guided_choice,
             Some(vec!["choice1".to_string(), "choice2".to_string()])
+        );
+        assert_eq!(
+            common_ext
+                .structured_outputs
+                .as_ref()
+                .and_then(|s| s.json.clone()),
+            Some(serde_json::json!({"type": "object"}))
         );
         assert_eq!(
             common_ext.guided_decoding_backend,
@@ -203,6 +247,7 @@ mod tests {
             guided_regex: None,
             guided_grammar: None,
             guided_choice: None,
+            structured_outputs: None,
             guided_decoding_backend: None,
             guided_whitespace_pattern: None,
             skip_special_tokens: None,

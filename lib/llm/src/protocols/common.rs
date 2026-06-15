@@ -347,7 +347,7 @@ pub struct SamplingOptions {
 
 /// Guided Decoding Options
 ///
-/// Only one of `json`, `regex`, `choice`, or `grammar` should be set.
+/// Only one of `json`, `regex`, `choice`, `grammar`, or `structural_tag` should be set.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct GuidedDecodingOptions {
     /// If specified, the output will follow the JSON schema. Can be a string, an object, or null.
@@ -365,6 +365,10 @@ pub struct GuidedDecodingOptions {
     /// If specified, the output will follow the context-free grammar. Can be a string or null.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grammar: Option<String>,
+
+    /// If specified, the output will follow a structural tag constraint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structural_tag: Option<serde_json::Value>,
 
     /// If specified, the backend to use for guided decoding, can be backends like xgrammar or custom guided decoding backend
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -390,6 +394,7 @@ impl GuidedDecodingOptions {
             regex,
             choice,
             grammar,
+            structural_tag: None,
             backend,
             whitespace_pattern,
         }
@@ -418,16 +423,40 @@ impl GuidedDecodingOptions {
         backend: Option<String>,
         whitespace_pattern: Option<String>,
     ) -> Result<Option<Self>> {
+        Self::from_optional_with_structural_tag(
+            json,
+            regex,
+            choice,
+            grammar,
+            None,
+            backend,
+            whitespace_pattern,
+        )
+    }
+
+    /// Construct only if one field is Some, including structural tag (fallible).
+    pub fn from_optional_with_structural_tag(
+        json: Option<serde_json::Value>,
+        regex: Option<String>,
+        choice: Option<Vec<String>>,
+        grammar: Option<String>,
+        structural_tag: Option<serde_json::Value>,
+        backend: Option<String>,
+        whitespace_pattern: Option<String>,
+    ) -> Result<Option<Self>> {
         let is_empty_choice = choice.as_ref().is_none_or(|v| v.is_empty());
         if json.is_none()
             && regex.is_none()
             && is_empty_choice
             && grammar.is_none()
+            && structural_tag.is_none()
             && whitespace_pattern.is_none()
         {
             return Ok(None);
         }
-        let instance = Self::validated(json, regex, choice, grammar, backend, whitespace_pattern)?;
+        let mut instance = Self::new(json, regex, choice, grammar, backend, whitespace_pattern);
+        instance.structural_tag = structural_tag;
+        instance.validate()?;
         Ok(Some(instance))
     }
 
@@ -439,6 +468,7 @@ impl GuidedDecodingOptions {
             self.regex.is_some(),
             self.choice.as_ref().is_some_and(|v| !v.is_empty()),
             self.grammar.is_some(),
+            self.structural_tag.is_some(),
             self.whitespace_pattern.is_some(),
         ]
         .iter()
@@ -447,7 +477,7 @@ impl GuidedDecodingOptions {
 
         if count > 1 {
             return Err(anyhow::anyhow!(
-                "Only one of json, regex, choice, or grammar can be set, but multiple are specified: {:?}",
+                "Only one of json, regex, choice, grammar, structural_tag, or whitespace_pattern can be set, but multiple are specified: {:?}",
                 self
             ));
         }

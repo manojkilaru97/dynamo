@@ -201,21 +201,25 @@ impl
                         return Some((output, state));
                     }
 
-                    // if we have a data field without an event, then we might need to update the data
-                    if let Some(data) = &output.data
-                        && data.text.is_some()
-                        && !state.validate_engine_decode
-                    {
-                        // Text already decoded; track finish for this choice
+                    let data = output.data.as_ref().unwrap();
+                    let choice_idx = data.index.unwrap_or(0);
+                    let engine_text = if !state.validate_engine_decode {
+                        data.text.clone()
+                    } else {
+                        None
+                    };
+
+                    if engine_text.is_some() && data.token_ids.is_empty() {
+                        // Text already decoded and there are no tokens to advance
+                        // through Dynamo's decoder state.
                         if data.finish_reason.is_some() {
-                            let choice_idx = data.index.unwrap_or(0);
                             state.finished_choices.insert(choice_idx);
+                            if state.finished_choices.len() >= state.decoders.len() {
+                                state.finished = true;
+                            }
                         }
                         return Some((output, state));
                     }
-
-                    let data = output.data.as_ref().unwrap();
-                    let choice_idx = data.index.unwrap_or(0);
 
                     let Some(decoder) = state.decoders.get_mut(&choice_idx) else {
                         tracing::error!(
@@ -331,7 +335,7 @@ impl
                         data.finish_reason = finish_reason;
                         data.stop_reason = stop_reason.or(data.stop_reason);
                     }
-                    data.text = text;
+                    data.text = engine_text.or(text);
                     data.tokens = Some(tokens);
 
                     // Per-entry decode is O(positions * top_k) per delta. Bounded in
@@ -388,6 +392,7 @@ impl
                     index: data.index,
                     completion_usage: data.completion_usage,
                     disaggregated_params: data.disaggregated_params,
+                    extra_args: data.extra_args,
                     engine_data: data.engine_data,
                 })
             })

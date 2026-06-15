@@ -245,6 +245,7 @@ async fn handle_shared_request(
     let namespace = handler.namespace.clone();
     let component_name = handler.component_name.clone();
     let endpoint_name = handler.endpoint_name.clone();
+    let system_health = handler.system_health.clone();
     let instance_id = handler.instance_id;
 
     tokio::spawn(async move {
@@ -266,9 +267,21 @@ async fn handle_shared_request(
             .await;
         match result {
             Ok(_) => {
+                system_health
+                    .lock()
+                    .record_endpoint_request_result(endpoint_name.as_ref(), true);
                 tracing::trace!(instance_id, "request handled successfully");
             }
             Err(e) => {
+                if matches!(e, PipelineError::ServiceOverloaded(_)) {
+                    system_health
+                        .lock()
+                        .record_endpoint_request_overload(endpoint_name.as_ref());
+                } else {
+                    system_health
+                        .lock()
+                        .record_endpoint_request_result(endpoint_name.as_ref(), false);
+                }
                 tracing::warn!("Failed to handle request: {}", e.to_string());
             }
         }

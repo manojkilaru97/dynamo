@@ -37,6 +37,8 @@ _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "router_reset_states",
     "router_ttl_secs",
     "router_queue_threshold",
+    "router_max_pending_per_worker",
+    "router_max_queue_wait_ms",
     "router_event_threads",
     "router_queue_policy",
     "use_remote_indexer",
@@ -114,6 +116,8 @@ class KvRouterConfigBase(ConfigBase):
     router_reset_states: bool
     router_ttl_secs: float
     router_queue_threshold: Optional[float]
+    router_max_pending_per_worker: Optional[int]
+    router_max_queue_wait_ms: Optional[int]
     router_event_threads: int
     router_queue_policy: str
     use_remote_indexer: bool = False
@@ -345,6 +349,28 @@ class KvRouterArgGroup(ArgGroup):
                 "explicitly for predictable semantics, or use a smaller threshold."
             ),
             arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--router-max-pending-per-worker",
+            env_var="DYN_ROUTER_MAX_PENDING_PER_WORKER",
+            default=8,
+            help=(
+                "KV Router: Maximum number of scheduler-queued requests per eligible "
+                "DP rank before rejecting new requests."
+            ),
+            arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--router-max-queue-wait-ms",
+            env_var="DYN_ROUTER_MAX_QUEUE_WAIT_MS",
+            default=30000,
+            help=(
+                "KV Router: Maximum time in milliseconds a request may wait in the "
+                "scheduler queue before being failed."
+            ),
+            arg_type=int,
         )
         add_argument(
             g,

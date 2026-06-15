@@ -332,6 +332,7 @@ mod tests {
             index: None,
             disaggregated_params: None,
             completion_usage: None,
+            extra_args: None,
             engine_data: None,
         })
     }

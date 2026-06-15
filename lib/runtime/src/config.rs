@@ -28,7 +28,15 @@ const DEFAULT_SYSTEM_LIVE_PATH: &str = "/live";
 /// This is the wait time before sending canary health checks when no activity is detected
 pub const DEFAULT_CANARY_WAIT_TIME_SECS: u64 = 10;
 /// Default timeout for individual health check requests
-pub const DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS: u64 = 3;
+pub const DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Default TTL for the last fully successful health check.
+pub const DEFAULT_HEALTH_CHECK_SUCCESS_TTL_SECS: u64 = 120;
+/// Default real-traffic failure window in seconds.
+pub const DEFAULT_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS: u64 = 600;
+/// Default minimum eligible real-traffic samples before fencing canary failures.
+pub const DEFAULT_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES: usize = 20;
+/// Default real-traffic failure threshold.
+pub const DEFAULT_HEALTH_CHECK_REAL_FAILURE_THRESHOLD: f64 = 0.8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerConfig {
@@ -177,6 +185,30 @@ pub struct RuntimeConfig {
     #[builder(default = "DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS")]
     #[builder_field_attr(serde(skip_serializing_if = "Option::is_none"))]
     pub health_check_request_timeout_secs: u64,
+
+    /// Health check success TTL in seconds.
+    /// Set this at runtime with environment variable DYN_HEALTH_CHECK_SUCCESS_TTL
+    #[builder(default = "DEFAULT_HEALTH_CHECK_SUCCESS_TTL_SECS")]
+    #[builder_field_attr(serde(skip_serializing_if = "Option::is_none"))]
+    pub health_check_success_ttl_secs: u64,
+
+    /// Real-traffic failure window in seconds.
+    /// Set this at runtime with environment variable DYN_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS
+    #[builder(default = "DEFAULT_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS")]
+    #[builder_field_attr(serde(skip_serializing_if = "Option::is_none"))]
+    pub health_check_real_failure_window_secs: u64,
+
+    /// Minimum eligible real-traffic samples before the failure ratio is considered.
+    /// Set this at runtime with environment variable DYN_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES
+    #[builder(default = "DEFAULT_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES")]
+    #[builder_field_attr(serde(skip_serializing_if = "Option::is_none"))]
+    pub health_check_real_failure_min_samples: usize,
+
+    /// Real-traffic failure ratio threshold.
+    /// Set this at runtime with environment variable DYN_HEALTH_CHECK_REAL_FAILURE_THRESHOLD
+    #[builder(default = "DEFAULT_HEALTH_CHECK_REAL_FAILURE_THRESHOLD")]
+    #[builder_field_attr(serde(skip_serializing_if = "Option::is_none"))]
+    pub health_check_real_failure_threshold: f64,
 }
 
 impl fmt::Display for RuntimeConfig {
@@ -208,6 +240,26 @@ impl fmt::Display for RuntimeConfig {
             f,
             ", health_check_request_timeout_secs={}",
             self.health_check_request_timeout_secs
+        )?;
+        write!(
+            f,
+            ", health_check_success_ttl_secs={}",
+            self.health_check_success_ttl_secs
+        )?;
+        write!(
+            f,
+            ", health_check_real_failure_window_secs={}",
+            self.health_check_real_failure_window_secs
+        )?;
+        write!(
+            f,
+            ", health_check_real_failure_min_samples={}",
+            self.health_check_real_failure_min_samples
+        )?;
+        write!(
+            f,
+            ", health_check_real_failure_threshold={}",
+            self.health_check_real_failure_threshold
         )?;
 
         Ok(())
@@ -279,6 +331,10 @@ impl RuntimeConfig {
                         let mapped_key = match k.as_str() {
                             "ENABLED" => "health_check_enabled",
                             "REQUEST_TIMEOUT" => "health_check_request_timeout_secs",
+                            "SUCCESS_TTL" => "health_check_success_ttl_secs",
+                            "REAL_FAILURE_WINDOW_SECS" => "health_check_real_failure_window_secs",
+                            "REAL_FAILURE_MIN_SAMPLES" => "health_check_real_failure_min_samples",
+                            "REAL_FAILURE_THRESHOLD" => "health_check_real_failure_threshold",
                             _ => k.as_str(),
                         };
                         Some(mapped_key.into())
@@ -361,6 +417,10 @@ impl RuntimeConfig {
             health_check_enabled: false,
             canary_wait_time_secs: DEFAULT_CANARY_WAIT_TIME_SECS,
             health_check_request_timeout_secs: DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS,
+            health_check_success_ttl_secs: DEFAULT_HEALTH_CHECK_SUCCESS_TTL_SECS,
+            health_check_real_failure_window_secs: DEFAULT_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS,
+            health_check_real_failure_min_samples: DEFAULT_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES,
+            health_check_real_failure_threshold: DEFAULT_HEALTH_CHECK_REAL_FAILURE_THRESHOLD,
         }
     }
 
@@ -405,6 +465,10 @@ impl Default for RuntimeConfig {
             health_check_enabled: false,
             canary_wait_time_secs: DEFAULT_CANARY_WAIT_TIME_SECS,
             health_check_request_timeout_secs: DEFAULT_HEALTH_CHECK_REQUEST_TIMEOUT_SECS,
+            health_check_success_ttl_secs: DEFAULT_HEALTH_CHECK_SUCCESS_TTL_SECS,
+            health_check_real_failure_window_secs: DEFAULT_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS,
+            health_check_real_failure_min_samples: DEFAULT_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES,
+            health_check_real_failure_threshold: DEFAULT_HEALTH_CHECK_REAL_FAILURE_THRESHOLD,
         }
     }
 }

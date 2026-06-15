@@ -21,6 +21,7 @@ use crate::{
 use super::utils::GracefulShutdownTracker;
 use crate::SystemHealth;
 use crate::runtime::Runtime;
+use crate::system_health::RealTrafficHealthConfig;
 
 // Used instead of std::cell::OnceCell because get_or_try_init there is nightly
 use async_once_cell::OnceCell;
@@ -143,6 +144,11 @@ impl DistributedRuntime {
             config.health_check_enabled,
             health_endpoint_path,
             live_endpoint_path,
+            RealTrafficHealthConfig {
+                window: Duration::from_secs(config.health_check_real_failure_window_secs),
+                min_samples: config.health_check_real_failure_min_samples,
+                failure_threshold: config.health_check_real_failure_threshold,
+            },
         )));
 
         // Initialize discovery client based on backend configuration
@@ -277,10 +283,9 @@ impl DistributedRuntime {
         // Start health check manager if enabled
         if config.health_check_enabled {
             let health_check_config = crate::health_check::HealthCheckConfig {
-                canary_wait_time: std::time::Duration::from_secs(config.canary_wait_time_secs),
-                request_timeout: std::time::Duration::from_secs(
-                    config.health_check_request_timeout_secs,
-                ),
+                canary_wait_time: Duration::from_secs(config.canary_wait_time_secs),
+                request_timeout: Duration::from_secs(config.health_check_request_timeout_secs),
+                success_ttl: Duration::from_secs(config.health_check_success_ttl_secs),
             };
 
             // Start the health check manager (spawns per-endpoint monitoring tasks)
@@ -291,9 +296,10 @@ impl DistributedRuntime {
             .await
             {
                 Ok(()) => tracing::info!(
-                    "Health check manager started (canary_wait_time: {}s, request_timeout: {}s)",
+                    "Health check manager started (canary_wait_time: {}s, request_timeout: {}s, success_ttl: {}s)",
                     config.canary_wait_time_secs,
-                    config.health_check_request_timeout_secs
+                    config.health_check_request_timeout_secs,
+                    config.health_check_success_ttl_secs
                 ),
                 Err(e) => tracing::error!("Health check manager failed to start: {e}"),
             }

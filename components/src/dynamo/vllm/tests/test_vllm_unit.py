@@ -3,6 +3,7 @@
 
 """Unit tests for vLLM backend components."""
 
+import asyncio
 import json
 import re
 import socket
@@ -736,3 +737,190 @@ def test_build_sampling_params_maps_max_thinking_tokens():
     }
     sp = build_sampling_params(request, default_sampling_params={})
     assert sp.thinking_token_budget == 1024
+    assert sp.extra_args["reasoning_budget"] == 1024
+
+
+def test_build_sampling_params_forwards_reasoning_budget_extra_args():
+    from dynamo.vllm.handlers import build_sampling_params
+
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {},
+        "stop_conditions": {},
+        "output_options": {},
+        "reasoning_budget": "24000",
+        "reasoning_budget_grace_period": 16,
+        "chat_template_kwargs": {"enable_thinking": True},
+        "extra_args": {"request_tag": "kept"},
+    }
+    sp = build_sampling_params(request, default_sampling_params={})
+
+    assert sp.extra_args["reasoning_budget"] == "24000"
+    assert sp.extra_args["reasoning_budget_grace_period"] == 16
+    assert sp.extra_args["enable_thinking"] is True
+    assert sp.extra_args["request_tag"] == "kept"
+
+
+def test_build_sampling_params_reasoning_budget_syncs_hidden_eos_stop_ids():
+    from dynamo.vllm.handlers import build_sampling_params
+
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {},
+        "stop_conditions": {"stop_token_ids": [7]},
+        "output_options": {},
+        "reasoning_budget": 24000,
+        "eos_token_ids": [11],
+    }
+    sp = build_sampling_params(request, default_sampling_params={})
+
+    assert sp.stop_token_ids == [7, 11]
+    assert {7, 11}.issubset(sp.all_stop_token_ids)
+
+
+def test_build_sampling_params_openai_forwards_reasoning_budget_extra_args():
+    from dynamo.vllm.handlers import build_sampling_params_openai
+
+    request = {
+        "max_tokens": 32,
+        "reasoning_budget": 8,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    sp = build_sampling_params_openai(request, default_sampling_params={})
+
+    assert sp.extra_args["reasoning_budget"] == 8
+    assert sp.extra_args["enable_thinking"] is False
+
+
+def test_apply_reasoning_budget_derives_end_token_ids():
+    from vllm.sampling_params import SamplingParams
+
+    from dynamo.vllm.handlers import BaseWorkerHandler
+
+    class FakeTokenizer:
+        vocab_size = 2
+
+        def encode(self, text, add_special_tokens=False):
+            if text == "</think>":
+                return [13]
+            return [10]
+
+        def decode(self, token_ids):
+            return "\n" if token_ids == [10] else "x"
+
+    class FakeHandler(BaseWorkerHandler):
+        def generate(self, request, context):
+            raise NotImplementedError
+
+    handler = object.__new__(FakeHandler)
+    handler.engine_client = SimpleNamespace(
+        tokenizer=FakeTokenizer(),
+        vllm_config=SimpleNamespace(
+            reasoning_config=SimpleNamespace(reasoning_end_str="</think>")
+        ),
+    )
+    handler.config = SimpleNamespace(engine_args=SimpleNamespace(reasoning_parser=None))
+
+    sp = SamplingParams(extra_args={"reasoning_budget": "8"})
+    handler._apply_reasoning_budget_extra_args(sp)
+
+    assert sp.extra_args["reasoning_budget"] == 8
+    assert sp.extra_args["reasoning_budget_grace_period"] == 0
+    assert sp.extra_args["think_end_token_id"] == 13
+    assert sp.extra_args["end_token_ids"] == [13]
+    assert 10 in sp.extra_args["newline_token_ids"]
+
+
+def _make_fake_worker_handler():
+    from dynamo.vllm.handlers import BaseWorkerHandler
+
+    class FakeHandler(BaseWorkerHandler):
+        def generate(self, request, context):
+            raise NotImplementedError
+
+    handler = object.__new__(FakeHandler)
+    handler._request_admission_lock = asyncio.Lock()
+    handler._pending_request_admissions = 0
+    handler.max_decode_wall_clock_secs = None
+    handler.dp_range = (0, 1)
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_rejects_at_total_request_limit():
+    handler = _make_fake_worker_handler()
+    handler.max_total_requests = 2
+    handler.engine_client = SimpleNamespace(
+        output_processor=SimpleNamespace(get_num_unfinished_requests=lambda: 2)
+    )
+
+    reserved, current, limit = await handler._try_reserve_request_slot("req-1", {})
+
+    assert reserved is False
+    assert current == 2
+    assert limit == 2
+    assert handler._pending_request_admissions == 0
+
+
+def test_worker_admission_ignores_per_dp_limit_for_single_local_rank(monkeypatch):
+    handler = _make_fake_worker_handler()
+    handler.engine_client = SimpleNamespace(
+        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=64))
+    )
+    monkeypatch.setenv("DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP", "16")
+    monkeypatch.setenv("DYN_REQUEST_MAX_TOTAL_REQUESTS", "32")
+
+    assert handler._configured_max_total_requests() == 32
+
+
+def test_worker_admission_uses_per_dp_limit_for_multi_local_rank(monkeypatch):
+    handler = _make_fake_worker_handler()
+    handler.dp_range = (0, 2)
+    handler.engine_client = SimpleNamespace(
+        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=64))
+    )
+    monkeypatch.setenv("DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP", "16")
+    monkeypatch.setenv("DYN_REQUEST_MAX_TOTAL_REQUESTS", "32")
+
+    assert handler._configured_max_total_requests() == 16
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_health_check_bypasses_limit():
+    from dynamo.health_check import HEALTH_CHECK_KEY
+
+    handler = _make_fake_worker_handler()
+    handler.max_total_requests = 1
+    handler.engine_client = SimpleNamespace(
+        output_processor=SimpleNamespace(get_num_unfinished_requests=lambda: 99)
+    )
+
+    reserved, current, limit = await handler._try_reserve_request_slot(
+        "health", {HEALTH_CHECK_KEY: True}
+    )
+
+    assert reserved is True
+    assert current is None
+    assert limit is None
+    assert handler._pending_request_admissions == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_releases_on_first_engine_item():
+    handler = _make_fake_worker_handler()
+    handler.max_total_requests = 4
+    handler.engine_client = SimpleNamespace(abort=None)
+    handler._pending_request_admissions = 1
+
+    async def stream():
+        yield "first"
+        yield "second"
+
+    observed = []
+    async for item in handler._iterate_engine_stream(
+        stream(), "req-1", release_request_admission=True
+    ):
+        observed.append(item)
+
+    assert observed == ["first", "second"]
+    assert handler._pending_request_admissions == 0
