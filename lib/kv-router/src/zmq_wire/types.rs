@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fmt;
+
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de::{self, Deserializer, Visitor};
 
 use crate::protocols::BlockExtraInfo;
 
@@ -31,11 +34,12 @@ impl<'de> Deserialize<'de> for KvEventBatch {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[derive(Debug, Serialize, Clone, Copy)]
 #[serde(untagged)]
 pub enum BlockHashValue {
     Signed(i64),
     Unsigned(u64),
+    Bytes(u64),
 }
 
 impl BlockHashValue {
@@ -43,8 +47,65 @@ impl BlockHashValue {
         match self {
             BlockHashValue::Signed(v) => v.cast_unsigned(),
             BlockHashValue::Unsigned(v) => v,
+            BlockHashValue::Bytes(v) => v,
         }
     }
+}
+
+impl<'de> Deserialize<'de> for BlockHashValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(BlockHashValueVisitor)
+    }
+}
+
+struct BlockHashValueVisitor;
+
+impl<'de> Visitor<'de> for BlockHashValueVisitor {
+    type Value = BlockHashValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a signed, unsigned, or byte block hash")
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(BlockHashValue::Signed(value))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(BlockHashValue::Unsigned(value))
+    }
+
+    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(BlockHashValue::Bytes(block_hash_bytes_to_u64(value)))
+    }
+
+    fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_bytes(&value)
+    }
+}
+
+fn block_hash_bytes_to_u64(value: &[u8]) -> u64 {
+    let mut tail = [0u8; 8];
+    let tail_len = tail.len();
+    let start = value.len().saturating_sub(tail_len);
+    let bytes = &value[start..];
+    tail[tail_len - bytes.len()..].copy_from_slice(bytes);
+    u64::from_be_bytes(tail)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

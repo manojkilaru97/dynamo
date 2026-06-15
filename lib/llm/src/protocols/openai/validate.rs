@@ -203,9 +203,104 @@ pub fn validate_response_format(
                     "`response_format.json_schema.schema` is required when `response_format.type` is `json_schema`"
                 );
             }
+            if matches!(
+                json_schema.schema.as_ref(),
+                Some(serde_json::Value::Bool(false))
+            ) {
+                anyhow::bail!(
+                    "`response_format.json_schema.schema` cannot be boolean false because it cannot match any response"
+                );
+            }
             Ok(())
         }
     }
+}
+
+/// Validates vLLM-compatible structured_outputs payloads.
+pub fn validate_structured_outputs(
+    structured_outputs: &Option<crate::protocols::openai::common_ext::StructuredOutputs>,
+) -> Result<(), anyhow::Error> {
+    let Some(params) = structured_outputs else {
+        return Ok(());
+    };
+
+    let count = [
+        params.json.is_some(),
+        params.json_object.unwrap_or(false),
+        params.regex.is_some(),
+        params
+            .choice
+            .as_ref()
+            .is_some_and(|choice| !choice.is_empty()),
+        params.grammar.is_some(),
+        params.structural_tag.is_some(),
+    ]
+    .iter()
+    .filter(|&&present| present)
+    .count();
+
+    if count > 1 {
+        anyhow::bail!(
+            "Only one structured_outputs constraint may be set at a time (`json`, `json_object`, `regex`, `choice`, `grammar`, or `structural_tag`)"
+        );
+    }
+    if count == 0 {
+        anyhow::bail!(
+            "structured_outputs requires one constraint (`json`, `json_object`, `regex`, `choice`, `grammar`, or `structural_tag`)"
+        );
+    }
+    if let Some(choice) = &params.choice
+        && choice.iter().any(|value| value.is_empty())
+    {
+        anyhow::bail!("structured_outputs.choice cannot contain empty choices");
+    }
+    if params
+        .json
+        .as_ref()
+        .is_some_and(|schema| schema == &serde_json::Value::Bool(false))
+    {
+        anyhow::bail!("`structured_outputs.json=false` is unsatisfiable and is not supported");
+    }
+    if let Some(grammar) = &params.grammar {
+        validate_guided_grammar_sanity(grammar)?;
+    }
+    Ok(())
+}
+
+fn validate_guided_grammar_sanity(grammar: &str) -> Result<(), anyhow::Error> {
+    let mut paren_depth = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+
+    for ch in grammar.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            '"' if !in_single_quote => in_double_quote = !in_double_quote,
+            '(' if !in_single_quote && !in_double_quote => paren_depth += 1,
+            ')' if !in_single_quote && !in_double_quote => {
+                paren_depth = paren_depth.checked_sub(1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Grammar error: invalid structured_outputs.grammar specification"
+                    )
+                })?;
+            }
+            _ => {}
+        }
+    }
+
+    if paren_depth != 0 || in_single_quote || in_double_quote {
+        anyhow::bail!("Grammar error: invalid structured_outputs.grammar specification");
+    }
+    Ok(())
 }
 
 /// Validates the temperature parameter
@@ -226,7 +321,7 @@ pub fn validate_temperature(temperature: Option<f32>) -> Result<(), anyhow::Erro
 /// Validates the top_p parameter
 pub fn validate_top_p(top_p: Option<f32>) -> Result<(), anyhow::Error> {
     if let Some(p) = top_p
-        && !(MIN_TOP_P..=MAX_TOP_P).contains(&p)
+        && (p <= MIN_TOP_P || p > MAX_TOP_P)
     {
         anyhow::bail!(
             "Top_p must be between {} and {}, got {}",

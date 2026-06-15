@@ -8,11 +8,13 @@ pub use super::preprocessor::PreprocessedRequest;
 use crate::protocols::TokenIdType;
 use dynamo_protocols::types::CompletionUsage;
 use dynamo_protocols::types::StopReason;
-use dynamo_runtime::error::DynamoError;
+use dynamo_runtime::error::{DynamoError, ErrorType};
 use dynamo_runtime::protocols::maybe_error::MaybeError;
 
 pub type TokenType = Option<String>;
 pub type LogProbs = Vec<f64>;
+pub const DYNAMO_ERROR_TYPE_KEY: &str = "dynamo_error_type";
+pub const SERVICE_OVERLOADED_ERROR_TYPE: &str = "service_overloaded";
 
 /// Per-position prompt logprob entry reported by an engine adapter.
 #[derive(Serialize, Deserialize, utoipa::ToSchema, Debug, Clone, PartialEq)]
@@ -149,6 +151,20 @@ pub struct BackendOutput {
     /// consumed by the frontend and not surfaced to clients. See [`RoutingData`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_data: Option<crate::protocols::common::timing::RoutingData>,
+}
+
+pub fn is_service_overloaded(extra_args: Option<&serde_json::Value>) -> bool {
+    extra_args
+        .and_then(|extra_args| extra_args.get(DYNAMO_ERROR_TYPE_KEY))
+        .and_then(|value| value.as_str())
+        == Some(SERVICE_OVERLOADED_ERROR_TYPE)
+}
+
+pub fn service_overloaded_error(message: impl Into<String>) -> DynamoError {
+    DynamoError::builder()
+        .error_type(ErrorType::ResourceExhausted)
+        .message(message)
+        .build()
 }
 
 /// The LLM engine and backnd with manage it's own state, specifically translating how a

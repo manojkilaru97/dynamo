@@ -425,6 +425,28 @@ class KvRouterArgGroup(ArgGroup):
         )
         add_argument(
             g,
+            flag_name="--router-max-pending-per-worker",
+            env_var="DYN_ROUTER_MAX_PENDING_PER_WORKER",
+            default=8,
+            help=(
+                "KV Router: Maximum number of scheduler-queued requests per eligible "
+                "DP rank before rejecting new requests."
+            ),
+            arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--router-max-queue-wait-ms",
+            env_var="DYN_ROUTER_MAX_QUEUE_WAIT_MS",
+            default=30000,
+            help=(
+                "KV Router: Maximum time in milliseconds a request may wait in the "
+                "scheduler queue before being failed."
+            ),
+            arg_type=int,
+        )
+        add_argument(
+            g,
             flag_name="--router-event-threads",
             env_var="DYN_ROUTER_EVENT_THREADS",
             default=4,

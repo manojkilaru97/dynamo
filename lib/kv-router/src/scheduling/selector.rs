@@ -544,6 +544,8 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             .unwrap_or(0);
 
         if self.worker_type == "decode" {
+            let effective_overlap_blocks = request.effective_overlap_blocks_for(best_worker);
+            let cached_tokens = request.effective_cached_tokens_for(best_worker);
             tracing::info!(
                 router_mode = "kv",
                 request_id,
@@ -555,8 +557,6 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 disk_blocks = best_disk_overlap_blocks,
                 "Selected worker"
             );
-            let effective_overlap_blocks = request.effective_overlap_blocks_for(best_worker);
-            let cached_tokens = request.effective_cached_tokens_for(best_worker);
 
             return Ok(WorkerSelectionResult {
                 worker: best_worker,

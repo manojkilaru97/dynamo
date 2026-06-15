@@ -158,12 +158,14 @@ impl<T: OpenAISamplingOptionsProvider + CommonExtProvider> SamplingOptionsProvid
         let guided_regex = self.get_guided_regex();
         let guided_grammar = self.get_guided_grammar();
         let guided_choice = self.get_guided_choice();
+        let guided_structural_tag = self.get_guided_structural_tag();
         let guided_whitespace_pattern = self.get_guided_whitespace_pattern();
         let guided_decoding = match common::GuidedDecodingOptions::from_optional(
             guided_json,
             guided_regex,
             guided_choice,
             guided_grammar,
+            guided_structural_tag,
             guided_decoding_backend,
             guided_whitespace_pattern,
             None,
@@ -324,6 +326,11 @@ pub trait DeltaGeneratorExt<ResponseType: Send + 'static + std::fmt::Debug>:
 
     /// Check if continuous usage tracking is enabled.
     fn is_continuous_usage_enabled(&self) -> bool;
+
+    /// Whether the response stream should stop after the current chunk.
+    fn should_terminate_stream(&self) -> bool {
+        false
+    }
 
     /// Get the current usage statistics with properly calculated total_tokens.
     fn get_usage(&self) -> dynamo_protocols::types::CompletionUsage;

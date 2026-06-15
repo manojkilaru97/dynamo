@@ -167,7 +167,7 @@ pub async fn spawn_system_status_server(
             &live_path,
             get({
                 let state = Arc::clone(&server_state);
-                move || health_handler(state)
+                move || live_handler(state)
             }),
         )
         .route(
@@ -294,6 +294,18 @@ async fn health_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
     tracing::trace!("Response {}", response.to_string());
 
     (status_code, response.to_string())
+}
+
+/// Liveness handler. This is intentionally shallow: readiness belongs to /health.
+#[tracing::instrument(skip_all, level = "trace")]
+async fn live_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
+    let system_health = state.drt().system_health();
+    let uptime = system_health.lock().uptime();
+    let response = json!({
+        "status": "alive",
+        "uptime": uptime,
+    });
+    (StatusCode::OK, response.to_string())
 }
 
 /// Metrics handler with DistributedRuntime uptime
@@ -928,12 +940,12 @@ mod integration_tests {
                 match custom_live_path {
                     None => {
                         // When using default paths, test the default paths
-                        test_cases.push(("/live", expected_status, expected_body));
+                        test_cases.push(("/live", 200, "alive"));
                     }
                     Some(clp) => {
                         // When using custom paths, default paths should not exist
                         test_cases.push(("/live", 404, "Route not found"));
-                        test_cases.push((clp, expected_status, expected_body));
+                        test_cases.push((clp, 200, "alive"));
                     }
                 }
                 test_cases.push(("/someRandomPathNotFoundHere", 404, "Route not found"));
@@ -1150,7 +1162,7 @@ mod integration_tests {
                 let client = reqwest::Client::new();
                 for (path, expect_200, expect_body) in [
                     ("/health", true, "ready"),
-                    ("/live", true, "ready"),
+                    ("/live", true, "alive"),
                     ("/someRandomPathNotFoundHere", false, "Route not found"),
                 ] {
                     println!("[test] Sending request to {}", path);

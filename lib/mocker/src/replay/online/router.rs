@@ -6,6 +6,7 @@ use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use dynamo_kv_router::config::KvRouterConfig;
