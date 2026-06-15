@@ -216,22 +216,43 @@ fn parse_tool_call_block(
             continue;
         }
 
+        let raw_parameters: Vec<(String, &str)> = parameter_regex
+            .captures_iter(function_body)
+            .filter_map(|param_cap| {
+                let param_name_raw = param_cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+                let param_name = strip_quotes(param_name_raw);
+                if param_name.is_empty() {
+                    return None;
+                }
+                let param_value = param_cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                Some((param_name.to_string(), param_value))
+            })
+            .collect();
+
+        let function_name = recover_function_name(function_name, &raw_parameters, tools);
+        if let Some(tools) = tools
+            && !tools
+                .iter()
+                .any(|tool| tool.name.as_str() == function_name.as_str())
+        {
+            tracing::warn!(
+                "Dropping XML tool call with unresolved function name '{}' not present in tools list.",
+                function_name
+            );
+            continue;
+        }
+        let function_name = function_name.as_str();
+
         // Get parameter config for this function
         let param_config = get_arguments_config(function_name, tools);
 
         // Parse parameters from the function body.
         let mut parameters: HashMap<String, serde_json::Value> = HashMap::new();
 
-        for param_cap in parameter_regex.captures_iter(function_body) {
-            let param_name_raw = param_cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-            let param_name = strip_quotes(param_name_raw);
-            let param_value = param_cap.get(2).map(|m| m.as_str()).unwrap_or("");
-
-            if !param_name.is_empty() {
-                let parsed_value =
-                    convert_param_value(param_value, param_name, &param_config, function_name);
-                parameters.insert(param_name.to_string(), parsed_value);
-            }
+        for (param_name, param_value) in raw_parameters {
+            let parsed_value =
+                convert_param_value(param_value, &param_name, &param_config, function_name);
+            parameters.insert(param_name, parsed_value);
         }
 
         // Create tool call response.
@@ -252,6 +273,44 @@ fn parse_tool_call_block(
     Ok(results)
 }
 
+fn recover_function_name(
+    function_name: &str,
+    raw_parameters: &[(String, &str)],
+    tools: Option<&[ToolDefinition]>,
+) -> String {
+    let Some(tools) = tools else {
+        return function_name.to_string();
+    };
+    if tools.iter().any(|tool| tool.name == function_name) || raw_parameters.is_empty() {
+        return function_name.to_string();
+    }
+
+    let candidates: Vec<&str> = tools
+        .iter()
+        .filter_map(|tool| {
+            let param_config = arguments_config_for_tool(tool);
+            if param_config.is_empty() {
+                return None;
+            }
+            let all_params_match = raw_parameters
+                .iter()
+                .all(|(param_name, _)| param_config.contains_key(param_name));
+            all_params_match.then_some(tool.name.as_str())
+        })
+        .collect();
+
+    if let [recovered] = candidates.as_slice() {
+        tracing::warn!(
+            "Recovered malformed tool name '{}' as '{}' from XML parameter names.",
+            function_name,
+            recovered
+        );
+        return (*recovered).to_string();
+    }
+
+    function_name.to_string()
+}
+
 /// Extract argument configuration for a function from the tool definitions.
 /// Returns a HashMap of parameter names to their schema definitions.
 fn get_arguments_config(
@@ -264,28 +323,37 @@ fn get_arguments_config(
 
     for tool in tools {
         if tool.name == func_name {
-            if let Some(params) = &tool.parameters {
-                // Try to extract "properties" from the parameters schema
-                if let Some(properties) = params.get("properties") {
-                    if let Some(props_obj) = properties.as_object() {
-                        return props_obj
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
-                    }
-                } else if let Some(params_obj) = params.as_object() {
-                    // If no "properties" field, treat the whole thing as the config
-                    return params_obj
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-                }
-            }
-            return HashMap::new();
+            return arguments_config_for_tool(tool);
         }
     }
 
     tracing::warn!("Tool '{}' is not defined in the tools list.", func_name);
+    HashMap::new()
+}
+
+fn arguments_config_for_tool(tool: &ToolDefinition) -> HashMap<String, Value> {
+    let Some(params) = &tool.parameters else {
+        return HashMap::new();
+    };
+
+    // Try to extract "properties" from the parameters schema
+    if let Some(properties) = params.get("properties")
+        && let Some(props_obj) = properties.as_object()
+    {
+        return props_obj
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+    }
+
+    if let Some(params_obj) = params.as_object() {
+        // If no "properties" field, treat the whole thing as the config
+        return params_obj
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+    }
+
     HashMap::new()
 }
 
@@ -889,6 +957,87 @@ Boston
 
         let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["city"], "Boston");
+    }
+
+    #[test] // PARSER.batch.4
+    fn test_parse_recovers_malformed_function_name_from_unique_parameters() {
+        let tools = vec![
+            ToolDefinition {
+                name: "execute_sql".to_string(),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "dialect": {"type": "string"},
+                        "timeout": {"type": "integer"},
+                        "read_only": {"type": "boolean"}
+                    }
+                })),
+            },
+            ToolDefinition {
+                name: "search_documents".to_string(),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "tags": {"type": "array"}
+                    }
+                })),
+            },
+        ];
+        let input = r#"<tool_call>
+<function=execue
+</parameter>
+<parameter=dialect>sqlite</parameter>
+<parameter=timeout>30</parameter>
+<parameter=read_only>true</parameter>
+</function>
+</tool_call>"#;
+
+        let (calls, _) =
+            try_tool_call_parse_xml(input, &XmlParserConfig::default(), Some(&tools)).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "execute_sql");
+
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["dialect"], "sqlite");
+        assert_eq!(args["timeout"], 30);
+        assert_eq!(args["read_only"], true);
+    }
+
+    #[test] // PARSER.batch.4
+    fn test_parse_drops_unresolved_malformed_function_name_with_tools() {
+        let tools = vec![
+            ToolDefinition {
+                name: "get_weather".to_string(),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                        "unit": {"type": "string"}
+                    }
+                })),
+            },
+            ToolDefinition {
+                name: "calculate".to_string(),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "expression": {"type": "string"},
+                        "precision": {"type": "integer"}
+                    }
+                })),
+            },
+        ];
+        let input = r#"<tool_call>
+<function=</parameter>
+</function>
+</tool_call>"#;
+
+        let (calls, normal) =
+            try_tool_call_parse_xml(input, &XmlParserConfig::default(), Some(&tools)).unwrap();
+        assert_eq!(calls.len(), 0);
+        assert_eq!(normal, Some("".to_string()));
     }
 
     #[test] // PARSER.batch.4

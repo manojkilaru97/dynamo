@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use dynamo_kv_router::ConcurrentRadixTree;
@@ -159,6 +160,8 @@ impl KvReplayRouter {
             slots,
             worker_config_rx,
             config.router_queue_threshold,
+            config.router_max_pending_per_worker,
+            config.router_max_queue_wait_ms.map(Duration::from_millis),
             args.block_size as u32,
             selector,
             policy,

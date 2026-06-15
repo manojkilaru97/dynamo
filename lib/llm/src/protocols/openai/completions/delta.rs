@@ -306,7 +306,17 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateCompletionResponse> for
             delta.top_logprobs,
         );
 
-        let finish_reason = delta.finish_reason.map(Into::into);
+        let backend_service_overloaded =
+            common::llm_backend::is_service_overloaded(delta.extra_args.as_ref());
+        let finish_reason = match delta.finish_reason {
+            Some(common::FinishReason::Error(err_msg)) => {
+                if backend_service_overloaded {
+                    return Err(common::llm_backend::service_overloaded_error(err_msg).into());
+                }
+                return Err(anyhow::anyhow!(err_msg));
+            }
+            finish_reason => finish_reason.map(Into::into),
+        };
         let stop_reason = delta.stop_reason.clone();
 
         // create choice
@@ -425,6 +435,7 @@ mod tests {
                 "token_ids": [11, 22, 33],
                 "routed_experts": {"layer_0": [1, 3]}
             })),
+            extra_args: None,
             engine_data: None,
         }
     }
@@ -464,6 +475,7 @@ mod tests {
             index: Some(0),
             completion_usage: None,
             disaggregated_params: None,
+            extra_args: None,
             engine_data: Some(serde_json::json!({
                 "kv_transfer_time_ms": 12.3,
                 "disaggregated_kv_transfer_time_ms": 8.1,
@@ -734,6 +746,7 @@ mod tests {
             index: Some(0),
             completion_usage: None,
             disaggregated_params: None,
+            extra_args: None,
             engine_data: None, // engine didn't provide any data
         };
 

@@ -8,6 +8,7 @@ use dynamo_runtime::config::environment_names::llm::audit as env_audit;
 use crate::telemetry::parse_sink_names;
 
 const DEFAULT_CAPACITY: usize = 1024;
+const DEFAULT_OTEL_MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_JSONL_BUFFER_BYTES: usize = 1024 * 1024;
 const DEFAULT_JSONL_FLUSH_INTERVAL_MS: u64 = 1000;
 const DEFAULT_JSONL_GZ_ROLL_BYTES: u64 = 256 * 1024 * 1024;
@@ -19,6 +20,7 @@ pub struct AuditPolicy {
     pub capacity: usize,
     pub sinks: Vec<String>,
     pub output_path: Option<String>,
+    pub otel_max_payload_bytes: usize,
     pub jsonl_buffer_bytes: usize,
     pub jsonl_flush_interval_ms: u64,
     pub jsonl_gz_roll_bytes: u64,
@@ -42,6 +44,11 @@ fn load_from_env() -> AuditPolicy {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_CAPACITY);
+    let otel_max_payload_bytes = std::env::var(env_audit::DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_OTEL_MAX_PAYLOAD_BYTES);
     let jsonl_buffer_bytes = std::env::var(env_audit::DYN_AUDIT_JSONL_BUFFER_BYTES)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -69,6 +76,7 @@ fn load_from_env() -> AuditPolicy {
         capacity,
         sinks,
         output_path,
+        otel_max_payload_bytes,
         jsonl_buffer_bytes,
         jsonl_flush_interval_ms,
         jsonl_gz_roll_bytes,

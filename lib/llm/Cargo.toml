@@ -85,6 +85,7 @@ parking_lot = { workspace = true }
 prometheus = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+opentelemetry-proto = { version = "0.31.0", default-features = false, features = ["gen-tonic-messages", "logs"] }
 sha2 = "0.10"
 strum = { workspace = true }
 tempfile = { workspace = true }
@@ -147,6 +148,7 @@ utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 tonic = { version = "0.13.1" }
 # Request prost specifically so tonic-build properly compiles protobuf message
 prost = { version = "0.13.5" }
+prost014 = { package = "prost", version = "0.14" }
 
 # tokenizers
 tokenizers = { version = "0.21.4", default-features = false, features = [

@@ -304,6 +304,8 @@ struct KvRouterConfigSerde {
     router_reset_states: bool,
     router_ttl_secs: f64,
     router_queue_threshold: Option<f64>,
+    router_max_pending_per_worker: Option<usize>,
+    router_max_queue_wait_ms: Option<u64>,
     router_event_threads: u32,
     skip_initial_worker_wait: bool,
     router_queue_policy: RouterQueuePolicy,
@@ -335,6 +337,8 @@ impl Default for KvRouterConfigSerde {
             router_reset_states: config.router_reset_states,
             router_ttl_secs: config.router_ttl_secs,
             router_queue_threshold: config.router_queue_threshold,
+            router_max_pending_per_worker: config.router_max_pending_per_worker,
+            router_max_queue_wait_ms: config.router_max_queue_wait_ms,
             router_event_threads: config.router_event_threads,
             skip_initial_worker_wait: config.skip_initial_worker_wait,
             router_queue_policy: config.router_queue_policy,
@@ -421,6 +425,15 @@ pub struct KvRouterConfig {
     #[validate(range(min = 0.0))]
     pub router_queue_threshold: Option<f64>,
 
+    /// Maximum number of pending scheduler-queue requests to allow per eligible worker.
+    /// Once the derived global pending limit is reached, new requests are rejected early.
+    /// Default: 8.
+    pub router_max_pending_per_worker: Option<usize>,
+
+    /// Maximum time a request may remain in the scheduler queue before it is failed.
+    /// Default: 30000ms.
+    pub router_max_queue_wait_ms: Option<u64>,
+
     /// Number of KV indexer worker threads.
     /// When > 1, uses ConcurrentRadixTree with a thread pool for event-driven
     /// and approximate routing writes. Default: 4.
@@ -476,6 +489,8 @@ impl Default for KvRouterConfig {
             router_reset_states: false,
             router_ttl_secs: 120.0,
             router_queue_threshold: Some(4.0),
+            router_max_pending_per_worker: Some(8),
+            router_max_queue_wait_ms: Some(30_000),
             router_event_threads: 4,
             skip_initial_worker_wait: false,
             router_queue_policy: RouterQueuePolicy::default(),
@@ -520,6 +535,8 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             router_reset_states: compat.router_reset_states,
             router_ttl_secs: compat.router_ttl_secs,
             router_queue_threshold: compat.router_queue_threshold,
+            router_max_pending_per_worker: compat.router_max_pending_per_worker,
+            router_max_queue_wait_ms: compat.router_max_queue_wait_ms,
             router_event_threads: compat.router_event_threads,
             skip_initial_worker_wait: compat.skip_initial_worker_wait,
             router_queue_policy: compat.router_queue_policy,

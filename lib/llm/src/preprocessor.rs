@@ -148,6 +148,28 @@ impl LLMMetricAnnotation {
 struct ReasoningState {
     stream: Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>,
     reasoning_parser: Option<Box<dyn ReasoningParser>>,
+    choices: HashMap<u32, ReasoningChoiceState>,
+}
+
+#[derive(Default)]
+struct ReasoningChoiceState {
+    reasoning_content: String,
+    emitted_content: bool,
+    emitted_tool_calls: bool,
+}
+
+const THINK_END_TOKEN: &str = "</think>";
+
+fn split_content_after_reasoning_boundary(text: String) -> (Option<String>, String) {
+    if let Some(end_idx) = text.rfind(THINK_END_TOKEN) {
+        let before = text[..end_idx].to_string();
+        let after = text[end_idx + THINK_END_TOKEN.len()..]
+            .trim_start_matches(|ch| ch == '\n' || ch == '\r')
+            .to_string();
+        (Some(before), after)
+    } else {
+        (None, text)
+    }
 }
 
 /// Per-image routing payload accumulated by `gather_multi_modal_data` and
@@ -464,13 +486,20 @@ impl OpenAIPreprocessor {
             .with_label_values(&[STAGE_PREPROCESS])
             .observe(preprocess_start.elapsed().as_secs_f64());
 
+        let mut common_request = builder.build()?;
+        self.attach_reasoning_engine_extra_args(
+            &mut common_request,
+            request,
+            prompt_injected_reasoning,
+        );
+
         if let Some(nvext) = request.nvext()
             && let Some(router_params) = &nvext.router
         {
-            builder.router(Some(router_params.clone()));
+            common_request.router = Some(router_params.clone());
         }
 
-        Ok((builder.build()?, annotations, prompt_injected_reasoning))
+        Ok((common_request, annotations, prompt_injected_reasoning))
     }
 
     pub fn builder<
@@ -1696,7 +1725,7 @@ impl OpenAIPreprocessor {
                     );
 
                     // Check if this response has a finish_reason
-                    let has_finish_reason = response
+                    let mut has_finish_reason = response
                         .data
                         .as_ref()
                         .map(|d| d.finish_reason.is_some())
@@ -1730,6 +1759,14 @@ impl OpenAIPreprocessor {
                             })
                             .map_err(|e| e.to_string())
                     });
+
+                    if inner.response_generator.should_terminate_stream() {
+                        has_finish_reason = true;
+                        inner.context.stop_generating();
+                        if !inner.response_generator.is_usage_enabled() {
+                            inner.finished = true;
+                        }
+                    }
 
                     // Create LLM metrics annotation with prefill/decode worker info from tracker.
                     // Worker types are stored at routing time to avoid expensive MDC lookup.
@@ -2022,6 +2059,13 @@ impl OpenAIPreprocessor {
             | None => {
                 // Traditional marker-based jail for auto/none/unspecified
                 if let Some(parser) = tool_call_parser {
+                    if matches!(parser.as_str(), "qwen3_coder" | "nemotron_nano") {
+                        builder = builder
+                            .jail_start_sequence("<tools>")
+                            .jail_start_sequence("<tool_call>")
+                            .jail_end_sequence("</tools>")
+                            .jail_end_sequence("</tool_call>");
+                    }
                     builder = builder.tool_call_parser(parser);
                 }
             }
@@ -2051,12 +2095,23 @@ impl OpenAIPreprocessor {
         // - harmony / gpt_oss: `<|channel|>analysis<|message|>...<|end|>`.
         // - kimi_k2: `<|tool_calls_section_begin|>` / `<|tool_calls_section_end|>`.
         // - kimi_k25: `</think>` (special token id 163607).
+        // - nemotron_nano/nemotron3/nemotron_v3: `</think>` is a special
+        //   token in the Nano tokenizer, and Dynamo's Rust postprocessor
+        //   parses reasoning from decoded text after backend conversion.
         matches!(
             tool_call_parser,
             Some("gemma4") | Some("gemma-4") | Some("harmony") | Some("kimi_k2")
         ) || matches!(
             reasoning_parser,
-            Some("gemma4") | Some("gemma-4") | Some("gpt_oss") | Some("kimi_k25")
+            Some(
+                "gemma4"
+                    | "gemma-4"
+                    | "gpt_oss"
+                    | "kimi_k25"
+                    | "nemotron_nano"
+                    | "nemotron3"
+                    | "nemotron_v3"
+            )
         )
     }
 
@@ -2070,7 +2125,7 @@ impl OpenAIPreprocessor {
     /// Check if reasoning parsing should be disabled based on per-request parameters.
     /// For kimi_k25: disabled when chat_template_args contains "thinking": false.
     /// For Nemotron force-reasoning aliases: disabled when chat_template_args
-    ///   contains "enable_thinking": false or "force_nonempty_content": true.
+    ///   contains "enable_thinking": false.
     /// For deepseek_r1 / deepseek_v4: disabled when chat_template_args contains
     ///   "thinking": false or "thinking_mode": "chat" — matches the V4 formatter's
     ///   `resolve_thinking_mode` convention, so the parser and the prompt stay in sync.
@@ -2096,11 +2151,6 @@ impl OpenAIPreprocessor {
                 if let Some(args) = chat_template_args {
                     if let Some(enable_thinking) = args.get("enable_thinking")
                         && enable_thinking == &serde_json::Value::Bool(false)
-                    {
-                        return true;
-                    }
-                    if let Some(force_nonempty) = args.get("force_nonempty_content")
-                        && force_nonempty == &serde_json::Value::Bool(true)
                     {
                         return true;
                     }
@@ -2133,6 +2183,68 @@ impl OpenAIPreprocessor {
         }
     }
 
+    fn attach_reasoning_engine_extra_args<R: OAIChatLikeRequest>(
+        &self,
+        common_request: &mut PreprocessedRequest,
+        request: &R,
+        prompt_injected_reasoning: bool,
+    ) {
+        let Some(reasoning_parser) = self.runtime_config.reasoning_parser.as_deref() else {
+            return;
+        };
+
+        let chat_template_args = request.chat_template_args();
+        let mut updates = serde_json::Map::new();
+
+        if Self::is_reasoning_disabled_by_request(Some(reasoning_parser), chat_template_args) {
+            updates.insert("reasoning_ended".to_string(), serde_json::Value::Bool(true));
+        } else if prompt_injected_reasoning {
+            updates.insert(
+                "reasoning_ended".to_string(),
+                serde_json::Value::Bool(false),
+            );
+        }
+
+        let chat_template_kwargs = chat_template_args
+            .map(|args| serde_json::to_value(args).unwrap_or_else(|_| serde_json::json!({})))
+            .unwrap_or_else(|| serde_json::json!({}));
+        updates.insert(
+            "reasoning_parser_kwargs".to_string(),
+            serde_json::json!({
+                "chat_template_kwargs": chat_template_kwargs,
+            }),
+        );
+
+        Self::merge_extra_args(common_request, updates);
+    }
+
+    fn merge_extra_args(
+        common_request: &mut PreprocessedRequest,
+        updates: serde_json::Map<String, serde_json::Value>,
+    ) {
+        if updates.is_empty() {
+            return;
+        }
+
+        let mut extra_args = match common_request.extra_args.take() {
+            Some(serde_json::Value::Object(map)) => map,
+            Some(other) => {
+                tracing::debug!(
+                    extra_args = ?other,
+                    "replacing non-object PreprocessedRequest.extra_args while attaching reasoning metadata"
+                );
+                serde_json::Map::new()
+            }
+            None => serde_json::Map::new(),
+        };
+
+        for (key, value) in updates {
+            extra_args.entry(key).or_insert(value);
+        }
+
+        common_request.extra_args = Some(serde_json::Value::Object(extra_args));
+    }
+
     // Motivation: Each transformation on the stream should be a separate step to allow for more flexibility
     // Earlier reasoning parser logic was nested under delta generation logic in choice_from_postprocessor
     // Since we have tool calling parsing as separate step, it makes sense to have reasoning parser as separate step as well
@@ -2163,15 +2275,32 @@ impl OpenAIPreprocessor {
         let state = ReasoningState {
             stream: Box::pin(stream),
             reasoning_parser: Some(reasoning_parser),
+            choices: HashMap::new(),
         };
 
         stream::unfold(state, |mut state| async move {
             if let Some(response) = state.stream.next().await {
                 // Process the response through reasoning parser if available
                 let processed_response = if let Some(ref mut parser) = state.reasoning_parser {
-                    response.map_data(|mut data| {
+                    let mut response = response;
+                    if let Some(mut data) = response.data.take() {
                         // Process all choices, not just the first one
                         for choice in data.inner.choices.iter_mut() {
+                            let choice_state = state.choices.entry(choice.index).or_default();
+                            if choice
+                                .delta
+                                .tool_calls
+                                .as_ref()
+                                .is_some_and(|tool_calls| !tool_calls.is_empty())
+                            {
+                                choice_state.emitted_tool_calls = true;
+                            }
+                            if let Some(reasoning_content) = &choice.delta.reasoning_content
+                                && !reasoning_content.is_empty()
+                            {
+                                choice_state.reasoning_content.push_str(reasoning_content);
+                            }
+
                             // Reasoning parsing only applies to text content
                             if let Some(
                                 dynamo_protocols::types::ChatCompletionMessageContent::Text(text),
@@ -2181,15 +2310,72 @@ impl OpenAIPreprocessor {
                                     parser.parse_reasoning_streaming_incremental(text, &[]);
 
                                 // Update this specific choice with parsed content
-                                choice.delta.content = parser_result.get_some_normal_text().map(
-                                    dynamo_protocols::types::ChatCompletionMessageContent::Text,
-                                );
-                                choice.delta.reasoning_content = parser_result.get_some_reasoning();
+                                let mut delta_reasoning = parser_result.reasoning_text;
+                                if !delta_reasoning.is_empty() {
+                                    choice_state.reasoning_content.push_str(&delta_reasoning);
+                                }
+
+                                let mut normal_text = parser_result.normal_text;
+                                if !normal_text.is_empty()
+                                    && !choice_state.reasoning_content.is_empty()
+                                {
+                                    let (boundary_reasoning, after_boundary) =
+                                        split_content_after_reasoning_boundary(std::mem::take(
+                                            &mut normal_text,
+                                        ));
+                                    if let Some(boundary_reasoning) = boundary_reasoning {
+                                        if !boundary_reasoning.is_empty() {
+                                            choice_state
+                                                .reasoning_content
+                                                .push_str(&boundary_reasoning);
+                                            delta_reasoning.push_str(&boundary_reasoning);
+                                        }
+                                        normal_text = after_boundary;
+                                    }
+                                }
+
+                                choice.delta.reasoning_content = if delta_reasoning.is_empty() {
+                                    None
+                                } else {
+                                    Some(delta_reasoning)
+                                };
+
+                                normal_text = if choice_state.emitted_content {
+                                    normal_text
+                                } else {
+                                    normal_text
+                                        .trim_start_matches(|ch| ch == '\n' || ch == '\r')
+                                        .to_string()
+                                };
+                                if normal_text.is_empty() {
+                                    choice.delta.content = None;
+                                } else {
+                                    choice_state.emitted_content = true;
+                                    choice.delta.content = Some(
+                                        dynamo_protocols::types::ChatCompletionMessageContent::Text(
+                                            normal_text,
+                                        ),
+                                    );
+                                }
                             }
                             // For multimodal content, pass through unchanged
+
+                            if choice.finish_reason.is_some()
+                                && !choice_state.emitted_content
+                                && !choice_state.emitted_tool_calls
+                                && !choice_state.reasoning_content.is_empty()
+                            {
+                                choice.delta.content = Some(
+                                    dynamo_protocols::types::ChatCompletionMessageContent::Text(
+                                        choice_state.reasoning_content.clone(),
+                                    ),
+                                );
+                                choice_state.emitted_content = true;
+                            }
                         }
-                        Ok(data)
-                    })
+                        response.data = Some(data);
+                    }
+                    response
                 } else {
                     // No reasoning parser configured, pass through unchanged
                     response
@@ -2375,11 +2561,16 @@ impl
         let request_id = context.id().to_string();
         let original_stream_flag = request.inner.stream.unwrap_or(false);
 
-        // Build audit handle (None if no DYN_AUDIT_SINKS)
-        let mut audit_handle = crate::audit::handle::create_handle(&request, &request_id);
+        // Build audit handle (None if no DYN_AUDIT_SINKS). Request payloads are
+        // emitted immediately to the audit bus; sink workers do serialization
+        // and export off the generation path.
+        let audit_handle = crate::audit::handle::create_handle(&request, &request_id);
 
-        if let Some(ref mut h) = audit_handle {
-            h.set_request(std::sync::Arc::new(request.clone()));
+        if let Some(ref h) = audit_handle {
+            let headers = context.get::<serde_json::Value>("http_headers").ok();
+            let raw_request = context.get::<serde_json::Value>("http_raw_payload").ok();
+            let typed_request = raw_request.is_none().then(|| Arc::new(request.clone()));
+            h.emit_request(typed_request, raw_request, headers);
         }
 
         // For non-streaming requests (stream=false), enable usage by default
@@ -2465,29 +2656,7 @@ impl
         let transformed_stream =
             self.postprocessor_parsing_stream(stream, &request, prompt_injected_reasoning)?;
 
-        // Apply audit aggregation strategy.
-        // The audit branch already returns Pin<Box<...>> from scan/fold_aggregate_with_future,
-        // while the non-audit branch boxes the impl Stream from postprocessor_parsing_stream.
-        let final_stream = if let Some(mut audit) = audit_handle {
-            let (stream, agg_fut) = if audit.streaming() {
-                // Streaming: apply scan (pass-through + parallel aggregation)
-                crate::audit::stream::scan_aggregate_with_future(transformed_stream)
-            } else {
-                // Non-streaming: apply fold (collect all, then emit single chunk)
-                crate::audit::stream::fold_aggregate_with_future(transformed_stream)
-            };
-
-            // Spawn audit task
-            tokio::spawn(async move {
-                let final_resp = agg_fut.await;
-                audit.set_response(Arc::new(final_resp));
-                audit.emit();
-            });
-
-            stream
-        } else {
-            Box::pin(transformed_stream)
-        };
+        let final_stream = Box::pin(transformed_stream);
 
         // Step 5: Speculative next-turn prefill
         let final_stream = speculative_prefill::maybe_wrap_stream(
@@ -2757,6 +2926,31 @@ mod strip_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn split_content_after_reasoning_boundary_leaves_plain_text_unchanged() {
+        let (reasoning, content) = split_content_after_reasoning_boundary("plain text".to_string());
+
+        assert_eq!(reasoning, None);
+        assert_eq!(content, "plain text");
+    }
+
+    #[test]
+    fn split_content_after_reasoning_boundary_strips_marker() {
+        let (reasoning, content) =
+            split_content_after_reasoning_boundary("leaked reasoning</think>\nanswer".to_string());
+
+        assert_eq!(reasoning.as_deref(), Some("leaked reasoning"));
+        assert_eq!(content, "answer");
+    }
+
+    #[test]
+    fn split_content_after_reasoning_boundary_drops_empty_marker_chunk() {
+        let (reasoning, content) = split_content_after_reasoning_boundary("</think>\n".to_string());
+
+        assert_eq!(reasoning.as_deref(), Some(""));
+        assert_eq!(content, "");
+    }
+
     /// PRE.1 — `skip_special_tokens` default. See `lib/llm/PREPROCESSOR_CASES.md`.
     #[test]
     fn test_parser_requires_special_tokens() {
@@ -2824,6 +3018,24 @@ mod tests {
                 Some("kimi_k25"),
                 true,
                 "kimi_k25 reasoning only → required (`</think>` is special token id 163607)",
+            ),
+            (
+                None,
+                Some("nemotron_nano"),
+                true,
+                "nemotron_nano reasoning only → required (`</think>` is a special token)",
+            ),
+            (
+                None,
+                Some("nemotron3"),
+                true,
+                "nemotron3 reasoning only → required (`</think>` is a special token)",
+            ),
+            (
+                None,
+                Some("nemotron_v3"),
+                true,
+                "nemotron_v3 reasoning only → required (`</think>` is a special token)",
             ),
             (
                 Some("kimi_k2"),
@@ -2998,8 +3210,8 @@ mod tests {
             (
                 Some("nemotron3"),
                 Some(&force_nonempty_content_true),
-                true,
-                "nemotron3 + force_nonempty_content=true → disabled",
+                false,
+                "nemotron3 + force_nonempty_content=true → parser stays enabled",
             ),
             (
                 Some("nemotron_v3"),
@@ -3010,8 +3222,8 @@ mod tests {
             (
                 Some("nemotron_v3"),
                 Some(&force_nonempty_content_true),
-                true,
-                "nemotron_v3 + force_nonempty_content=true → disabled",
+                false,
+                "nemotron_v3 + force_nonempty_content=true → parser stays enabled",
             ),
             // deepseek_v4 — same convention as deepseek_r1; verify all three aliases
             // (deepseek_v4 / deepseek-v4 / deepseekv4) plus both signal keys.

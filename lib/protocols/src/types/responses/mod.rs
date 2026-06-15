@@ -53,6 +53,33 @@ pub type PromptConfig = Prompt;
 pub type TextConfig = ResponseTextParam;
 pub type TextResponseFormat = TextResponseFormatConfiguration;
 
+fn default_text_response_format() -> TextResponseFormatConfiguration {
+    TextResponseFormatConfiguration::Text
+}
+
+/// Request-side text configuration.
+///
+/// Upstream documents `format` as defaulting to `{ "type": "text" }`, but the
+/// struct currently requires it during deserialization. Real Responses API
+/// clients send `{"text": {"verbosity": "medium"}}`; accept that shape while
+/// preserving the upstream wire model when serialized.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct ResponseTextParam {
+    #[serde(default = "default_text_response_format")]
+    pub format: TextResponseFormatConfiguration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<Verbosity>,
+}
+
+pub fn response_text_param_to_upstream(
+    text: ResponseTextParam,
+) -> async_openai::types::responses::ResponseTextParam {
+    async_openai::types::responses::ResponseTextParam {
+        format: text.format,
+        verbosity: text.verbosity,
+    }
+}
+
 /// Stream of response events.
 pub type ResponseStream = std::pin::Pin<
     Box<dyn futures::Stream<Item = Result<ResponseStreamEvent, crate::error::OpenAIError>> + Send>,
@@ -315,6 +342,8 @@ pub struct CreateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safety_identifier: Option<String>,
@@ -330,6 +359,12 @@ pub struct CreateResponse {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<ResponseTextParam>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "chat_template_kwargs"
+    )]
+    pub chat_template_args: Option<HashMap<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoiceParam>,
     #[serde(skip_serializing_if = "Option::is_none")]

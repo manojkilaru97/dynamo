@@ -15,6 +15,7 @@ pub const HEADER_WORKER_INSTANCE_ID: &str = "x-worker-instance-id";
 pub const HEADER_PREFILL_INSTANCE_ID: &str = "x-prefill-instance-id";
 pub const HEADER_DP_RANK: &str = "x-dp-rank";
 pub const HEADER_PREFILL_DP_RANK: &str = "x-prefill-dp-rank";
+pub const HEADER_BILLING_REQUEST_PRIORITY: &str = "x-billing-request-priority";
 const UNSET_DP_RANK_SENTINEL: u32 = u32::MAX;
 
 /// Apply routing overrides from HTTP headers to nvext.
@@ -24,6 +25,7 @@ const UNSET_DP_RANK_SENTINEL: u32 = u32::MAX;
 /// - `x-prefill-instance-id` -> `prefill_worker_id`
 /// - `x-dp-rank` -> `dp_rank` (decode worker's DP rank)
 /// - `x-prefill-dp-rank` -> `prefill_dp_rank`
+/// - `x-billing-request-priority` -> `agent_hints.priority`
 ///
 /// Headers take priority over existing nvext values when present.
 /// If no headers are present, returns the original nvext unchanged.
@@ -48,8 +50,16 @@ pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u32>().ok());
     let prefill_dp_rank = prefill_dp_rank.filter(|rank| *rank != UNSET_DP_RANK_SENTINEL);
+    let priority = headers
+        .get(HEADER_BILLING_REQUEST_PRIORITY)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_billing_request_priority);
 
-    if worker_id.is_none() && prefill_id.is_none() && dp_rank.is_none() && prefill_dp_rank.is_none()
+    if worker_id.is_none()
+        && prefill_id.is_none()
+        && dp_rank.is_none()
+        && prefill_dp_rank.is_none()
+        && priority.is_none()
     {
         return nvext;
     }
@@ -68,7 +78,25 @@ pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap)
     if let Some(rank) = prefill_dp_rank {
         ext.prefill_dp_rank = Some(rank);
     }
+    if let Some(priority) = priority {
+        ext.agent_hints
+            .get_or_insert_with(AgentHints::default)
+            .priority = Some(priority);
+    }
     Some(ext)
+}
+
+fn parse_billing_request_priority(value: &str) -> Option<i32> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "high" | "priority" | "premium" => Some(1),
+        "normal" | "standard" | "default" => Some(0),
+        "low" | "background" => Some(-1),
+        _ => value.parse::<i32>().ok(),
+    }
 }
 
 pub trait NvExtProvider {
@@ -652,6 +680,42 @@ mod tests {
         assert_eq!(result.prefill_worker_id, Some(456));
         assert_eq!(result.dp_rank, Some(3));
         assert_eq!(result.prefill_dp_rank, Some(5));
+    }
+
+    #[test]
+    fn test_apply_header_billing_priority_override() {
+        use axum::http::HeaderMap;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_BILLING_REQUEST_PRIORITY, "high".parse().unwrap());
+
+        let result = apply_header_routing_overrides(None, &headers).unwrap();
+        assert_eq!(
+            result.agent_hints.as_ref().and_then(|h| h.priority),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_billing_priority_header_overrides_nvext() {
+        use axum::http::HeaderMap;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_BILLING_REQUEST_PRIORITY, "0".parse().unwrap());
+
+        let nvext = NvExt::builder()
+            .agent_hints(AgentHints {
+                priority: Some(7),
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+
+        let result = apply_header_routing_overrides(Some(nvext), &headers).unwrap();
+        assert_eq!(
+            result.agent_hints.as_ref().and_then(|h| h.priority),
+            Some(0)
+        );
     }
 
     #[test]

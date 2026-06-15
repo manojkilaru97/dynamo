@@ -64,7 +64,6 @@ pub use async_openai::types::chat::{
     PredictionContentContent,
     Prompt,
     PromptTokensDetails,
-    ReasoningEffort,
     ResponseFormat,
     ResponseFormatJsonSchema,
     Role,
@@ -76,6 +75,22 @@ pub use async_openai::types::chat::{
     WebSearchUserLocation,
     WebSearchUserLocationType,
 };
+
+/// Effort level for reasoning models.
+///
+/// This mirrors the upstream OpenAI values and includes Dynamo/NVIDIA extension
+/// values used by Nemotron-family deployments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
 
 /// OpenAI stop configuration, with Dynamo's token-id stop extension.
 ///
@@ -839,6 +854,17 @@ mod tests {
         let stop: Stop = serde_json::from_value(serde_json::json!([32, 34])).unwrap();
 
         assert_eq!(stop, Stop::TokenIdArray(vec![32, 34]));
+    }
+
+    #[test]
+    fn reasoning_effort_accepts_nvidia_max_extension() {
+        let effort: ReasoningEffort = serde_json::from_value(serde_json::json!("max")).unwrap();
+
+        assert_eq!(effort, ReasoningEffort::Max);
+        assert_eq!(
+            serde_json::to_value(effort).unwrap(),
+            serde_json::json!("max")
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    pin::Pin,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -12,8 +13,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::State,
-    http::Request,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -28,7 +28,7 @@ use dynamo_runtime::{
     pipeline::{AsyncEngineContextProvider, Context},
     protocols::annotated::AnnotationsProvider,
 };
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -65,6 +65,8 @@ use tracing::Instrument;
 
 pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
 const X_REQUEST_ID_HEADER: &str = "x-request-id";
+const AUDIT_HTTP_HEADERS_KEY: &str = "http_headers";
+const AUDIT_RAW_PAYLOAD_KEY: &str = "http_raw_payload";
 
 /// Dynamo Annotation for the request ID
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
@@ -84,12 +86,41 @@ pub(super) fn get_body_limit() -> usize {
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Deserialize, Debug)]
 pub(crate) struct ErrorMessage {
     message: String,
     #[serde(rename = "type")]
     error_type: String,
     code: u16,
+}
+
+#[derive(Serialize)]
+struct OpenAIErrorEnvelope<'a> {
+    error: OpenAIErrorBody<'a>,
+}
+
+#[derive(Serialize)]
+struct OpenAIErrorBody<'a> {
+    message: &'a str,
+    #[serde(rename = "type")]
+    error_type: &'a str,
+    code: u16,
+}
+
+impl Serialize for ErrorMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        OpenAIErrorEnvelope {
+            error: OpenAIErrorBody {
+                message: &self.message,
+                error_type: &self.error_type,
+                code: self.code,
+            },
+        }
+        .serialize(serializer)
+    }
 }
 
 fn map_error_code_to_error_type(code: StatusCode) -> String {
@@ -127,6 +158,30 @@ fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
 /// Extract ErrorType from ErrorResponse for metrics
 fn extract_error_type_from_response(response: &ErrorResponse) -> ErrorType {
     classify_error_for_metrics(response.0, &response.1.message)
+}
+
+fn backend_error_status_from_error(
+    error: Option<&dynamo_runtime::error::DynamoError>,
+) -> Option<StatusCode> {
+    error.and_then(|error| {
+        if dynamo_runtime::error::match_error_chain(
+            error,
+            &[dynamo_runtime::error::ErrorType::ResourceExhausted],
+            &[],
+        ) {
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        } else {
+            None
+        }
+    })
+}
+
+fn backend_error_status_from_text(error: &str) -> Option<StatusCode> {
+    if error.starts_with("ResourceExhausted: ") {
+        Some(StatusCode::SERVICE_UNAVAILABLE)
+    } else {
+        None
+    }
 }
 
 impl ErrorMessage {
@@ -367,6 +422,41 @@ pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
         None
     };
 
+    // If an explicit internal request id was not supplied, honor x-request-id
+    // for gateway/client correlation. This keeps OpenAI response ids and audit
+    // payload logs joinable by the same request id users see in headers.
+    let validated_x_request_id = if validated_header.is_none() {
+        headers
+            .get(X_REQUEST_ID_HEADER)
+            .and_then(|raw| match raw.to_str() {
+                Ok(value) => {
+                    let value = value.trim();
+                    if !value.is_empty()
+                        && value.len() <= 512
+                        && !value.chars().any(char::is_control)
+                    {
+                        Some(value.to_string())
+                    } else {
+                        tracing::warn!(
+                            "{} header must be non-empty, <=512 bytes, and contain no control characters",
+                            X_REQUEST_ID_HEADER
+                        );
+                        None
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!("{} header must be a valid UTF-8 string", X_REQUEST_ID_HEADER);
+                    None
+                }
+            })
+    } else {
+        None
+    };
+
+    if let Some(request_id) = validated_x_request_id {
+        return request_id;
+    }
+
     // Prefer trace context (set by make_inference_request_span via DistributedTraceIdLayer)
     if let Some(trace_context) = get_distributed_tracing_context()
         && let Some(request_id) = trace_context.request_id
@@ -376,6 +466,74 @@ pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
 
     // Fallback: use validated header for backwards compat, or generate new UUID
     validated_header.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn audit_headers_from_header_map(headers: &HeaderMap) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (name, value) in headers.iter() {
+        let value = match value.to_str() {
+            Ok(value) => serde_json::Value::String(value.to_string()),
+            Err(_) => serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(value.as_bytes()),
+            ),
+        };
+        out.insert(name.as_str().to_string(), value);
+    }
+    serde_json::Value::Object(out)
+}
+
+fn raw_chat_error_payload(err_response: &ErrorResponse) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": err_response.1.message.clone(),
+            "type": err_response.1.error_type.clone(),
+            "code": err_response.1.code,
+        }
+    })
+}
+
+fn emit_raw_chat_error_audit(
+    request_id: &str,
+    raw_request: &serde_json::Value,
+    headers: &HeaderMap,
+    err_response: &ErrorResponse,
+) {
+    let model = raw_request
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let requested_streaming = raw_request
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    crate::audit::handle::emit_raw_request_response(
+        request_id,
+        model,
+        requested_streaming,
+        Some(Arc::new(raw_request.clone())),
+        Some(Arc::new(audit_headers_from_header_map(headers))),
+        Arc::new(raw_chat_error_payload(err_response)),
+    );
+}
+
+fn emit_chat_validation_error_audit(
+    request: &Context<NvCreateChatCompletionRequest>,
+    err_response: &ErrorResponse,
+) {
+    let Some(handle) = crate::audit::handle::create_handle(request.content(), request.id()) else {
+        return;
+    };
+    let headers = request
+        .get::<serde_json::Value>(AUDIT_HTTP_HEADERS_KEY)
+        .ok();
+    let raw_request = request.get::<serde_json::Value>(AUDIT_RAW_PAYLOAD_KEY).ok();
+    let typed_request = raw_request
+        .is_none()
+        .then(|| Arc::new(request.content().clone()));
+    handle.emit_request(typed_request, raw_request, headers);
+    handle.emit_raw_response(Arc::new(raw_chat_error_payload(err_response)));
 }
 
 fn attach_x_request_id<T: Send + Sync + 'static>(request: &mut Context<T>, headers: &HeaderMap) {
@@ -597,7 +755,12 @@ async fn completions_single(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        Ok(response)
     } else {
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
@@ -777,7 +940,12 @@ async fn completions_batch(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        Ok(response)
     } else {
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
@@ -903,15 +1071,29 @@ async fn embeddings(
 async fn handler_chat_completions(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(mut request): Json<NvCreateChatCompletionRequest>,
+    Json(raw_request): Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
+    let request_id = get_or_create_request_id(&headers);
+    let mut request: NvCreateChatCompletionRequest =
+        NvCreateChatCompletionRequest::deserialize(&raw_request).map_err(|err| {
+            let err_response = (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorMessage {
+                    message: err.to_string(),
+                    error_type: map_error_code_to_error_type(StatusCode::BAD_REQUEST),
+                    code: StatusCode::BAD_REQUEST.as_u16(),
+                }),
+            );
+            emit_raw_chat_error_audit(&request_id, &raw_request, &headers, &err_response);
+            err_response
+        })?;
+
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
     // create the context for the request
-    let request_id = get_or_create_request_id(&headers);
     let streaming = request.inner.stream.unwrap_or(false);
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone(),
@@ -920,6 +1102,11 @@ async fn handler_chat_completions(
     };
     let mut request = Context::with_id(request, request_id);
     attach_x_request_id(&mut request, &headers);
+    request.insert(
+        AUDIT_HTTP_HEADERS_KEY,
+        audit_headers_from_header_map(&headers),
+    );
+    request.insert(AUDIT_RAW_PAYLOAD_KEY, raw_request);
     let context = request.context();
 
     // create the connection handles
@@ -984,18 +1171,24 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
                 .map(|c| c.join(", "))
                 .unwrap_or_else(|| "Unknown error".to_string())
         };
+        let inferred_status_code = backend_error_status_from_error(event.error.as_ref())
+            .or_else(|| backend_error_status_from_text(&error_str));
 
         // Try to parse as error JSON to extract status code
         if let Ok(error_payload) = serde_json::from_str::<ErrorPayload>(&error_str) {
             let code = error_payload
                 .code
                 .and_then(|c| StatusCode::from_u16(c).ok())
+                .or(inferred_status_code)
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let message = error_payload.message.unwrap_or(error_str);
             return Some((message, code));
         }
 
-        return Some((error_str, StatusCode::INTERNAL_SERVER_ERROR));
+        return Some((
+            error_str,
+            inferred_status_code.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        ));
     }
 
     // Check if the data payload itself contains an error structure with code >= 400
@@ -1214,6 +1407,8 @@ async fn chat_completions(
     // todo - determine the proper error code for when a request model is not present
     let model = request.inner.model.clone();
 
+    request.normalize_reasoning_controls();
+
     tracing::trace!("Received chat completions request: {:?}", request.content());
 
     // Create inflight_guard early to ensure all errors (including validation) are counted
@@ -1230,25 +1425,38 @@ async fn chat_completions(
     // and early return a 501 NOT_IMPLEMENTED status code. Otherwise, proceeed.
     if let Err(err_response) = validate_chat_completion_unsupported_fields(&request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        emit_chat_validation_error_audit(&request, &err_response);
         return Err(err_response);
     }
 
     // Handle required fields like messages shouldn't be empty.
     if let Err(err_response) = validate_chat_completion_required_fields(&request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        emit_chat_validation_error_audit(&request, &err_response);
         return Err(err_response);
     }
 
     // Validate stream_options is only used when streaming (NVBug 5662680)
     if let Err(err_response) = validate_chat_completion_stream_options(&request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        emit_chat_validation_error_audit(&request, &err_response);
         return Err(err_response);
     }
 
     // Handle Rest of Validation Errors
     if let Err(err_response) = validate_chat_completion_fields_generic(&request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        emit_chat_validation_error_audit(&request, &err_response);
         return Err(err_response);
+    }
+
+    if let Ok(raw_request) = request.get::<serde_json::Value>(AUDIT_RAW_PAYLOAD_KEY) {
+        state.metrics_clone().record_chat_request_shape(
+            &model,
+            Endpoint::ChatCompletions,
+            streaming,
+            raw_request.as_ref(),
+        );
     }
 
     // Create HTTP queue guard after template resolution so labels are correct
@@ -1256,7 +1464,7 @@ async fn chat_completions(
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
-    let (engine, parsing_options) = state
+    let (engine, mut parsing_options) = state
         .manager()
         .get_chat_completions_engine_with_parsing(&model)
         .map_err(|e| {
@@ -1264,10 +1472,20 @@ async fn chat_completions(
             inflight_guard.mark_error(extract_error_type_from_response(&err_response));
             err_response
         })?;
+    if let Some(tool_names) = bare_json_auto_tool_parse_names(&request) {
+        parsing_options.tool_names = Some(tool_names);
+        parsing_options.parse_bare_json_tool_calls = true;
+    }
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     let annotations = request.annotations();
+    let frontend_stream_tool_jail = forced_tool_choice_stream_jail_config(&request);
+    let http_audit_headers = request
+        .get::<serde_json::Value>(AUDIT_HTTP_HEADERS_KEY)
+        .ok();
+    let http_audit_handle = crate::audit::handle::create_handle(request.content(), &request_id)
+        .map(|handle| handle.with_headers(http_audit_headers));
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
@@ -1305,6 +1523,34 @@ async fn chat_completions(
     // note - we might do this as part of the post processing set to make it more generic
 
     if streaming {
+        let stream: Pin<
+            Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>,
+        > = if let Some((tool_choice, tool_definitions)) = frontend_stream_tool_jail {
+            Box::pin(
+                crate::preprocessor::OpenAIPreprocessor::apply_tool_calling_jail(
+                    None,
+                    Some(tool_choice),
+                    Some(tool_definitions),
+                    stream,
+                ),
+            )
+        } else {
+            Box::pin(stream)
+        };
+        let stream = if let Some(audit) = http_audit_handle {
+            let (stream, agg_fut) = crate::audit::stream::scan_aggregate_with_future_and_options(
+                stream,
+                parsing_options.clone(),
+            );
+            tokio::spawn(async move {
+                let final_resp = agg_fut.await;
+                audit.emit_response(Arc::new(final_resp));
+            });
+            stream
+        } else {
+            stream
+        };
+
         // For streaming responses, we return HTTP 200 immediately without checking for errors.
         // Once HTTP 200 OK is sent, we cannot change the status code, so any backend errors
         // must be delivered as SSE events with `event: error` in the stream (handled by
@@ -1361,7 +1607,12 @@ async fn chat_completions(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        Ok(response)
     } else {
         // Check first event for backend errors before aggregating (non-streaming only)
         let stream_with_check =
@@ -1406,8 +1657,83 @@ async fn chat_completions(
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
         }
-        Ok(Json(response).into_response())
+        let http_response = Json(&response).into_response();
+        if let Some(audit) = http_audit_handle {
+            audit.emit_response(Arc::new(response));
+        }
+        Ok(http_response)
     }
+}
+
+fn bare_json_auto_tool_parse_names(request: &NvCreateChatCompletionRequest) -> Option<Vec<String>> {
+    use dynamo_protocols::types::{ChatCompletionToolChoiceOption, ResponseFormat};
+
+    let tools = request
+        .inner
+        .tools
+        .as_ref()
+        .filter(|tools| !tools.is_empty())?;
+
+    if !matches!(
+        request.inner.tool_choice.as_ref(),
+        None | Some(ChatCompletionToolChoiceOption::Auto)
+    ) {
+        return None;
+    }
+
+    let has_structured_outputs = request.common.guided_json.is_some()
+        || request.common.guided_regex.is_some()
+        || request.common.guided_grammar.is_some()
+        || request.common.guided_choice.is_some()
+        || request.common.structured_outputs.is_some()
+        || matches!(
+            request.inner.response_format.as_ref(),
+            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        );
+    if has_structured_outputs {
+        return None;
+    }
+
+    let names: Vec<_> = tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .filter(|name| !name.is_empty())
+        .collect();
+    (!names.is_empty()).then_some(names)
+}
+
+fn forced_tool_choice_stream_jail_config(
+    request: &NvCreateChatCompletionRequest,
+) -> Option<(
+    dynamo_protocols::types::ChatCompletionToolChoiceOption,
+    Vec<dynamo_parsers::tool_calling::ToolDefinition>,
+)> {
+    use dynamo_protocols::types::ChatCompletionToolChoiceOption;
+
+    let tool_choice = match request.inner.tool_choice.as_ref()? {
+        ChatCompletionToolChoiceOption::Named(_) | ChatCompletionToolChoiceOption::Required => {
+            request.inner.tool_choice.clone()?
+        }
+        ChatCompletionToolChoiceOption::None | ChatCompletionToolChoiceOption::Auto => {
+            return None;
+        }
+    };
+
+    let tools = request
+        .inner
+        .tools
+        .as_ref()
+        .filter(|tools| !tools.is_empty())?;
+
+    let tool_definitions = tools
+        .iter()
+        .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
+            name: tool.function.name.clone(),
+            parameters: tool.function.parameters.clone(),
+        })
+        .collect();
+
+    Some((tool_choice, tool_definitions))
 }
 
 /// Checks for unsupported fields in the request.
@@ -1520,15 +1846,33 @@ pub fn validate_completion_fields_generic(
 async fn handler_responses(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(mut request): Json<NvCreateResponse>,
+    Json(raw_request): Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
+    let request_id = raw_request
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|request_id| !request_id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| get_or_create_request_id(&headers));
+    let mut request: NvCreateResponse =
+        NvCreateResponse::deserialize(&raw_request).map_err(|err| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorMessage {
+                    message: err.to_string(),
+                    error_type: map_error_code_to_error_type(StatusCode::BAD_REQUEST),
+                    code: StatusCode::BAD_REQUEST.as_u16(),
+                }),
+            )
+        })?;
+
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
     // create the context for the request
-    let request_id = get_or_create_request_id(&headers);
     let streaming = request.inner.stream.unwrap_or(false);
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone().unwrap_or_default(),
@@ -1537,6 +1881,11 @@ async fn handler_responses(
     };
     let mut request = Context::with_id(request, request_id);
     attach_x_request_id(&mut request, &headers);
+    request.insert(AUDIT_RAW_PAYLOAD_KEY, raw_request);
+    request.insert(
+        AUDIT_HTTP_HEADERS_KEY,
+        audit_headers_from_header_map(&headers),
+    );
     let context = request.context();
 
     // create the connection handles
@@ -1592,6 +1941,18 @@ async fn responses(
 
     let model = request.inner.model.clone().unwrap_or_default();
     let streaming = request.inner.stream.unwrap_or(false);
+    let raw_audit_request = request.get::<serde_json::Value>(AUDIT_RAW_PAYLOAD_KEY).ok();
+    let raw_audit_headers = request
+        .get::<serde_json::Value>(AUDIT_HTTP_HEADERS_KEY)
+        .ok();
+    if let Some(raw_request) = raw_audit_request.as_ref() {
+        state.metrics_clone().record_chat_request_shape(
+            &model,
+            Endpoint::Responses,
+            streaming,
+            raw_request,
+        );
+    }
 
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
@@ -1726,6 +2087,10 @@ async fn responses(
         // synchronous -- no .await while lock is held. Avoids async lock overhead per token.
         let converter = std::sync::Arc::new(std::sync::Mutex::new(converter));
         let converter_end = converter.clone();
+        let audit_request_id = request_id.clone();
+        let audit_model = model.clone();
+        let audit_raw_request = raw_audit_request.clone();
+        let audit_headers = raw_audit_headers.clone();
 
         // Track whether the backend sent an error event during the stream.
         // Shared between event_stream (writer) and done_stream (reader).
@@ -1773,6 +2138,21 @@ async fn responses(
             } else {
                 conv.emit_end_events()
             };
+            if !saw_error_end.load(Ordering::Acquire)
+                && crate::audit::handle::should_emit_raw_request_response(
+                    audit_raw_request.as_deref(),
+                )
+                && let Some(raw_response) = conv.last_completed_response_value()
+            {
+                crate::audit::handle::emit_raw_request_response(
+                    &audit_request_id,
+                    audit_model,
+                    true,
+                    audit_raw_request,
+                    audit_headers,
+                    Arc::new(raw_response),
+                );
+            }
             stream::iter(end_events)
         })
         .flatten();
@@ -1790,7 +2170,12 @@ async fn responses(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        Ok(response)
     } else {
         // Non-streaming path: aggregate stream into single response
 
@@ -1846,6 +2231,18 @@ async fn responses(
         // assembled but never delivered. Override to cancelled.
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
+        }
+        if crate::audit::handle::should_emit_raw_request_response(raw_audit_request.as_deref())
+            && let Ok(raw_response) = serde_json::to_value(&response)
+        {
+            crate::audit::handle::emit_raw_request_response(
+                &request_id,
+                model,
+                false,
+                raw_audit_request,
+                raw_audit_headers,
+                Arc::new(raw_response),
+            );
         }
 
         Ok(Json(response).into_response())
@@ -2331,7 +2728,12 @@ async fn videos(
         // Disarm immediately: we return the body directly, so disconnect detection
         // transfers to stream_handle (armed inside monitor_for_disconnects).
         connection_handle.disarm();
-        Ok(sse_stream.into_response())
+        let mut response = sse_stream.into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        Ok(response)
     } else {
         let stream = stream.inspect(move |response| {
             process_response_and_observe_metrics(
@@ -2734,6 +3136,23 @@ mod tests {
         assert_eq!(
             response.1.message,
             "ResourceExhausted: All workers are busy, please retry later"
+        );
+    }
+
+    #[test]
+    fn test_service_overloaded_error_response_from_anyhow() {
+        use dynamo_runtime::pipeline::error::PipelineError;
+
+        let err: anyhow::Error = PipelineError::ServiceOverloaded(
+            "scheduler queue full: pending=8, limit=8".to_string(),
+        )
+        .into();
+        let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
+        assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.1.code, 503);
+        assert_eq!(
+            response.1.message,
+            "Service temporarily unavailable: scheduler queue full: pending=8, limit=8"
         );
     }
 
@@ -3334,6 +3753,21 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_completions_request_id_field_is_accepted() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "test-model",
+            "request_id": "dbg-structured-output-case"
+        }"#;
+
+        let request: NvCreateChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(request.unsupported_fields.contains_key("request_id"));
+
+        let result = validate_chat_completion_fields_generic(&request);
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn test_completions_unsupported_fields_rejected() {
         // Test that known unsupported fields are rejected and all shown in error message
         let json = r#"{
@@ -3415,6 +3849,35 @@ mod tests {
             assert_eq!(error_response.0, StatusCode::INTERNAL_SERVER_ERROR);
             assert_eq!(error_response.1.message, "prompt > max_seq_len");
             assert_eq!(error_response.1.code, 500);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_for_backend_error_with_resource_exhausted_text() {
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+        use futures::stream;
+
+        let error_event = Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: None,
+            id: None,
+            event: Some("error".to_string()),
+            comment: Some(vec![
+                "ResourceExhausted: Worker local total request limit reached (16/16)".to_string(),
+            ]),
+            error: None,
+        };
+
+        let test_stream = stream::iter(vec![error_event]);
+        let result = check_for_backend_error(test_stream).await;
+
+        assert!(result.is_err());
+        if let Err(error_response) = result {
+            assert_eq!(error_response.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error_response.1.code, 503);
+            assert_eq!(
+                error_response.1.message,
+                "ResourceExhausted: Worker local total request limit reached (16/16)"
+            );
         }
     }
 

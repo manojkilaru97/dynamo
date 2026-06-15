@@ -61,6 +61,7 @@ Routing fields can also be set via HTTP headers, which take priority over `nvext
 |--------|-----------|
 | `x-worker-instance-id` | `backend_instance_id` and `decode_worker_id` |
 | `x-prefill-instance-id` | `prefill_worker_id` |
+| `x-billing-request-priority` | `agent_hints.priority`; accepts `high`, `normal`, `low`, or an integer |
 
 ## Agent Context
 

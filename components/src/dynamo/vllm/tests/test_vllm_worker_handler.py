@@ -131,6 +131,538 @@ def _make_engine_response(request_id: str = "req-1", finished: bool = True):
     return resp
 
 
+class TestOpenAISamplingParams:
+    def test_pure_json_structured_output_stream_guard_emits_once(self):
+        assert mod._request_has_pure_json_structured_output(
+            {"structured_outputs": {"json": {"type": "object"}}}
+        )
+        assert mod._request_has_pure_json_structured_output(
+            {"sampling_options": {"guided_decoding": {"json": {"type": "object"}}}}
+        )
+        assert not mod._request_has_pure_json_structured_output(
+            {
+                "tools": [{"type": "function", "function": {"name": "x"}}],
+                "structured_outputs": {"json": {"type": "object"}},
+            }
+        )
+
+        guard = mod._StructuredJsonStreamGuard()
+        assert guard.filter_delta('{"a":1') == ""
+        assert guard.filter_delta('} {"a":2}') == '{"a":1}'
+        assert guard.filter_delta(' {"a":3}') == ""
+
+    def test_unsupported_structured_regex_fails_before_sampling_params(self):
+        with pytest.raises(ValueError, match="lookaround assertions"):
+            mod.build_sampling_params_openai(
+                {"structured_outputs": {"regex": r"AB(?=CD)"}},
+                {},
+            )
+
+    def test_unsupported_json_schema_pattern_fails_before_sampling_params(self):
+        with pytest.raises(ValueError, match="lookaround assertions"):
+            mod.build_sampling_params_openai(
+                {
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "bad",
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "code": {
+                                        "type": "string",
+                                        "pattern": r"^[A-Z]{2}(?=\d{2})\d{2}$",
+                                    }
+                                },
+                            },
+                        },
+                    }
+                },
+                {},
+            )
+
+    def test_unsupported_grammar_newline_char_class_fails_before_sampling_params(self):
+        with pytest.raises(ValueError, match="raw newlines"):
+            mod.build_sampling_params_openai(
+                {"structured_outputs": {"grammar": 'root ::= "A"\nws ::= [ \n]*\n'}},
+                {},
+            )
+
+    def test_named_tool_choice_sets_structured_outputs(self, monkeypatch):
+        monkeypatch.delenv("DYN_DYNAMO_TOOL_CALL_PARSER", raising=False)
+        params = mod.build_sampling_params_openai(
+            {
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "send_message"},
+                },
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "send_message",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "body": {"type": "string"},
+                                },
+                                "required": ["body"],
+                            },
+                        },
+                    }
+                ],
+            },
+            {},
+        )
+
+        schema = params.structured_outputs.json
+        assert schema["type"] == "object"
+        assert "additionalProperties" not in schema
+        assert schema["properties"]["body"] == {"type": "string", "maxLength": 256}
+
+    def test_named_tool_choice_short_request_preserves_body_schema(self, monkeypatch):
+        monkeypatch.delenv("DYN_DYNAMO_TOOL_CALL_PARSER", raising=False)
+        params = mod.build_sampling_params_openai(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Send message to alice@test.com body 'plain ascii body'",
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "send_message"},
+                },
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "send_message",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "body": {"type": "string"},
+                                },
+                                "required": ["body"],
+                            },
+                        },
+                    }
+                ],
+            },
+            {},
+        )
+
+        schema = params.structured_outputs.json
+        assert schema["properties"]["body"] == {"type": "string", "maxLength": 256}
+
+    def test_named_tool_choice_long_request_preserves_body_schema(self, monkeypatch):
+        monkeypatch.delenv("DYN_DYNAMO_TOOL_CALL_PARSER", raising=False)
+        params = mod.build_sampling_params_openai(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Send this exact long body: " + ("abcdef " * 600),
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "send_message"},
+                },
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "send_message",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "body": {"type": "string"},
+                                },
+                                "required": ["body"],
+                            },
+                        },
+                    }
+                ],
+            },
+            {},
+        )
+
+        schema = params.structured_outputs.json
+        expected_len = mod._tool_long_text_budget(
+            len("Send this exact long body: " + ("abcdef " * 600))
+        )
+        assert schema["properties"]["body"] == {
+            "type": "string",
+            "maxLength": expected_len,
+        }
+
+    def test_required_tool_choice_sets_tool_array_schema(self, monkeypatch):
+        monkeypatch.delenv("DYN_DYNAMO_TOOL_CALL_PARSER", raising=False)
+        params = mod.build_sampling_params_openai(
+            {
+                "tool_choice": "required",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {"type": "string"},
+                                },
+                            },
+                        },
+                    }
+                ],
+            },
+            {},
+        )
+
+        schema = params.structured_outputs.json
+        assert schema["type"] == "array"
+        assert schema["maxItems"] == mod.DEFAULT_SCHEMA_MAX_ARRAY_ITEMS
+        assert "type" not in schema["items"]
+        assert schema["items"]["anyOf"][0]["type"] == "object"
+        assert schema["items"]["anyOf"][0]["additionalProperties"] is False
+        assert schema["items"]["anyOf"][0]["properties"]["name"]["enum"] == ["lookup"]
+
+    def test_named_tool_choice_qwen_parser_sets_structural_tag(self, monkeypatch):
+        monkeypatch.delenv("DYN_DYNAMO_TOOL_CALL_PARSER", raising=False)
+        params = mod.build_sampling_params_openai(
+            {
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "send_message"},
+                },
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "send_message",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "note": {"type": "string"},
+                                },
+                                "required": ["note"],
+                            },
+                        },
+                    }
+                ],
+            },
+            {},
+            tool_call_parser_name="qwen3_coder",
+        )
+
+        assert params.structured_outputs.json is None
+        structural_tag = json.loads(params.structured_outputs.structural_tag)
+        tag_format = structural_tag["format"]
+        assert tag_format["type"] == "tags_with_separator"
+        assert tag_format["triggers"] == [""]
+        assert tag_format["at_least_one"] is True
+        assert tag_format["stop_after_first"] is True
+        tag = tag_format["tags"][0]
+        assert tag["begin"] == "<tool_call>\n<function=send_message>\n"
+        assert tag["content"]["style"] == "qwen_xml"
+        assert "additionalProperties" not in tag["content"]["json_schema"]
+        assert tag["content"]["json_schema"]["properties"]["note"] == {
+            "type": "string",
+            "maxLength": 4096,
+        }
+
+    def test_named_tool_choice_qwen_parser_text_field_uses_json_schema(self, monkeypatch):
+        monkeypatch.delenv("DYN_DYNAMO_TOOL_CALL_PARSER", raising=False)
+        params = mod.build_sampling_params_openai(
+            {
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "send_message"},
+                },
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "send_message",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "body": {"type": "string"},
+                                },
+                                "required": ["body"],
+                            },
+                        },
+                    }
+                ],
+            },
+            {},
+            tool_call_parser_name="qwen3_coder",
+        )
+
+        assert params.structured_outputs.structural_tag is None
+        assert params.structured_outputs.json["properties"]["body"] == {
+            "type": "string",
+            "maxLength": 256,
+        }
+
+    def test_required_tool_choice_qwen_parser_sets_structural_tag(self, monkeypatch):
+        monkeypatch.delenv("DYN_DYNAMO_TOOL_CALL_PARSER", raising=False)
+        params = mod.build_sampling_params_openai(
+            {
+                "tool_choice": "required",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {"type": "string"},
+                                },
+                            },
+                        },
+                    }
+                ],
+            },
+            {},
+            tool_call_parser_name="qwen3_coder",
+        )
+
+        assert params.structured_outputs.json is None
+        structural_tag = json.loads(params.structured_outputs.structural_tag)
+        tag_format = structural_tag["format"]
+        assert tag_format["type"] == "tags_with_separator"
+        assert tag_format["at_least_one"] is True
+        assert tag_format["stop_after_first"] is True
+        assert tag_format["triggers"] == [""]
+        assert (
+            tag_format["tags"][0]["begin"]
+            == "<tool_call>\n<function=lookup>\n"
+        )
+
+    def test_required_tool_choice_qwen_parser_normalizes_frontend_repeat_tag(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("DYN_DYNAMO_TOOL_CALL_PARSER", raising=False)
+        params = mod.build_sampling_params_openai(
+            {
+                "tool_choice": "required",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {"type": "string"},
+                                },
+                            },
+                        },
+                    }
+                ],
+                "guided_decoding": {
+                    "structural_tag": {
+                        "type": "structural_tag",
+                        "format": {
+                            "type": "repeat",
+                            "min": 1,
+                            "max": 1,
+                            "triggers": ["<tool_call>"],
+                            "content": {
+                                "type": "or",
+                                "elements": [
+                                    {
+                                        "type": "tag",
+                                        "begin": "<tool_call>\n<function=lookup>\n",
+                                        "content": {
+                                            "type": "json_schema",
+                                            "json_schema": {"type": "object"},
+                                            "style": "qwen_xml",
+                                        },
+                                        "end": "\n</function>\n</tool_call>",
+                                    }
+                                ],
+                            },
+                        },
+                    }
+                },
+            },
+            {},
+            tool_call_parser_name="qwen3_coder",
+        )
+
+        structural_tag = json.loads(params.structured_outputs.structural_tag)
+        tag_format = structural_tag["format"]
+        assert tag_format["type"] == "tags_with_separator"
+        assert tag_format["stop_after_first"] is True
+        assert tag_format["tags"][0]["begin"] == "<tool_call>\n<function=lookup>\n"
+
+    def test_qwen_forced_tool_structural_tag_precedes_guided_json(self, monkeypatch):
+        monkeypatch.delenv("DYN_DYNAMO_TOOL_CALL_PARSER", raising=False)
+        params = mod.build_sampling_params_openai(
+            {
+                "guided_json": {"type": "object", "properties": {"wrong": {}}},
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "send_message"},
+                },
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "send_message",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "note": {"type": "string"},
+                                },
+                            },
+                        },
+                    }
+                ],
+            },
+            {},
+            tool_call_parser_name="qwen3_coder",
+        )
+
+        assert params.structured_outputs.json is None
+        structural_tag = json.loads(params.structured_outputs.structural_tag)
+        assert structural_tag["format"]["tags"][0]["content"]["json_schema"]["properties"] == {
+            "note": {"type": "string", "maxLength": 4096}
+        }
+        assert (
+            "additionalProperties"
+            not in structural_tag["format"]["tags"][0]["content"]["json_schema"]
+        )
+
+    def test_qwen_forced_tool_structural_tag_precedes_guided_decoding_json(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("DYN_DYNAMO_TOOL_CALL_PARSER", raising=False)
+        params = mod.build_sampling_params_openai(
+            {
+                "guided_decoding": {
+                    "json": {"type": "object", "properties": {"wrong": {}}}
+                },
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "send_message"},
+                },
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "send_message",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "note": {"type": "string"},
+                                },
+                            },
+                        },
+                    }
+                ],
+            },
+            {},
+            tool_call_parser_name="qwen3_coder",
+        )
+
+        assert params.structured_outputs.json is None
+        structural_tag = json.loads(params.structured_outputs.structural_tag)
+        assert structural_tag["format"]["tags"][0]["content"]["json_schema"]["properties"] == {
+            "note": {"type": "string", "maxLength": 4096}
+        }
+        assert (
+            "additionalProperties"
+            not in structural_tag["format"]["tags"][0]["content"]["json_schema"]
+        )
+
+    def test_explicit_guided_decoding_structural_tag_still_wins(self, monkeypatch):
+        monkeypatch.delenv("DYN_DYNAMO_TOOL_CALL_PARSER", raising=False)
+        explicit_tag = {
+            "type": "structural_tag",
+            "format": {
+                "type": "tag",
+                "begin": "<custom>",
+                "content": "payload",
+                "end": "</custom>",
+            },
+        }
+        params = mod.build_sampling_params_openai(
+            {
+                "guided_decoding": {"structural_tag": json.dumps(explicit_tag)},
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "send_message"},
+                },
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "send_message",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+            {},
+            tool_call_parser_name="qwen3_coder",
+        )
+
+        assert json.loads(params.structured_outputs.structural_tag) == explicit_tag
+
+    def test_auto_tool_choice_does_not_set_structured_outputs(self):
+        params = mod.build_sampling_params_openai(
+            {
+                "tool_choice": "auto",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+            {},
+        )
+
+        assert params.structured_outputs is None
+
+
+class TestPreprocessedSamplingParams:
+    def test_structural_tag_guided_decoding_is_forwarded(self):
+        structural_tag = {
+            "type": "structural_tag",
+            "format": {
+                "type": "tag",
+                "begin": "<tool_call>\n<function=send_message>\n",
+                "content": {
+                    "type": "json_schema",
+                    "json_schema": {"type": "object"},
+                    "style": "qwen_xml",
+                },
+                "end": "\n</function>\n</tool_call>",
+            },
+        }
+        params = mod.build_sampling_params(
+            {
+                "sampling_options": {
+                    "guided_decoding": {"structural_tag": structural_tag},
+                },
+                "stop_conditions": {},
+            },
+            {},
+        )
+
+        assert json.loads(params.structured_outputs.structural_tag) == structural_tag
+
+
 class TestReasoningParserForwarding:
     def test_request_reasoning_metadata_reads_extra_args(self):
         request = {
@@ -278,6 +810,161 @@ class TestReasoningParserForwarding:
 
         assert chunks == []
         assert calls == {"called": True}
+
+    def test_generate_tokens_decodes_parser_marker_deltas(self):
+        from vllm.sampling_params import SamplingParams
+
+        class FakeTokenizer:
+            ids = {
+                "<think>": 12,
+                "</think>": 13,
+                "<tool_call>": 14,
+                "</tool_call>": 15,
+            }
+            text = {
+                12: "<think>",
+                13: "</think>",
+                14: "<tool_call>",
+                15: "</tool_call>",
+                42: "plain",
+                100: "body",
+            }
+
+            def convert_tokens_to_ids(self, token):
+                return self.ids.get(token, -1)
+
+            def encode(self, token, add_special_tokens=False):
+                if token in self.ids:
+                    return [self.ids[token]]
+                return [900, 901]
+
+            def decode(self, token_ids, skip_special_tokens=True):
+                if skip_special_tokens:
+                    return "".join(
+                        ""
+                        if int(token_id) in self.ids.values()
+                        else self.text.get(int(token_id), "")
+                        for token_id in token_ids
+                    )
+                return "".join(self.text.get(int(token_id), "") for token_id in token_ids)
+
+        class FakeOutput:
+            def __init__(self, token_ids):
+                self.index = 0
+                self.token_ids = token_ids
+                self.logprobs = None
+                self.finish_reason = None
+                self.stop_reason = None
+
+        class FakeResponse:
+            def __init__(self, token_ids):
+                self.outputs = [FakeOutput(token_ids)]
+
+        handler = _make_handler()
+        handler.engine_client = MagicMock()
+        handler.engine_client.tokenizer = FakeTokenizer()
+        assert handler._decode_parser_visible_text([13, 100, 15]) == (
+            "</think>body</tool_call>"
+        )
+
+        async def fake_generate(*args, **kwargs):
+            for token_ids in ([42], [42, 13], [42, 13, 100], [42, 13, 100, 14]):
+                yield FakeResponse(list(token_ids))
+
+        handler.engine_client.generate = fake_generate
+
+        async def collect_chunks():
+            chunks = []
+            async for chunk in handler.generate_tokens(
+                PatchedTokensPrompt(prompt_token_ids=[1]),
+                SamplingParams(max_tokens=4),
+                "req-1",
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = asyncio.run(collect_chunks())
+
+        assert chunks[0] == {"index": 0, "token_ids": [42]}
+        assert chunks[1] == {"index": 0, "token_ids": [13], "text": "</think>"}
+        assert chunks[2] == {"index": 0, "token_ids": [100]}
+        assert chunks[3] == {"index": 0, "token_ids": [14], "text": "<tool_call>"}
+
+    def test_generate_tokens_replays_final_retroactive_parser_markers(self):
+        from vllm.sampling_params import SamplingParams
+
+        class FakeTokenizer:
+            ids = {
+                "</think>": 13,
+                "<tool_call>": 14,
+                "</tool_call>": 15,
+            }
+            text = {
+                13: "</think>",
+                14: "<tool_call>",
+                15: "</tool_call>",
+                42: "reasoning",
+                100: "answer",
+            }
+
+            def convert_tokens_to_ids(self, token):
+                return self.ids.get(token, -1)
+
+            def encode(self, token, add_special_tokens=False):
+                if token in self.ids:
+                    return [self.ids[token]]
+                return [900, 901]
+
+            def decode(self, token_ids, skip_special_tokens=True):
+                if skip_special_tokens:
+                    return "".join(
+                        ""
+                        if int(token_id) in self.ids.values()
+                        else self.text.get(int(token_id), "")
+                        for token_id in token_ids
+                    )
+                return "".join(self.text.get(int(token_id), "") for token_id in token_ids)
+
+        class FakeOutput:
+            def __init__(self, token_ids, finish_reason=None):
+                self.index = 0
+                self.token_ids = token_ids
+                self.logprobs = None
+                self.finish_reason = finish_reason
+                self.stop_reason = None
+
+        class FakeResponse:
+            def __init__(self, token_ids, finish_reason=None):
+                self.outputs = [FakeOutput(token_ids, finish_reason)]
+
+        handler = _make_handler()
+        handler.engine_client = MagicMock()
+        handler.engine_client.tokenizer = FakeTokenizer()
+
+        async def fake_generate(*args, **kwargs):
+            yield FakeResponse([42])
+            yield FakeResponse([42, 100])
+            yield FakeResponse([42, 13, 100], "stop")
+
+        handler.engine_client.generate = fake_generate
+
+        async def collect_chunks():
+            chunks = []
+            async for chunk in handler.generate_tokens(
+                PatchedTokensPrompt(prompt_token_ids=[1]),
+                SamplingParams(max_tokens=3),
+                "req-1",
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = asyncio.run(collect_chunks())
+
+        assert chunks[0] == {"index": 0, "token_ids": [42]}
+        assert chunks[1] == {"index": 0, "token_ids": [100]}
+        assert chunks[2]["token_ids"] == [100]
+        assert chunks[2]["text"] == "</think>answer"
+        assert chunks[2]["finish_reason"] == "stop"
 
 
 # ── Tests ────────────────────────────────────────────────────────────

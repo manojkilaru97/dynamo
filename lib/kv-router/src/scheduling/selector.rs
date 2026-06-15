@@ -269,7 +269,11 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             self.worker_logit(request, worker, block_size, weights, "Formula")
         };
 
-        let worker_iter = workers
+        let total_worker_dp_count = workers
+            .values()
+            .map(|config| config.data_parallel_size() as usize)
+            .sum::<usize>();
+        let candidate_workers = workers
             .iter()
             .filter(move |(worker_id, _)| request.is_worker_allowed(**worker_id))
             .flat_map(|(worker_id, config)| {
@@ -277,12 +281,15 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 let data_parallel_start_rank = config.data_parallel_start_rank();
                 (data_parallel_start_rank..(data_parallel_start_rank + data_parallel_size))
                     .map(move |dp_rank| WorkerWithDpRank::new(*worker_id, dp_rank))
-            });
+            })
+            .collect::<Vec<_>>();
+        let candidate_count = candidate_workers.len();
+        let disallowed_worker_dps = total_worker_dp_count.saturating_sub(candidate_count);
 
         let (best_worker, best_logit) = if temperature == 0.0 {
             let mut min_workers = Vec::new();
             let mut min_score = f64::INFINITY;
-            for worker in worker_iter {
+            for worker in candidate_workers.iter().copied() {
                 let score = get_score(worker);
                 if score < min_score {
                     min_workers.clear();
@@ -301,7 +308,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             }
         } else {
             let mut worker_logits = FxHashMap::default();
-            for worker in worker_iter {
+            for worker in candidate_workers.iter().copied() {
                 let score = get_score(worker);
                 worker_logits.insert(worker, score);
             }
@@ -323,17 +330,25 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             .unwrap_or(0);
 
         if self.worker_type == "decode" {
+            let effective_overlap_blocks = request.effective_overlap_blocks_for(best_worker);
+            let cached_tokens = request.effective_cached_tokens_for(best_worker);
             tracing::info!(
-                "Selected worker: worker_type={}, worker_id={} dp_rank={:?}, logit: {:.3}, host_pinned blocks: {}, disk blocks: {}",
+                candidate_count,
+                disallowed_worker_dps,
+                selection_path = %self.worker_type,
+                "Selected worker: worker_type={}, worker_id={} dp_rank={:?}, logit: {:.3}, effective cached blocks: {:.2}, cached tokens: {}, host_pinned blocks: {}, disk blocks: {}, candidate_count={}, disallowed_worker_dps={}, selection_path={}",
                 self.worker_type,
                 best_worker.worker_id,
                 best_worker.dp_rank,
                 best_logit,
+                effective_overlap_blocks,
+                cached_tokens,
                 best_host_pinned_overlap_blocks,
                 best_disk_overlap_blocks,
+                candidate_count,
+                disallowed_worker_dps,
+                self.worker_type,
             );
-            let effective_overlap_blocks = request.effective_overlap_blocks_for(best_worker);
-            let cached_tokens = request.effective_cached_tokens_for(best_worker);
 
             return Ok(WorkerSelectionResult {
                 worker: best_worker,
@@ -353,7 +368,10 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             .unwrap_or_default();
 
         tracing::info!(
-            "Selected worker: worker_type={}, worker_id={} dp_rank={:?}, logit: {:.3}, effective cached blocks: {:.2}, host_pinned blocks: {}, disk blocks: {}{}",
+            candidate_count,
+            disallowed_worker_dps,
+            selection_path = %self.worker_type,
+            "Selected worker: worker_type={}, worker_id={} dp_rank={:?}, logit: {:.3}, effective cached blocks: {:.2}, host_pinned blocks: {}, disk blocks: {}{}, candidate_count={}, disallowed_worker_dps={}, selection_path={}",
             self.worker_type,
             best_worker.worker_id,
             best_worker.dp_rank,
@@ -361,7 +379,10 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             best_overlap,
             best_host_pinned_overlap_blocks,
             best_disk_overlap_blocks,
-            total_blocks_info
+            total_blocks_info,
+            candidate_count,
+            disallowed_worker_dps,
+            self.worker_type,
         );
 
         Ok(WorkerSelectionResult {

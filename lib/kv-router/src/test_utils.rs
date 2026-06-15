@@ -368,6 +368,7 @@ impl SequencePublisher for NoopSequencePublisher {
 pub struct SimpleWorkerConfig {
     pub data_parallel_start_rank: u32,
     pub data_parallel_size: u32,
+    pub max_num_seqs: Option<u64>,
     pub max_num_batched_tokens: Option<u64>,
     pub total_kv_blocks: Option<u64>,
 }
@@ -377,6 +378,7 @@ impl Default for SimpleWorkerConfig {
         Self {
             data_parallel_start_rank: 0,
             data_parallel_size: 1,
+            max_num_seqs: None,
             max_num_batched_tokens: None,
             total_kv_blocks: None,
         }
@@ -390,6 +392,10 @@ impl WorkerConfigLike for SimpleWorkerConfig {
 
     fn data_parallel_size(&self) -> u32 {
         self.data_parallel_size
+    }
+
+    fn max_num_seqs(&self) -> Option<u64> {
+        self.max_num_seqs
     }
 
     fn max_num_batched_tokens(&self) -> Option<u64> {

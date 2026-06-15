@@ -52,8 +52,23 @@ pub mod logging {
         /// Spec: https://opentelemetry.io/docs/specs/otel/protocol/exporter/
         pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 
+        /// Base OTLP exporter endpoint URL shared across signals.
+        pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+
         /// OTLP exporter endpoint URL for logs (defaults to traces endpoint if unset)
         pub const OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT";
+
+        /// OTLP exporter protocol for logs.
+        pub const OTEL_EXPORTER_OTLP_LOGS_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL";
+
+        /// OTLP exporter protocol fallback shared across signals.
+        pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+
+        /// OTLP exporter timeout for logs, in milliseconds.
+        pub const OTEL_EXPORTER_OTLP_LOGS_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT";
+
+        /// OTLP exporter timeout fallback shared across signals, in milliseconds.
+        pub const OTEL_EXPORTER_OTLP_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TIMEOUT";
 
         /// Service name for OTLP traces and logs
         pub const OTEL_SERVICE_NAME: &str = "OTEL_SERVICE_NAME";
@@ -111,6 +126,30 @@ pub mod runtime {
     pub mod canary {
         /// Wait time in seconds for canary deployments
         pub const DYN_CANARY_WAIT_TIME: &str = "DYN_CANARY_WAIT_TIME";
+    }
+
+    /// Health check configuration
+    pub mod health_check {
+        /// Enable worker health checks.
+        pub const DYN_HEALTH_CHECK_ENABLED: &str = "DYN_HEALTH_CHECK_ENABLED";
+
+        /// Timeout in seconds for a health-check request.
+        pub const DYN_HEALTH_CHECK_REQUEST_TIMEOUT: &str = "DYN_HEALTH_CHECK_REQUEST_TIMEOUT";
+
+        /// Grace window after a successful health check.
+        pub const DYN_HEALTH_CHECK_SUCCESS_TTL: &str = "DYN_HEALTH_CHECK_SUCCESS_TTL";
+
+        /// Real-traffic failure window in seconds.
+        pub const DYN_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS: &str =
+            "DYN_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS";
+
+        /// Minimum eligible real-traffic samples before the failure ratio can fence.
+        pub const DYN_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES: &str =
+            "DYN_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES";
+
+        /// Failure ratio threshold for real-traffic health.
+        pub const DYN_HEALTH_CHECK_REAL_FAILURE_THRESHOLD: &str =
+            "DYN_HEALTH_CHECK_REAL_FAILURE_THRESHOLD";
     }
 }
 
@@ -303,6 +342,16 @@ pub mod llm {
     /// Set to `0` or leave unset to disable the timeout (default: disabled).
     pub const DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS: &str = "DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS";
 
+    /// Maximum unfinished requests admitted by each local worker process.
+    pub const DYN_REQUEST_MAX_TOTAL_REQUESTS: &str = "DYN_REQUEST_MAX_TOTAL_REQUESTS";
+
+    /// Alias for the per-DP worker admission limit.
+    pub const DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP: &str = "DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP";
+
+    /// Per-request decode wall-clock timeout in seconds.
+    pub const DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS: &str =
+        "DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS";
+
     /// Enable the LoRA allocation controller (set to "true" to enable)
     pub const DYN_LORA_ALLOCATION_ENABLED: &str = "DYN_LORA_ALLOCATION_ENABLED";
 
@@ -352,6 +401,9 @@ pub mod llm {
 
         /// In-process audit bus capacity.
         pub const DYN_AUDIT_CAPACITY: &str = "DYN_AUDIT_CAPACITY";
+
+        /// Maximum serialized payload bytes emitted to OTEL before marker fallback.
+        pub const DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES: &str = "DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES";
 
         /// NATS subject the JetStream audit sink publishes to.
         pub const DYN_AUDIT_NATS_SUBJECT: &str = "DYN_AUDIT_NATS_SUBJECT";
@@ -451,6 +503,12 @@ pub mod router {
     /// Queue threshold fraction for prefill token capacity.
     /// When set, requests are queued if all workers exceed this fraction of max_num_batched_tokens.
     pub const DYN_ROUTER_QUEUE_THRESHOLD: &str = "DYN_ROUTER_QUEUE_THRESHOLD";
+
+    /// Maximum number of scheduler-queued requests per eligible DP rank.
+    pub const DYN_ROUTER_MAX_PENDING_PER_WORKER: &str = "DYN_ROUTER_MAX_PENDING_PER_WORKER";
+
+    /// Maximum scheduler queue wait time in milliseconds.
+    pub const DYN_ROUTER_MAX_QUEUE_WAIT_MS: &str = "DYN_ROUTER_MAX_QUEUE_WAIT_MS";
 
     /// Scheduling policy for the router queue ("fcfs" or "wspt").
     pub const DYN_ROUTER_QUEUE_POLICY: &str = "DYN_ROUTER_QUEUE_POLICY";
@@ -572,9 +630,14 @@ mod tests {
             logging::DYN_LOG_USE_LOCAL_TZ,
             logging::DYN_LOGGING_SPAN_EVENTS,
             logging::otlp::OTEL_EXPORT_ENABLED,
+            logging::otlp::OTEL_EXPORTER_OTLP_ENDPOINT,
             logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
             logging::otlp::OTEL_SERVICE_NAME,
             logging::otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
+            logging::otlp::OTEL_EXPORTER_OTLP_LOGS_PROTOCOL,
+            logging::otlp::OTEL_EXPORTER_OTLP_PROTOCOL,
+            logging::otlp::OTEL_EXPORTER_OTLP_LOGS_TIMEOUT,
+            logging::otlp::OTEL_EXPORTER_OTLP_TIMEOUT,
             // Runtime
             runtime::DYN_RUNTIME_NUM_WORKER_THREADS,
             runtime::DYN_RUNTIME_MAX_BLOCKING_THREADS,
@@ -586,6 +649,12 @@ mod tests {
             runtime::system::DYN_SYSTEM_HEALTH_PATH,
             runtime::system::DYN_SYSTEM_LIVE_PATH,
             runtime::canary::DYN_CANARY_WAIT_TIME,
+            runtime::health_check::DYN_HEALTH_CHECK_ENABLED,
+            runtime::health_check::DYN_HEALTH_CHECK_REQUEST_TIMEOUT,
+            runtime::health_check::DYN_HEALTH_CHECK_SUCCESS_TTL,
+            runtime::health_check::DYN_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS,
+            runtime::health_check::DYN_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES,
+            runtime::health_check::DYN_HEALTH_CHECK_REAL_FAILURE_THRESHOLD,
             // Worker
             worker::DYN_WORKER_GRACEFUL_SHUTDOWN_TIMEOUT,
             // NATS
@@ -619,6 +688,9 @@ mod tests {
             // LLM
             llm::DYN_HTTP_BODY_LIMIT_MB,
             llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS,
+            llm::DYN_REQUEST_MAX_TOTAL_REQUESTS,
+            llm::DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP,
+            llm::DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS,
             llm::DYN_LORA_ENABLED,
             llm::DYN_LORA_PATH,
             llm::DYN_ENABLE_ANTHROPIC_API,
@@ -637,6 +709,7 @@ mod tests {
             llm::audit::DYN_AUDIT_SINKS,
             llm::audit::DYN_AUDIT_FORCE_LOGGING,
             llm::audit::DYN_AUDIT_CAPACITY,
+            llm::audit::DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES,
             llm::audit::DYN_AUDIT_NATS_SUBJECT,
             llm::audit::DYN_AUDIT_OUTPUT_PATH,
             llm::audit::DYN_AUDIT_JSONL_BUFFER_BYTES,
@@ -663,6 +736,8 @@ mod tests {
             // Router
             router::DYN_ROUTER_PREFILL_LOAD_SCALE,
             router::DYN_ROUTER_QUEUE_THRESHOLD,
+            router::DYN_ROUTER_MAX_PENDING_PER_WORKER,
+            router::DYN_ROUTER_MAX_QUEUE_WAIT_MS,
             router::DYN_ROUTER_QUEUE_POLICY,
             // TCP Response Stream
             tcp_response_stream::DYN_TCP_RESPONSE_STREAM_PORT,
