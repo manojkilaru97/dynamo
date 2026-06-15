@@ -361,6 +361,10 @@ impl CommonExtProvider for UnifiedRequest {
         self.inner.common.guided_choice.clone()
     }
 
+    fn get_guided_structural_tag(&self) -> Option<serde_json::Value> {
+        CommonExtProvider::get_guided_structural_tag(&self.inner)
+    }
+
     fn get_guided_decoding_backend(&self) -> Option<String> {
         self.inner.common.guided_decoding_backend.clone()
     }

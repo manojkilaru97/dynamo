@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +24,8 @@ from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
 from vllm.utils.async_utils import make_async
+
+logger = logging.getLogger(__name__)
 
 
 class _Renderer(Protocol):
@@ -86,6 +90,77 @@ def _materialize_assistant_tool_calls(
     return normalized
 
 
+def _resolve_chat_template_kwargs(
+    request: ChatCompletionRequest,
+) -> dict[str, Any]:
+    resolver = getattr(request, "get_resolved_chat_template_kwargs", None)
+    if callable(resolver):
+        return dict(resolver())
+
+    kwargs = dict(request.chat_template_kwargs or {})
+    if "thinking" in kwargs and "enable_thinking" not in kwargs:
+        kwargs["enable_thinking"] = kwargs["thinking"]
+    if any(
+        key in kwargs
+        for key in ("enable_thinking", "thinking", "low_effort", "medium_effort")
+    ):
+        return kwargs
+
+    effort = request.reasoning_effort
+    if effort == "none":
+        kwargs.setdefault("enable_thinking", False)
+    elif effort in ("minimal", "low", "medium"):
+        kwargs.setdefault("enable_thinking", True)
+        kwargs.setdefault("low_effort", True)
+        kwargs.setdefault("medium_effort", True)
+    elif effort in ("high", "xhigh", "max"):
+        kwargs.setdefault("enable_thinking", True)
+
+    return kwargs
+
+
+def _has_user_structured_output_constraint(request: ChatCompletionRequest) -> bool:
+    structured_outputs = getattr(request, "structured_outputs", None)
+    if structured_outputs is None:
+        model_extra = getattr(request, "model_extra", None)
+        if isinstance(model_extra, dict):
+            structured_outputs = model_extra.get("structured_outputs")
+    if StreamingPostProcessor._structured_outputs_has_json(structured_outputs):
+        return True
+    if structured_outputs is not None:
+        if isinstance(structured_outputs, dict):
+            if any(
+                structured_outputs.get(key) is not None
+                for key in ("regex", "choice", "grammar", "structural_tag")
+            ):
+                return True
+        elif not structured_outputs.all_constraints_none():
+            return True
+
+    response_format = getattr(request, "response_format", None)
+    if response_format is None:
+        return False
+    response_type = (
+        response_format.get("type")
+        if isinstance(response_format, dict)
+        else getattr(response_format, "type", None)
+    )
+    return response_type in {"json_schema", "json_object", "structural_tag"}
+
+
+def _value_from_mapping_or_object(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _named_tool_choice_name(tool_choice: Any) -> str | None:
+    function = _value_from_mapping_or_object(tool_choice, "function")
+    if function is None:
+        return None
+    return _value_from_mapping_or_object(function, "name")
+
+
 def _prepare_request(
     request: dict[str, Any] | ChatCompletionRequest,
     *,
@@ -103,6 +178,13 @@ def _prepare_request(
         messages_for_render: Messages to pass as first arg to render_messages.
         chat_params: ChatParams for render_messages / render_messages_async.
     """
+    if (
+        isinstance(request, dict)
+        and "tool_choice" not in request
+        and request.get("tools")
+    ):
+        request = {**request, "tool_choice": "auto"}
+
     if isinstance(request, ChatCompletionRequest):
         request_for_sampling = request
     elif SKIP_REQUEST_VALIDATION:
@@ -120,10 +202,17 @@ def _prepare_request(
     # client did not supply an explicit `tools` list, so we activate the parser
     # whenever the tool_parser_class is available.
     has_tools = bool(request_for_sampling.tools)
-    if tool_parser_class and (has_tools or enable_auto_tool_choice):
-        if request_for_sampling.tool_choice != "none":
-            tool_parser = tool_parser_class(tokenizer, request_for_sampling.tools)
-            request_for_sampling = tool_parser.adjust_request(request_for_sampling)
+    has_structured_output = _has_user_structured_output_constraint(request_for_sampling)
+    tool_choice = request_for_sampling.tool_choice
+    should_parse_tools = (
+        tool_parser_class
+        and (has_tools or enable_auto_tool_choice)
+        and not has_structured_output
+        and tool_choice in (None, "auto")
+    )
+    if should_parse_tools:
+        tool_parser = tool_parser_class(tokenizer, request_for_sampling.tools)
+        request_for_sampling = tool_parser.adjust_request(request_for_sampling)
 
     # Strip tools from the template when tool_choice=none so the model doesn't
     # see them and generate raw XML tool calls in its response.
@@ -136,7 +225,7 @@ def _prepare_request(
         )
         else None
     )
-    chat_template_kwargs = dict(request_for_sampling.chat_template_kwargs or {})
+    chat_template_kwargs = _resolve_chat_template_kwargs(request_for_sampling)
     chat_template_kwargs["reasoning_effort"] = request_for_sampling.reasoning_effort
 
     # Mistral warns that tokenize=False is unsafe for chat templates.
@@ -253,9 +342,24 @@ class StreamingPostProcessor:
             if reasoning_parser_class and not thinking_disabled
             else None
         )
-        self._fast_plain_text = (
-            self.tool_parser is None and self.reasoning_parser is None
+        self._structured_json_guard = self._is_pure_structured_json_request()
+        self._structured_tool_call_name = self._structured_tool_call_name_from_request()
+        self._structured_required_tool_choice = (
+            self._structured_required_tool_choice_from_request()
         )
+        self._fast_plain_text = (
+            (
+                self.tool_parser is None
+                and self.reasoning_parser is None
+                and self._structured_tool_call_name is None
+                and not self._structured_required_tool_choice
+            )
+            or self._structured_json_guard
+        )
+        self._structured_json_buffer = ""
+        self._structured_json_emitted = False
+        self._structured_tool_json_buffer = ""
+        self._structured_tool_json_emitted = False
 
         self._control_markers = tuple(
             t for t in getattr(tokenizer, "all_special_tokens", ()) if t
@@ -275,6 +379,117 @@ class StreamingPostProcessor:
         # this correctly, so we accumulate text here and fall back to the
         # non-streaming extract_tool_calls() once the buffer is complete.
         self._tool_text_buffer: str | None = None
+        # Full text seen after reasoning ends. This lets the final chunk fall
+        # back to non-streaming extraction if the streaming parser missed a
+        # complete tool call split across many small chunks.
+        self._post_reasoning_text_buffer = ""
+        # Parser-only decoded token stream after reasoning. Some models emit
+        # tool-call markers as token IDs while the visible text delta is empty;
+        # keep those markers available to the fallback tool parser without
+        # changing client-visible content deltas.
+        self._post_reasoning_raw_text_buffer = ""
+        # Parser-only capture for tool calls that start before the reasoning
+        # parser declares </think>. This keeps force_nonempty_content from
+        # hiding a valid tool call inside replayed reasoning text.
+        self._raw_tool_text_buffer = ""
+        self._raw_tool_capture_started = False
+        self._tool_marker_ids = self._tool_marker_token_ids()
+
+    def _is_pure_structured_json_request(self) -> bool:
+        if getattr(self.request_for_sampling, "tools", None):
+            return False
+        structured_outputs = getattr(self.sampling_params, "structured_outputs", None)
+        if self._structured_outputs_has_json(structured_outputs):
+            return True
+        request_structured_outputs = getattr(
+            self.request_for_sampling, "structured_outputs", None
+        )
+        if request_structured_outputs is None:
+            model_extra = getattr(self.request_for_sampling, "model_extra", None)
+            if isinstance(model_extra, dict):
+                request_structured_outputs = model_extra.get("structured_outputs")
+        if self._structured_outputs_has_json(request_structured_outputs):
+            return True
+        response_format = getattr(self.request_for_sampling, "response_format", None)
+        if response_format is None:
+            return False
+        if isinstance(response_format, dict):
+            response_type = response_format.get("type")
+        else:
+            response_type = getattr(response_format, "type", None)
+        return response_type in {"json_schema", "json_object"}
+
+    def _structured_tool_call_name_from_request(self) -> str | None:
+        if (
+            not getattr(self.request_for_sampling, "tools", None)
+            or _has_user_structured_output_constraint(self.request_for_sampling)
+            or getattr(self.request_for_sampling, "tool_choice", None) == "required"
+        ):
+            return None
+
+        return _named_tool_choice_name(
+            getattr(self.request_for_sampling, "tool_choice", None)
+        )
+
+    def _structured_required_tool_choice_from_request(self) -> bool:
+        if (
+            not getattr(self.request_for_sampling, "tools", None)
+            or _has_user_structured_output_constraint(self.request_for_sampling)
+            or getattr(self.request_for_sampling, "tool_choice", None) != "required"
+        ):
+            return False
+
+        return True
+
+    @staticmethod
+    def _structured_outputs_has_json(structured_outputs: Any) -> bool:
+        if structured_outputs is None:
+            return False
+        if isinstance(structured_outputs, dict):
+            return (
+                structured_outputs.get("json") is not None
+                or structured_outputs.get("json_object") is not None
+            )
+        return (
+            getattr(structured_outputs, "json", None) is not None
+            or getattr(structured_outputs, "json_object", None) is not None
+        )
+
+    @property
+    def structured_json_complete(self) -> bool:
+        return self._structured_json_guard and self._structured_json_emitted
+
+    @property
+    def structured_tool_complete(self) -> bool:
+        return self._structured_tool_json_emitted
+
+    def _structured_json_delta(self, delta_text: str) -> str | None:
+        if self._structured_json_emitted:
+            return None
+        self._structured_json_buffer += delta_text
+        candidate = self._structured_json_buffer.lstrip()
+        if not candidate:
+            return None
+        try:
+            _, end = json.JSONDecoder().raw_decode(candidate)
+        except json.JSONDecodeError:
+            return None
+        self._structured_json_emitted = True
+        return candidate[:end]
+
+    def _structured_tool_json_delta(self, delta_text: str) -> str | None:
+        if self._structured_tool_json_emitted:
+            return None
+        self._structured_tool_json_buffer += delta_text
+        candidate = self._structured_tool_json_buffer.lstrip()
+        if not candidate:
+            return None
+        try:
+            _, end = json.JSONDecoder().raw_decode(candidate)
+        except json.JSONDecodeError:
+            return None
+        self._structured_tool_json_emitted = True
+        return candidate[:end]
 
     def _should_buffer_for_non_streaming_tool_parse(self) -> bool:
         return (
@@ -321,6 +536,130 @@ class StreamingPostProcessor:
         return (
             self.tool_parser is not None
             and self.request_for_sampling.tool_choice != "none"
+            and self._structured_tool_call_name is None
+            and not self._structured_required_tool_choice
+        )
+
+    def _decode_token_ids_for_parser(self, token_ids: Sequence[int]) -> str:
+        if not token_ids:
+            return ""
+        try:
+            return self.tokenizer.decode(
+                list(token_ids),
+                skip_special_tokens=False,
+            )
+        except TypeError:
+            return self.tokenizer.decode(list(token_ids))
+        except Exception:
+            try:
+                tokens = self.tokenizer.convert_ids_to_tokens(list(token_ids))
+                return self.tokenizer.convert_tokens_to_string(tokens)
+            except Exception:
+                return ""
+
+    def _buffer_tool_calls_until_finish(self) -> bool:
+        if self.tool_parser is None:
+            return False
+        tool_call_start = getattr(self.tool_parser, "tool_call_start_token", None)
+        tool_call_end = getattr(self.tool_parser, "tool_call_end_token", None)
+        return tool_call_start == "<tool_call>" and tool_call_end == "</tool_call>"
+
+    def _raw_post_reasoning_text(
+        self, current_token_ids: Sequence[int], raw_delta_text: str
+    ) -> str:
+        if not self.reasoning_parser:
+            return raw_delta_text
+        end_token = getattr(self.reasoning_parser, "end_token", None)
+        if not end_token:
+            return raw_delta_text
+        raw_current_text = self._decode_token_ids_for_parser(current_token_ids)
+        if end_token in raw_current_text:
+            return raw_current_text.rpartition(end_token)[2]
+        return raw_delta_text
+
+    def _tool_marker_token_ids(self) -> set[int]:
+        marker_ids: set[int] = set()
+        if self.tool_parser:
+            for attr in ("tool_call_start_token_id", "tool_call_end_token_id"):
+                token_id = getattr(self.tool_parser, attr, None)
+                if isinstance(token_id, int):
+                    marker_ids.add(token_id)
+        if self.reasoning_parser:
+            token_id = getattr(self.reasoning_parser, "end_token_id", None)
+            if isinstance(token_id, int):
+                marker_ids.add(token_id)
+        return marker_ids
+
+    def _maybe_capture_raw_tool_text(
+        self,
+        *,
+        delta_text: str,
+        raw_delta_token_ids: list[int],
+        get_raw_delta_text: Any,
+    ) -> None:
+        if not self._should_parse_tools():
+            return
+
+        tool_call_start = getattr(self.tool_parser, "tool_call_start_token", None)
+        saw_marker_id = bool(
+            self._tool_marker_ids
+            and self._tool_marker_ids.intersection(raw_delta_token_ids)
+        )
+        saw_start_text = bool(tool_call_start and tool_call_start in delta_text)
+        if saw_marker_id:
+            self._debug_handoff(
+                "raw_tool_marker_seen",
+                raw_tail=raw_delta_token_ids[-32:],
+                marker_ids=sorted(self._tool_marker_ids),
+                capture_started=self._raw_tool_capture_started,
+                delta_len=len(delta_text),
+                delta_tail=delta_text[-240:],
+            )
+        if (
+            not self._raw_tool_capture_started
+            and not saw_marker_id
+            and not saw_start_text
+        ):
+            return
+
+        raw_delta_text = get_raw_delta_text() or delta_text
+        if not raw_delta_text:
+            return
+
+        if self._raw_tool_capture_started:
+            self._raw_tool_text_buffer += raw_delta_text
+            self._debug_handoff(
+                "raw_tool_capture_append",
+                raw_text_tail=raw_delta_text[-240:],
+                buffer_len=len(self._raw_tool_text_buffer),
+                buffer_tail=self._raw_tool_text_buffer[-240:],
+            )
+            return
+
+        if tool_call_start and tool_call_start in raw_delta_text:
+            self._raw_tool_capture_started = True
+            self._raw_tool_text_buffer += raw_delta_text[
+                raw_delta_text.index(tool_call_start) :
+            ]
+            self._debug_handoff(
+                "raw_tool_capture_start",
+                raw_text_tail=raw_delta_text[-240:],
+                buffer_len=len(self._raw_tool_text_buffer),
+                buffer_tail=self._raw_tool_text_buffer[-240:],
+            )
+
+    def _debug_handoff(self, message: str, **kwargs: Any) -> None:
+        if os.environ.get("DYN_DEBUG_REASONING_BUDGET") != "1":
+            return
+        logger.warning("tool handoff debug: %s %s", message, kwargs)
+
+    def needs_raw_parser_delta(self, raw_delta_token_ids: Sequence[int]) -> bool:
+        return (
+            bool(self._raw_tool_capture_started or self._tool_text_buffer is not None)
+            or bool(
+                self._tool_marker_ids
+                and self._tool_marker_ids.intersection(raw_delta_token_ids)
+            )
         )
 
     @staticmethod
@@ -352,6 +691,16 @@ class StreamingPostProcessor:
             return self._compose_delta_message(saved_reasoning, None)
 
         extracted = self.tool_parser.extract_tool_calls(text, self.request_for_sampling)
+        self._debug_handoff(
+            "extract_tool_calls",
+            text_len=len(text),
+            text_head=text[:120],
+            text_tail=text[-240:],
+            tools_called=extracted.tools_called,
+            tool_calls=len(extracted.tool_calls),
+            content_len=len(extracted.content or ""),
+            tool_choice=str(self.request_for_sampling.tool_choice),
+        )
         if extracted.tools_called:
             for i, tool_call in enumerate(extracted.tool_calls):
                 self._add_tool_call_from_extracted(i, tool_call)
@@ -381,6 +730,54 @@ class StreamingPostProcessor:
             request=self.request_for_sampling,
         )
 
+    def _extract_buffered_post_reasoning_tool_calls(
+        self, output: Any
+    ) -> DeltaMessage | None:
+        if (
+            not self._should_parse_tools()
+            or output.index in self._tool_call_choices_emitted
+            or self.in_progress_tool_calls
+        ):
+            return None
+
+        tool_call_start = getattr(self.tool_parser, "tool_call_start_token", None)
+        tool_call_end = getattr(self.tool_parser, "tool_call_end_token", None)
+        if not tool_call_start or not tool_call_end:
+            return None
+
+        buffered_text = ""
+        for candidate in (
+            self._raw_tool_text_buffer,
+            self._post_reasoning_raw_text_buffer,
+            self._post_reasoning_text_buffer,
+        ):
+            if (
+                candidate
+                and tool_call_start in candidate
+                and tool_call_end in candidate
+            ):
+                buffered_text = candidate
+                break
+
+        self._debug_handoff(
+            "buffered_tool_fallback",
+            finish_reason=str(output.finish_reason),
+            raw_buffer_len=len(self._raw_tool_text_buffer),
+            post_raw_len=len(self._post_reasoning_raw_text_buffer),
+            post_text_len=len(self._post_reasoning_text_buffer),
+            selected_len=len(buffered_text),
+            raw_buffer_tail=self._raw_tool_text_buffer[-240:],
+        )
+
+        if not buffered_text:
+            return None
+
+        self._raw_tool_text_buffer = ""
+        self._raw_tool_capture_started = False
+        self._post_reasoning_text_buffer = ""
+        self._post_reasoning_raw_text_buffer = ""
+        return self._extract_tool_calls_from_text(buffered_text)
+
     def _merge_streaming_tool_calls(self, tool_calls: list[DeltaToolCall]) -> None:
         for tool_delta in tool_calls:
             existing = self.in_progress_tool_calls.get(tool_delta.index)
@@ -402,34 +799,105 @@ class StreamingPostProcessor:
         # choice. Per-choice tracking is required for `n > 1` requests —
         # choice 0 emitting tool_calls must not remap choice 1's stop.
         # Spec: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
-        if finish_reason == "stop" and output_index in self._tool_call_choices_emitted:
+        if (
+            finish_reason in {"stop", "length"}
+            and output_index in self._tool_call_choices_emitted
+        ):
             return "tool_calls"
         return finish_reason
 
-    def _emit_tool_calls_choice(self, output: Any) -> dict[str, Any]:
+    def _emit_tool_calls_choice(
+        self,
+        output: Any,
+        *,
+        reasoning: str | None = None,
+        finish_reason: str | None = None,
+    ) -> dict[str, Any]:
         self._tool_call_choices_emitted.add(output.index)
+        delta: dict[str, Any] = {
+            "role": "assistant",
+            "tool_calls": self._dump_in_progress_tool_calls(),
+        }
+        if reasoning:
+            delta["reasoning_content"] = reasoning
         choice = {
             "index": output.index,
-            "delta": {
-                "role": "assistant",
-                "tool_calls": self._dump_in_progress_tool_calls(),
-            },
-            "finish_reason": self._remap_finish_reason(
-                output.index, output.finish_reason
-            ),
+            "delta": delta,
+            "finish_reason": finish_reason
+            or self._remap_finish_reason(output.index, output.finish_reason),
             "logprobs": output.logprobs,
         }
         self.in_progress_tool_calls.clear()
         return choice
 
+    def _maybe_emit_structured_tool_call(
+        self,
+        output: Any,
+        delta_message: DeltaMessage | None,
+    ) -> tuple[DeltaMessage | None, dict[str, Any] | None]:
+        if (
+            self._structured_tool_call_name is None
+            and not self._structured_required_tool_choice
+        ) or delta_message is None:
+            return delta_message, None
+
+        content = delta_message.content or ""
+        if not content:
+            return delta_message, None
+
+        arguments = self._structured_tool_json_delta(content)
+        if arguments is None:
+            return self._compose_delta_message(delta_message.reasoning, None), None
+
+        if self._structured_tool_call_name is not None:
+            self.in_progress_tool_calls[output.index] = DeltaToolCall(
+                index=output.index,
+                type="function",
+                id=make_tool_call_id(),
+                function=DeltaFunctionCall(
+                    name=self._structured_tool_call_name,
+                    arguments=arguments,
+                ),
+            )
+        else:
+            try:
+                decoded = json.loads(arguments)
+            except json.JSONDecodeError:
+                return self._compose_delta_message(delta_message.reasoning, None), None
+            calls = decoded if isinstance(decoded, list) else [decoded]
+            for index, item in enumerate(calls):
+                name = _value_from_mapping_or_object(item, "name")
+                parameters = _value_from_mapping_or_object(item, "parameters", {})
+                if not isinstance(name, str):
+                    continue
+                if not isinstance(parameters, str):
+                    parameters = json.dumps(parameters, ensure_ascii=False)
+                self.in_progress_tool_calls[index] = DeltaToolCall(
+                    index=index,
+                    type="function",
+                    id=make_tool_call_id(),
+                    function=DeltaFunctionCall(name=name, arguments=parameters),
+                )
+            if not self.in_progress_tool_calls:
+                return self._compose_delta_message(delta_message.reasoning, None), None
+
+        return None, self._emit_tool_calls_choice(
+            output,
+            reasoning=delta_message.reasoning,
+            finish_reason="tool_calls",
+        )
+
     def _build_choice(self, output: Any, delta: dict[str, Any]) -> dict[str, Any]:
         if delta.get("tool_calls"):
             self._tool_call_choices_emitted.add(output.index)
+        finish_reason = output.finish_reason
+        if self.structured_json_complete and finish_reason is None:
+            finish_reason = "stop"
         return {
             "index": output.index,
             "delta": delta,
             "finish_reason": self._remap_finish_reason(
-                output.index, output.finish_reason
+                output.index, finish_reason
             ),
             "logprobs": output.logprobs,
         }
@@ -481,15 +949,31 @@ class StreamingPostProcessor:
             return self._process_non_streaming_tool_output(output)
 
         delta_token_ids = list(output.token_ids or [])
+        raw_delta_token_ids = list(raw_delta_token_ids or delta_token_ids)
         # vLLM output_processor already applies stop-token/stop-string trimming
         # to text. Re-detokenizing from token_ids can reintroduce stop markers.
         delta_text = output.text or ""
+        raw_delta_text: str | None = None
+
+        def get_raw_delta_text() -> str:
+            nonlocal raw_delta_text
+            if raw_delta_text is None:
+                raw_delta_text = (
+                    self._decode_token_ids_for_parser(raw_delta_token_ids)
+                    if self._should_parse_tools()
+                    else ""
+                )
+            return raw_delta_text
+
         delta: dict[str, Any] = {}
         if self._fast_plain_text:
-            if delta_text:
+            content = delta_text
+            if self._structured_json_guard:
+                content = self._structured_json_delta(delta_text)
+            if content:
                 delta = {
                     "role": "assistant",
-                    "content": delta_text,
+                    "content": content,
                 }
             elif output.finish_reason:
                 delta = {}
@@ -499,6 +983,19 @@ class StreamingPostProcessor:
 
         current_text = self.previous_text + delta_text
         current_token_ids = self.previous_token_ids + delta_token_ids
+
+        self._maybe_capture_raw_tool_text(
+            delta_text=delta_text,
+            raw_delta_token_ids=raw_delta_token_ids,
+            get_raw_delta_text=get_raw_delta_text,
+        )
+
+        if output.index in self._tool_call_choices_emitted:
+            self.previous_text = current_text
+            self.previous_token_ids = current_token_ids
+            if output.finish_reason:
+                return self._build_choice(output, {})
+            return None
 
         delta_message: DeltaMessage | None = DeltaMessage(content=delta_text)
 
@@ -512,7 +1009,9 @@ class StreamingPostProcessor:
             self._tool_text_buffer += delta_text
             tool_call_end = getattr(self.tool_parser, "tool_call_end_token", None)
             buffer_complete = (
-                tool_call_end and tool_call_end in self._tool_text_buffer
+                tool_call_end
+                and tool_call_end in self._tool_text_buffer
+                and not self._buffer_tool_calls_until_finish()
             ) or output.finish_reason
             if buffer_complete:
                 buffered_text = self._tool_text_buffer
@@ -545,6 +1044,14 @@ class StreamingPostProcessor:
                 self.reasoning_is_done = True
                 saved_reasoning = delta_message.reasoning if delta_message else None
                 post_content = (delta_message.content if delta_message else None) or ""
+                raw_post_content = (
+                    self._raw_post_reasoning_text(
+                        current_token_ids,
+                        get_raw_delta_text(),
+                    )
+                    if self._should_parse_tools()
+                    else ""
+                )
 
                 self.previous_text = ""
                 self.previous_token_ids = []
@@ -554,11 +1061,22 @@ class StreamingPostProcessor:
                 tool_call_start = getattr(
                     self.tool_parser, "tool_call_start_token", None
                 )
-                if post_content and tool_call_start and tool_call_start in post_content:
+                tool_post_content = (
+                    raw_post_content
+                    if raw_post_content
+                    and tool_call_start
+                    and tool_call_start in raw_post_content
+                    else post_content
+                )
+                if (
+                    tool_post_content
+                    and tool_call_start
+                    and tool_call_start in tool_post_content
+                ):
                     # Tool call markup present — buffer for non-streaming
                     # extraction (streaming parser can't handle the combined
                     # reasoning-end + tool-start in a single chunk).
-                    self._tool_text_buffer = post_content
+                    self._tool_text_buffer = tool_post_content
                     if output.finish_reason:
                         # If finish_reason is already set, this is the final
                         # chunk; parse buffered text now instead of waiting for
@@ -575,6 +1093,24 @@ class StreamingPostProcessor:
                             None,
                         )
                 else:
+                    if post_content and self._should_parse_tools():
+                        self._post_reasoning_text_buffer += post_content
+                    if raw_post_content and self._should_parse_tools():
+                        self._post_reasoning_raw_text_buffer += raw_post_content
+                    self._debug_handoff(
+                        "reasoning_end_plain_content",
+                        post_len=len(post_content),
+                        post_head=post_content[:120],
+                        post_tail=post_content[-240:],
+                        raw_post_len=len(raw_post_content),
+                        raw_post_head=raw_post_content[:120],
+                        raw_post_tail=raw_post_content[-240:],
+                        tool_start=tool_call_start,
+                        finish_reason=str(output.finish_reason),
+                        delta_len=len(delta_text),
+                        delta_tail=delta_text[-240:],
+                        delta_token_tail=delta_token_ids[-32:],
+                    )
                     # Plain content (or no content) after reasoning end.
                     delta_message = self._compose_delta_message(
                         reasoning=saved_reasoning,
@@ -598,6 +1134,35 @@ class StreamingPostProcessor:
                 )
         else:
             if self._should_parse_tools():
+                tool_call_start = getattr(
+                    self.tool_parser, "tool_call_start_token", None
+                )
+                if (
+                    self._buffer_tool_calls_until_finish()
+                    and self._tool_text_buffer is None
+                    and tool_call_start
+                    and tool_call_start in delta_text
+                ):
+                    self._tool_text_buffer = delta_text[
+                        delta_text.index(tool_call_start) :
+                    ]
+                    if output.finish_reason:
+                        buffered_text = self._tool_text_buffer
+                        self._tool_text_buffer = None
+                        delta_message = self._extract_tool_calls_from_text(
+                            buffered_text
+                        )
+                    else:
+                        self.previous_text = current_text
+                        self.previous_token_ids = current_token_ids
+                        return None
+
+                if self.reasoning_is_done and delta_text:
+                    self._post_reasoning_text_buffer += delta_text
+                if self.reasoning_is_done:
+                    raw_after_reasoning = get_raw_delta_text()
+                    if raw_after_reasoning:
+                        self._post_reasoning_raw_text_buffer += raw_after_reasoning
                 no_prev_reasoning = (
                     delta_message
                     and delta_message.content
@@ -610,6 +1175,27 @@ class StreamingPostProcessor:
                         current_token_ids=current_token_ids,
                         delta_token_ids=delta_token_ids,
                     )
+                    had_tool_calls = bool(self.in_progress_tool_calls)
+                    fallback_message = (
+                        self._extract_buffered_post_reasoning_tool_calls(output)
+                    )
+                    if fallback_message is not None or (
+                        not had_tool_calls and self.in_progress_tool_calls
+                    ):
+                        delta_message = fallback_message
+
+        if self._should_parse_tools() and not self.in_progress_tool_calls:
+            fallback_message = self._extract_buffered_post_reasoning_tool_calls(output)
+            if fallback_message is not None or self.in_progress_tool_calls:
+                delta_message = fallback_message
+
+        delta_message, structured_tool_choice = self._maybe_emit_structured_tool_call(
+            output, delta_message
+        )
+        if structured_tool_choice is not None:
+            self.previous_text = current_text
+            self.previous_token_ids = current_token_ids
+            return structured_tool_choice
 
         choice = None
         if delta_message is None:

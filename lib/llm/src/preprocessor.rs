@@ -883,10 +883,17 @@ impl OpenAIPreprocessor {
             .with_label_values(&[STAGE_PREPROCESS])
             .observe(preprocess_start.elapsed().as_secs_f64());
 
+        let mut common_request = builder.build()?;
+        self.attach_reasoning_engine_extra_args(
+            &mut common_request,
+            request,
+            prompt_injected_reasoning,
+        );
+
         if let Some(nvext) = request.nvext()
             && let Some(router_params) = &nvext.router
         {
-            builder.router(Some(router_params.clone()));
+            common_request.router = Some(router_params.clone());
         }
 
         let mut preprocessed = builder.build()?;
@@ -2301,7 +2308,7 @@ impl OpenAIPreprocessor {
                     );
 
                     // Check if this response has a finish_reason
-                    let has_finish_reason = response
+                    let mut has_finish_reason = response
                         .data
                         .as_ref()
                         .map(|d| d.finish_reason.is_some())
@@ -2342,6 +2349,14 @@ impl OpenAIPreprocessor {
                             })
                             .map_err(|e| e.to_string())
                     });
+
+                    if inner.response_generator.should_terminate_stream() {
+                        has_finish_reason = true;
+                        inner.context.stop_generating();
+                        if !inner.response_generator.is_usage_enabled() {
+                            inner.finished = true;
+                        }
+                    }
 
                     // Create LLM metrics annotation with prefill/decode worker info from tracker.
                     // Worker types are stored at routing time to avoid expensive MDC lookup.
@@ -2925,6 +2940,68 @@ impl OpenAIPreprocessor {
         }
     }
 
+    fn attach_reasoning_engine_extra_args<R: OAIChatLikeRequest>(
+        &self,
+        common_request: &mut PreprocessedRequest,
+        request: &R,
+        prompt_injected_reasoning: bool,
+    ) {
+        let Some(reasoning_parser) = self.runtime_config.reasoning_parser.as_deref() else {
+            return;
+        };
+
+        let chat_template_args = request.chat_template_args();
+        let mut updates = serde_json::Map::new();
+
+        if Self::is_reasoning_disabled_by_request(Some(reasoning_parser), chat_template_args) {
+            updates.insert("reasoning_ended".to_string(), serde_json::Value::Bool(true));
+        } else if prompt_injected_reasoning {
+            updates.insert(
+                "reasoning_ended".to_string(),
+                serde_json::Value::Bool(false),
+            );
+        }
+
+        let chat_template_kwargs = chat_template_args
+            .map(|args| serde_json::to_value(args).unwrap_or_else(|_| serde_json::json!({})))
+            .unwrap_or_else(|| serde_json::json!({}));
+        updates.insert(
+            "reasoning_parser_kwargs".to_string(),
+            serde_json::json!({
+                "chat_template_kwargs": chat_template_kwargs,
+            }),
+        );
+
+        Self::merge_extra_args(common_request, updates);
+    }
+
+    fn merge_extra_args(
+        common_request: &mut PreprocessedRequest,
+        updates: serde_json::Map<String, serde_json::Value>,
+    ) {
+        if updates.is_empty() {
+            return;
+        }
+
+        let mut extra_args = match common_request.extra_args.take() {
+            Some(serde_json::Value::Object(map)) => map,
+            Some(other) => {
+                tracing::debug!(
+                    extra_args = ?other,
+                    "replacing non-object PreprocessedRequest.extra_args while attaching reasoning metadata"
+                );
+                serde_json::Map::new()
+            }
+            None => serde_json::Map::new(),
+        };
+
+        for (key, value) in updates {
+            extra_args.entry(key).or_insert(value);
+        }
+
+        common_request.extra_args = Some(serde_json::Value::Object(extra_args));
+    }
+
     // Motivation: Each transformation on the stream should be a separate step to allow for more flexibility
     // Earlier reasoning parser logic was nested under delta generation logic in choice_from_postprocessor
     // Since we have tool calling parsing as separate step, it makes sense to have reasoning parser as separate step as well
@@ -3015,6 +3092,21 @@ impl OpenAIPreprocessor {
                     response.map_data(|mut data| {
                         // Process all choices, not just the first one
                         for choice in data.inner.choices.iter_mut() {
+                            let choice_state = state.choices.entry(choice.index).or_default();
+                            if choice
+                                .delta
+                                .tool_calls
+                                .as_ref()
+                                .is_some_and(|tool_calls| !tool_calls.is_empty())
+                            {
+                                choice_state.emitted_tool_calls = true;
+                            }
+                            if let Some(reasoning_content) = &choice.delta.reasoning_content
+                                && !reasoning_content.is_empty()
+                            {
+                                choice_state.reasoning_content.push_str(reasoning_content);
+                            }
+
                             // Reasoning parsing only applies to text content
                             if let Some(ChatCompletionMessageContent::Text(text)) =
                                 choice.delta.content.as_ref()
@@ -3029,9 +3121,23 @@ impl OpenAIPreprocessor {
                                 choice.delta.reasoning_content = parser_result.get_some_reasoning();
                             }
                             // For multimodal content, pass through unchanged
+
+                            if choice.finish_reason.is_some()
+                                && !choice_state.emitted_content
+                                && !choice_state.emitted_tool_calls
+                                && !choice_state.reasoning_content.is_empty()
+                            {
+                                choice.delta.content = Some(
+                                    dynamo_protocols::types::ChatCompletionMessageContent::Text(
+                                        choice_state.reasoning_content.clone(),
+                                    ),
+                                );
+                                choice_state.emitted_content = true;
+                            }
                         }
-                        Ok(data)
-                    })
+                        response.data = Some(data);
+                    }
+                    response
                 } else {
                     // No reasoning parser configured, pass through unchanged
                     response
@@ -3219,11 +3325,16 @@ impl
         let request_id = context.id().to_string();
         let original_stream_flag = request.inner.stream.unwrap_or(false);
 
-        // Build audit handle (None if no DYN_AUDIT_SINKS)
-        let mut audit_handle = crate::audit::handle::create_handle(&request, &request_id);
+        // Build audit handle (None if no DYN_AUDIT_SINKS). Request payloads are
+        // emitted immediately to the audit bus; sink workers do serialization
+        // and export off the generation path.
+        let audit_handle = crate::audit::handle::create_handle(&request, &request_id);
 
-        if let Some(ref mut h) = audit_handle {
-            h.set_request(std::sync::Arc::new(request.clone()));
+        if let Some(ref h) = audit_handle {
+            let headers = context.get::<serde_json::Value>("http_headers").ok();
+            let raw_request = context.get::<serde_json::Value>("http_raw_payload").ok();
+            let typed_request = raw_request.is_none().then(|| Arc::new(request.clone()));
+            h.emit_request(typed_request, raw_request, headers);
         }
 
         // For non-streaming requests (stream=false), enable usage by default
@@ -3313,29 +3424,7 @@ impl
             uses_tool_call_structural_tag,
         )?;
 
-        // Apply audit aggregation strategy.
-        // The audit branch already returns Pin<Box<...>> from scan/fold_aggregate_with_future,
-        // while the non-audit branch boxes the impl Stream from postprocessor_parsing_stream.
-        let final_stream = if let Some(mut audit) = audit_handle {
-            let (stream, agg_fut) = if audit.streaming() {
-                // Streaming: apply scan (pass-through + parallel aggregation)
-                crate::audit::stream::scan_aggregate_with_future(transformed_stream)
-            } else {
-                // Non-streaming: apply fold (collect all, then emit single chunk)
-                crate::audit::stream::fold_aggregate_with_future(transformed_stream)
-            };
-
-            // Spawn audit task
-            tokio::spawn(async move {
-                let final_resp = agg_fut.await;
-                audit.set_response(Arc::new(final_resp));
-                audit.emit();
-            });
-
-            stream
-        } else {
-            Box::pin(transformed_stream)
-        };
+        let final_stream = Box::pin(transformed_stream);
 
         // Step 5: Speculative next-turn prefill
         let final_stream = speculative_prefill::maybe_wrap_stream(
@@ -4610,8 +4699,8 @@ mod tests {
             (
                 Some("nemotron3"),
                 Some(&force_nonempty_content_true),
-                true,
-                "nemotron3 + force_nonempty_content=true → disabled",
+                false,
+                "nemotron3 + force_nonempty_content=true → parser stays enabled",
             ),
             (
                 Some("nemotron_v3"),
@@ -4622,8 +4711,8 @@ mod tests {
             (
                 Some("nemotron_v3"),
                 Some(&force_nonempty_content_true),
-                true,
-                "nemotron_v3 + force_nonempty_content=true → disabled",
+                false,
+                "nemotron_v3 + force_nonempty_content=true → parser stays enabled",
             ),
             // deepseek_v4 — same convention as deepseek_r1; verify all three aliases
             // (deepseek_v4 / deepseek-v4 / deepseekv4) plus both signal keys.

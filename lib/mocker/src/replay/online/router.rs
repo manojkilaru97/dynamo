@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use dynamo_kv_router::ConcurrentRadixTree;

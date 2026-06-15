@@ -282,6 +282,10 @@ impl dynamo_kv_router::WorkerConfigLike for ModelRuntimeConfig {
         self.data_parallel_size
     }
 
+    fn max_num_seqs(&self) -> Option<u64> {
+        self.max_num_seqs
+    }
+
     fn max_num_batched_tokens(&self) -> Option<u64> {
         self.max_num_batched_tokens
     }

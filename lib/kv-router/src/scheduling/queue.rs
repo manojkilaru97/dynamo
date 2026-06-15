@@ -263,6 +263,8 @@ impl<
         slots: Arc<ActiveSequencesMultiWorker<P>>,
         workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
         threshold_frac: Option<f64>,
+        max_pending_per_worker: Option<usize>,
+        max_queue_wait: Option<Duration>,
         block_size: u32,
         selector: Sel,
         queue_policy: RouterQueuePolicy,
@@ -805,6 +807,7 @@ impl<
         decay_now: Instant,
     ) -> bool {
         let active_tokens = self.slots.active_tokens(decay_now);
+        let active_requests = self.slots.active_requests();
         let configs = self.workers_with_configs.borrow();
         Self::all_workers_prefill_busy_with(&active_tokens, &configs, class, eligibility)
     }
@@ -860,6 +863,103 @@ impl<
         counters
             .pending_cached_tokens
             .fetch_sub(snapshot.cached_tokens, AtomicOrdering::Relaxed);
+    }
+
+    fn worker_is_saturated(
+        &self,
+        worker: WorkerWithDpRank,
+        config: &C,
+        threshold: f64,
+        active_tokens: &HashMap<WorkerWithDpRank, usize>,
+        active_requests: &HashMap<WorkerWithDpRank, usize>,
+    ) -> bool {
+        if let Some(max_num_seqs) = config.max_num_seqs() {
+            let requests = active_requests.get(&worker).copied().unwrap_or(0);
+            if (requests as u64) >= max_num_seqs {
+                return true;
+            }
+        }
+
+        let max_batched = config
+            .max_num_batched_tokens()
+            .unwrap_or(DEFAULT_MAX_BATCHED_TOKENS);
+        let tokens = active_tokens.get(&worker).copied().unwrap_or(0);
+        (tokens as f64) > threshold * (max_batched as f64)
+    }
+
+    fn current_pending_limit(
+        &self,
+        allowed: Option<&HashSet<WorkerId>>,
+        pinned_worker: Option<WorkerWithDpRank>,
+    ) -> Option<usize> {
+        let per_worker_limit = self.max_pending_per_worker?;
+        let configs = self.workers_with_configs.borrow();
+
+        if let Some(worker) = pinned_worker {
+            return pinned_worker_config::<C>(&*configs, worker)
+                .ok()
+                .map(|_| per_worker_limit);
+        }
+
+        let eligible_ranks: usize = configs
+            .iter()
+            .filter(|(worker_id, _)| allowed.is_none_or(|ids| ids.contains(worker_id)))
+            .map(|(_, config)| config.data_parallel_size() as usize)
+            .sum();
+
+        Some(per_worker_limit.saturating_mul(eligible_ranks.max(1)))
+    }
+
+    fn is_expired(&self, entry: &QueueEntry<S::Key>) -> bool {
+        let Some(limit) = self.max_queue_wait else {
+            return false;
+        };
+        entry.enqueued_at.elapsed() >= limit
+    }
+
+    fn expired_request(&self, entry: QueueEntry<S::Key>) -> (SchedulingRequest, u64, u64) {
+        let waited_ms = entry.enqueued_at.elapsed().as_millis() as u64;
+        let limit_ms = self
+            .max_queue_wait
+            .map(|limit| limit.as_millis() as u64)
+            .unwrap_or_default();
+        (entry.request, waited_ms, limit_ms)
+    }
+
+    fn refresh_pending_locked(
+        &self,
+        heap: &mut BinaryHeap<QueueEntry<S::Key>>,
+    ) -> Vec<(SchedulingRequest, u64, u64)> {
+        if self.max_queue_wait.is_none() {
+            return Vec::new();
+        }
+
+        let pending = std::mem::take(heap).into_vec();
+        let mut fresh = Vec::with_capacity(pending.len());
+        let mut expired = Vec::new();
+        for entry in pending {
+            if self.is_expired(&entry) {
+                self.pending_isl_tokens
+                    .fetch_sub(entry.request.isl_tokens, AtomicOrdering::Relaxed);
+                expired.push(self.expired_request(entry));
+            } else {
+                fresh.push(entry);
+            }
+        }
+
+        *heap = BinaryHeap::from(fresh);
+        self.pending_count
+            .store(heap.len(), AtomicOrdering::Relaxed);
+        expired
+    }
+
+    fn fail_expired(&self, expired: Vec<(SchedulingRequest, u64, u64)>) {
+        for (mut request, waited_ms, limit_ms) in expired {
+            request.respond(Err(KvSchedulerError::QueueWaitTimeout {
+                waited_ms,
+                limit_ms,
+            }));
+        }
     }
 }
 
@@ -1055,6 +1155,8 @@ mod tests {
             Arc::clone(&slots),
             cfg_rx,
             threshold_frac,
+            None,
+            None,
             block_size,
             selector,
             RouterQueuePolicy::Fcfs,
@@ -1070,6 +1172,31 @@ mod tests {
         block_size: u32,
         isl: usize,
         threshold_frac: Option<f64>,
+        prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
+    ) -> (
+        Arc<SchedulerQueue<NoopSequencePublisher, SimpleWorkerConfig>>,
+        Arc<ActiveSequencesMultiWorker<NoopSequencePublisher>>,
+        watch::Sender<HashMap<u64, SimpleWorkerConfig>>,
+    ) {
+        make_queue_with_sender_and_limits(
+            num_workers,
+            block_size,
+            isl,
+            threshold_frac,
+            None,
+            None,
+            prefill_load_estimator,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn make_queue_with_sender_and_limits(
+        num_workers: usize,
+        block_size: u32,
+        isl: usize,
+        threshold_frac: Option<f64>,
+        max_pending_per_worker: Option<usize>,
+        max_queue_wait: Option<Duration>,
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
     ) -> (
         Arc<SchedulerQueue<NoopSequencePublisher, SimpleWorkerConfig>>,
@@ -1104,6 +1231,8 @@ mod tests {
             Arc::clone(&slots),
             cfg_rx,
             threshold_frac,
+            max_pending_per_worker,
+            max_queue_wait,
             block_size,
             selector,
             RouterQueuePolicy::Fcfs,

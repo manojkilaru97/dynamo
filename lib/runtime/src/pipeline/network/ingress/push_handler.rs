@@ -30,6 +30,30 @@ pub struct WorkHandlerMetrics {
     pub cancellation_total: IntCounter,
 }
 
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn serialized_response_is_error(resp_bytes: &[u8]) -> bool {
+    contains_bytes(resp_bytes, br#""finish_reason":{"error":"#)
+        || contains_bytes(resp_bytes, br#""finish_reason":"error"#)
+        || serialized_response_is_service_overloaded(resp_bytes)
+}
+
+fn serialized_response_is_service_overloaded(resp_bytes: &[u8]) -> bool {
+    contains_bytes(resp_bytes, br#""dynamo_error_type":"service_overloaded""#)
+        || contains_bytes(resp_bytes, br#""error_type":"ResourceExhausted""#)
+}
+
+fn is_resource_exhausted(error: &crate::error::DynamoError) -> bool {
+    crate::error::match_error_chain(error, &[crate::error::ErrorType::ResourceExhausted], &[])
+}
+
 impl WorkHandlerMetrics {
     pub fn new(
         request_counter: IntCounter,
@@ -160,13 +184,17 @@ impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
 
         // TODO: Detect end-of-stream using Server-Sent Events (SSE)
         let mut send_complete_final = true;
-        let mut saw_error_response = false;
+        let mut saw_success_response = false;
+        let mut saw_stream_failure = false;
+        let mut saw_service_overloaded = false;
         while let Some(resp) = stream.next().await {
             tracing::trace!("Sending response: {:?}", resp);
-            let is_error = resp.err().is_some();
-            if is_error {
-                saw_error_response = true;
-            }
+            let typed_error = resp.err();
+            let is_service_overloaded = typed_error
+                .as_ref()
+                .map(is_resource_exhausted)
+                .unwrap_or(false);
+            let is_error = typed_error.is_some();
             let resp_wrapper = NetworkStreamWrapper {
                 data: Some(resp),
                 complete_final: false,
@@ -176,6 +204,16 @@ impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
                 .expect("fatal error: invalid request-plane response object");
             if let Some(m) = self.metrics() {
                 m.response_bytes.inc_by(resp_bytes.len() as u64);
+            }
+            let serialized_service_overloaded =
+                serialized_response_is_service_overloaded(&resp_bytes);
+            let is_error_response = is_error || serialized_response_is_error(&resp_bytes);
+            if is_error_response {
+                if is_service_overloaded || serialized_service_overloaded {
+                    saw_service_overloaded = true;
+                } else {
+                    saw_stream_failure = true;
+                }
             }
             if (publisher.send(resp_bytes.into()).await).is_err() {
                 send_complete_final = false;
@@ -202,12 +240,13 @@ impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
                         .inc();
                 }
                 break;
-            } else if !is_error {
+            } else if !is_error_response {
                 // Only notify on non-error chunks — error responses don't prove
                 // the engine is healthy and should not reset the canary timer.
                 if let Some(notifier) = self.endpoint_health_check_notifier.get() {
                     notifier.notify_one();
                 }
+                saw_success_response = true;
             }
         }
         if send_complete_final {
@@ -232,12 +271,10 @@ impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
                         .inc();
                 }
             }
-            // Only notify on stream completion if no error responses were seen
-            if let (false, Some(notifier)) = (
-                saw_error_response,
-                self.endpoint_health_check_notifier.get(),
-            ) {
-                notifier.notify_one();
+            if saw_success_response {
+                if let Some(notifier) = self.endpoint_health_check_notifier.get() {
+                    notifier.notify_one();
+                }
             }
         }
     }
@@ -630,6 +667,17 @@ where
         // Ensure the metrics guard is not dropped until the end of the function.
         // Drop fires "request completed" log via RAII.
         drop(_inflight_guard);
+
+        if saw_stream_failure {
+            return Err(PipelineError::Generic(
+                "response stream contained an error response".to_string(),
+            ));
+        }
+        if saw_service_overloaded {
+            return Err(PipelineError::ServiceOverloaded(
+                "response stream contained a service overloaded response".to_string(),
+            ));
+        }
 
         Ok(())
     }

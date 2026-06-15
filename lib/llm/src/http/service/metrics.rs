@@ -18,6 +18,7 @@ use prometheus::{
     Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
 };
 use serde::Serialize;
+use serde_json::Value;
 use std::{
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -37,7 +38,25 @@ use dynamo_runtime::error::ErrorType as DynamoErrorType;
 pub fn request_was_rejected(err: &(dyn std::error::Error + 'static)) -> bool {
     const REJECTION: &[DynamoErrorType] = &[DynamoErrorType::ResourceExhausted];
     const NON_REJECTION: &[DynamoErrorType] = &[];
-    dynamo_runtime::error::match_error_chain(err, REJECTION, NON_REJECTION)
+    if dynamo_runtime::error::match_error_chain(err, REJECTION, NON_REJECTION) {
+        return true;
+    }
+
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if let Some(pipeline_error) =
+            error.downcast_ref::<dynamo_runtime::pipeline::error::PipelineError>()
+            && matches!(
+                pipeline_error,
+                dynamo_runtime::pipeline::error::PipelineError::ServiceOverloaded(_)
+            )
+        {
+            return true;
+        }
+        current = error.source();
+    }
+
+    false
 }
 
 /// Check whether an error chain indicates that no backend worker is available.
@@ -378,6 +397,24 @@ pub struct Metrics {
     cached_tokens: HistogramVec,
     tokenizer_latency: HistogramVec,
     output_tokens_counter: IntCounterVec,
+    prompt_tokens_total: IntCounterVec,
+    generation_tokens_total: IntCounterVec,
+    request_success_total: IntCounterVec,
+    request_mode_total: IntCounterVec,
+    request_outcome_total: IntCounterVec,
+    request_finish_reason_total: IntCounterVec,
+    request_type_image_total: IntCounterVec,
+    request_type_video_total: IntCounterVec,
+    request_type_audio_total: IntCounterVec,
+    request_type_tool_call_total: IntCounterVec,
+    request_type_structured_output_total: IntCounterVec,
+    request_input_images_total: IntCounterVec,
+    request_input_videos_total: IntCounterVec,
+    request_input_audios_total: IntCounterVec,
+    request_input_tools_total: IntCounterVec,
+    request_tool_choice_total: IntCounterVec,
+    request_structured_output_kind_total: IntCounterVec,
+    request_structured_output_backend_total: IntCounterVec,
     time_to_first_token: HistogramVec,
     inter_token_latency: HistogramVec,
     /// End-to-end latency of an OpenAI `/v1/embeddings` request. Distinct from
@@ -530,6 +567,7 @@ pub struct ResponseMetricCollector {
     last_response_time: Option<Duration>,
     osl: usize,
     isl: usize,
+    counted_output_tokens: usize,
     ttft_ms: Option<f64>,
     itl_sum_secs: f64,
     itl_count: u64,
@@ -537,6 +575,8 @@ pub struct ResponseMetricCollector {
     cached_tokens_observed: bool,
     // we track if tokenize latency has been observed to ensure we only increment once per request
     tokenize_latency_observed: bool,
+    // we track if prompt tokens have been observed to ensure we only increment once per request
+    prompt_tokens_observed: bool,
     // latest accumulated detokenize latency and sample count reported by tracker
     detokenize_latency_total: Duration,
     detokenize_count_total: u64,
@@ -738,6 +778,135 @@ impl Metrics {
         )
         .unwrap();
 
+        let prompt_tokens_total = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name("prompt_tokens_total"),
+                "Total prompt/input tokens processed",
+            ),
+            &["model"],
+        )
+        .unwrap();
+
+        let generation_tokens_total = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name("generation_tokens_total"),
+                "Total generation/output tokens produced",
+            ),
+            &["model"],
+        )
+        .unwrap();
+
+        let request_success_total = IntCounterVec::new(
+            Opts::new("request_success_total", "Total successful LLM requests"),
+            &["model", "endpoint", "request_type"],
+        )
+        .unwrap();
+
+        let request_mode_total = IntCounterVec::new(
+            Opts::new("request_mode_total", "Total requests by response mode"),
+            &["model", "endpoint", "request_type"],
+        )
+        .unwrap();
+
+        let request_outcome_total = IntCounterVec::new(
+            Opts::new("request_outcome_total", "Total requests by final outcome"),
+            &["model", "endpoint", "request_type", "outcome"],
+        )
+        .unwrap();
+
+        let request_finish_reason_total = IntCounterVec::new(
+            Opts::new(
+                "request_finish_reason_total",
+                "Total requests by final finish reason",
+            ),
+            &["model", "endpoint", "request_type", "finish_reason"],
+        )
+        .unwrap();
+
+        let request_type_image_total = IntCounterVec::new(
+            Opts::new("request_type_image_total", "Total image-input requests"),
+            &["model", "endpoint", "request_type"],
+        )
+        .unwrap();
+
+        let request_type_video_total = IntCounterVec::new(
+            Opts::new("request_type_video_total", "Total video-input requests"),
+            &["model", "endpoint", "request_type"],
+        )
+        .unwrap();
+
+        let request_type_audio_total = IntCounterVec::new(
+            Opts::new("request_type_audio_total", "Total audio-input requests"),
+            &["model", "endpoint", "request_type"],
+        )
+        .unwrap();
+
+        let request_type_tool_call_total = IntCounterVec::new(
+            Opts::new(
+                "request_type_tool_call_total",
+                "Total tool-enabled requests",
+            ),
+            &["model", "endpoint", "request_type"],
+        )
+        .unwrap();
+
+        let request_type_structured_output_total = IntCounterVec::new(
+            Opts::new(
+                "request_type_structured_output_total",
+                "Total structured-output requests",
+            ),
+            &["model", "endpoint", "request_type"],
+        )
+        .unwrap();
+
+        let request_input_images_total = IntCounterVec::new(
+            Opts::new("request_input_images_total", "Total input images requested"),
+            &["model", "endpoint", "request_type"],
+        )
+        .unwrap();
+
+        let request_input_videos_total = IntCounterVec::new(
+            Opts::new("request_input_videos_total", "Total input videos requested"),
+            &["model", "endpoint", "request_type"],
+        )
+        .unwrap();
+
+        let request_input_audios_total = IntCounterVec::new(
+            Opts::new("request_input_audios_total", "Total input audios requested"),
+            &["model", "endpoint", "request_type"],
+        )
+        .unwrap();
+
+        let request_input_tools_total = IntCounterVec::new(
+            Opts::new("request_input_tools_total", "Total input tools requested"),
+            &["model", "endpoint", "request_type"],
+        )
+        .unwrap();
+
+        let request_tool_choice_total = IntCounterVec::new(
+            Opts::new("request_tool_choice_total", "Total requests by tool choice"),
+            &["model", "endpoint", "request_type", "tool_choice"],
+        )
+        .unwrap();
+
+        let request_structured_output_kind_total = IntCounterVec::new(
+            Opts::new(
+                "request_structured_output_kind_total",
+                "Total structured output requests by kind",
+            ),
+            &["model", "endpoint", "request_type", "kind"],
+        )
+        .unwrap();
+
+        let request_structured_output_backend_total = IntCounterVec::new(
+            Opts::new(
+                "request_structured_output_backend_total",
+                "Total structured output requests by backend",
+            ),
+            &["model", "endpoint", "request_type", "backend"],
+        )
+        .unwrap();
+
         // Time to first token buckets: configurable via DYN_METRICS_TTFT_{MIN,MAX,COUNT}
         let (ttft_min, ttft_max, ttft_count) =
             parse_bucket_config("DYN_METRICS_TTFT", 0.001, 480.0, 18);
@@ -916,6 +1085,24 @@ impl Metrics {
             cached_tokens,
             tokenizer_latency,
             output_tokens_counter,
+            prompt_tokens_total,
+            generation_tokens_total,
+            request_success_total,
+            request_mode_total,
+            request_outcome_total,
+            request_finish_reason_total,
+            request_type_image_total,
+            request_type_video_total,
+            request_type_audio_total,
+            request_type_tool_call_total,
+            request_type_structured_output_total,
+            request_input_images_total,
+            request_input_videos_total,
+            request_input_audios_total,
+            request_input_tools_total,
+            request_tool_choice_total,
+            request_structured_output_kind_total,
+            request_structured_output_backend_total,
             time_to_first_token,
             inter_token_latency,
             embedding_latency,
@@ -1070,6 +1257,26 @@ impl Metrics {
         registry.register(Box::new(self.cached_tokens.clone()))?;
         registry.register(Box::new(self.tokenizer_latency.clone()))?;
         registry.register(Box::new(self.output_tokens_counter.clone()))?;
+        registry.register(Box::new(self.prompt_tokens_total.clone()))?;
+        registry.register(Box::new(self.generation_tokens_total.clone()))?;
+        registry.register(Box::new(self.request_success_total.clone()))?;
+        registry.register(Box::new(self.request_mode_total.clone()))?;
+        registry.register(Box::new(self.request_outcome_total.clone()))?;
+        registry.register(Box::new(self.request_finish_reason_total.clone()))?;
+        registry.register(Box::new(self.request_type_image_total.clone()))?;
+        registry.register(Box::new(self.request_type_video_total.clone()))?;
+        registry.register(Box::new(self.request_type_audio_total.clone()))?;
+        registry.register(Box::new(self.request_type_tool_call_total.clone()))?;
+        registry.register(Box::new(self.request_type_structured_output_total.clone()))?;
+        registry.register(Box::new(self.request_input_images_total.clone()))?;
+        registry.register(Box::new(self.request_input_videos_total.clone()))?;
+        registry.register(Box::new(self.request_input_audios_total.clone()))?;
+        registry.register(Box::new(self.request_input_tools_total.clone()))?;
+        registry.register(Box::new(self.request_tool_choice_total.clone()))?;
+        registry.register(Box::new(self.request_structured_output_kind_total.clone()))?;
+        registry.register(Box::new(
+            self.request_structured_output_backend_total.clone(),
+        ))?;
         registry.register(Box::new(self.time_to_first_token.clone()))?;
         registry.register(Box::new(self.inter_token_latency.clone()))?;
         registry.register(Box::new(self.embedding_latency.clone()))?;
@@ -1353,6 +1560,39 @@ impl Drop for InflightGuard {
             &self.status,
             &self.error_type,
         );
+        if self.status == Status::Success {
+            self.metrics
+                .request_success_total
+                .with_label_values(&[
+                    self.model.as_str(),
+                    self.endpoint.as_str(),
+                    self.request_type.as_str(),
+                ])
+                .inc();
+        }
+        let outcome = if self.status == Status::Success {
+            "success"
+        } else {
+            self.error_type.as_str()
+        };
+        self.metrics
+            .request_outcome_total
+            .with_label_values(&[
+                self.model.as_str(),
+                self.endpoint.as_str(),
+                self.request_type.as_str(),
+                outcome,
+            ])
+            .inc();
+        self.metrics
+            .request_finish_reason_total
+            .with_label_values(&[
+                self.model.as_str(),
+                self.endpoint.as_str(),
+                self.request_type.as_str(),
+                "unknown",
+            ])
+            .inc();
         self.metrics
             .request_duration
             .with_label_values(&[&self.model])
@@ -1500,11 +1740,13 @@ impl ResponseMetricCollector {
             start_time: Instant::now(),
             osl: 0,
             isl: 0,
+            counted_output_tokens: 0,
             ttft_ms: None,
             itl_sum_secs: 0.0,
             itl_count: 0,
             cached_tokens_observed: false,
             tokenize_latency_observed: false,
+            prompt_tokens_observed: false,
             detokenize_latency_total: Duration::ZERO,
             detokenize_count_total: 0,
             prefill_worker_id: None,
@@ -1597,12 +1839,42 @@ impl ResponseMetricCollector {
 
     /// Observe a response with input sequence length and number of new tokens
     pub fn observe_response(&mut self, isl: usize, num_tokens: usize) {
+        self.observe_response_metrics(isl, self.osl, num_tokens);
+    }
+
+    /// Observe a response with input sequence length, cumulative output length,
+    /// and number of new text tokens.
+    pub fn observe_response_metrics(
+        &mut self,
+        isl: usize,
+        output_tokens: usize,
+        num_tokens: usize,
+    ) {
+        if isl > 0 {
+            // Store ISL for span recording on drop. Some tool-only responses
+            // report prompt usage on a final metrics annotation with no text
+            // token delta, so prompt accounting must not depend on num_tokens.
+            self.isl = isl;
+        }
+        if isl > 0 && !self.prompt_tokens_observed {
+            self.prompt_tokens_observed = true;
+            self.metrics
+                .prompt_tokens_total
+                .with_label_values(&[&self.model])
+                .inc_by(isl as u64);
+        }
+
+        let num_tokens = output_tokens
+            .checked_sub(self.counted_output_tokens)
+            .filter(|delta| *delta > 0)
+            .unwrap_or(num_tokens);
         if num_tokens == 0 {
             return;
         }
-
-        // Store ISL for span recording on drop
-        self.isl = isl;
+        self.counted_output_tokens = self
+            .counted_output_tokens
+            .saturating_add(num_tokens)
+            .max(output_tokens);
 
         // Increment the real-time output tokens counter
         self.output_tokens_counter.inc_by(num_tokens as u64);
@@ -1733,6 +2005,83 @@ impl Drop for ResponseMetricCollector {
         if let Some(worker_id) = self.decode_worker_id {
             span.record("decode_worker_id", worker_id);
         }
+    }
+}
+
+#[derive(Default)]
+struct MultimodalCounts {
+    images: u64,
+    videos: u64,
+    audios: u64,
+}
+
+fn count_multimodal_inputs(value: &Value) -> MultimodalCounts {
+    let mut counts = MultimodalCounts::default();
+    count_multimodal_inputs_inner(value, &mut counts);
+    counts
+}
+
+fn count_multimodal_inputs_inner(value: &Value, counts: &mut MultimodalCounts) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                count_multimodal_inputs_inner(item, counts);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(input_type) = map.get("type").and_then(Value::as_str) {
+                match input_type {
+                    "image_url" | "input_image" => counts.images += 1,
+                    "video_url" | "input_video" => counts.videos += 1,
+                    "audio_url" | "input_audio" => counts.audios += 1,
+                    _ => {}
+                }
+            }
+            for (key, child) in map {
+                match key.as_str() {
+                    "image_url" | "input_image" => counts.images += 1,
+                    "video_url" | "input_video" => counts.videos += 1,
+                    "audio_url" | "input_audio" => counts.audios += 1,
+                    _ => count_multimodal_inputs_inner(child, counts),
+                }
+            }
+        }
+        Value::String(text) => {
+            counts.images += text.matches("data:image/").count() as u64;
+            counts.videos += text.matches("data:video/").count() as u64;
+            counts.audios += text.matches("data:audio/").count() as u64;
+        }
+        _ => {}
+    }
+}
+
+fn request_tool_choice_label(raw_request: &Value) -> Option<&'static str> {
+    let tool_choice = raw_request.get("tool_choice")?;
+    if let Some(choice) = tool_choice.as_str() {
+        return match choice {
+            "none" => Some("none"),
+            "auto" => Some("auto"),
+            "required" => Some("required"),
+            _ => Some("other"),
+        };
+    }
+    if tool_choice.is_object() {
+        return Some("named");
+    }
+    Some("other")
+}
+
+fn structured_output_kind(raw_request: &Value) -> Option<&'static str> {
+    let response_format = raw_request
+        .get("response_format")
+        .or_else(|| raw_request.get("text").and_then(|text| text.get("format")))?;
+    let kind = response_format.get("type").and_then(Value::as_str)?;
+    match kind {
+        "json_object" => Some("json_object"),
+        "json_schema" => Some("json_schema"),
+        "grammar" => Some("grammar"),
+        "text" => None,
+        _ => Some("other"),
     }
 }
 

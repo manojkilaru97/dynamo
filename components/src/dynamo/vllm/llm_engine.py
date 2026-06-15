@@ -366,6 +366,7 @@ class VllmLLMEngine(LLMEngine):
         prompt = TokensPrompt(prompt_token_ids=token_ids)
 
         # TODO: remove dict() once build_sampling_params accepts GenerateRequest
+        request_dict = dict(request)
         sampling_params = build_sampling_params(
             dict(request),
             self._default_sampling_params,

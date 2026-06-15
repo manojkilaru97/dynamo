@@ -23,15 +23,21 @@ type AuditFuture =
 /// Forwards transformed chunks unchanged; collects them for aggregation.
 pub struct PassThroughWithAgg<S> {
     inner: S,
-    chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>>,
+    aggregator: DeltaAggregator,
+    parsing_options: ParsingOptions,
     done_tx: Option<oneshot::Sender<NvCreateChatCompletionResponse>>,
 }
 
 impl<S> PassThroughWithAgg<S> {
-    fn new(inner: S, tx: oneshot::Sender<NvCreateChatCompletionResponse>) -> Self {
+    fn new(
+        inner: S,
+        tx: oneshot::Sender<NvCreateChatCompletionResponse>,
+        parsing_options: ParsingOptions,
+    ) -> Self {
         Self {
             inner,
-            chunks: Vec::new(),
+            aggregator: DeltaAggregator::new(),
+            parsing_options,
             done_tx: Some(tx),
         }
     }
@@ -46,20 +52,16 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(chunk)) => {
-                // Store chunk for aggregation
-                self.chunks.push(chunk.clone());
-                // Forward the chunk unchanged downstream
+                self.aggregator.observe(&chunk);
                 Poll::Ready(Some(chunk))
             }
             Poll::Ready(None) => {
                 if let Some(tx) = self.done_tx.take() {
-                    // Aggregate all collected chunks
-                    let chunks = std::mem::take(&mut self.chunks);
-                    let chunks_stream = futures::stream::iter(chunks);
-                    let parsing_options = ParsingOptions::default();
+                    let aggregator = std::mem::take(&mut self.aggregator);
+                    let parsing_options = self.parsing_options.clone();
 
                     tokio::spawn(async move {
-                        match DeltaAggregator::apply(chunks_stream, parsing_options).await {
+                        match aggregator.finalize(parsing_options).await {
                             Ok(final_resp) => {
                                 let _ = tx.send(final_resp);
                             }
@@ -81,8 +83,20 @@ pub fn scan_aggregate_with_future<S>(stream: S) -> (AuditStream, AuditFuture)
 where
     S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Unpin + Send + 'static,
 {
+    scan_aggregate_with_future_and_options(stream, ParsingOptions::default())
+}
+
+/// Return (pass-through stream, future -> final aggregated response for audit)
+/// using explicit parsing options.
+pub fn scan_aggregate_with_future_and_options<S>(
+    stream: S,
+    parsing_options: ParsingOptions,
+) -> (AuditStream, AuditFuture)
+where
+    S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Unpin + Send + 'static,
+{
     let (tx, rx) = oneshot::channel::<NvCreateChatCompletionResponse>();
-    let passthrough = PassThroughWithAgg::new(stream, tx);
+    let passthrough = PassThroughWithAgg::new(stream, tx, parsing_options);
     (
         Box::pin(passthrough),
         Box::pin(async move {

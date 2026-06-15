@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import inspect
+import json
 import logging
 import math
 import os
@@ -78,6 +79,7 @@ from dynamo.common.utils.engine_response import normalize_finish_reason
 from dynamo.common.utils.input_params import InputParamManager
 from dynamo.common.utils.structural_tag import serialize_structural_tag
 from dynamo.common.utils.time_section import time_and_log_code_section
+from dynamo.health_check import HEALTH_CHECK_KEY
 from dynamo.llm import (
     KvEventPublisher,
     ModelInput,
@@ -121,6 +123,31 @@ DECODED_VARIANT_KEY: Final = "Decoded"
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 
+DEFAULT_TOOL_CALL_MAX_ARRAY_ITEMS = 8
+DEFAULT_SCHEMA_MAX_STRING_LENGTH = 4096
+DEFAULT_SCHEMA_MAX_ARRAY_ITEMS = 32
+DEFAULT_TOOL_SHORT_TEXT_MAX_LENGTH = 256
+DEFAULT_TOOL_LONG_TEXT_MAX_LENGTH = 8192
+TOOL_LONG_REQUEST_THRESHOLD = 2048
+TOOL_LONG_REQUEST_MARGIN = 512
+TOOL_FIELD_STRING_BUDGETS = {
+    "expression": 256,
+}
+TOOL_LONG_TEXT_FIELD_NAMES = {"body", "content", "message"}
+SERVICE_OVERLOADED_ERROR_TYPE: Final = "service_overloaded"
+QWEN_XML_STRUCTURAL_TAG_TOOL_PARSERS = {"qwen3_coder", "qwen3_xml"}
+FORCED_TOOL_STRUCTURAL_TAG_TRIGGERS = [""]
+PARSER_VISIBLE_MARKER_TOKENS: Final = (
+    "<think>",
+    "</think>",
+    "<tool_call>",
+    "</tool_call>",
+    "<tools>",
+    "</tools>",
+)
+UNSUPPORTED_STRUCTURED_REGEX_TOKENS: Final = ("(?=", "(?!", "(?<=", "(?<!")
+TOOL_CHOICE_SCHEMA_MARKER: Final = "x-dynamo-tool-choice-schema"
+
 _GENERATE_REASONING_SUPPORT_CACHE_ATTR = "_dynamo_generate_reasoning_support"
 _DELTA_REQUEST_OUTPUT_KIND = RequestOutputKind.DELTA
 _RL_INIT_WEIGHTS_TIMEOUT_ENV = "DYN_RL_INIT_WEIGHTS_TIMEOUT_S"
@@ -143,6 +170,146 @@ def _rl_init_weights_timeout_s() -> float:
             str(_RL_INIT_WEIGHTS_TIMEOUT_DEFAULT_S),
         )
     )
+
+
+def _build_token_error_response(message: str) -> dict[str, Any]:
+    return {
+        "finish_reason": f"error: {message}",
+        "token_ids": [],
+    }
+
+
+def _build_prefill_error_response(message: str) -> dict[str, Any]:
+    return {
+        "finish_reason": f"error: {message}",
+        "token_ids": [],
+        "disaggregated_params": None,
+        "completion_usage": None,
+    }
+
+
+def _build_overload_extra_args(
+    message: str,
+    *,
+    current_total_requests: int | None = None,
+    total_request_limit: int | None = None,
+) -> dict[str, Any]:
+    extra_args: dict[str, Any] = {
+        "dynamo_error_type": SERVICE_OVERLOADED_ERROR_TYPE,
+        "error_message": message,
+    }
+    if current_total_requests is not None:
+        extra_args["worker_total_requests"] = current_total_requests
+    if total_request_limit is not None:
+        extra_args["worker_total_request_limit"] = total_request_limit
+    return extra_args
+
+
+def _build_token_overload_response(
+    message: str,
+    *,
+    current_total_requests: int | None = None,
+    total_request_limit: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "finish_reason": {"error": message},
+        "token_ids": [],
+        "extra_args": _build_overload_extra_args(
+            message,
+            current_total_requests=current_total_requests,
+            total_request_limit=total_request_limit,
+        ),
+    }
+
+
+def _build_prefill_overload_response(
+    message: str,
+    *,
+    current_total_requests: int | None = None,
+    total_request_limit: int | None = None,
+) -> dict[str, Any]:
+    response = _build_prefill_error_response(message)
+    response["finish_reason"] = {"error": message}
+    response["extra_args"] = _build_overload_extra_args(
+        message,
+        current_total_requests=current_total_requests,
+        total_request_limit=total_request_limit,
+    )
+    return response
+
+
+def _build_text_error_chunk(message: str, request_id: str) -> dict[str, Any]:
+    return {
+        "id": request_id,
+        "created": int(time.time()),
+        "object": "chat.completion.chunk",
+        "model": "unknown",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": "error",
+            }
+        ],
+        "error": {"message": message},
+    }
+
+
+def _build_text_overload_chunk(
+    message: str,
+    request_id: str,
+    *,
+    current_total_requests: int | None = None,
+    total_request_limit: int | None = None,
+) -> dict[str, Any]:
+    chunk = _build_text_error_chunk(message, request_id)
+    chunk["extra_args"] = _build_overload_extra_args(
+        message,
+        current_total_requests=current_total_requests,
+        total_request_limit=total_request_limit,
+    )
+    return chunk
+
+
+class DecodeWallClockTimeoutError(RuntimeError):
+    pass
+
+
+def _coerce_token_ids(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, int):
+        return [value]
+    if isinstance(value, (str, bytes)):
+        return []
+    if not isinstance(value, list):
+        return []
+
+    token_ids: list[int] = []
+    for item in value:
+        try:
+            token_ids.append(int(item))
+        except Exception:
+            continue
+    return token_ids
+
+
+def _merge_stop_token_ids(existing: Any, added: Any) -> list[int]:
+    merged: list[int] = []
+    seen: set[int] = set()
+    for token_id in [*_coerce_token_ids(existing), *_coerce_token_ids(added)]:
+        if token_id not in seen:
+            merged.append(token_id)
+            seen.add(token_id)
+    return merged
+
+
+def _sync_all_stop_token_ids(
+    sampling_params: SamplingParams, token_ids: Any
+) -> None:
+    all_stop_token_ids = getattr(sampling_params, "_all_stop_token_ids", None)
+    if isinstance(all_stop_token_ids, set):
+        all_stop_token_ids.update(_coerce_token_ids(token_ids))
 
 
 class _DeferredAbort:
@@ -704,6 +871,55 @@ def _serialize_routed_experts(
     }
 
 
+def _normalize_structural_tag(value: Any) -> Any:
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+def _merge_sampling_extra_args(
+    sampling_params: SamplingParams, extra_args: dict[str, Any]
+) -> None:
+    if not extra_args:
+        return
+    merged: dict[str, Any] = {}
+    existing = getattr(sampling_params, "extra_args", None)
+    if isinstance(existing, dict):
+        merged.update(existing)
+    merged.update(extra_args)
+    sampling_params.extra_args = merged
+
+
+def _reasoning_budget_extra_args(request: Dict[str, Any]) -> dict[str, Any]:
+    extra_args: dict[str, Any] = {}
+    request_extra_args = request.get("extra_args")
+    if isinstance(request_extra_args, dict):
+        extra_args.update(request_extra_args)
+
+    chat_template_args = request.get("chat_template_args")
+    if not isinstance(chat_template_args, dict):
+        chat_template_args = request.get("chat_template_kwargs")
+    if not isinstance(chat_template_args, dict):
+        chat_template_args = {}
+
+    for key in ("reasoning_budget", "reasoning_budget_grace_period"):
+        value = request.get(key)
+        if value is None:
+            value = chat_template_args.get(key)
+        if value is not None:
+            extra_args[key] = value
+
+    stop_conditions = request.get("stop_conditions")
+    if isinstance(stop_conditions, dict) and "reasoning_budget" not in extra_args:
+        max_thinking_tokens = stop_conditions.get("max_thinking_tokens")
+        if max_thinking_tokens is not None:
+            extra_args["reasoning_budget"] = max_thinking_tokens
+
+    if "enable_thinking" in chat_template_args:
+        extra_args["enable_thinking"] = chat_template_args["enable_thinking"]
+    return extra_args
+
+
 def build_sampling_params(
     request: Dict[str, Any],
     default_sampling_params: Dict[str, Any],
@@ -795,13 +1011,17 @@ def build_sampling_params(
             if key == "stop":
                 continue
             setattr(sampling_params, key, value)
+            if key == "stop_token_ids":
+                _sync_all_stop_token_ids(sampling_params, value)
         if (
             key == "stop_token_ids_hidden"
             and value is not None
             and hasattr(sampling_params, "stop_token_ids")
         ):
-            existing = sampling_params.stop_token_ids or []
-            sampling_params.stop_token_ids = list(set(existing).union(value))
+            sampling_params.stop_token_ids = _merge_stop_token_ids(
+                sampling_params.stop_token_ids, value
+            )
+            _sync_all_stop_token_ids(sampling_params, value)
         # Dynamo's StopConditions uses `max_thinking_tokens`; vLLM 0.20+ exposes
         # the same concept as `thinking_token_budget` on SamplingParams and
         # enforces it via the builtin thinking-budget logits processor.
@@ -811,6 +1031,21 @@ def build_sampling_params(
             and hasattr(sampling_params, "thinking_token_budget")
         ):
             sampling_params.thinking_token_budget = value
+
+    _merge_sampling_extra_args(sampling_params, _reasoning_budget_extra_args(request))
+    if (
+        isinstance(sampling_params.extra_args, dict)
+        and "reasoning_budget" in sampling_params.extra_args
+        and not sampling_params.ignore_eos
+    ):
+        eos_token_ids = request.get("eos_token_ids")
+        if eos_token_ids is None:
+            eos_token_ids = sampling_params.extra_args.get("eos_token_ids")
+        if eos_token_ids is not None:
+            sampling_params.stop_token_ids = _merge_stop_token_ids(
+                sampling_params.stop_token_ids, eos_token_ids
+            )
+            _sync_all_stop_token_ids(sampling_params, eos_token_ids)
 
     # Apply output_options (logprobs, prompt_logprobs, etc.)
     output_options = request.get("output_options", {}) or {}
@@ -844,9 +1079,620 @@ def build_sampling_params(
     return sampling_params
 
 
+def _value_from_mapping_or_object(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def bound_json_schema_for_constrained_decoding(
+    schema: Any,
+    field_name: str | None = None,
+    field_string_budgets: dict[str, int] | None = None,
+    request_text_len: int | None = None,
+) -> Any:
+    if isinstance(schema, list):
+        return [
+            bound_json_schema_for_constrained_decoding(
+                item, field_name, field_string_budgets, request_text_len
+            )
+            for item in schema
+        ]
+    if not isinstance(schema, dict):
+        return schema
+
+    bounded = copy.deepcopy(schema)
+    bounded.pop(TOOL_CHOICE_SCHEMA_MARKER, None)
+    for key in ("format", "pattern"):
+        if bounded.get(key) == "":
+            bounded.pop(key)
+    pattern = bounded.get("pattern")
+    if isinstance(pattern, str) and ".*" in pattern:
+        bounded.pop("pattern")
+
+    schema_type = bounded.get("type")
+    schema_types = schema_type if isinstance(schema_type, list) else [schema_type]
+    if (
+        "string" in schema_types
+        and "maxLength" not in bounded
+        and "enum" not in bounded
+        and "const" not in bounded
+    ):
+        max_length = DEFAULT_SCHEMA_MAX_STRING_LENGTH
+        if field_string_budgets is not None and field_name is not None:
+            max_length = field_string_budgets.get(field_name, max_length)
+        if field_name in TOOL_LONG_TEXT_FIELD_NAMES:
+            max_length = _tool_long_text_budget(request_text_len)
+        bounded["maxLength"] = max_length
+    if "array" in schema_types and "maxItems" not in bounded:
+        bounded["maxItems"] = DEFAULT_SCHEMA_MAX_ARRAY_ITEMS
+
+    for key in ("properties", "$defs", "definitions", "patternProperties"):
+        value = bounded.get(key)
+        if isinstance(value, dict):
+            bounded[key] = {
+                name: bound_json_schema_for_constrained_decoding(
+                    subschema,
+                    name if key == "properties" else None,
+                    field_string_budgets,
+                    request_text_len,
+                )
+                for name, subschema in value.items()
+            }
+
+    for key in ("items", "additionalProperties"):
+        value = bounded.get(key)
+        if isinstance(value, (dict, list)):
+            bounded[key] = bound_json_schema_for_constrained_decoding(
+                value, field_name, field_string_budgets, request_text_len
+            )
+
+    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        value = bounded.get(key)
+        if isinstance(value, list):
+            bounded[key] = [
+                bound_json_schema_for_constrained_decoding(
+                    subschema, field_name, field_string_budgets, request_text_len
+                )
+                for subschema in value
+            ]
+
+    return bounded
+
+
+def _tool_long_text_budget(request_text_len: int | None) -> int:
+    if request_text_len is None or request_text_len < TOOL_LONG_REQUEST_THRESHOLD:
+        return DEFAULT_TOOL_SHORT_TEXT_MAX_LENGTH
+    return max(
+        DEFAULT_TOOL_SHORT_TEXT_MAX_LENGTH,
+        min(DEFAULT_TOOL_LONG_TEXT_MAX_LENGTH, request_text_len + TOOL_LONG_REQUEST_MARGIN),
+    )
+
+
+def _request_text_len(request: Dict[str, Any]) -> int | None:
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return None
+    total = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, str):
+                    total += len(part)
+                elif isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        total += len(text)
+    return total
+
+
+def _schema_has_freeform_long_text_field(schema: Any) -> bool:
+    if not isinstance(schema, dict):
+        return False
+
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        for name, subschema in properties.items():
+            if (
+                name in TOOL_LONG_TEXT_FIELD_NAMES
+                and _schema_type_includes(subschema, "string")
+                and isinstance(subschema, dict)
+                and "enum" not in subschema
+                and "const" not in subschema
+            ):
+                return True
+            if _schema_has_freeform_long_text_field(subschema):
+                return True
+
+    for key in ("items", "additionalProperties", "anyOf", "oneOf", "allOf"):
+        value = schema.get(key)
+        if isinstance(value, list):
+            if any(_schema_has_freeform_long_text_field(item) for item in value):
+                return True
+        elif isinstance(value, dict) and _schema_has_freeform_long_text_field(value):
+            return True
+
+    return False
+
+
+def _schema_type_includes(schema: Any, expected: str) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        return expected in schema_type
+    return schema_type == expected
+
+
+def _tool_function(tool: Any) -> Any:
+    return _value_from_mapping_or_object(tool, "function", {})
+
+
+def _tool_name(tool: Any) -> str | None:
+    return _value_from_mapping_or_object(_tool_function(tool), "name")
+
+
+def _tool_parameters(tool: Any) -> dict[str, Any]:
+    params = _value_from_mapping_or_object(_tool_function(tool), "parameters")
+    if isinstance(params, dict):
+        return copy.deepcopy(params)
+    return {"type": "object", "properties": {}}
+
+
+def _named_tool_choice_name(tool_choice: Any) -> str | None:
+    function = _value_from_mapping_or_object(tool_choice, "function")
+    if function is None:
+        return None
+    return _value_from_mapping_or_object(function, "name")
+
+
+def _schema_for_required_tool_choice(
+    tools: list[Any],
+    request_text_len: int | None = None,
+) -> dict[str, Any]:
+    if not tools:
+        raise ValueError("tool_choice='required' needs at least one tool")
+
+    defs: dict[str, Any] = {}
+    any_of: list[dict[str, Any]] = []
+    for tool in tools:
+        name = _tool_name(tool)
+        if not name:
+            continue
+
+        params = _tool_parameters(tool)
+        tool_defs = params.pop("$defs", None)
+        if isinstance(tool_defs, dict):
+            for def_name, def_schema in tool_defs.items():
+                if def_name in defs and defs[def_name] != def_schema:
+                    raise ValueError(
+                        f"Tool definition '{def_name}' has multiple schemas"
+                    )
+                defs[def_name] = def_schema
+
+        any_of.append(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "enum": [name]},
+                    "parameters": params,
+                },
+                "required": ["name", "parameters"],
+                "additionalProperties": False,
+            }
+        )
+
+    if not any_of:
+        raise ValueError("tool_choice='required' needs at least one named tool")
+
+    schema: dict[str, Any] = {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+            "anyOf": any_of,
+        },
+    }
+    if defs:
+        schema["$defs"] = defs
+    return bound_json_schema_for_constrained_decoding(
+        schema,
+        field_string_budgets=TOOL_FIELD_STRING_BUDGETS,
+        request_text_len=request_text_len,
+    )
+
+
+def _schema_for_tool_choice(request: Dict[str, Any]) -> dict[str, Any] | None:
+    tools = request.get("tools")
+    tool_choice = request.get("tool_choice")
+    if tool_choice in (None, "none", "auto") or not tools:
+        return None
+
+    if tool_choice == "required":
+        return _schema_for_required_tool_choice(tools, _request_text_len(request))
+
+    if isinstance(tool_choice, dict) or _named_tool_choice_name(tool_choice):
+        tool_name = _named_tool_choice_name(tool_choice)
+        if not tool_name:
+            return None
+        for tool in tools:
+            if _tool_name(tool) == tool_name:
+                return bound_json_schema_for_constrained_decoding(
+                    _tool_parameters(tool),
+                    field_string_budgets=TOOL_FIELD_STRING_BUDGETS,
+                    request_text_len=_request_text_len(request),
+                )
+        raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`")
+
+    return None
+
+
+def _tool_call_parser_name(parser_name: str | None = None) -> str:
+    return (parser_name or "").strip() or (
+        os.environ.get("DYN_DYNAMO_TOOL_CALL_PARSER")
+        or os.environ.get("DYN_TOOL_CALL_PARSER")
+        or ""
+    ).strip()
+
+
+def _qwen_xml_tool_tag(
+    tool: Any,
+    request_text_len: int | None = None,
+) -> dict[str, Any]:
+    name = _tool_name(tool)
+    if not name:
+        raise ValueError("Tool choice needs a named tool")
+    return {
+        "type": "tag",
+        "begin": f"<tool_call>\n<function={name}>\n",
+        "content": {
+            "type": "json_schema",
+            "json_schema": bound_json_schema_for_constrained_decoding(
+                _tool_parameters(tool),
+                field_string_budgets=TOOL_FIELD_STRING_BUDGETS,
+                request_text_len=request_text_len,
+            ),
+            "style": "qwen_xml",
+        },
+        "end": "\n</function>\n</tool_call>",
+    }
+
+
+def _qwen_xml_structural_tag_for_tool_choice(
+    request: Dict[str, Any],
+    tool_call_parser_name: str | None = None,
+) -> StructuredOutputsParams | None:
+    if (
+        _tool_call_parser_name(tool_call_parser_name)
+        not in QWEN_XML_STRUCTURAL_TAG_TOOL_PARSERS
+    ):
+        return None
+
+    tools = request.get("tools")
+    tool_choice = request.get("tool_choice")
+    if not tools or tool_choice in (None, "none", "auto"):
+        return None
+    request_text_len = _request_text_len(request)
+
+    if tool_choice == "required":
+        tags = [
+            _qwen_xml_tool_tag(tool, request_text_len)
+            for tool in tools
+            if _tool_name(tool)
+        ]
+        if not tags:
+            raise ValueError("tool_choice='required' needs at least one named tool")
+        if len(tags) == 1:
+            structural_tag = {
+                "type": "structural_tag",
+                "format": {
+                    "type": "tags_with_separator",
+                    "tags": tags,
+                    "triggers": FORCED_TOOL_STRUCTURAL_TAG_TRIGGERS,
+                    "separator": "",
+                    "at_least_one": True,
+                    "stop_after_first": True,
+                },
+            }
+            return StructuredOutputsParams(structural_tag=json.dumps(structural_tag))
+        max_tags = min(len(tags), DEFAULT_TOOL_CALL_MAX_ARRAY_ITEMS)
+        structural_tag = {
+            "type": "structural_tag",
+            "format": {
+                "type": "repeat",
+                "min": 1,
+                "max": max_tags,
+                "triggers": FORCED_TOOL_STRUCTURAL_TAG_TRIGGERS,
+                "content": {
+                    "type": "or",
+                    "elements": tags,
+                },
+            },
+        }
+        return StructuredOutputsParams(structural_tag=json.dumps(structural_tag))
+
+    tool_name = _named_tool_choice_name(tool_choice)
+    if not tool_name:
+        return None
+    for tool in tools:
+        if _tool_name(tool) == tool_name:
+            if _schema_has_freeform_long_text_field(_tool_parameters(tool)):
+                return None
+            structural_tag = {
+                "type": "structural_tag",
+                "format": {
+                    "type": "tags_with_separator",
+                    "tags": [_qwen_xml_tool_tag(tool, request_text_len)],
+                    "triggers": FORCED_TOOL_STRUCTURAL_TAG_TRIGGERS,
+                    "separator": "",
+                    "at_least_one": True,
+                    "stop_after_first": True,
+                },
+            }
+            return StructuredOutputsParams(structural_tag=json.dumps(structural_tag))
+    raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`")
+
+
+def _validate_structured_regex(pattern: Any) -> None:
+    if not isinstance(pattern, str):
+        return
+    if any(token in pattern for token in UNSUPPORTED_STRUCTURED_REGEX_TOKENS):
+        raise ValueError(
+            "Unsupported structured output regex: lookaround assertions are not "
+            "supported by the configured guided-decoding backend"
+        )
+
+
+def _validate_structured_json_schema(schema: Any) -> None:
+    if isinstance(schema, dict):
+        if schema.get(TOOL_CHOICE_SCHEMA_MARKER) is True:
+            return
+
+        pattern = schema.get("pattern")
+        if pattern is not None:
+            _validate_structured_regex(pattern)
+
+        pattern_properties = schema.get("patternProperties")
+        if isinstance(pattern_properties, dict):
+            for property_pattern in pattern_properties:
+                _validate_structured_regex(property_pattern)
+
+        for value in schema.values():
+            _validate_structured_json_schema(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            _validate_structured_json_schema(item)
+
+
+def _validate_structured_grammar(grammar: Any) -> None:
+    if not isinstance(grammar, str):
+        return
+
+    in_char_class = False
+    escaped = False
+    for char in grammar:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if in_char_class:
+            if char in "\r\n":
+                raise ValueError(
+                    "Unsupported structured output grammar: raw newlines inside "
+                    "character classes are not supported"
+                )
+            if char == "]":
+                in_char_class = False
+            continue
+        if char == "[":
+            in_char_class = True
+
+
+def _structured_outputs_from_fields(fields: Any) -> StructuredOutputsParams | None:
+    if isinstance(fields, StructuredOutputsParams):
+        return fields
+    if not isinstance(fields, dict):
+        return None
+
+    params: dict[str, Any] = {}
+    if fields.get("json") is not None:
+        _validate_structured_json_schema(fields["json"])
+        params["json"] = bound_json_schema_for_constrained_decoding(fields["json"])
+    for key in ("regex", "choice", "grammar", "json_object"):
+        if fields.get(key) is not None:
+            if key == "regex":
+                _validate_structured_regex(fields[key])
+            elif key == "grammar":
+                _validate_structured_grammar(fields[key])
+            params[key] = fields[key]
+    if fields.get("structural_tag") is not None:
+        params["structural_tag"] = _normalize_structural_tag(fields["structural_tag"])
+    if not params:
+        return None
+    for key in (
+        "disable_any_whitespace",
+        "disable_additional_properties",
+        "whitespace_pattern",
+    ):
+        if fields.get(key) is not None:
+            params[key] = fields[key]
+    return StructuredOutputsParams(**params)
+
+
+def _is_required_single_tool_repeat_structural_tag(
+    value: Any,
+    request: Dict[str, Any],
+) -> bool:
+    if request.get("tool_choice") != "required":
+        return False
+
+    tool_names = [_tool_name(tool) for tool in request.get("tools") or []]
+    tool_names = [name for name in tool_names if name]
+    if len(tool_names) != 1:
+        return False
+
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return False
+    if not isinstance(value, dict):
+        return False
+
+    tag_format = value.get("format")
+    if not isinstance(tag_format, dict) or tag_format.get("type") != "repeat":
+        return False
+    if tag_format.get("min") != 1 or tag_format.get("max") != 1:
+        return False
+
+    content = tag_format.get("content")
+    if not isinstance(content, dict) or content.get("type") != "or":
+        return False
+    elements = content.get("elements")
+    if not isinstance(elements, list) or len(elements) != 1:
+        return False
+    expected_begin = f"<tool_call>\n<function={tool_names[0]}>\n"
+    return isinstance(elements[0], dict) and elements[0].get("begin") == expected_begin
+
+
+def _request_has_pure_json_structured_output(request: dict[str, Any]) -> bool:
+    if request.get("tools"):
+        return False
+
+    guided_decoding = request.get("guided_decoding")
+    if isinstance(guided_decoding, dict) and (
+        guided_decoding.get("json") is not None
+        or guided_decoding.get("json_object") is not None
+    ):
+        return True
+
+    sampling_options = request.get("sampling_options")
+    if isinstance(sampling_options, dict):
+        guided_decoding = sampling_options.get("guided_decoding")
+        if isinstance(guided_decoding, dict) and (
+            guided_decoding.get("json") is not None
+            or guided_decoding.get("json_object") is not None
+        ):
+            return True
+
+    if request.get("guided_json") is not None:
+        return True
+
+    structured_outputs = request.get("structured_outputs")
+    if isinstance(structured_outputs, dict) and (
+        structured_outputs.get("json") is not None
+        or structured_outputs.get("json_object") is not None
+    ):
+        return True
+
+    response_format = request.get("response_format")
+    if isinstance(response_format, dict):
+        return response_format.get("type") in {"json_schema", "json_object"}
+    return False
+
+
+class _StructuredJsonStreamGuard:
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._emitted = False
+
+    @property
+    def emitted(self) -> bool:
+        return self._emitted
+
+    def filter_delta(self, delta_text: str) -> str:
+        if self._emitted:
+            return ""
+        self._buffer += delta_text
+        candidate = self._buffer.lstrip()
+        if not candidate:
+            return ""
+        try:
+            _, end = json.JSONDecoder().raw_decode(candidate)
+        except json.JSONDecodeError:
+            return ""
+        self._emitted = True
+        return candidate[:end]
+
+
+def _structured_outputs_from_openai_request(
+    request: Dict[str, Any],
+    tool_call_parser_name: str | None = None,
+) -> StructuredOutputsParams | None:
+    guided_decoding = request.get("guided_decoding")
+    tool_structural_tag = _qwen_xml_structural_tag_for_tool_choice(
+        request, tool_call_parser_name
+    )
+    guided_outputs = _structured_outputs_from_fields(guided_decoding)
+    if (
+        guided_outputs is not None
+        and isinstance(guided_decoding, dict)
+        and guided_decoding.get("structural_tag") is not None
+    ):
+        if tool_structural_tag is not None and _is_required_single_tool_repeat_structural_tag(
+            guided_decoding.get("structural_tag"),
+            request,
+        ):
+            return tool_structural_tag
+        return guided_outputs
+
+    if tool_structural_tag is not None:
+        return tool_structural_tag
+
+    if guided_outputs is not None:
+        return guided_outputs
+
+    if request.get("guided_json") is not None:
+        _validate_structured_json_schema(request["guided_json"])
+        return StructuredOutputsParams(
+            json=bound_json_schema_for_constrained_decoding(request["guided_json"])
+        )
+    if request.get("guided_regex") is not None:
+        _validate_structured_regex(request["guided_regex"])
+        return StructuredOutputsParams(regex=request["guided_regex"])
+    if request.get("guided_choice") is not None:
+        return StructuredOutputsParams(choice=request["guided_choice"])
+    if request.get("guided_grammar") is not None:
+        _validate_structured_grammar(request["guided_grammar"])
+        return StructuredOutputsParams(grammar=request["guided_grammar"])
+
+    tool_schema = _schema_for_tool_choice(request)
+    if tool_schema is not None:
+        return StructuredOutputsParams(json=tool_schema)
+
+    structured_outputs = _structured_outputs_from_fields(
+        request.get("structured_outputs")
+    )
+    if structured_outputs is not None:
+        return structured_outputs
+
+    response_format = request.get("response_format")
+    if isinstance(response_format, dict):
+        response_type = response_format.get("type")
+        if response_type == "json_object":
+            return StructuredOutputsParams(json={"type": "object"})
+        if response_type == "json_schema":
+            json_schema = response_format.get("json_schema") or {}
+            schema = json_schema.get("schema")
+            if schema is not None:
+                _validate_structured_json_schema(schema)
+                return StructuredOutputsParams(
+                    json=bound_json_schema_for_constrained_decoding(schema)
+                )
+
+    return None
+
+
 def build_sampling_params_openai(
     request: Dict[str, Any],
     default_sampling_params: Dict[str, Any],
+    tool_call_parser_name: str | None = None,
 ) -> SamplingParams:
     """
     Build SamplingParams from an OpenAI-compatible request format.
@@ -3077,7 +3923,11 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         priority=0,
         reasoning_ended=None,
         reasoning_parser_kwargs=None,
+        enforce_decode_timeout: bool = False,
+        release_request_admission: bool = False,
+        abort_guard: Optional[_DeferredAbort] = None,
     ):
+        admission_handed_to_iterator = False
         try:
             # Log LoRA usage for this generation (debug level to avoid log spam)
             self._log_with_lora_context(
@@ -3226,10 +4076,16 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                     yield out
 
         except EngineDeadError as e:
+            if release_request_admission and not admission_handed_to_iterator:
+                await self._release_request_slot_reservation()
             logger.error(f"vLLM EngineDeadError: {e}")
             logger.warning("Initiating Dynamo Runtime shutdown.")
             self.runtime.shutdown()
             os._exit(1)
+        except Exception:
+            if release_request_admission and not admission_handed_to_iterator:
+                await self._release_request_slot_reservation()
+            raise
 
 
 class DecodeWorkerHandler(BaseWorkerHandler):
@@ -3417,6 +4273,24 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             self.model_max_len,
             enable_rl=self.config.enable_rl,
         )
+        self._apply_reasoning_budget_extra_args(sampling_params)
+        if os.environ.get("DYN_DEBUG_REASONING_BUDGET") == "1":
+            extra_args = (
+                sampling_params.extra_args
+                if isinstance(sampling_params.extra_args, dict)
+                else {}
+            )
+            logger.warning(
+                "reasoning budget sampling params request_id=%s "
+                "budget=%s grace=%s end_token_ids=%s stop_token_ids=%s "
+                "all_stop_token_ids=%s",
+                request_id,
+                extra_args.get("reasoning_budget"),
+                extra_args.get("reasoning_budget_grace_period"),
+                extra_args.get("end_token_ids"),
+                getattr(sampling_params, "stop_token_ids", None),
+                getattr(sampling_params, "all_stop_token_ids", None),
+            )
 
         if kv_params is not None:
             if sampling_params.extra_args is None:
@@ -3495,6 +4369,11 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         priority=priority,
                         reasoning_ended=reasoning_ended,
                         reasoning_parser_kwargs=reasoning_parser_kwargs,
+                        enforce_decode_timeout=not self._is_health_check_request(
+                            request
+                        ),
+                        release_request_admission=reserved,
+                        abort_guard=abort_guard,
                     ):
                         if abort_guard is not None:
                             abort_guard.signal_first_token()
@@ -3511,6 +4390,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                                 accumulated_log_probs,
                             )
                         yield tok
+                except DecodeWallClockTimeoutError as e:
+                    yield _build_token_error_response(str(e))
                 except EngineDeadError as e:
                     logger.error(f"vLLM EngineDeadError: {e}")
                     logger.warning("Initiating Dynamo Runtime shutdown.")
@@ -3532,14 +4413,40 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
         # Build sampling params from OpenAI-style request
         sampling_params = build_sampling_params_openai(
-            request, self.default_sampling_params
+            request,
+            self.default_sampling_params,
+            tool_call_parser_name=self.config.dyn_tool_call_parser,
         )
+        self._apply_reasoning_budget_extra_args(sampling_params)
 
         routing = request.get("routing") or {}
         dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
         priority = -int(routing.get("priority", 0))
         openai_request_id = request.get("id") or request.get("request_id", request_id)
         previous_text_per_choice: dict[int, str] = {}
+        structured_json_guards: dict[int, _StructuredJsonStreamGuard] | None = (
+            {} if _request_has_pure_json_structured_output(request) else None
+        )
+        early_stop_structured_json = (
+            structured_json_guards is not None
+            and int(getattr(sampling_params, "n", 1) or 1) == 1
+        )
+
+        reserved, current_total_requests, total_request_limit = (
+            await self._try_reserve_request_slot(request_id, request)
+        )
+        if not reserved:
+            message = (
+                f"Worker local total request limit reached "
+                f"({current_total_requests}/{total_request_limit})"
+            )
+            yield _build_text_overload_chunk(
+                message,
+                openai_request_id,
+                current_total_requests=current_total_requests,
+                total_request_limit=total_request_limit,
+            )
+            return
 
         trace_headers = context.trace_headers()
 
@@ -3567,7 +4474,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     priority=priority,
                 )
 
-                async for res in gen:
+                admission_handed_to_iterator = True
+                async for res in self._iterate_engine_stream(
+                    gen,
+                    request_id,
+                    enforce_decode_timeout=not self._is_health_check_request(request),
+                    release_request_admission=reserved,
+                ):
                     if not res.outputs:
                         yield {
                             "id": openai_request_id,
@@ -3591,6 +4504,16 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         previous_text = previous_text_per_choice.get(output_idx, "")
                         # Calculate the delta text (new text since last chunk)
                         delta_text = output.text[len(previous_text) :]
+                        structured_json_complete = False
+                        if structured_json_guards is not None:
+                            guard = structured_json_guards.setdefault(
+                                output_idx, _StructuredJsonStreamGuard()
+                            )
+                            delta_text = guard.filter_delta(delta_text)
+                            structured_json_complete = bool(delta_text and guard.emitted)
+                        finish_reason = normalize_finish_reason(output.finish_reason)
+                        if structured_json_complete and finish_reason is None:
+                            finish_reason = "stop"
 
                         choice_data = {
                             "index": output_idx,
@@ -3598,9 +4521,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                                 "role": "assistant",
                                 "content": delta_text,
                             },
-                            "finish_reason": normalize_finish_reason(
-                                output.finish_reason
-                            ),
+                            "finish_reason": finish_reason,
                         }
 
                         chunk = {
@@ -3618,12 +4539,35 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
                         yield chunk
                         previous_text_per_choice[output_idx] = output.text
+                        if (
+                            early_stop_structured_json
+                            and structured_json_complete
+                            and output.finish_reason is None
+                        ):
+                            try:
+                                await self.engine_client.abort(request_id)
+                            except Exception as abort_error:
+                                logger.warning(
+                                    "Failed to abort structured JSON request %s "
+                                    "after complete value: %s",
+                                    request_id,
+                                    abort_error,
+                                )
+                            return
 
+            except DecodeWallClockTimeoutError as e:
+                yield _build_text_error_chunk(str(e), openai_request_id)
             except EngineDeadError as e:
+                if reserved and not admission_handed_to_iterator:
+                    await self._release_request_slot_reservation()
                 logger.error(f"vLLM EngineDeadError: {e}")
                 logger.warning("Initiating Dynamo Runtime shutdown.")
                 self.runtime.shutdown()
                 os._exit(1)
+            except Exception:
+                if reserved and not admission_handed_to_iterator:
+                    await self._release_request_slot_reservation()
+                raise
 
 
 class PrefillWorkerHandler(BaseWorkerHandler):
@@ -3722,6 +4666,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             self.model_max_len,
             enable_rl=self.config.enable_rl,
         )
+        self._apply_reasoning_budget_extra_args(sampling_params)
 
         # One protocol instance per request; carries per-request state
         # (e.g. Mooncake's transfer_id) into the response loop below.
@@ -3756,6 +4701,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
 
         trace_headers = context.trace_headers()
         reasoning_ended, reasoning_parser_kwargs = _request_reasoning_metadata(request)
+        admission_handed_to_iterator = False
 
         async with self._abort_monitor(context, request_id, is_prefill=True):
             try:
@@ -3776,13 +4722,24 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                         ),
                     ),
                 )
+                admission_handed_to_iterator = True
             except EngineDeadError as e:
+                if reserved and not admission_handed_to_iterator:
+                    await self._release_request_slot_reservation()
                 logger.error(f"vLLM EngineDeadError: {e}")
                 logger.warning("Initiating Dynamo Runtime shutdown.")
                 self.runtime.shutdown()
                 os._exit(1)
+            except Exception:
+                if reserved and not admission_handed_to_iterator:
+                    await self._release_request_slot_reservation()
+                raise
 
-            async for res in gen:
+            async for res in self._iterate_engine_stream(
+                gen,
+                request_id,
+                release_request_admission=reserved,
+            ):
                 logger.debug(f"kv transfer params: {res.kv_transfer_params}")
 
                 token_ids = res.outputs[0].token_ids if res.outputs else []

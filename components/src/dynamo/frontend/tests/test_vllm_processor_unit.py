@@ -15,7 +15,7 @@ import pytest
 from _routed_engine_fakes import FakeRoutedEngine as _FakeRoutedEngine
 from transformers import AutoTokenizer
 
-from dynamo.frontend.prepost import _prepare_request
+from dynamo.frontend.prepost import StreamingPostProcessor, _prepare_request
 
 # NOTE: dynamo.frontend.vllm_processor is imported lazily inside the tests that
 # need it. Importing it at module top level would run its `from vllm.tasks import ...`
@@ -126,6 +126,35 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
             tools is not None and len(tools) == 1
         ), "tool_choice=auto should keep tools in template"
 
+    def test_structured_outputs_skip_auto_tool_parser(self, tokenizer):
+        """Explicit structured outputs stay on grammar path, not auto tool parsing."""
+        _, parser, _, _, _ = _prepare_request(
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Return JSON"}],
+                "structured_outputs": {"json": {"type": "object"}},
+            },
+            tokenizer=tokenizer,
+            tool_parser_class=Qwen3CoderToolParser,
+            enable_auto_tool_choice=True,
+        )
+
+        assert parser is None
+
+    def test_omitted_tool_choice_with_tools_defaults_to_auto(self, tokenizer):
+        """OpenAI-compatible default: omitted tool_choice plus tools means auto."""
+        request_for_sampling, _, _, _, chat_params = _prepare_request(
+            TOOL_REQUEST,
+            tokenizer=tokenizer,
+            tool_parser_class=None,
+            exclude_tools_when_tool_choice_none=True,
+        )
+        assert request_for_sampling.tool_choice == "auto"
+        tools = chat_params.chat_template_kwargs["tools"]
+        assert (
+            tools is not None and len(tools) == 1
+        ), "omitted tool_choice with tools should keep tools in template"
+
     def test_tool_choice_required_keeps_tools(self, tokenizer):
         """tool_choice=required should always include tools regardless of flag."""
         _, _, _, _, chat_params = _prepare_request(
@@ -139,6 +168,75 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
             tools is not None and len(tools) == 1
         ), "tool_choice=required should keep tools in template"
 
+    def test_tool_choice_required_preserves_template_thinking(self, tokenizer):
+        _, _, chat_template_kwargs, _, chat_params = _prepare_request(
+            {
+                **TOOL_REQUEST,
+                "tool_choice": "required",
+                "chat_template_kwargs": {"enable_thinking": True, "thinking": True},
+            },
+            tokenizer=tokenizer,
+            tool_parser_class=None,
+            exclude_tools_when_tool_choice_none=True,
+        )
+
+        assert chat_template_kwargs["enable_thinking"] is True
+        assert chat_template_kwargs["thinking"] is True
+        assert chat_params.chat_template_kwargs["enable_thinking"] is True
+        assert chat_params.chat_template_kwargs["thinking"] is True
+
+    def test_named_tool_choice_preserves_template_thinking(self, tokenizer):
+        _, _, chat_template_kwargs, _, chat_params = _prepare_request(
+            {
+                **TOOL_REQUEST,
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "get_weather"},
+                },
+                "chat_template_kwargs": {"enable_thinking": True, "thinking": True},
+            },
+            tokenizer=tokenizer,
+            tool_parser_class=None,
+            exclude_tools_when_tool_choice_none=True,
+        )
+
+        assert chat_template_kwargs["enable_thinking"] is True
+        assert chat_template_kwargs["thinking"] is True
+        assert chat_params.chat_template_kwargs["enable_thinking"] is True
+        assert chat_params.chat_template_kwargs["thinking"] is True
+
+    def test_tool_choice_auto_preserves_template_thinking(self, tokenizer):
+        _, _, chat_template_kwargs, _, chat_params = _prepare_request(
+            {
+                **TOOL_REQUEST,
+                "tool_choice": "auto",
+                "chat_template_kwargs": {"enable_thinking": True, "thinking": True},
+            },
+            tokenizer=tokenizer,
+            tool_parser_class=None,
+            exclude_tools_when_tool_choice_none=True,
+        )
+
+        assert chat_template_kwargs["enable_thinking"] is True
+        assert chat_template_kwargs["thinking"] is True
+        assert chat_params.chat_template_kwargs["enable_thinking"] is True
+        assert chat_params.chat_template_kwargs["thinking"] is True
+
+    def test_thinking_alias_disables_enable_thinking(self, tokenizer):
+        _, _, chat_template_kwargs, _, chat_params = _prepare_request(
+            {
+                **TOOL_REQUEST,
+                "chat_template_kwargs": {"thinking": False},
+            },
+            tokenizer=tokenizer,
+            tool_parser_class=None,
+            exclude_tools_when_tool_choice_none=True,
+        )
+
+        assert chat_template_kwargs["thinking"] is False
+        assert chat_template_kwargs["enable_thinking"] is False
+        assert chat_params.chat_template_kwargs["enable_thinking"] is False
+
     def test_no_tools_in_request(self, tokenizer):
         """Request without tools should produce None tools in template kwargs."""
         _, _, _, _, chat_params = _prepare_request(
@@ -150,6 +248,79 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
         assert (
             chat_params.chat_template_kwargs["tools"] is None
         ), "No tools in request should produce None tools in template"
+
+
+class TestReasoningEffortTemplateKwargs:
+    @pytest.mark.parametrize("effort", ["minimal", "low", "medium"])
+    def test_non_high_efforts_set_size_specific_flags(self, tokenizer, effort):
+        _, _, chat_template_kwargs, _, chat_params = _prepare_request(
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "reasoning_effort": effort,
+            },
+            tokenizer=tokenizer,
+            tool_parser_class=None,
+        )
+
+        assert chat_template_kwargs["enable_thinking"] is True
+        assert chat_template_kwargs["low_effort"] is True
+        assert chat_template_kwargs["medium_effort"] is True
+        assert chat_params.chat_template_kwargs["enable_thinking"] is True
+        assert chat_params.chat_template_kwargs["low_effort"] is True
+        assert chat_params.chat_template_kwargs["medium_effort"] is True
+
+    @pytest.mark.parametrize("effort", ["high", "xhigh", "max"])
+    def test_high_efforts_enable_max_thinking(self, tokenizer, effort):
+        _, _, chat_template_kwargs, _, chat_params = _prepare_request(
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "reasoning_effort": effort,
+            },
+            tokenizer=tokenizer,
+            tool_parser_class=None,
+        )
+
+        assert chat_template_kwargs["enable_thinking"] is True
+        assert "low_effort" not in chat_template_kwargs
+        assert "medium_effort" not in chat_template_kwargs
+        assert chat_params.chat_template_kwargs["enable_thinking"] is True
+        assert "low_effort" not in chat_params.chat_template_kwargs
+        assert "medium_effort" not in chat_params.chat_template_kwargs
+
+    def test_none_disables_thinking(self, tokenizer):
+        _, _, chat_template_kwargs, _, chat_params = _prepare_request(
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "reasoning_effort": "none",
+            },
+            tokenizer=tokenizer,
+            tool_parser_class=None,
+        )
+
+        assert chat_template_kwargs["enable_thinking"] is False
+        assert chat_params.chat_template_kwargs["enable_thinking"] is False
+
+    def test_explicit_template_flags_win(self, tokenizer):
+        _, _, chat_template_kwargs, _, chat_params = _prepare_request(
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "reasoning_effort": "low",
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            tokenizer=tokenizer,
+            tool_parser_class=None,
+        )
+
+        assert chat_template_kwargs["enable_thinking"] is False
+        assert "low_effort" not in chat_template_kwargs
+        assert "medium_effort" not in chat_template_kwargs
+        assert chat_params.chat_template_kwargs["enable_thinking"] is False
+        assert "low_effort" not in chat_params.chat_template_kwargs
+        assert "medium_effort" not in chat_params.chat_template_kwargs
 
 
 class TestReasoningParserMetadata:
@@ -182,6 +353,38 @@ class TestReasoningParserMetadata:
         assert reasoning_ended is True
         assert parser_kwargs == {"chat_template_kwargs": {"reasoning_effort": "low"}}
 
+    def test_enable_thinking_false_marks_reasoning_ended(self):
+        from dynamo.frontend.vllm_processor import _build_reasoning_parser_metadata
+
+        class ParserShouldNotBeBuilt:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("parser should not be constructed")
+
+        reasoning_ended, parser_kwargs = _build_reasoning_parser_metadata(
+            ParserShouldNotBeBuilt,
+            object(),
+            {"enable_thinking": False},
+            SimpleNamespace(include_reasoning=True),
+            [1, 2, 3],
+        )
+
+        assert reasoning_ended is True
+        assert parser_kwargs == {"chat_template_kwargs": {"enable_thinking": False}}
+
+    def test_enable_thinking_false_without_frontend_parser_marks_reasoning_ended(self):
+        from dynamo.frontend.vllm_processor import _build_reasoning_parser_metadata
+
+        reasoning_ended, parser_kwargs = _build_reasoning_parser_metadata(
+            None,
+            object(),
+            {"enable_thinking": False},
+            SimpleNamespace(include_reasoning=True),
+            [1, 2, 3],
+        )
+
+        assert reasoning_ended is True
+        assert parser_kwargs == {"chat_template_kwargs": {"enable_thinking": False}}
+
     def test_parser_receives_chat_template_kwargs(self):
         from dynamo.frontend.vllm_processor import _build_reasoning_parser_metadata
 
@@ -205,6 +408,78 @@ class TestReasoningParserMetadata:
         assert reasoning_ended is True
         assert parser_kwargs == {"chat_template_kwargs": {"reasoning_effort": "high"}}
 
+    def test_structured_outputs_serialize_to_guided_decoding(self):
+        from dynamo.frontend.vllm_processor import _structured_outputs_to_guided_decoding
+
+        guided = _structured_outputs_to_guided_decoding(
+            StructuredOutputsParams(
+                json={
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                },
+                disable_any_whitespace=True,
+            )
+        )
+
+        assert guided == {
+            "json": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            },
+            "disable_any_whitespace": True,
+            "disable_additional_properties": False,
+        }
+
+    def test_response_format_json_schema_serializes_to_guided_decoding(self):
+        from dynamo.frontend.vllm_processor import (
+            _structured_outputs_from_response_format,
+            _structured_outputs_to_guided_decoding,
+        )
+
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        }
+        structured_outputs = _structured_outputs_from_response_format(
+            {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": schema},
+            }
+        )
+
+        guided = _structured_outputs_to_guided_decoding(structured_outputs)
+
+        assert guided == {
+            "json": schema,
+            "disable_any_whitespace": False,
+            "disable_additional_properties": False,
+        }
+
+    def test_request_extra_structured_outputs_serializes_to_guided_decoding(self):
+        from dynamo.frontend.vllm_processor import (
+            _request_structured_outputs,
+            _structured_outputs_to_guided_decoding,
+        )
+
+        schema = {
+            "type": "object",
+            "properties": {"records": {"type": "array"}},
+            "required": ["records"],
+        }
+        structured_outputs = _request_structured_outputs(
+            SimpleNamespace(
+                structured_outputs=None,
+                model_extra={"structured_outputs": {"json": schema}},
+                response_format=None,
+            ),
+            SamplingParams(max_tokens=128),
+        )
+
+        assert _structured_outputs_to_guided_decoding(structured_outputs)["json"] == schema
+
     def test_kv_router_copies_reasoning_metadata_to_extra_args(self):
         from dynamo.frontend.vllm_processor import _inject_routing_metadata
 
@@ -215,6 +490,8 @@ class TestReasoningParserMetadata:
                 "reasoning_parser_kwargs": {
                     "chat_template_kwargs": {"reasoning_effort": "high"}
                 },
+                "reasoning_budget": 24000,
+                "reasoning_budget_grace_period": 128,
             },
             kv_kwargs,
         )
@@ -225,6 +502,8 @@ class TestReasoningParserMetadata:
             "reasoning_parser_kwargs": {
                 "chat_template_kwargs": {"reasoning_effort": "high"}
             },
+            "reasoning_budget": 24000,
+            "reasoning_budget_grace_period": 128,
         }
 
 

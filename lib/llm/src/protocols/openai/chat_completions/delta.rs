@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use super::{NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse};
 use crate::{
@@ -73,6 +76,8 @@ impl DeltaGenerator {
             usage,
             msg_counter: 0,
             options,
+            structured_json_buffers: HashMap::new(),
+            structured_json_completed: HashSet::new(),
             tracker,
         }
     }
@@ -233,6 +238,65 @@ impl DeltaGenerator {
         usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
         usage
     }
+
+    fn apply_structured_json_guard(
+        &mut self,
+        index: u32,
+        text: Option<String>,
+        finish_reason: Option<dynamo_protocols::types::FinishReason>,
+    ) -> (
+        Option<String>,
+        Option<dynamo_protocols::types::FinishReason>,
+    ) {
+        if !self.options.structured_json_guard {
+            return (text, finish_reason);
+        }
+
+        if self.structured_json_completed.contains(&index) {
+            return (None, finish_reason);
+        }
+
+        if let Some(text) = text {
+            let complete_json = {
+                let buffer = self.structured_json_buffers.entry(index).or_default();
+                buffer.push_str(&text);
+                first_complete_json_value(buffer)
+            };
+
+            if let Some(json) = complete_json {
+                self.structured_json_completed.insert(index);
+                return (
+                    Some(json),
+                    Some(finish_reason.unwrap_or(dynamo_protocols::types::FinishReason::Stop)),
+                );
+            }
+        }
+
+        if finish_reason.is_some()
+            && let Some(buffer) = self.structured_json_buffers.remove(&index)
+            && !buffer.is_empty()
+        {
+            return (Some(buffer), finish_reason);
+        }
+
+        (None, finish_reason)
+    }
+}
+
+fn first_complete_json_value(input: &str) -> Option<String> {
+    let trimmed = input.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut values = serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>();
+    values.next()?.ok()?;
+    let end = values.byte_offset();
+    if end == 0 {
+        return None;
+    }
+
+    Some(trimmed[..end].to_string())
 }
 
 /// Implements the [`crate::protocols::openai::DeltaGeneratorExt`] trait for [`DeltaGenerator`], allowing
@@ -278,6 +342,9 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
             delta.top_logprobs,
         );
 
+        let backend_service_overloaded =
+            common::llm_backend::is_service_overloaded(delta.extra_args.as_ref());
+
         // Map backend finish reasons to OpenAI's finish reasons.
         let finish_reason = match delta.finish_reason {
             Some(common::FinishReason::EoS) => Some(dynamo_protocols::types::FinishReason::Stop),
@@ -292,15 +359,21 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
                 Some(dynamo_protocols::types::FinishReason::ContentFilter)
             }
             Some(common::FinishReason::Error(err_msg)) => {
+                if backend_service_overloaded {
+                    return Err(common::llm_backend::service_overloaded_error(err_msg).into());
+                }
                 return Err(anyhow::anyhow!(err_msg));
             }
             None => None,
         };
         let stop_reason = delta.stop_reason.clone();
 
-        // Create the streaming response.
         let index = delta.index.unwrap_or(0);
-        let mut stream_response = self.create_choice(index, delta.text, finish_reason, logprobs);
+        let (text, finish_reason) =
+            self.apply_structured_json_guard(index, delta.text, finish_reason);
+
+        // Create the streaming response.
+        let mut stream_response = self.create_choice(index, text, finish_reason, logprobs);
 
         // Record finish for timing/ITL accounting even when timing is not returned to the client.
         // Kept at call site because it's a side effect on the tracker — not a gating decision.
@@ -363,6 +436,11 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
 
     fn is_continuous_usage_enabled(&self) -> bool {
         DeltaGenerator::is_continuous_usage_enabled(self)
+    }
+
+    fn should_terminate_stream(&self) -> bool {
+        self.options.structured_json_guard
+            && (self.structured_json_completed.len() as u32) >= self.options.expected_choices
     }
 
     fn get_usage(&self) -> dynamo_protocols::types::CompletionUsage {
@@ -475,6 +553,80 @@ mod tests {
             encoder_result: None,
             routing_data: None,
         }
+    }
+
+    fn backend_text(text: &str) -> BackendOutput {
+        BackendOutput {
+            token_ids: vec![1],
+            tokens: vec![Some(text.to_string())],
+            text: Some(text.to_string()),
+            cum_log_probs: None,
+            log_probs: None,
+            top_logprobs: None,
+            finish_reason: None,
+            stop_reason: None,
+            index: Some(0),
+            completion_usage: None,
+            disaggregated_params: None,
+            extra_args: None,
+            engine_data: None,
+        }
+    }
+
+    fn assert_text_delta(response: &NvCreateChatCompletionStreamResponse, expected: &str) {
+        match response.inner.choices[0].delta.content.as_ref() {
+            Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(text)) => {
+                assert_eq!(text, expected);
+            }
+            other => panic!("expected text delta {expected:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pure_structured_json_stream_buffers_until_complete_value() {
+        let mut request = create_test_request();
+        request.inner.stream = Some(true);
+        request.common.structured_outputs =
+            Some(crate::protocols::openai::common_ext::StructuredOutputs {
+                json: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "records": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "message": {"type": "string"}
+                                }
+                            }
+                        }
+                    }
+                })),
+                ..Default::default()
+            });
+        let mut generator = request.response_generator("req-structured-json".to_string());
+
+        let first = generator
+            .choice_from_postprocessor(backend_text(r#"{"records":["#))
+            .expect("first chunk");
+        assert!(first.inner.choices[0].delta.content.is_none());
+        assert!(first.inner.choices[0].finish_reason.is_none());
+        assert!(!generator.should_terminate_stream());
+
+        let second = generator
+            .choice_from_postprocessor(backend_text(
+                r#"{"message":"He said \"ready\", proceed."}]} trailing explanation"#,
+            ))
+            .expect("second chunk");
+        assert_text_delta(
+            &second,
+            r#"{"records":[{"message":"He said \"ready\", proceed."}]}"#,
+        );
+        assert_eq!(
+            second.inner.choices[0].finish_reason,
+            Some(dynamo_protocols::types::FinishReason::Stop)
+        );
+        assert!(generator.should_terminate_stream());
     }
 
     fn create_test_request_with_extra_fields(fields: Vec<String>) -> NvCreateChatCompletionRequest {
@@ -755,5 +907,41 @@ mod tests {
                 "engine_data should not appear when backend provides None"
             );
         }
+    }
+
+    #[test]
+    fn test_backend_service_overloaded_error_is_typed() {
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-overload".to_string());
+
+        let backend_output = crate::protocols::common::llm_backend::BackendOutput {
+            token_ids: vec![],
+            tokens: vec![],
+            text: None,
+            cum_log_probs: None,
+            log_probs: None,
+            top_logprobs: None,
+            finish_reason: Some(crate::protocols::common::FinishReason::Error(
+                "Worker local total request limit reached (16/16)".to_string(),
+            )),
+            stop_reason: None,
+            index: Some(0),
+            completion_usage: None,
+            disaggregated_params: None,
+            extra_args: Some(serde_json::json!({
+                "dynamo_error_type": "service_overloaded",
+            })),
+            engine_data: None,
+        };
+
+        let err = generator
+            .choice_from_postprocessor(backend_output)
+            .expect_err("overload marker should produce a typed error");
+
+        assert!(dynamo_runtime::error::match_error_chain(
+            err.as_ref(),
+            &[dynamo_runtime::error::ErrorType::ResourceExhausted],
+            &[],
+        ));
     }
 }

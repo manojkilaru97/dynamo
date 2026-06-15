@@ -4,6 +4,7 @@
 pub mod bus;
 pub mod config;
 pub mod handle;
+pub mod otel_sink;
 pub mod sink;
 pub mod stream;
 

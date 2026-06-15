@@ -132,6 +132,7 @@ struct WorkItem {
     namespace: String,
     component_name: String,
     endpoint_name: String,
+    system_health: Arc<Mutex<SystemHealth>>,
 }
 
 /// Shared TCP server that handles multiple endpoints on a single port
@@ -330,12 +331,31 @@ impl SharedTcpServer {
             .instrument(span)
             .await;
 
-        if let Err(e) = result {
-            tracing::warn!(
-                instance_id = work_item.instance_id,
-                error = %e,
-                "TCP worker failed to handle request"
-            );
+        match result {
+            Ok(_) => {
+                work_item
+                    .system_health
+                    .lock()
+                    .record_endpoint_request_result(&work_item.endpoint_name, true);
+            }
+            Err(e) => {
+                if matches!(e, crate::pipeline::PipelineError::ServiceOverloaded(_)) {
+                    work_item
+                        .system_health
+                        .lock()
+                        .record_endpoint_request_overload(&work_item.endpoint_name);
+                } else {
+                    work_item
+                        .system_health
+                        .lock()
+                        .record_endpoint_request_result(&work_item.endpoint_name, false);
+                }
+                tracing::warn!(
+                    instance_id = work_item.instance_id,
+                    error = %e,
+                    "TCP worker failed to handle request"
+                );
+            }
         }
 
         work_item.inflight.fetch_sub(1, Ordering::SeqCst);
@@ -633,6 +653,7 @@ impl SharedTcpServer {
                 namespace: handler.namespace.clone(),
                 component_name: handler.component_name.clone(),
                 endpoint_name: handler.endpoint_name.clone(),
+                system_health: handler.system_health.clone(),
             };
 
             // Engine permit free and nothing queued ahead → dispatch directly.
@@ -778,6 +799,23 @@ mod tests {
     use std::time::Duration;
     use tokio::time::Instant;
 
+    fn test_system_health() -> Arc<Mutex<SystemHealth>> {
+        Arc::new(Mutex::new(SystemHealth::new(
+            crate::HealthStatus::Ready,
+            vec![],
+            false,
+            "/health".to_string(),
+            "/live".to_string(),
+            crate::system_health::RealTrafficHealthConfig {
+                window: Duration::from_secs(
+                    crate::config::DEFAULT_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS,
+                ),
+                min_samples: crate::config::DEFAULT_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES,
+                failure_threshold: crate::config::DEFAULT_HEALTH_CHECK_REAL_FAILURE_THRESHOLD,
+            },
+        )))
+    }
+
     /// Mock handler that simulates slow request processing for testing
     struct SlowMockHandler {
         /// Tracks if a request is currently being processed
@@ -860,6 +898,13 @@ mod tests {
             false, // health_check_enabled
             "/health".to_string(),
             "/live".to_string(),
+            crate::system_health::RealTrafficHealthConfig {
+                window: Duration::from_secs(
+                    crate::config::DEFAULT_HEALTH_CHECK_REAL_FAILURE_WINDOW_SECS,
+                ),
+                min_samples: crate::config::DEFAULT_HEALTH_CHECK_REAL_FAILURE_MIN_SAMPLES,
+                failure_threshold: crate::config::DEFAULT_HEALTH_CHECK_REAL_FAILURE_THRESHOLD,
+            },
         )));
 
         server
@@ -1084,6 +1129,7 @@ mod tests {
                 namespace: "test".to_string(),
                 component_name: "test".to_string(),
                 endpoint_name: "test".to_string(),
+                system_health: test_system_health(),
             };
             work_tx.send(work_item).await.expect("send should succeed");
         }
@@ -1163,6 +1209,7 @@ mod tests {
                 namespace: "test".to_string(),
                 component_name: "test".to_string(),
                 endpoint_name: "test".to_string(),
+                system_health: test_system_health(),
             };
             work_tx.send(work_item).await.expect("send should succeed");
         }

@@ -50,6 +50,26 @@ fn test_deserialize_bigram_block_stored_sequence() {
     }
 }
 
+#[test]
+fn test_deserialize_byte_block_hash_sequence() {
+    let hash_bytes: Vec<u8> = (0u8..32u8).collect();
+    let expected = u64::from_be_bytes(hash_bytes[24..32].try_into().unwrap());
+    let raw_event = (
+        "BlockRemoved",
+        vec![serde_bytes::ByteBuf::from(hash_bytes)],
+        Option::<String>::None,
+    );
+    let encoded = to_vec(&raw_event).unwrap();
+    let event: RawKvEvent = from_slice(&encoded).unwrap();
+
+    match event {
+        RawKvEvent::BlockRemoved { block_hashes, .. } => {
+            assert_eq!(block_hashes[0].into_u64(), expected);
+        }
+        other => panic!("expected BlockRemoved, got {other:?}"),
+    }
+}
+
 fn block_stored_sequence(
     group_idx: Option<u32>,
     kv_cache_spec_kind: Option<&'static str>,

@@ -4,7 +4,10 @@
 use futures::{Stream, StreamExt};
 use std::collections::{BTreeMap, HashMap};
 
-use dynamo_parsers::tool_calling::try_tool_call_parse_aggregate_finalize;
+use dynamo_parsers::tool_calling::{
+    JsonParserConfig, ToolCallResponse, try_tool_call_parse_aggregate_finalize,
+    try_tool_call_parse_json,
+};
 
 use super::{NvCreateChatCompletionResponse, NvCreateChatCompletionStreamResponse};
 use crate::protocols::{
@@ -82,6 +85,58 @@ struct DeltaChoice {
 
     /// Accumulated content parts for multimodal responses
     content_parts: Vec<dynamo_protocols::types::ChatCompletionResponseContentPart>,
+}
+
+impl DeltaChoice {
+    fn has_reasoning_content(&self) -> bool {
+        self.reasoning_content
+            .as_ref()
+            .is_some_and(|reasoning| !reasoning.is_empty())
+    }
+
+    fn has_tool_calls_or_chunks(&self) -> bool {
+        self.tool_calls
+            .as_ref()
+            .is_some_and(|tool_calls| !tool_calls.is_empty())
+            || !self.tool_call_chunks.is_empty()
+    }
+
+    fn normalize_content_after_reasoning(&mut self) {
+        if !self.has_reasoning_content() || self.text.is_empty() {
+            return;
+        }
+
+        const THINK_END: &str = "</think>";
+        if let Some(end_idx) = self.text.rfind(THINK_END) {
+            let before = self.text[..end_idx].to_string();
+            let after = self.text[end_idx + THINK_END.len()..]
+                .trim_start_matches(|ch| ch == '\n' || ch == '\r')
+                .to_string();
+            if !before.is_empty() {
+                self.reasoning_content
+                    .get_or_insert_with(String::new)
+                    .push_str(&before);
+            }
+            self.text = after;
+        } else {
+            self.text = self
+                .text
+                .trim_start_matches(|ch| ch == '\n' || ch == '\r')
+                .to_string();
+        }
+    }
+
+    fn mirror_reasoning_as_content_if_needed(&mut self) {
+        if !self.text.is_empty() || self.has_tool_calls_or_chunks() {
+            return;
+        }
+        let Some(reasoning) = self.reasoning_content.as_ref() else {
+            return;
+        };
+        if !reasoning.is_empty() {
+            self.text = reasoning.clone();
+        }
+    }
 }
 
 impl Default for DeltaAggregator {
@@ -218,14 +273,76 @@ impl DeltaAggregator {
         stream: impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>>,
         parsing_options: ParsingOptions,
     ) -> Result<NvCreateChatCompletionResponse, String> {
-        let mut aggregator = stream
-            .fold(DeltaAggregator::new(), |mut aggregator, delta| async move {
-                // Attempt to unwrap the delta, capturing any errors.
-                let delta = match delta.ok() {
-                    Ok(delta) => delta,
-                    Err(error) => {
-                        aggregator.error = Some(error);
-                        return aggregator;
+        futures::pin_mut!(stream);
+        let mut aggregator = DeltaAggregator::new();
+        while let Some(delta) = stream.next().await {
+            aggregator.observe(&delta);
+        }
+
+        aggregator.finalize(parsing_options).await
+    }
+
+    /// Observes a streaming chunk by reference. This is used by the HTTP audit
+    /// path to build the final logged response without cloning every chunk.
+    pub fn observe(&mut self, delta: &Annotated<NvCreateChatCompletionStreamResponse>) {
+        if let Some(event) = &delta.event
+            && event == "error"
+        {
+            self.error = Some(if let Some(ref err) = delta.error {
+                err.to_string()
+            } else {
+                delta
+                    .comment
+                    .clone()
+                    .unwrap_or_else(|| vec!["unknown error".to_string()])
+                    .join(", ")
+            });
+            return;
+        }
+
+        if self.error.is_some() {
+            return;
+        }
+
+        let Some(delta) = delta.data.as_ref() else {
+            return;
+        };
+
+        self.id = delta.inner.id.clone();
+        self.model = delta.inner.model.clone();
+        self.created = delta.inner.created;
+        self.service_tier = delta.inner.service_tier.clone();
+
+        if let Some(usage) = &delta.inner.usage {
+            self.usage = Some(usage.clone());
+        }
+        if let Some(system_fingerprint) = &delta.inner.system_fingerprint {
+            self.system_fingerprint = Some(system_fingerprint.clone());
+        }
+
+        merge_response_nvext(&mut self.nvext, delta.nvext.clone());
+
+        for choice in &delta.inner.choices {
+            let state_choice = self.choices.entry(choice.index).or_insert(DeltaChoice {
+                index: choice.index,
+                text: "".to_string(),
+                role: choice.delta.role.clone(),
+                finish_reason: None,
+                logprobs: None,
+                tool_call_chunks: BTreeMap::new(),
+                tool_calls: None,
+                reasoning_content: None,
+                content_parts: Vec::new(),
+            });
+
+            if state_choice.role.is_none() {
+                state_choice.role = choice.delta.role.clone();
+            }
+
+            if let Some(content) = &choice.delta.content {
+                match content {
+                    ChatCompletionMessageContent::Text(text) => {
+                        state_choice.text.push_str(text);
                     }
                 };
 
@@ -339,12 +456,70 @@ impl DeltaAggregator {
                         }
                     }
                 }
-                aggregator
-            })
-            .await;
+            }
 
+            if let Some(reasoning_content) = &choice.delta.reasoning_content {
+                state_choice
+                    .reasoning_content
+                    .get_or_insert_with(String::new)
+                    .push_str(reasoning_content);
+            }
+
+            // #8640: streaming producers split a single tool call across
+            // multiple deltas (delta 1 = id + name; delta 2..N = argument
+            // fragments), so we merge chunks into a per-index accumulator
+            // here instead of treating each chunk as a complete tool call.
+            // Finalization to `tool_calls` happens after observation.
+            if let Some(incoming_chunks) = &choice.delta.tool_calls {
+                for chunk in incoming_chunks {
+                    let entry = state_choice
+                        .tool_call_chunks
+                        .entry(chunk.index)
+                        .or_insert_with(|| {
+                            dynamo_protocols::types::ChatCompletionMessageToolCallChunk {
+                                index: chunk.index,
+                                id: None,
+                                r#type: None,
+                                function: None,
+                            }
+                        });
+                    merge_tool_call_chunk(entry, chunk.clone());
+                }
+            }
+
+            if let Some(finish_reason) = &choice.finish_reason {
+                state_choice.finish_reason = Some(finish_reason.clone());
+            }
+
+            if let Some(logprobs) = &choice.logprobs {
+                let state_lps = state_choice.logprobs.get_or_insert(
+                    dynamo_protocols::types::ChatChoiceLogprobs {
+                        content: None,
+                        refusal: None,
+                    },
+                );
+                if let Some(content_lps) = &logprobs.content {
+                    state_lps
+                        .content
+                        .get_or_insert(Vec::new())
+                        .extend(content_lps.clone());
+                }
+                if let Some(refusal_lps) = &logprobs.refusal {
+                    state_lps
+                        .refusal
+                        .get_or_insert(Vec::new())
+                        .extend(refusal_lps.clone());
+                }
+            }
+        }
+    }
+
+    pub async fn finalize(
+        mut self,
+        parsing_options: ParsingOptions,
+    ) -> Result<NvCreateChatCompletionResponse, String> {
         // Return early if an error was encountered.
-        if let Some(error) = aggregator.error {
+        if let Some(error) = self.error {
             return Err(error);
         }
 
@@ -353,7 +528,7 @@ impl DeltaAggregator {
         // whole stream are dropped here (they're not a valid tool call in the
         // final schema), but chunks missing only `arguments` get defaulted to
         // "" — the old code dropped those entirely.
-        for choice in aggregator.choices.values_mut() {
+        for choice in self.choices.values_mut() {
             if choice.tool_call_chunks.is_empty() {
                 continue;
             }
@@ -370,8 +545,13 @@ impl DeltaAggregator {
             }
         }
 
+        for choice in self.choices.values_mut() {
+            choice.normalize_content_after_reasoning();
+            choice.mirror_reasoning_as_content_if_needed();
+        }
+
         if let Some(parser) = parsing_options.tool_call_parser.as_deref() {
-            for choice in aggregator.choices.values_mut() {
+            for choice in self.choices.values_mut() {
                 if choice
                     .tool_calls
                     .as_ref()
@@ -409,6 +589,25 @@ impl DeltaAggregator {
                     }
                 };
 
+                if parsed.0.is_empty()
+                    && parsing_options.parse_bare_json_tool_calls
+                    && let Some(tool_names) = parsing_options.tool_names.as_deref()
+                    && !tool_names.is_empty()
+                {
+                    match try_jsonish_tool_call_parse_aggregate_finalize(&choice.text, tool_names) {
+                        Ok(result) => parsed = result,
+                        Err(error) => {
+                            tracing::debug!(
+                                error = %error,
+                                parser,
+                                "failed to parse aggregated bare JSON tool calls"
+                            );
+                        }
+                    }
+                }
+
+                let (tool_calls, content) = parsed;
+
                 if !tool_calls.is_empty() {
                     choice.tool_calls = Some(
                         tool_calls
@@ -419,12 +618,13 @@ impl DeltaAggregator {
                     choice.text = content.unwrap_or_default();
                 } else if is_harmony_parser(parser) && contains_harmony_protocol(&choice.text) {
                     choice.text = content.unwrap_or_default();
+                    choice.normalize_content_after_reasoning();
                 }
             }
         }
 
         // Extract aggregated choices and sort them by index.
-        let mut choices: Vec<_> = aggregator
+        let mut choices: Vec<_> = self
             .choices
             .into_values()
             .map(dynamo_protocols::types::ChatChoice::from)
@@ -435,20 +635,71 @@ impl DeltaAggregator {
         // Construct the final response object.
         let response = NvCreateChatCompletionResponse {
             inner: dynamo_protocols::types::CreateChatCompletionResponse {
-                id: aggregator.id,
-                created: aggregator.created,
-                usage: aggregator.usage,
-                model: aggregator.model,
+                id: self.id,
+                created: self.created,
+                usage: self.usage,
+                model: self.model,
                 object: "chat.completion".to_string(),
-                system_fingerprint: aggregator.system_fingerprint,
+                system_fingerprint: self.system_fingerprint,
                 choices,
-                service_tier: aggregator.service_tier,
+                service_tier: self.service_tier,
             },
-            nvext: aggregator.nvext,
+            nvext: self.nvext,
         };
 
         Ok(response)
     }
+}
+
+fn try_jsonish_tool_call_parse_aggregate_finalize(
+    message: &str,
+    tool_names: &[String],
+) -> anyhow::Result<(
+    Vec<dynamo_protocols::types::ChatCompletionMessageToolCall>,
+    Option<String>,
+)> {
+    let mut tagged_config = JsonParserConfig::default();
+    tagged_config.tool_call_start_tokens = vec!["<tools>".to_string()];
+    tagged_config.tool_call_end_tokens = vec!["</tools>".to_string()];
+    tagged_config.allow_eof_recovery = true;
+
+    let mut bare_config = JsonParserConfig::default();
+    bare_config.bare_json_mode = true;
+    bare_config.allow_eof_recovery = true;
+
+    for config in [&tagged_config, &bare_config] {
+        let (parsed, content) = try_tool_call_parse_json(message, config, None)?;
+        let tool_calls = filter_tool_calls_by_name(parsed, tool_names);
+        if !tool_calls.is_empty() {
+            return Ok((tool_calls, content));
+        }
+    }
+
+    Ok((vec![], Some(message.to_string())))
+}
+
+fn filter_tool_calls_by_name(
+    parsed: Vec<ToolCallResponse>,
+    tool_names: &[String],
+) -> Vec<dynamo_protocols::types::ChatCompletionMessageToolCall> {
+    let mut tool_calls = Vec::new();
+    for parsed in parsed {
+        if !tool_names
+            .iter()
+            .any(|tool_name| tool_name == &parsed.function.name)
+        {
+            continue;
+        }
+        tool_calls.push(dynamo_protocols::types::ChatCompletionMessageToolCall {
+            id: parsed.id,
+            r#type: dynamo_protocols::types::FunctionType::Function,
+            function: dynamo_protocols::types::FunctionCall {
+                name: parsed.function.name,
+                arguments: parsed.function.arguments,
+            },
+        });
+    }
+    tool_calls
 }
 
 #[allow(deprecated)]

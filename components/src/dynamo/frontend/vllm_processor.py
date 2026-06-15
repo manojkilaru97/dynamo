@@ -12,13 +12,19 @@ import os
 import time
 from argparse import Namespace
 from collections.abc import AsyncGenerator
+from types import SimpleNamespace
 from typing import Any
 
 from msgspec.structs import replace as msgspec_replace
+from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.config import CacheConfig, LoadConfig, ModelConfig, VllmConfig
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
-from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.sampling_params import (
+    RequestOutputKind,
+    SamplingParams,
+    StructuredOutputsParams,
+)
 from vllm.tasks import GENERATION_TASKS
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser, ToolParserManager
@@ -59,6 +65,17 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "content_filter": FinishReason.STOP,
 }
 
+DEFAULT_TOOL_SCHEMA_MAX_STRING_LENGTH = 4096
+DEFAULT_TOOL_SCHEMA_MAX_ARRAY_ITEMS = 32
+DEFAULT_TOOL_SHORT_TEXT_MAX_LENGTH = 256
+DEFAULT_TOOL_LONG_TEXT_MAX_LENGTH = 8192
+TOOL_LONG_REQUEST_THRESHOLD = 2048
+TOOL_LONG_REQUEST_MARGIN = 512
+TOOL_FIELD_STRING_BUDGETS = {
+    "expression": 256,
+}
+TOOL_LONG_TEXT_FIELD_NAMES = {"body", "content", "message"}
+
 
 def map_finish_reason(raw_reason: str | None) -> FinishReason | None:
     if raw_reason is None:
@@ -94,14 +111,16 @@ def _build_reasoning_parser_metadata(
     request_for_sampling: Any,
     prompt_token_ids: list[int],
 ) -> tuple[bool | None, dict[str, Any] | None]:
-    if reasoning_parser_class is None:
-        return None, None
-
     parser_kwargs = {"chat_template_kwargs": chat_template_kwargs}
     if not getattr(request_for_sampling, "include_reasoning", True):
         return True, parser_kwargs
     if getattr(request_for_sampling, "_grammar_from_tool_parser", False):
         return True, parser_kwargs
+    if chat_template_kwargs.get("enable_thinking") is False:
+        return True, parser_kwargs
+
+    if reasoning_parser_class is None:
+        return None, None
 
     reasoning_parser = reasoning_parser_class(
         tokenizer,
@@ -150,6 +169,7 @@ class VllmProcessor:
         self.routed_engine = routed_engine
         self.output_processor = output_processor
         self.tool_parser_class = tool_parser_class
+        self.tool_parser_name = tool_parser_name
         self.reasoning_parser_class = reasoning_parser_class
         self.exclude_tools_when_tool_choice_none = True
         self.block_size = block_size
@@ -345,6 +365,16 @@ class VllmProcessor:
         request_for_sampling = pre.request_for_sampling
         tool_parser = pre.tool_parser
         chat_template_kwargs = pre.chat_template_kwargs
+        raw_chat_template_kwargs = request.get("chat_template_kwargs")
+        if not isinstance(raw_chat_template_kwargs, dict):
+            raw_chat_template_kwargs = request.get("chat_template_args")
+        if isinstance(raw_chat_template_kwargs, dict):
+            effective_chat_template_kwargs = {
+                **raw_chat_template_kwargs,
+                **chat_template_kwargs,
+            }
+        else:
+            effective_chat_template_kwargs = chat_template_kwargs
         engine_prompt = pre.engine_prompt
         tokens = pre.prompt_token_ids
 
@@ -379,6 +409,12 @@ class VllmProcessor:
             v = getattr(request_for_sampling, k, None)
             if v is not None:
                 setattr(sampling_params, k, v)
+        if not _has_structured_outputs(sampling_params.structured_outputs):
+            tool_schema = _tool_choice_guided_json_schema(request_for_sampling)
+            if tool_schema is not None:
+                sampling_params.structured_outputs = StructuredOutputsParams(
+                    json=tool_schema
+                )
         # nvext.max_thinking_tokens is enforced on the worker, not here. The
         # frontend's InputProcessor is built without reasoning_config (it only
         # tokenizes), so setting sampling_params.thinking_token_budget would
@@ -388,6 +424,12 @@ class VllmProcessor:
         nvext_max_thinking_tokens = (request.get("nvext") or {}).get(
             "max_thinking_tokens"
         )
+        if nvext_max_thinking_tokens is None:
+            nvext_max_thinking_tokens = _default_constrained_max_thinking_tokens(
+                request_for_sampling=request_for_sampling,
+                sampling_params=sampling_params,
+                chat_template_kwargs=effective_chat_template_kwargs,
+            )
         logprobs = request_for_sampling.logprobs
         top_logprobs = request_for_sampling.top_logprobs
         if logprobs is True:
@@ -467,10 +509,21 @@ class VllmProcessor:
             "annotations": [],
             "routing": request.get("routing"),
         }
+        guided_decoding = _structured_outputs_to_guided_decoding(
+            _request_structured_outputs(request_for_sampling, sp)
+        )
+        if guided_decoding is not None:
+            dynamo_preproc["sampling_options"]["guided_decoding"] = guided_decoding
         if reasoning_ended is not None:
             dynamo_preproc["reasoning_ended"] = reasoning_ended
         if reasoning_parser_kwargs is not None:
             dynamo_preproc["reasoning_parser_kwargs"] = reasoning_parser_kwargs
+        if request_for_sampling.reasoning_budget is not None:
+            dynamo_preproc["reasoning_budget"] = request_for_sampling.reasoning_budget
+        if request_for_sampling.reasoning_budget_grace_period is not None:
+            dynamo_preproc["reasoning_budget_grace_period"] = (
+                request_for_sampling.reasoning_budget_grace_period
+            )
 
         # Extract MM routing metadata and prepare transfer.
         cleanup_items: list = []
@@ -507,7 +560,7 @@ class VllmProcessor:
                 return StreamingPostProcessor(
                     tokenizer=self.tokenizer,
                     request_for_sampling=request_for_sampling,
-                    sampling_params=sampling_params,
+                    sampling_params=sp,
                     prompt_token_ids=tokens,
                     tool_parser=tool_parser,
                     reasoning_parser_class=self.reasoning_parser_class,
@@ -656,10 +709,26 @@ class VllmProcessor:
                 raw_finish_reason = engine_response.get("finish_reason")
                 finish_reason = map_finish_reason(raw_finish_reason)
                 stop_reason = engine_response.get("stop_reason")
+                raw_token_ids = list(engine_response["token_ids"])
+                if os.environ.get("DYN_DEBUG_REASONING_BUDGET") == "1" and (
+                    raw_finish_reason or 14 in raw_token_ids or 15 in raw_token_ids
+                ):
+                    logger.warning(
+                        "frontend raw engine response request_id=%s index=%s "
+                        "finish_reason=%s stop_reason=%s contains_14=%s "
+                        "contains_15=%s raw_tail=%s",
+                        request_id,
+                        output_idx,
+                        raw_finish_reason,
+                        stop_reason,
+                        14 in raw_token_ids,
+                        15 in raw_token_ids,
+                        raw_token_ids[-32:],
+                    )
 
                 output_kwargs: dict[str, Any] = {
                     "request_id": output_request_id,
-                    "new_token_ids": engine_response["token_ids"],
+                    "new_token_ids": raw_token_ids,
                     "finish_reason": finish_reason,
                     "stop_reason": stop_reason,
                 }
@@ -709,6 +778,10 @@ class VllmProcessor:
                 # client cancellation can't drop the annotation between yields.
                 envelope: dict[str, Any] = {"_dynamo_annotated": True}
                 if choices:
+                    choices = _bridge_structured_tool_content_choices(
+                        request,
+                        choices,
+                    )
                     dynamo_out = {
                         "id": request_id,
                         "choices": choices,

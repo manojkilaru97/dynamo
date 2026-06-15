@@ -9,10 +9,10 @@ use dynamo_protocols::types::responses::{
     AssistantRole, FunctionCallOutput, FunctionToolCall, IncludeEnum, InputContent, InputItem,
     InputOutputMessageContent, InputParam, InputRole, InputTokenDetails, Instructions, Item,
     MessageItem, OutputItem, OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent,
-    OutputTokenDetails, PromptCacheRetention, Reasoning, ReasoningItem, Response,
-    ResponseTextParam, ResponseUsage, Role as ResponseRole, ServiceTier, Status, SummaryPart,
-    SummaryTextContent, TextResponseFormatConfiguration, Tool, ToolChoiceOptions, ToolChoiceParam,
-    Truncation,
+    OutputTokenDetails, PromptCacheRetention, Reasoning, ReasoningItem, ReasoningTextContent,
+    Response, ResponseTextParam, ResponseUsage, Role as ResponseRole, ServiceTier, Status,
+    SummaryPart, SummaryTextContent, TextResponseFormatConfiguration, Tool, ToolChoiceOptions,
+    ToolChoiceParam, Truncation,
 };
 use dynamo_protocols::types::{
     ChatCompletionMessageToolCall, ChatCompletionNamedToolChoice,
@@ -125,6 +125,31 @@ pub(crate) fn patch_response_for_spec(
         serde_json::json!(frequency_penalty),
     );
     obj.insert("store".into(), serde_json::json!(store));
+
+    if let Some(serde_json::Value::Array(output)) = obj.get_mut("output") {
+        for item in output {
+            patch_output_item_for_spec(item);
+        }
+    }
+}
+
+pub(crate) fn patch_output_item_for_spec(item: &mut serde_json::Value) {
+    let serde_json::Value::Object(item_obj) = item else {
+        return;
+    };
+    if item_obj.get("type").and_then(|value| value.as_str()) != Some("reasoning") {
+        return;
+    }
+    let Some(serde_json::Value::Array(content)) = item_obj.get_mut("content") else {
+        return;
+    };
+    for part in content {
+        if let serde_json::Value::Object(part_obj) = part {
+            part_obj
+                .entry("type".to_string())
+                .or_insert_with(|| serde_json::json!("reasoning_text"));
+        }
+    }
 }
 
 impl Serialize for NvResponse {
@@ -661,6 +686,13 @@ fn convert_text_format(text: &ResponseTextParam) -> Option<ResponseFormat> {
     }
 }
 
+pub(crate) fn default_response_text_param() -> ResponseTextParam {
+    ResponseTextParam {
+        format: TextResponseFormatConfiguration::Text,
+        verbosity: None,
+    }
+}
+
 /// Convert Responses API `ServiceTier` to Chat Completions `ServiceTier`.
 /// These are structurally identical enums in different modules.
 fn convert_service_tier(tier: &ServiceTier) -> ChatServiceTier {
@@ -782,7 +814,7 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
         // Map service_tier
         let service_tier = resp.inner.service_tier.as_ref().map(convert_service_tier);
 
-        Ok(NvCreateChatCompletionRequest {
+        let mut chat_request = NvCreateChatCompletionRequest {
             inner: CreateChatCompletionRequest {
                 messages,
                 model: resp.inner.model.unwrap_or_default(),
@@ -811,12 +843,19 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
             unsupported_fields: Default::default(),
-        })
+        };
+        chat_request.normalize_reasoning_controls();
+        Ok(chat_request)
     }
 }
 
 fn convert_top_logprobs(input: Option<u8>) -> Option<u8> {
     input.map(|x| x.min(20))
+}
+
+fn convert_reasoning_effort<T: Serialize>(effort: Option<&T>) -> Option<ChatReasoningEffort> {
+    let value = serde_json::to_value(effort?).ok()?;
+    serde_json::from_value(value).ok()
 }
 
 /// Parse `<tool_call>` blocks from model text output.
@@ -1014,9 +1053,11 @@ pub fn chat_completion_to_response(
             output.push(OutputItem::Reasoning(ReasoningItem {
                 id: format!("rs_{}", Uuid::new_v4().simple()),
                 summary: vec![SummaryPart::SummaryText(SummaryTextContent {
-                    text: reasoning_text,
+                    text: reasoning_text.clone(),
                 })],
-                content: None,
+                content: Some(vec![ReasoningTextContent {
+                    text: reasoning_text,
+                }]),
                 encrypted_content: None,
                 status: Some(OutputStatus::Completed),
             }));
@@ -1098,10 +1139,14 @@ pub fn chat_completion_to_response(
         metadata: Some(HashMap::new()),
         parallel_tool_calls: params.parallel_tool_calls.or(Some(true)),
         temperature: params.temperature.or(Some(1.0)),
-        text: Some(params.text.clone().unwrap_or(ResponseTextParam {
-            format: TextResponseFormatConfiguration::Text,
-            verbosity: None,
-        })),
+        text: Some(
+            dynamo_protocols::types::responses::response_text_param_to_upstream(
+                params
+                    .text
+                    .clone()
+                    .unwrap_or_else(default_response_text_param),
+            ),
+        ),
         tool_choice: params
             .tool_choice
             .clone()
@@ -2671,6 +2716,8 @@ thinking
     fn test_response_echoes_reasoning() {
         use dynamo_protocols::types::responses::Reasoning;
 
+        let mut input_reasoning = Reasoning::default();
+        input_reasoning.effort = Some(serde_json::from_value(serde_json::json!("high")).unwrap());
         let params = ResponseParams {
             reasoning: Some(Reasoning {
                 effort: Some(serde_json::from_value(serde_json::json!("high")).unwrap()),

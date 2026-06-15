@@ -253,6 +253,8 @@ impl KvRouterConfig {
         router_reset_states: bool,
         router_ttl_secs: f64,
         router_queue_threshold: Option<f64>,
+        router_max_pending_per_worker: Option<usize>,
+        router_max_queue_wait_ms: Option<u64>,
         router_event_threads: u32,
         router_queue_policy: &str,
         use_remote_indexer: bool,

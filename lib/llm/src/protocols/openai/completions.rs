@@ -201,19 +201,46 @@ impl CommonExtProvider for NvCreateCompletionRequest {
 
     /// Guided Decoding Options
     fn get_guided_json(&self) -> Option<serde_json::Value> {
-        self.common.guided_json.clone()
+        self.common.guided_json.clone().or_else(|| {
+            self.common
+                .structured_outputs
+                .as_ref()
+                .and_then(|structured| structured.json.clone())
+        })
     }
 
     fn get_guided_regex(&self) -> Option<String> {
-        self.common.guided_regex.clone()
+        self.common.guided_regex.clone().or_else(|| {
+            self.common
+                .structured_outputs
+                .as_ref()
+                .and_then(|structured| structured.regex.clone())
+        })
     }
 
     fn get_guided_grammar(&self) -> Option<String> {
-        self.common.guided_grammar.clone()
+        self.common.guided_grammar.clone().or_else(|| {
+            self.common
+                .structured_outputs
+                .as_ref()
+                .and_then(|structured| structured.grammar.clone())
+        })
     }
 
     fn get_guided_choice(&self) -> Option<Vec<String>> {
-        self.common.guided_choice.clone()
+        self.common.guided_choice.clone().or_else(|| {
+            self.common
+                .structured_outputs
+                .as_ref()
+                .and_then(|structured| structured.choice.clone())
+        })
+    }
+
+    fn get_guided_structural_tag(&self) -> Option<serde_json::Value> {
+        self.common
+            .structured_outputs
+            .as_ref()
+            .and_then(|structured| structured.structural_tag.clone())
     }
 
     fn get_guided_decoding_backend(&self) -> Option<String> {

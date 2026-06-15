@@ -19,6 +19,7 @@ use super::{
     bus,
     config::{self, AuditPolicy},
     handle::AuditRecord,
+    otel_sink::OtelSink,
 };
 
 #[async_trait]
@@ -185,6 +186,7 @@ async fn parse_sinks_from_env() -> anyhow::Result<Vec<Arc<dyn AuditSink>>> {
                     })?;
                 out.push(Arc::new(NatsSink::new(nats_client)));
             }
+            "otel" => out.push(Arc::new(OtelSink::from_policy(policy).await?)),
             "jsonl" => {
                 let sink: Arc<dyn AuditSink> = Arc::new(JsonlAuditSink::from_policy(policy).await?);
                 out.push(sink);
@@ -256,6 +258,7 @@ mod tests {
     use flate2::read::MultiGzDecoder;
     use tempfile::tempdir;
 
+    use crate::audit::handle::AuditEventType;
     use crate::telemetry::jsonl_gz::segment_path;
 
     use super::*;
@@ -263,11 +266,15 @@ mod tests {
     fn sample_record() -> AuditRecord {
         AuditRecord {
             schema_version: 1,
+            event_type: AuditEventType::Response,
             request_id: "req-abc".to_string(),
             requested_streaming: false,
             model: "test-model".to_string(),
             request: None,
+            raw_request: None,
             response: None,
+            raw_response: None,
+            headers: None,
         }
     }
 
