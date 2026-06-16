@@ -160,6 +160,39 @@ def test_model_express_url_none_for_default_load_format(mock_vllm_cli):
     assert config.model_express_url is None
 
 
+def test_served_model_aliases_are_separate_from_primary_name(mock_vllm_cli):
+    """Test Dynamo aliases do not require multiple vLLM served model names."""
+    mock_vllm_cli(
+        "--model",
+        "Qwen/Qwen3-0.6B",
+        "--served-model-name",
+        "primary-model",
+        "--dyn-served-model-alias",
+        "alias-a",
+        "alias-b",
+    )
+
+    config = parse_args()
+
+    assert config.served_model_name == "primary-model"
+    assert config.dyn_served_model_alias == ["alias-a", "alias-b"]
+    assert config.engine_args.served_model_name == ["primary-model"]
+
+
+def test_multiple_served_model_names_fail_with_alias_hint(mock_vllm_cli):
+    """Test startup fails before vLLM registration when aliases are misconfigured."""
+    mock_vllm_cli(
+        "--model",
+        "Qwen/Qwen3-0.6B",
+        "--served-model-name",
+        "primary-model",
+        "alias-a",
+    )
+
+    with pytest.raises(ValueError, match="Fix multiple model names issue"):
+        parse_args()
+
+
 # --endpoint flag tests
 
 

@@ -87,6 +87,9 @@ pub struct ModelManager {
 
     /// Per-endpoint runtime config watchers. Keyed by EndpointId (includes namespace).
     runtime_configs: DashMap<EndpointId, RuntimeConfigWatch>,
+
+    /// Alias to primary model name mapping.
+    alias_to_primary: DashMap<String, String>,
 }
 
 impl Default for ModelManager {
@@ -102,6 +105,7 @@ impl ModelManager {
             cards: DashMap::new(),
             prefill_router_activators: DashMap::new(),
             runtime_configs: DashMap::new(),
+            alias_to_primary: DashMap::new(),
         }
     }
 
@@ -138,6 +142,33 @@ impl ModelManager {
     pub fn add_worker_set(&self, model_name: &str, namespace: &str, worker_set: WorkerSet) {
         let model = self.get_or_create_model(model_name);
         model.add_worker_set(namespace.to_string(), Arc::new(worker_set));
+    }
+
+    /// Add an already shared WorkerSet to a Model. Used for model aliases.
+    pub fn add_worker_set_arc(
+        &self,
+        model_name: &str,
+        namespace: &str,
+        worker_set: Arc<WorkerSet>,
+    ) {
+        let model = self.get_or_create_model(model_name);
+        model.add_worker_set(namespace.to_string(), worker_set);
+    }
+
+    pub fn register_alias(&self, alias: &str, primary: &str) {
+        self.alias_to_primary
+            .insert(alias.to_string(), primary.to_string());
+    }
+
+    pub fn unregister_alias(&self, alias: &str) {
+        self.alias_to_primary.remove(alias);
+    }
+
+    pub fn resolve_canonical_name(&self, model: &str) -> String {
+        self.alias_to_primary
+            .get(model)
+            .map(|v| v.value().clone())
+            .unwrap_or_else(|| model.to_string())
     }
 
     /// Remove a WorkerSet from a Model. Removes the Model if it becomes empty.

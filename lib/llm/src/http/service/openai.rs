@@ -627,7 +627,7 @@ async fn handler_completions(
 #[tracing::instrument(skip_all)]
 async fn completions(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
 ) -> Result<Response, ErrorResponse> {
     use crate::protocols::openai::completions::get_prompt_batch_size;
@@ -639,6 +639,9 @@ async fn completions(
     validate_completion_stream_options(&request)?;
 
     validate_completion_fields_generic(&request)?;
+
+    let model = state.manager().resolve_canonical_name(&request.inner.model);
+    request.inner.model = model;
 
     // Detect batch prompts
     let batch_size = get_prompt_batch_size(&request.inner.prompt);
@@ -994,7 +997,7 @@ async fn embeddings(
     check_ready(&state)?;
 
     let request_id = get_or_create_request_id(&headers);
-    let request = Context::with_id(request, request_id);
+    let mut request = Context::with_id(request, request_id);
     let request_id = request.id().to_string();
 
     // Embeddings are typically not streamed, so we default to non-streaming
@@ -1002,28 +1005,29 @@ async fn embeddings(
 
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
-    let model = &request.inner.model;
+    let model = state.manager().resolve_canonical_name(&request.inner.model);
+    request.inner.model = model.clone();
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight = state.metrics_clone().create_inflight_guard(
-        model,
+        &model,
         Endpoint::Embeddings,
         streaming,
         &request_id,
     );
 
     // Create http_queue_guard early - tracks time waiting to be processed
-    let http_queue_guard = state.metrics_clone().create_http_queue_guard(model);
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(&model);
 
     // todo - error handling should be more robust
-    let engine = state.manager().get_embeddings_engine(model).map_err(|e| {
+    let engine = state.manager().get_embeddings_engine(&model).map_err(|e| {
         let err_response = ErrorMessage::from_model_error(&e);
         inflight.mark_error(extract_error_type_from_response(&err_response));
         err_response
     })?;
 
-    let mut response_collector = state.metrics_clone().create_response_collector(model);
-    let model_name = model.to_string();
+    let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    let model_name = model.clone();
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
@@ -1405,7 +1409,8 @@ async fn chat_completions(
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
     // todo - determine the proper error code for when a request model is not present
-    let model = request.inner.model.clone();
+    let model = state.manager().resolve_canonical_name(&request.inner.model);
+    request.inner.model = model.clone();
 
     request.normalize_reasoning_controls();
 
@@ -1939,7 +1944,10 @@ async fn responses(
     }
     tracing::trace!("Received responses request: {:?}", request.inner);
 
-    let model = request.inner.model.clone().unwrap_or_default();
+    let model = state
+        .manager()
+        .resolve_canonical_name(request.inner.model.as_deref().unwrap_or_default());
+    request.inner.model = Some(model.clone());
     let streaming = request.inner.stream.unwrap_or(false);
     let raw_audit_request = request.get::<serde_json::Value>(AUDIT_RAW_PAYLOAD_KEY).ok();
     let raw_audit_headers = request
