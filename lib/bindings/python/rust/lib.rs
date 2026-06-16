@@ -267,7 +267,7 @@ fn lora_name_to_id(lora_name: &str) -> i32 {
 /// For LoRA mode, both `lora_name` and `base_model_path` must be provided together.
 /// Providing only one of them will result in an error.
 #[pyfunction]
-#[pyo3(signature = (model_input, model_type, endpoint, model_path, model_name=None, context_length=None, kv_cache_block_size=None, router_config=None, runtime_config=None, user_data=None, custom_template_path=None, media_decoder=None, media_fetcher=None, lora_name=None, base_model_path=None, self_host_metadata=None, *, ignore_weights=false))]
+#[pyo3(signature = (model_input, model_type, endpoint, model_path, model_name=None, context_length=None, kv_cache_block_size=None, router_config=None, runtime_config=None, user_data=None, custom_template_path=None, media_decoder=None, media_fetcher=None, lora_name=None, base_model_path=None, self_host_metadata=None, model_aliases=None, *, ignore_weights=false))]
 #[allow(clippy::too_many_arguments)]
 fn register_model<'p>(
     py: Python<'p>,
@@ -287,6 +287,7 @@ fn register_model<'p>(
     lora_name: Option<&str>,
     base_model_path: Option<&str>,
     self_host_metadata: Option<bool>,
+    model_aliases: Option<Vec<String>>,
     ignore_weights: bool,
 ) -> PyResult<Bound<'p, PyAny>> {
     // Validate Prefill model type requirements
@@ -312,6 +313,7 @@ fn register_model<'p>(
 
     let inner_path = model_path.to_string();
     let model_name = model_name.map(|n| n.to_string());
+    let model_aliases = model_aliases.unwrap_or_default();
     // Only embed router_config in the MDC when the caller explicitly provided it.
     // This preserves backward-compat: workers that don't specify router_config continue to
     // fall back to the frontend-level global router config via the watcher.
@@ -365,6 +367,9 @@ fn register_model<'p>(
             card.model_type = model_type_obj;
             card.model_input = model_input;
             card.user_data = user_data_json;
+            if !model_aliases.is_empty() {
+                card.set_aliases(model_aliases);
+            }
 
             if let Some(cfg) = runtime_config {
                 card.runtime_config = cfg.inner;
@@ -405,6 +410,7 @@ fn register_model<'p>(
             .source_path(source_path.clone().into())
             // --served_model_name
             .model_name(model_name.clone())
+            .model_aliases(model_aliases)
             .context_length(context_length)
             .kv_cache_block_size(kv_cache_block_size)
             .router_config(explicit_router_config.clone())

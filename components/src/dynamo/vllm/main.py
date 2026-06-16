@@ -705,6 +705,7 @@ async def register_vllm_model(
         media_decoder=media_decoder,
         media_fetcher=media_fetcher,
         ignore_weights=should_register_model_ignore_weights(config),
+        model_aliases=config.dyn_served_model_alias or None,
     )
 
 
