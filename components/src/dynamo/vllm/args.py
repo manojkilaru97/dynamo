@@ -164,7 +164,11 @@ def update_dynamo_config_with_engine(
     if getattr(engine_config, "served_model_name", None) is not None:
         served = engine_config.served_model_name
         if len(served) > 1:
-            raise ValueError("We do not support multiple model names.")
+            raise ValueError(
+                "Dynamo vLLM supports only one --served-model-name. "
+                "Fix multiple model names issue by keeping the canonical model "
+                "there and putting aliases under --dyn-served-model-alias."
+            )
         dynamo_config.served_model_name = served[0]
     else:
         dynamo_config.served_model_name = None

@@ -827,6 +827,10 @@ pub struct ModelDeploymentCard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lora: Option<LoraInfo>,
 
+    /// Additional served names routed to this model.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+
     /// User-defined metadata for custom worker behavior
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_data: Option<serde_json::Value>,
@@ -1250,6 +1254,10 @@ impl ModelDeploymentCard {
         self.slug = Slug::from_string(name);
     }
 
+    pub fn set_aliases(&mut self, aliases: Vec<String>) {
+        self.aliases = aliases;
+    }
+
     pub fn source_path(&self) -> &str {
         self.source_path.as_ref().unwrap_or(&self.display_name)
     }
@@ -1598,6 +1606,7 @@ impl ModelDeploymentCard {
             worker_type: Default::default(), // set later
             needs: Default::default(),       // set later
             lora: None,
+            aliases: Vec::new(),
             user_data: None,
             runtime_config: ModelRuntimeConfig::default(),
             tensor_model_config: None,

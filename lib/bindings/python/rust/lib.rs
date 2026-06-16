@@ -472,6 +472,7 @@ fn register_model<'p>(
 
     let inner_path = model_path.to_string();
     let model_name = model_name.map(|n| n.to_string());
+    let model_aliases = model_aliases.unwrap_or_default();
     // Only embed router_config in the MDC when the caller explicitly provided it.
     // This preserves backward-compat: workers that don't specify router_config continue to
     // fall back to the frontend-level global router config via the watcher.
@@ -535,6 +536,9 @@ fn register_model<'p>(
             card.worker_type = worker_type_value;
             card.needs = needs_value.clone();
             card.user_data = user_data_json;
+            if !model_aliases.is_empty() {
+                card.set_aliases(model_aliases);
+            }
 
             card.runtime_config = runtime_config.inner;
             card.tensor_model_config = tensor_model_config;

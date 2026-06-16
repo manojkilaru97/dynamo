@@ -749,7 +749,7 @@ async fn handler_completions(
 #[tracing::instrument(skip_all)]
 async fn completions(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
 ) -> Result<Response, ErrorResponse> {
     use crate::protocols::openai::completions::get_prompt_batch_size;
@@ -761,6 +761,9 @@ async fn completions(
     validate_completion_stream_options(&request)?;
 
     validate_completion_fields_generic(&request)?;
+
+    let model = state.manager().resolve_canonical_name(&request.inner.model);
+    request.inner.model = model;
 
     // Detect batch prompts
     let batch_size = get_prompt_batch_size(&request.inner.prompt);
@@ -1190,7 +1193,7 @@ async fn embeddings(
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
 
     // todo - error handling should be more robust
-    let engine = state.manager().get_embeddings_engine(model).map_err(|e| {
+    let engine = state.manager().get_embeddings_engine(&model).map_err(|e| {
         let err_response = ErrorMessage::from_model_error(&e);
         inflight.mark_error(extract_error_type_from_response(&err_response));
         err_response
@@ -2453,7 +2456,10 @@ async fn responses(
     }
     tracing::trace!("Received responses request: {:?}", request.inner);
 
-    let model = request.inner.model.clone().unwrap_or_default();
+    let model = state
+        .manager()
+        .resolve_canonical_name(request.inner.model.as_deref().unwrap_or_default());
+    request.inner.model = Some(model.clone());
     let streaming = request.inner.stream.unwrap_or(false);
     let metric_model = state.manager().metric_model_for(&model).to_string();
 
