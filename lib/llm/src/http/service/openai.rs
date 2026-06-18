@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -23,8 +23,11 @@ use axum::{
 };
 use base64::Engine as _;
 use bytes::Bytes;
-use dynamo_protocols::types::ChatCompletionToolChoiceOption;
-use dynamo_runtime::config::environment_names::llm as env_llm;
+use dynamo_config::env_is_truthy;
+use dynamo_protocols::types::{
+    ChatCompletionMessageContent, ChatCompletionToolChoiceOption, ReasoningEffort,
+};
+use dynamo_runtime::config::environment_names::{llm as env_llm, logging as env_logging};
 use dynamo_runtime::{
     pipeline::{AsyncEngineContextProvider, Context},
     protocols::annotated::AnnotationsProvider,
@@ -61,57 +64,170 @@ use crate::protocols::openai::{
 use crate::protocols::unified::UnifiedRequest;
 use crate::request_template::RequestTemplate;
 use crate::types::Annotated;
-use dynamo_runtime::logging::get_distributed_tracing_context;
+use dynamo_runtime::logging::{emit_payload_log, get_distributed_tracing_context};
 use tracing::Instrument;
 
 pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Dynamo Annotation for the request ID
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
 
 const VALIDATION_PREFIX: &str = "Validation: ";
 
-fn disable_thinking_for_guided_outputs(request: &mut NvCreateChatCompletionRequest) {
-    let has_tools = request
-        .inner
-        .tools
-        .as_ref()
-        .is_some_and(|tools| !tools.is_empty());
-    let forced_tool_choice = matches!(
-        request.inner.tool_choice,
-        Some(ChatCompletionToolChoiceOption::Required)
-            | Some(ChatCompletionToolChoiceOption::Named(_))
-    );
-    let tools_may_be_used = has_tools
-        && !matches!(
-            request.inner.tool_choice,
-            Some(ChatCompletionToolChoiceOption::None)
-        );
-    let has_structured_outputs = request.structured_outputs.as_ref().is_some_and(|params| {
-        params.json.is_some()
-            || params.regex.is_some()
-            || params.choice.is_some()
-            || params.grammar.is_some()
-            || params.json_object == Some(true)
-            || params.structural_tag.is_some()
-    });
-    let has_response_format_constraint = request.inner.response_format.as_ref().is_some_and(|fmt| {
-        !matches!(fmt, dynamo_protocols::types::ResponseFormat::Text)
-    });
-    let has_common_guided_constraint = request.common.guided_json.is_some()
-        || request.common.guided_regex.is_some()
-        || request.common.guided_choice.is_some()
-        || request.common.guided_grammar.is_some();
+fn set_chat_template_bool(request: &mut NvCreateChatCompletionRequest, key: &str, value: bool) {
+    let args = request.chat_template_args.get_or_insert_with(HashMap::new);
+    args.insert(key.to_string(), serde_json::Value::Bool(value));
+}
 
-    if tools_may_be_used
-        || (has_tools && forced_tool_choice)
-        || has_structured_outputs
-        || has_response_format_constraint
-        || has_common_guided_constraint
+fn set_chat_template_bool_if_missing(
+    request: &mut NvCreateChatCompletionRequest,
+    key: &str,
+    value: bool,
+) {
+    let args = request.chat_template_args.get_or_insert_with(HashMap::new);
+    args.entry(key.to_string())
+        .or_insert(serde_json::Value::Bool(value));
+}
+
+fn disable_chat_template_thinking(request: &mut NvCreateChatCompletionRequest) {
+    set_chat_template_bool(request, "enable_thinking", false);
+    set_chat_template_bool(request, "thinking", false);
+}
+
+#[allow(deprecated)]
+fn apply_chat_max_output_cap(request: &mut NvCreateChatCompletionRequest) {
+    let Some(cap) = std::env::var("DYN_MAX_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|cap| *cap > 0)
+    else {
+        return;
+    };
+
+    if let Some(max_completion_tokens) = request.inner.max_completion_tokens.as_mut()
+        && *max_completion_tokens > cap
     {
-        let args = request.chat_template_args.get_or_insert_with(HashMap::new);
-        args.insert("enable_thinking".to_string(), serde_json::Value::Bool(false));
-        args.insert("thinking".to_string(), serde_json::Value::Bool(false));
+        *max_completion_tokens = cap;
+    }
+    if let Some(max_tokens) = request.inner.max_tokens.as_mut()
+        && *max_tokens > cap
+    {
+        *max_tokens = cap;
+    }
+}
+
+fn apply_chat_thinking_compat_controls(request: &mut NvCreateChatCompletionRequest) {
+    if let Some(args) = request.chat_template_args.as_ref() {
+        let thinking_enabled = args
+            .get("thinking")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let thinking_disabled = args
+            .get("thinking")
+            .and_then(serde_json::Value::as_bool)
+            .is_some_and(|thinking| !thinking);
+        let preserve_thinking = args
+            .get("preserve_thinking")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        if thinking_enabled {
+            set_chat_template_bool_if_missing(request, "enable_thinking", true);
+        } else if thinking_disabled {
+            set_chat_template_bool_if_missing(request, "enable_thinking", false);
+        }
+        if preserve_thinking {
+            set_chat_template_bool_if_missing(request, "truncate_history_thinking", false);
+        }
+    }
+
+    let Some(thinking_value) = request.thinking.clone() else {
+        return;
+    };
+
+    if thinking_value.as_bool() == Some(true) {
+        set_chat_template_bool_if_missing(request, "enable_thinking", true);
+        return;
+    }
+    if thinking_value.as_bool() == Some(false) {
+        disable_chat_template_thinking(request);
+        return;
+    }
+
+    let Some(thinking) = thinking_value.as_object() else {
+        return;
+    };
+    let thinking_type = thinking
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+
+    if matches!(thinking_type, "disabled" | "none") {
+        disable_chat_template_thinking(request);
+        return;
+    }
+    if thinking_type == "enabled" {
+        set_chat_template_bool_if_missing(request, "enable_thinking", true);
+    }
+    if thinking
+        .get("keep")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|keep| keep == "all")
+    {
+        set_chat_template_bool_if_missing(request, "truncate_history_thinking", false);
+    }
+}
+
+fn apply_chat_reasoning_object(request: &mut NvCreateChatCompletionRequest) {
+    let Some(reasoning) = request
+        .reasoning
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+
+    let enabled = reasoning
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool);
+    let effort = reasoning.get("effort").and_then(serde_json::Value::as_str);
+
+    if enabled == Some(false) || effort == Some("none") {
+        if request.inner.reasoning_effort.is_none() {
+            request.inner.reasoning_effort = Some(ReasoningEffort::None);
+        }
+        disable_chat_template_thinking(request);
+        return;
+    }
+
+    if request.inner.reasoning_effort.is_none()
+        && let Some(effort) = effort
+    {
+        request.inner.reasoning_effort = match effort {
+            "minimal" => Some(ReasoningEffort::Minimal),
+            "low" => Some(ReasoningEffort::Low),
+            "medium" => Some(ReasoningEffort::Medium),
+            "high" => Some(ReasoningEffort::High),
+            "xhigh" | "max" => Some(ReasoningEffort::Xhigh),
+            _ => None,
+        };
+    }
+
+    if matches!(
+        request.inner.reasoning_effort.as_ref(),
+        Some(ReasoningEffort::None)
+    ) {
+        disable_chat_template_thinking(request);
+    }
+}
+
+fn apply_chat_reasoning_effort_controls(request: &mut NvCreateChatCompletionRequest) {
+    if matches!(
+        request.inner.reasoning_effort.as_ref(),
+        Some(ReasoningEffort::None)
+    ) {
+        disable_chat_template_thinking(request);
     }
 }
 
@@ -126,14 +242,436 @@ pub(super) fn get_body_limit() -> usize {
         .unwrap_or(45 * 1024 * 1024)
 }
 
+const PAYLOAD_LOG_TARGET: &str = "dynamo_payload";
+const REDACTED_MM_INPUT: &str = "[redacted-mm-input]";
+
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Deserialize, Debug)]
 pub(crate) struct ErrorMessage {
     message: String,
     #[serde(rename = "type")]
     error_type: String,
     code: u16,
+}
+
+#[derive(Serialize)]
+struct OpenAIErrorEnvelope<'a> {
+    error: OpenAIErrorBody<'a>,
+}
+
+#[derive(Serialize)]
+struct OpenAIErrorBody<'a> {
+    message: &'a str,
+    #[serde(rename = "type")]
+    error_type: &'a str,
+    code: u16,
+}
+
+impl Serialize for ErrorMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        OpenAIErrorEnvelope {
+            error: OpenAIErrorBody {
+                message: &self.message,
+                error_type: &self.error_type,
+                code: self.code,
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
+fn header_map_to_json(headers: &HeaderMap) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (name, value) in headers {
+        out.insert(
+            name.as_str().to_string(),
+            serde_json::Value::String(value.to_str().unwrap_or_default().to_string()),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+#[derive(Clone, Debug, Default)]
+struct PayloadSuppression {
+    nca_id: Option<String>,
+    payload_suppressed: bool,
+}
+
+fn suppressed_payload_nca_ids() -> &'static HashSet<String> {
+    static IDS: OnceLock<HashSet<String>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        std::env::var("VLLM_SUPPRESS_PAYLOAD_NCA_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|part| {
+                let id = part.trim();
+                (!id.is_empty()).then(|| id.to_string())
+            })
+            .collect()
+    })
+}
+
+fn payload_suppression_from_headers(headers: &HeaderMap) -> PayloadSuppression {
+    let nca_id = headers
+        .get("nvcf-ncaid")
+        .or_else(|| headers.get("nvcf-nca-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let payload_suppressed = nca_id
+        .as_ref()
+        .is_some_and(|id| suppressed_payload_nca_ids().contains(id));
+    PayloadSuppression {
+        nca_id,
+        payload_suppressed,
+    }
+}
+
+fn error_response_payload(response: &ErrorResponse) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": response.1.message.clone(),
+            "type": response.1.error_type.clone(),
+            "code": response.1.code,
+        }
+    })
+}
+
+fn normalize_chat_error_response(response: ErrorResponse) -> ErrorResponse {
+    if response.0 == StatusCode::INTERNAL_SERVER_ERROR
+        && (response.1.message.contains("Grammar error:")
+            || response.1.message.contains("VLLMValidationError:")
+            || response
+                .1
+                .message
+                .contains("Failed to convert the grammar from GBNF to Lark")
+            || response
+                .1
+                .message
+                .contains("multimodal processing is not enabled"))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorMessage {
+                message: response.1.message.clone(),
+                error_type: map_error_code_to_error_type(StatusCode::BAD_REQUEST),
+                code: StatusCode::BAD_REQUEST.as_u16(),
+            }),
+        );
+    }
+    response
+}
+
+fn log_payloads_enabled() -> bool {
+    env_is_truthy(env_logging::DYNAMO_LOG_PAYLOADS)
+}
+
+fn count_payload_modalities(payload: &serde_json::Value) -> (usize, usize, usize) {
+    let mut counts = (0, 0, 0);
+    let Some(messages) = payload
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return counts;
+    };
+    for message in messages {
+        let Some(content) = message.get("content").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for part in content {
+            match part.get("type").and_then(serde_json::Value::as_str) {
+                Some("image_url" | "input_image") => counts.0 += 1,
+                Some("video_url") => counts.1 += 1,
+                Some("audio_url" | "input_audio") => counts.2 += 1,
+                _ => {}
+            }
+        }
+    }
+    counts
+}
+
+fn payload_tool_choice(payload: &serde_json::Value) -> Option<&'static str> {
+    match payload.get("tool_choice") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(choice)) => match choice.as_str() {
+            "auto" => Some("auto"),
+            "none" => Some("none"),
+            "required" => Some("required"),
+            _ => Some("other"),
+        },
+        Some(serde_json::Value::Object(choice)) => {
+            if choice
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .is_some()
+            {
+                Some("named")
+            } else {
+                Some("other")
+            }
+        }
+        Some(_) => Some("other"),
+    }
+}
+
+fn payload_structured_output_kind(payload: &serde_json::Value) -> Option<&'static str> {
+    if let Some(response_format) = payload
+        .get("response_format")
+        .and_then(serde_json::Value::as_object)
+        && let Some(format_type) = response_format
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+    {
+        return match format_type {
+            "json_schema" => Some("json_schema"),
+            "json_object" => Some("json_object"),
+            _ => None,
+        };
+    }
+
+    if let Some(structured_outputs) = payload.get("structured_outputs") {
+        if let Some(obj) = structured_outputs.as_object() {
+            for key in ["json", "json_object", "regex", "choice", "grammar"] {
+                if obj.get(key).is_some_and(|value| !value.is_null()) {
+                    return Some(if key == "json" { "json_schema" } else { key });
+                }
+            }
+        }
+        return Some("structured_outputs");
+    }
+    None
+}
+
+fn add_request_shape_log_attrs(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    payload: &serde_json::Value,
+) {
+    let (image_count, video_count, audio_count) = count_payload_modalities(payload);
+    let tool_count = payload
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let tool_choice = payload_tool_choice(payload);
+    let structured_output_kind = payload_structured_output_kind(payload);
+
+    fields.insert("input_image_count".to_string(), image_count.into());
+    fields.insert("input_video_count".to_string(), video_count.into());
+    fields.insert("input_audio_count".to_string(), audio_count.into());
+    fields.insert("input_tool_count".to_string(), tool_count.into());
+    fields.insert("has_images".to_string(), (image_count > 0).into());
+    fields.insert("has_videos".to_string(), (video_count > 0).into());
+    fields.insert("has_audios".to_string(), (audio_count > 0).into());
+    fields.insert("has_tools".to_string(), (tool_count > 0).into());
+    fields.insert(
+        "has_tool_calls_enabled".to_string(),
+        (tool_count > 0 && tool_choice != Some("none")).into(),
+    );
+    fields.insert(
+        "has_structured_output".to_string(),
+        structured_output_kind.is_some().into(),
+    );
+    if let Some(tool_choice) = tool_choice {
+        fields.insert("tool_choice".to_string(), tool_choice.into());
+    }
+    if let Some(kind) = structured_output_kind {
+        fields.insert("structured_output_kind".to_string(), kind.into());
+    }
+}
+
+fn redact_multimodal_string_for_logging(value: &str) -> serde_json::Value {
+    if value.starts_with("data:image/")
+        || value.starts_with("data:video/")
+        || value.starts_with("data:audio/")
+        || value.starts_with("file://")
+    {
+        return REDACTED_MM_INPUT.into();
+    }
+
+    let mut redacted = value.to_string();
+    for prefix in [
+        "src=\"data:image/",
+        "src=\"data:video/",
+        "src=\"data:audio/",
+        "src=\"file://",
+        "src='data:image/",
+        "src='data:video/",
+        "src='data:audio/",
+        "src='file://",
+    ] {
+        let quote = if prefix.starts_with("src=\"") {
+            '"'
+        } else {
+            '\''
+        };
+        while let Some(start) = redacted.find(prefix) {
+            let Some(end) = redacted[start + 5..].find(quote) else {
+                break;
+            };
+            redacted.replace_range(
+                start..start + 5 + end,
+                &format!("src={quote}{REDACTED_MM_INPUT}"),
+            );
+        }
+    }
+
+    serde_json::Value::String(redacted)
+}
+
+fn redact_multimodal_payload_for_logging(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(redact_multimodal_payload_for_logging)
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, child) in map {
+                let redacted = match key.as_str() {
+                    "image_url" | "video_url" | "audio_url" | "input_audio" => {
+                        REDACTED_MM_INPUT.into()
+                    }
+                    _ => redact_multimodal_payload_for_logging(child),
+                };
+                out.insert(key.clone(), redacted);
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::String(s) => redact_multimodal_string_for_logging(s),
+        _ => value.clone(),
+    }
+}
+
+fn emit_openai_request_log(
+    request_id: &str,
+    model: &str,
+    endpoint: &'static str,
+    streaming: bool,
+    headers: serde_json::Value,
+    payload: serde_json::Value,
+    suppression: &PayloadSuppression,
+) {
+    if !log_payloads_enabled() {
+        return;
+    }
+
+    let mut fields = serde_json::Map::new();
+    fields.insert("rid".to_string(), request_id.into());
+    fields.insert("request_id".to_string(), request_id.into());
+    fields.insert("model".to_string(), model.into());
+    fields.insert("endpoint".to_string(), endpoint.into());
+    fields.insert("streaming".to_string(), streaming.into());
+    fields.insert("headers".to_string(), headers);
+    add_request_shape_log_attrs(&mut fields, &payload);
+    if suppression.payload_suppressed {
+        fields.insert("payload_suppressed".to_string(), true.into());
+        if let Some(nca_id) = &suppression.nca_id {
+            fields.insert("nca_id".to_string(), nca_id.clone().into());
+        }
+    } else {
+        fields.insert(
+            "payload".to_string(),
+            redact_multimodal_payload_for_logging(&payload),
+        );
+    }
+
+    emit_payload_log(
+        "openai.request",
+        PAYLOAD_LOG_TARGET,
+        serde_json::Value::Object(fields),
+    );
+}
+
+fn normalize_chat_response_payload_for_logging(
+    mut payload: serde_json::Value,
+) -> serde_json::Value {
+    let Some(choices) = payload
+        .get_mut("choices")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return payload;
+    };
+
+    for choice in choices {
+        if let Some(choice_obj) = choice.as_object_mut()
+            && choice_obj
+                .get("logprobs")
+                .is_some_and(serde_json::Value::is_null)
+        {
+            choice_obj.remove("logprobs");
+        }
+        let Some(message) = choice
+            .get_mut("message")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        message
+            .entry("content".to_string())
+            .or_insert(serde_json::Value::Null);
+        if message
+            .get("reasoning_content")
+            .is_some_and(serde_json::Value::is_null)
+        {
+            message.remove("reasoning_content");
+        }
+    }
+    payload
+}
+
+fn emit_openai_response_log(
+    request_id: &str,
+    model: &str,
+    endpoint: &'static str,
+    streaming: bool,
+    status_code: u16,
+    payload: serde_json::Value,
+    suppression: &PayloadSuppression,
+) {
+    if !log_payloads_enabled() {
+        return;
+    }
+
+    let payload = if endpoint == "chat_completions" {
+        normalize_chat_response_payload_for_logging(payload)
+    } else {
+        payload
+    };
+
+    let payload = if suppression.payload_suppressed {
+        serde_json::json!({
+            "payload_suppressed": true,
+            "reason": "nca_id",
+        })
+    } else {
+        payload
+    };
+
+    let mut fields = serde_json::json!({
+        "rid": request_id,
+        "request_id": request_id,
+        "model": model,
+        "endpoint": endpoint,
+        "streaming": streaming,
+        "status_code": status_code,
+        "payload": payload,
+    });
+    if suppression.payload_suppressed
+        && let Some(obj) = fields.as_object_mut()
+    {
+        obj.insert("payload_suppressed".to_string(), true.into());
+        if let Some(nca_id) = &suppression.nca_id {
+            obj.insert("nca_id".to_string(), nca_id.clone().into());
+        }
+    }
+
+    emit_payload_log("openai.response", PAYLOAD_LOG_TARGET, fields);
 }
 
 fn map_error_code_to_error_type(code: StatusCode) -> String {
@@ -373,14 +911,15 @@ pub async fn smart_json_error_middleware(request: Request<Body>, next: Next) -> 
 
 /// Return the request ID for the current request.
 ///
-/// The canonical request ID is set by `make_inference_request_span()` and stored
-/// in the `DistributedTraceContext` via `DistributedTraceIdLayer`. This function
-/// retrieves it, falling back to a validated `x-dynamo-request-id` header value
-/// (deprecated, DEP #7812) or a new UUID.
+/// The canonical request ID is set by the client-supplied `x-request-id` header
+/// when present, then by `make_inference_request_span()` via the
+/// `DistributedTraceContext`, then by the optional primary value, falling back to
+/// a validated `x-dynamo-request-id` header value (deprecated, DEP #7812) or a
+/// new UUID.
 ///
 /// **Deprecation (DEP #7812):** The `x-dynamo-request-id` header is deprecated.
 /// Clients should rely on server-generated request IDs instead of supplying their own.
-pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
+pub(super) fn get_or_create_request_id(primary: Option<&str>, headers: &HeaderMap) -> String {
     // Validate x-dynamo-request-id header if present, warn on invalid values.
     // DEP #7812: x-dynamo-request-id is deprecated — clients should rely on
     // server-generated request IDs instead of supplying their own.
@@ -411,14 +950,29 @@ pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
         None
     };
 
+    if let Some(request_id) = headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return request_id.to_string();
+    }
+
+    if let Some(primary) = primary
+        && !primary.trim().is_empty()
+    {
+        return primary.to_string();
+    }
+
     // Prefer trace context (set by make_inference_request_span via DistributedTraceIdLayer)
+    // after explicit client IDs carried by the request payload/header.
     if let Some(trace_context) = get_distributed_tracing_context()
         && let Some(request_id) = trace_context.request_id
     {
         return request_id;
     }
 
-    // Fallback: use validated header for backwards compat, or generate new UUID
     validated_header.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
 }
 
@@ -441,7 +995,7 @@ async fn handler_completions(
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
     // create the context for the request
-    let request_id = get_or_create_request_id(&headers);
+    let request_id = get_or_create_request_id(None, &headers);
     let streaming = request.inner.stream.unwrap_or(false);
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone(),
@@ -510,7 +1064,7 @@ async fn completions(
 #[tracing::instrument(skip_all)]
 async fn completions_single(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
 ) -> Result<Response, ErrorResponse> {
     let request_id = request.id().to_string();
@@ -520,7 +1074,8 @@ async fn completions_single(
 
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
-    let model = request.inner.model.clone();
+    let model = state.manager().resolve_canonical_name(&request.inner.model);
+    request.inner.model = model.clone();
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -656,7 +1211,7 @@ async fn completions_single(
 #[tracing::instrument(skip_all)]
 async fn completions_batch(
     state: Arc<service_v2::State>,
-    request: Context<NvCreateCompletionRequest>,
+    mut request: Context<NvCreateCompletionRequest>,
     stream_handle: ConnectionHandle,
     batch_size: usize,
     n: u8,
@@ -666,7 +1221,8 @@ async fn completions_batch(
 
     let request_id = request.id().to_string();
     let streaming = request.inner.stream.unwrap_or(false);
-    let model = request.inner.model.clone();
+    let model = state.manager().resolve_canonical_name(&request.inner.model);
+    request.inner.model = model.clone();
 
     // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
@@ -845,7 +1401,7 @@ async fn embeddings(
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
-    let request_id = get_or_create_request_id(&headers);
+    let request_id = get_or_create_request_id(None, &headers);
     let request = Context::with_id(request, request_id);
     let request_id = request.id().to_string();
 
@@ -923,22 +1479,100 @@ async fn embeddings(
 async fn handler_chat_completions(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(mut request): Json<NvCreateChatCompletionRequest>,
+    body: Bytes,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
+    let payload_value =
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
+    let payload_obj = payload_value.as_object();
+    let request_id = get_or_create_request_id(
+        payload_obj
+            .and_then(|obj| obj.get("user"))
+            .and_then(serde_json::Value::as_str),
+        &headers,
+    );
+    let streaming = payload_obj
+        .and_then(|obj| obj.get("stream"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let raw_model = payload_obj
+        .and_then(|obj| obj.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let payload_suppression = payload_suppression_from_headers(&headers);
+
+    emit_openai_request_log(
+        &request_id,
+        &raw_model,
+        "chat_completions",
+        streaming,
+        header_map_to_json(&headers),
+        payload_value.clone(),
+        &payload_suppression,
+    );
+
+    let mut request: NvCreateChatCompletionRequest = serde_json::from_value(payload_value)
+        .map_err(|e| {
+            let err_response = ErrorMessage::from_http_error(HttpError {
+                code: 400,
+                message: format!("Failed to deserialize the JSON body into the target type: {e}"),
+            });
+            emit_openai_response_log(
+                &request_id,
+                &raw_model,
+                "chat_completions",
+                streaming,
+                err_response.0.as_u16(),
+                error_response_payload(&err_response),
+                &payload_suppression,
+            );
+            err_response
+        })?;
+
+    apply_chat_thinking_compat_controls(&mut request);
+    apply_chat_reasoning_object(&mut request);
+    apply_chat_reasoning_effort_controls(&mut request);
+
+    let has_tools = request
+        .inner
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty());
+    if !has_tools
+        && request
+            .inner
+            .tool_choice
+            .as_ref()
+            .is_some_and(|choice| !matches!(choice, ChatCompletionToolChoiceOption::None))
+    {
+        let err_response = ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: "When using `tool_choice`, `tools` must be set.".to_string(),
+        });
+        emit_openai_response_log(
+            &request_id,
+            &raw_model,
+            "chat_completions",
+            streaming,
+            err_response.0.as_u16(),
+            error_response_payload(&err_response),
+            &payload_suppression,
+        );
+        return Err(err_response);
+    }
+
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
     // create the context for the request
-    let request_id = get_or_create_request_id(&headers);
-    let streaming = request.inner.stream.unwrap_or(false);
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone(),
         endpoint: Endpoint::ChatCompletions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = Context::with_id(request, request_id);
+    let request = Context::with_id(request, request_id.clone());
     let context = request.context();
 
     // create the connection handles
@@ -949,19 +1583,54 @@ async fn handler_chat_completions(
     )
     .await;
 
-    let response =
-        tokio::spawn(chat_completions(state, template, request, stream_handle).in_current_span())
-            .await
-            .map_err(|e| {
-                ErrorMessage::internal_server_error(&format!(
-                    "Failed to await chat completions task: {:?}",
-                    e,
-                ))
-            })?;
+    let response = match tokio::spawn(
+        chat_completions(
+            state,
+            template,
+            request,
+            stream_handle,
+            payload_suppression.clone(),
+        )
+        .in_current_span(),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            let err_response = ErrorMessage::internal_server_error(&format!(
+                "Failed to await chat completions task: {:?}",
+                e,
+            ));
+            emit_openai_response_log(
+                &request_id,
+                &raw_model,
+                "chat_completions",
+                streaming,
+                err_response.0.as_u16(),
+                error_response_payload(&err_response),
+                &payload_suppression,
+            );
+            return Err(err_response);
+        }
+    };
 
     // if we got here, then we will return a response and the potentially long running task has completed successfully
     // without need to be cancelled.
     connection_handle.disarm();
+
+    let response = response.map_err(normalize_chat_error_response);
+
+    if let Err(err_response) = &response {
+        emit_openai_response_log(
+            &request_id,
+            &raw_model,
+            "chat_completions",
+            streaming,
+            err_response.0.as_u16(),
+            error_response_payload(err_response),
+            &payload_suppression,
+        );
+    }
 
     response
 }
@@ -985,6 +1654,13 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
         // Use message() instead of to_string() for DynamoError to avoid prefixing
         // the ErrorType (e.g., "Unknown: {...}"), which would break JSON parsing.
         let error_str = if let Some(ref dynamo_err) = event.error {
+            if super::metrics::request_was_rejected(dynamo_err) {
+                return Some((
+                    dynamo_err.message().to_string(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ));
+            }
+
             let mut parts = Vec::new();
             let mut current: Option<&dyn std::error::Error> = Some(dynamo_err);
             while let Some(e) = current {
@@ -1191,6 +1867,118 @@ fn accumulate_reasoning_dispatch(
     events
 }
 
+fn is_final_chat_payload_chunk(
+    response: &Annotated<NvCreateChatCompletionStreamResponse>,
+    expect_usage_chunk: bool,
+) -> bool {
+    let Some(data) = &response.data else {
+        return false;
+    };
+    if expect_usage_chunk {
+        return data.inner.usage.is_some();
+    }
+    data.inner
+        .choices
+        .iter()
+        .any(|choice| choice.finish_reason.is_some())
+}
+
+fn strip_leaked_think_end(text: &mut String) {
+    const THINK_END: &str = "</think>";
+    if let Some(idx) = text.rfind(THINK_END) {
+        let content_start = idx + THINK_END.len();
+        *text = text[content_start..].trim_start().to_string();
+    }
+}
+
+fn normalize_chat_completion_response(response: &mut NvCreateChatCompletionResponse) {
+    for choice in &mut response.inner.choices {
+        let has_reasoning = choice
+            .message
+            .reasoning_content
+            .as_ref()
+            .is_some_and(|text| !text.is_empty());
+        let has_tool_calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+
+        let Some(ChatCompletionMessageContent::Text(text)) = choice.message.content.as_mut() else {
+            continue;
+        };
+
+        if has_reasoning {
+            strip_leaked_think_end(text);
+            let trimmed = text.trim_start();
+            if trimmed.len() != text.len() {
+                *text = trimmed.to_string();
+            }
+        }
+        if has_tool_calls && text.trim().is_empty() {
+            choice.message.content = None;
+        }
+    }
+}
+
+fn normalize_chat_completion_stream_response(
+    response: &mut Annotated<NvCreateChatCompletionStreamResponse>,
+    choices_with_reasoning: &mut HashSet<u32>,
+    choices_with_content_after_reasoning: &mut HashSet<u32>,
+    drop_leading_whitespace_content: bool,
+) {
+    let Some(data) = response.data.as_mut() else {
+        return;
+    };
+
+    for choice in &mut data.inner.choices {
+        if choice
+            .delta
+            .reasoning_content
+            .as_ref()
+            .is_some_and(|text| !text.is_empty())
+        {
+            choices_with_reasoning.insert(choice.index);
+        }
+
+        let has_tool_calls = choice
+            .delta
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+        let should_trim_after_reasoning = choices_with_reasoning.contains(&choice.index)
+            && !choices_with_content_after_reasoning.contains(&choice.index);
+
+        let Some(ChatCompletionMessageContent::Text(text)) = choice.delta.content.as_mut() else {
+            continue;
+        };
+
+        if choices_with_reasoning.contains(&choice.index) {
+            strip_leaked_think_end(text);
+        }
+        if should_trim_after_reasoning {
+            let trimmed = text.trim_start();
+            if trimmed.len() != text.len() {
+                *text = trimmed.to_string();
+            }
+        }
+        if drop_leading_whitespace_content
+            && !choices_with_content_after_reasoning.contains(&choice.index)
+            && text.trim().is_empty()
+        {
+            choice.delta.content = None;
+            continue;
+        }
+        if has_tool_calls && text.trim().is_empty() {
+            choice.delta.content = None;
+            continue;
+        }
+        if !text.is_empty() {
+            choices_with_content_after_reasoning.insert(choice.index);
+        }
+    }
+}
+
 /// OpenAI Chat Completions Request Handler
 ///
 /// This method will handle the incoming request for the /v1/chat/completions endpoint. The endpoint is a "source"
@@ -1204,6 +1992,7 @@ async fn chat_completions(
     template: Option<RequestTemplate>,
     mut request: Context<NvCreateChatCompletionRequest>,
     mut stream_handle: ConnectionHandle,
+    payload_suppression: PayloadSuppression,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
@@ -1226,13 +2015,14 @@ async fn chat_completions(
             request.inner.max_completion_tokens = Some(template.max_completion_tokens);
         }
     }
-    disable_thinking_for_guided_outputs(&mut request);
+    apply_chat_max_output_cap(&mut request);
 
     // Capture the resolved model after template application for metrics and engine lookup
     // todo - make the protocols be optional for model name
     // todo - when optional, if none, apply a default
     // todo - determine the proper error code for when a request model is not present
-    let model = request.inner.model.clone();
+    let model = state.manager().resolve_canonical_name(&request.inner.model);
+    request.inner.model = model.clone();
 
     tracing::trace!("Received chat completions request: {:?}", request.content());
 
@@ -1288,6 +2078,16 @@ async fn chat_completions(
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     let annotations = request.annotations();
+    let expect_usage_chunk = request
+        .inner
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage);
+    let request_has_tools = request
+        .inner
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty());
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
@@ -1336,12 +2136,19 @@ async fn chat_completions(
         let reasoning_dispatch_enabled = state.streaming_reasoning_dispatch_enabled();
         let mut reasoning_buffer: HashMap<u32, String> = HashMap::new();
         let mut dispatched_tool_ids: HashSet<String> = HashSet::new();
-
+        let log_payloads = log_payloads_enabled();
+        let parsing_options_for_log = parsing_options.clone();
+        let mut payload_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> = Vec::new();
+        let request_id_for_log = request_id.clone();
+        let model_for_log = model.clone();
+        let payload_suppression_for_log = payload_suppression.clone();
+        let mut choices_with_reasoning = HashSet::new();
+        let mut choices_with_content_after_reasoning = HashSet::new();
         // flat_map lets us optionally prepend extra SSE events before each regular chunk:
         //   - `event: tool_call_dispatch`  — complete tool call detected early (tool dispatch)
         //   - `event: reasoning_dispatch`  — complete reasoning block (emitted once)
         // When both flags are off the flat_map is equivalent to the original map + filter_map.
-        let stream = stream.flat_map(move |response| {
+        let stream = stream.flat_map(move |mut response| {
             // Extract side-channel events before the response is consumed by EventConverter.
             let mut events: Vec<Result<Event, axum::Error>> = vec![];
             if tool_dispatch_enabled {
@@ -1357,6 +2164,31 @@ async fn chat_completions(
                 ));
             }
 
+            let has_reasoning_delta = response.data.as_ref().is_some_and(|data| {
+                data.inner.choices.iter().any(|choice| {
+                    choice
+                        .delta
+                        .reasoning_content
+                        .as_ref()
+                        .is_some_and(|text| !text.is_empty())
+                })
+            });
+            if request_has_tools || has_reasoning_delta || !choices_with_reasoning.is_empty() {
+                normalize_chat_completion_stream_response(
+                    &mut response,
+                    &mut choices_with_reasoning,
+                    &mut choices_with_content_after_reasoning,
+                    request_has_tools,
+                );
+            }
+
+            let is_final = if log_payloads {
+                payload_chunks.push(response.clone());
+                is_final_chat_payload_chunk(&response, expect_usage_chunk)
+            } else {
+                false
+            };
+
             // Convert to SSE event (this consumes the response).
             // EventConverter will detect `event: "error"` and convert to SSE error events.
             let sse_result = process_response_using_event_converter_and_observe_metrics(
@@ -1364,6 +2196,35 @@ async fn chat_completions(
                 &mut response_collector,
                 &mut http_queue_guard,
             );
+
+            if is_final {
+                let response_chunks = std::mem::take(&mut payload_chunks);
+                let request_id_for_log = request_id_for_log.clone();
+                let model_for_log = model_for_log.clone();
+                let parsing_options_for_log = parsing_options_for_log.clone();
+                let payload_suppression_for_log = payload_suppression_for_log.clone();
+                tokio::spawn(async move {
+                    let stream = stream::iter(response_chunks);
+                    if let Ok(final_response) =
+                        NvCreateChatCompletionResponse::from_annotated_stream(
+                            stream,
+                            parsing_options_for_log,
+                        )
+                        .await
+                    {
+                        emit_openai_response_log(
+                            &request_id_for_log,
+                            &model_for_log,
+                            "chat_completions",
+                            true,
+                            StatusCode::OK.as_u16(),
+                            serde_json::to_value(&final_response)
+                                .unwrap_or(serde_json::Value::Null),
+                            &payload_suppression_for_log,
+                        );
+                    }
+                });
+            }
 
             // Side-channel events come first, then the regular data event.
             match sse_result {
@@ -1408,7 +2269,7 @@ async fn chat_completions(
             );
         });
 
-        let response =
+        let mut response =
             NvCreateChatCompletionResponse::from_annotated_stream(stream, parsing_options.clone())
                 .await
                 .map_err(|e| {
@@ -1424,6 +2285,17 @@ async fn chat_completions(
                     inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                     err_response
                 })?;
+        normalize_chat_completion_response(&mut response);
+        let response_payload = serde_json::to_value(&response).unwrap_or(serde_json::Value::Null);
+        emit_openai_response_log(
+            &request_id,
+            &model,
+            "chat_completions",
+            false,
+            StatusCode::OK.as_u16(),
+            response_payload.clone(),
+            &payload_suppression,
+        );
 
         inflight_guard.mark_ok();
         // If the engine context was killed (client disconnect), the response was
@@ -1431,7 +2303,7 @@ async fn chat_completions(
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
         }
-        Ok(Json(response).into_response())
+        Ok(Json(response_payload).into_response())
     }
 }
 
@@ -1455,6 +2327,40 @@ pub fn validate_chat_completion_unsupported_fields(
             VALIDATION_PREFIX.to_string()
                 + "`functions` is deprecated. Please migrate to use `tools` instead.",
         ));
+    }
+
+    if let Some(ChatCompletionToolChoiceOption::Named(named_tool)) = inner.tool_choice.as_ref()
+        && let Some(tools) = inner.tools.as_ref()
+        && !tools
+            .iter()
+            .any(|tool| tool.function.name == named_tool.function.name)
+    {
+        return Err(ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: format!(
+                "{VALIDATION_PREFIX}`tool_choice.function.name` not found in the tools list."
+            ),
+        }));
+    }
+
+    let has_guided_constraint = request.common.guided_json.is_some()
+        || request.common.guided_regex.is_some()
+        || request.common.guided_choice.is_some()
+        || request.common.guided_grammar.is_some()
+        || request.structured_outputs.as_ref().is_some_and(|params| {
+            params.json.is_some()
+                || params.regex.is_some()
+                || params.choice.is_some()
+                || params.grammar.is_some()
+                || params.json_object == Some(true)
+        });
+    if request.common.guided_whitespace_pattern.is_some() && !has_guided_constraint {
+        return Err(ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: format!(
+                "{VALIDATION_PREFIX}`guided_whitespace_pattern` requires a guided decoding constraint."
+            ),
+        }));
     }
 
     Ok(())
@@ -1545,16 +2451,60 @@ pub fn validate_completion_fields_generic(
 async fn handler_responses(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(mut request): Json<NvCreateResponse>,
+    body: Bytes,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
+    let payload_value =
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
+    let payload_obj = payload_value.as_object();
+    let request_id = get_or_create_request_id(
+        payload_obj
+            .and_then(|obj| obj.get("request_id").or_else(|| obj.get("user")))
+            .and_then(serde_json::Value::as_str),
+        &headers,
+    );
+    let streaming = payload_obj
+        .and_then(|obj| obj.get("stream"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let raw_model = payload_obj
+        .and_then(|obj| obj.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let payload_suppression = payload_suppression_from_headers(&headers);
+
+    emit_openai_request_log(
+        &request_id,
+        &raw_model,
+        "responses",
+        streaming,
+        header_map_to_json(&headers),
+        payload_value.clone(),
+        &payload_suppression,
+    );
+
+    let mut request: NvCreateResponse = serde_json::from_value(payload_value).map_err(|e| {
+        let err_response = ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: format!("Failed to deserialize the JSON body into the target type: {e}"),
+        });
+        emit_openai_response_log(
+            &request_id,
+            &raw_model,
+            "responses",
+            streaming,
+            err_response.0.as_u16(),
+            error_response_payload(&err_response),
+            &payload_suppression,
+        );
+        err_response
+    })?;
+
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
-    // create the context for the request
-    let request_id = get_or_create_request_id(&headers);
-    let streaming = request.inner.stream.unwrap_or(false);
     let cancellation_labels = CancellationLabels {
         model: request.inner.model.clone().unwrap_or_default(),
         endpoint: Endpoint::Responses.to_string(),
@@ -1571,15 +2521,20 @@ async fn handler_responses(
     )
     .await;
 
-    let response =
-        tokio::spawn(responses(state, template, request, stream_handle).in_current_span())
-            .await
-            .map_err(|e| {
-                ErrorMessage::internal_server_error(&format!(
-                    "Failed to await responses task: {:?}",
-                    e,
-                ))
-            })?;
+    let response = tokio::spawn(
+        responses(
+            state,
+            template,
+            request,
+            stream_handle,
+            payload_suppression.clone(),
+        )
+        .in_current_span(),
+    )
+    .await
+    .map_err(|e| {
+        ErrorMessage::internal_server_error(&format!("Failed to await responses task: {:?}", e,))
+    })?;
 
     // if we got here, then we will return a response and the potentially long running task has completed successfully
     // without need to be cancelled.
@@ -1594,6 +2549,7 @@ async fn responses(
     template: Option<RequestTemplate>,
     mut request: Context<NvCreateResponse>,
     mut stream_handle: ConnectionHandle,
+    payload_suppression: PayloadSuppression,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
@@ -1619,7 +2575,10 @@ async fn responses(
     }
     tracing::trace!("Received responses request: {:?}", request.inner);
 
-    let model = request.inner.model.clone().unwrap_or_default();
+    let model = state
+        .manager()
+        .resolve_canonical_name(request.inner.model.as_deref().unwrap_or_default());
+    request.inner.model = Some(model.clone());
     let streaming = request.inner.stream.unwrap_or(false);
 
     // Create http_queue_guard early - tracks time waiting to be processed
@@ -1691,6 +2650,8 @@ async fn responses(
     // that the stream converter needs for faithful response reconstruction.
     let responses_ctx = unified_request.responses_context().cloned();
     let mut chat_request = unified_request.into_inner();
+    apply_chat_reasoning_effort_controls(&mut chat_request);
+    apply_chat_max_output_cap(&mut chat_request);
 
     // Always use internal streaming for aggregation.
     // Set stream_options.include_usage so the backend sends token counts in the final chunk.
@@ -1755,6 +2716,9 @@ async fn responses(
         // synchronous -- no .await while lock is held. Avoids async lock overhead per token.
         let converter = std::sync::Arc::new(std::sync::Mutex::new(converter));
         let converter_end = converter.clone();
+        let response_log_request_id = request_id.clone();
+        let response_log_model = model.clone();
+        let response_log_payload_suppression = payload_suppression.clone();
 
         // Track whether the backend sent an error event during the stream.
         // Shared between event_stream (writer) and done_stream (reader).
@@ -1800,6 +2764,16 @@ async fn responses(
             let end_events = if saw_error_end.load(Ordering::Acquire) {
                 conv.emit_error_events()
             } else {
+                let payload = conv.completed_response_payload_for_logging();
+                emit_openai_response_log(
+                    &response_log_request_id,
+                    &response_log_model,
+                    "responses",
+                    true,
+                    StatusCode::OK.as_u16(),
+                    payload,
+                    &response_log_payload_suppression,
+                );
                 conv.emit_end_events()
             };
             stream::iter(end_events)
@@ -1881,6 +2855,17 @@ async fn responses(
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
         }
+
+        let response_payload = serde_json::to_value(&response).unwrap_or(serde_json::Value::Null);
+        emit_openai_response_log(
+            &request_id,
+            &model,
+            "responses",
+            false,
+            StatusCode::OK.as_u16(),
+            response_payload,
+            &payload_suppression,
+        );
 
         Ok(Json(response).into_response())
     }
@@ -2155,7 +3140,7 @@ async fn images(
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
-    let request_id = get_or_create_request_id(&headers);
+    let request_id = get_or_create_request_id(None, &headers);
     let request = Context::with_id(request, request_id);
     let request_id = request.id().to_string();
 
@@ -2285,7 +3270,7 @@ async fn videos(
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
-    let request_id = get_or_create_request_id(&headers);
+    let request_id = get_or_create_request_id(None, &headers);
     let request = Context::with_id(request, request_id);
     let request_id = request.id().to_string();
 
@@ -2366,7 +3351,7 @@ async fn video_stream(
 ) -> Result<Response, ErrorResponse> {
     check_ready(&state)?;
 
-    let request_id = get_or_create_request_id(&headers);
+    let request_id = get_or_create_request_id(None, &headers);
     let request = Context::with_id(request, request_id);
     let model = request.model.clone();
 
@@ -2530,7 +3515,7 @@ async fn audio_speech(
     check_ready(&state)?;
 
     let response_format = request.response_format.clone();
-    let request_id = get_or_create_request_id(&headers);
+    let request_id = get_or_create_request_id(None, &headers);
     let request = Context::with_id(request, request_id);
     let request_id = request.id().to_string();
 
@@ -2870,6 +3855,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -2902,6 +3889,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_required_fields(&request);
@@ -2939,6 +3928,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
 
@@ -2963,6 +3954,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -2986,6 +3979,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -3009,6 +4004,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -3034,6 +4031,8 @@ mod tests {
                 .unwrap(),
             nvext: None,
             metadata: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -3057,6 +4056,8 @@ mod tests {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_completion_fields_generic(&request);
@@ -3088,6 +4089,8 @@ mod tests {
                 "session": {"id": "session-1", "timestamp": 1640995200}
             })
             .into(),
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
 
@@ -3118,6 +4121,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
 
@@ -3148,6 +4153,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -3177,6 +4184,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -3206,6 +4215,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -3237,6 +4248,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -3266,6 +4279,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
         let result = validate_chat_completion_fields_generic(&request);
@@ -3312,6 +4327,66 @@ mod tests {
             assert!(msg.contains("documents"));
             assert!(msg.contains("chat_template"));
         }
+    }
+
+    #[test]
+    fn test_chat_template_preserve_thinking_sets_history_flag() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "test-model",
+            "chat_template_kwargs": {
+                "thinking": true,
+                "preserve_thinking": true
+            }
+        }"#;
+
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_str(json).unwrap();
+        apply_chat_thinking_compat_controls(&mut request);
+        let args = request.chat_template_args.as_ref().unwrap();
+
+        assert_eq!(args["enable_thinking"], serde_json::Value::Bool(true));
+        assert_eq!(
+            args["truncate_history_thinking"],
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_chat_template_thinking_false_sets_enable_thinking_false() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "test-model",
+            "chat_template_kwargs": {
+                "thinking": false
+            }
+        }"#;
+
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_str(json).unwrap();
+        apply_chat_thinking_compat_controls(&mut request);
+        let args = request.chat_template_args.as_ref().unwrap();
+
+        assert_eq!(args["enable_thinking"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn test_top_level_thinking_keep_all_sets_history_flag() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "test-model",
+            "thinking": {"type": "enabled", "keep": "all"}
+        }"#;
+
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(request.unsupported_fields.is_empty());
+
+        apply_chat_thinking_compat_controls(&mut request);
+        let args = request.chat_template_args.as_ref().unwrap();
+
+        assert_eq!(args["enable_thinking"], serde_json::Value::Bool(true));
+        assert_eq!(
+            args["truncate_history_thinking"],
+            serde_json::Value::Bool(false)
+        );
     }
 
     #[test]

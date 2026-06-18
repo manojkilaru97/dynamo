@@ -16,9 +16,9 @@
 //! System health monitoring and health check management
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
@@ -33,6 +33,103 @@ pub struct HealthCheckTarget {
     pub payload: serde_json::Value,
 }
 
+#[derive(Clone, Debug)]
+pub struct RealTrafficHealthConfig {
+    pub window: Duration,
+    pub min_samples: usize,
+    pub failure_threshold: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestOutcome {
+    Success,
+    Failure,
+    Overloaded,
+}
+
+impl RequestOutcome {
+    fn is_failure(self) -> bool {
+        matches!(self, Self::Failure)
+    }
+
+    fn is_eligible_for_failure_ratio(self) -> bool {
+        !matches!(self, Self::Overloaded)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RealTrafficWindow {
+    events: VecDeque<(Instant, RequestOutcome)>,
+    status: HealthStatus,
+}
+
+impl Default for RealTrafficWindow {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::new(),
+            status: HealthStatus::Ready,
+        }
+    }
+}
+
+impl RealTrafficWindow {
+    fn record(&mut self, now: Instant, outcome: RequestOutcome, config: &RealTrafficHealthConfig) {
+        self.prune(now, config.window);
+        self.events.push_back((now, outcome));
+        self.status = self.compute_status(config);
+    }
+
+    fn prune(&mut self, now: Instant, window: Duration) {
+        while let Some((ts, _)) = self.events.front() {
+            if now.saturating_duration_since(*ts) <= window {
+                break;
+            }
+            self.events.pop_front();
+        }
+    }
+
+    fn sample_counts(&self) -> (usize, usize) {
+        let mut total = 0usize;
+        let mut failures = 0usize;
+        for (_, outcome) in &self.events {
+            if !outcome.is_eligible_for_failure_ratio() {
+                continue;
+            }
+            total += 1;
+            if outcome.is_failure() {
+                failures += 1;
+            }
+        }
+        (total, failures)
+    }
+
+    fn compute_status(&self, config: &RealTrafficHealthConfig) -> HealthStatus {
+        let (total, failures) = self.sample_counts();
+        if total < config.min_samples {
+            return HealthStatus::Ready;
+        }
+        if failures as f64 / total as f64 >= config.failure_threshold {
+            HealthStatus::NotReady
+        } else {
+            HealthStatus::Ready
+        }
+    }
+
+    fn status_at(&mut self, now: Instant, config: &RealTrafficHealthConfig) -> HealthStatus {
+        self.prune(now, config.window);
+        self.status = self.compute_status(config);
+        self.status.clone()
+    }
+
+    fn has_success_within(&mut self, now: Instant, within: Duration) -> bool {
+        self.prune(now, within);
+        self.events.iter().rev().any(|(ts, outcome)| {
+            matches!(outcome, RequestOutcome::Success)
+                && now.saturating_duration_since(*ts) <= within
+        })
+    }
+}
+
 /// Current Health Status
 /// If use_endpoint_health_status is set then
 /// initialize the endpoint_health hashmap to the
@@ -41,6 +138,8 @@ pub struct HealthCheckTarget {
 pub struct SystemHealth {
     system_health: HealthStatus,
     endpoint_health: Arc<std::sync::RwLock<HashMap<String, HealthStatus>>>,
+    endpoint_real_traffic_health: Arc<std::sync::RwLock<HashMap<String, RealTrafficWindow>>>,
+    real_traffic_health_config: RealTrafficHealthConfig,
     /// Maps endpoint subject to health check target (instance + payload)
     health_check_targets: Arc<std::sync::RwLock<HashMap<String, HealthCheckTarget>>>,
     /// Maps endpoint subject to its specific health check notifier
@@ -53,6 +152,7 @@ pub struct SystemHealth {
     use_endpoint_health_status: Vec<String>,
     health_path: String,
     live_path: String,
+    endpoint_last_health_check_success: Arc<std::sync::RwLock<HashMap<String, Instant>>>,
     start_time: Instant,
     uptime_gauge: OnceLock<prometheus::Gauge>,
 }
@@ -63,10 +163,13 @@ impl SystemHealth {
         use_endpoint_health_status: Vec<String>,
         health_path: String,
         live_path: String,
+        real_traffic_health_config: RealTrafficHealthConfig,
     ) -> Self {
         let mut endpoint_health = HashMap::new();
+        let mut endpoint_real_traffic_health = HashMap::new();
         for endpoint in &use_endpoint_health_status {
             endpoint_health.insert(endpoint.clone(), starting_health_status.clone());
+            endpoint_real_traffic_health.insert(endpoint.clone(), RealTrafficWindow::default());
         }
 
         // Create the channel for endpoint registration notifications
@@ -75,6 +178,10 @@ impl SystemHealth {
         SystemHealth {
             system_health: starting_health_status,
             endpoint_health: Arc::new(std::sync::RwLock::new(endpoint_health)),
+            endpoint_real_traffic_health: Arc::new(std::sync::RwLock::new(
+                endpoint_real_traffic_health,
+            )),
+            real_traffic_health_config,
             health_check_targets: Arc::new(std::sync::RwLock::new(HashMap::new())),
             health_check_notifiers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             new_endpoint_tx: tx,
@@ -82,6 +189,7 @@ impl SystemHealth {
             use_endpoint_health_status,
             health_path,
             live_path,
+            endpoint_last_health_check_success: Arc::new(std::sync::RwLock::new(HashMap::new())),
             start_time: Instant::now(),
             uptime_gauge: OnceLock::new(),
         }
@@ -95,17 +203,84 @@ impl SystemHealth {
         endpoint_health.insert(endpoint.to_string(), status);
     }
 
+    pub fn record_health_check_success(&self, endpoint: &str) {
+        self.endpoint_last_health_check_success
+            .write()
+            .unwrap()
+            .insert(endpoint.to_string(), Instant::now());
+    }
+
+    pub fn record_health_check_request_started(&self, _endpoint: &str, _trigger: &str) {}
+
+    pub fn record_health_check_request_completed(
+        &self,
+        _endpoint: &str,
+        _trigger: &str,
+        _result: &str,
+        _elapsed: Duration,
+    ) {
+    }
+
+    pub fn record_endpoint_request_result(&self, endpoint: &str, success: bool) {
+        let outcome = if success {
+            RequestOutcome::Success
+        } else {
+            RequestOutcome::Failure
+        };
+        self.record_endpoint_request_outcome(endpoint, outcome);
+    }
+
+    pub fn record_endpoint_request_overload(&self, endpoint: &str) {
+        self.record_endpoint_request_outcome(endpoint, RequestOutcome::Overloaded);
+    }
+
+    fn record_endpoint_request_outcome(&self, endpoint: &str, outcome: RequestOutcome) {
+        let now = Instant::now();
+        let mut windows = self.endpoint_real_traffic_health.write().unwrap();
+        let window = windows.entry(endpoint.to_string()).or_default();
+        window.record(now, outcome, &self.real_traffic_health_config);
+    }
+
+    pub fn get_endpoint_real_traffic_health_status(&self, endpoint: &str) -> Option<HealthStatus> {
+        let now = Instant::now();
+        let mut endpoint_real_traffic_health = self.endpoint_real_traffic_health.write().unwrap();
+        endpoint_real_traffic_health
+            .get_mut(endpoint)
+            .map(|window| window.status_at(now, &self.real_traffic_health_config))
+    }
+
+    pub fn real_traffic_window(&self) -> Duration {
+        self.real_traffic_health_config.window
+    }
+
+    pub fn has_recent_endpoint_success(&self, endpoint: &str, within: Duration) -> bool {
+        let now = Instant::now();
+        let mut endpoint_real_traffic_health = self.endpoint_real_traffic_health.write().unwrap();
+        endpoint_real_traffic_health
+            .get_mut(endpoint)
+            .is_some_and(|window| window.has_success_within(now, within))
+    }
+
     /// Returns the overall health status and endpoint health statuses
     /// System health is determined by ALL endpoints that have registered health checks
     pub fn get_health_status(&self) -> (bool, HashMap<String, String>) {
+        let now = Instant::now();
         let health_check_targets = self.health_check_targets.read().unwrap();
         let endpoint_health = self.endpoint_health.read().unwrap();
+        let mut endpoint_real_traffic_health = self.endpoint_real_traffic_health.write().unwrap();
         let mut endpoints: HashMap<String, String> = HashMap::new();
 
         for (endpoint, status) in endpoint_health.iter() {
+            let real_ready =
+                endpoint_real_traffic_health
+                    .get_mut(endpoint)
+                    .map_or(true, |window| {
+                        window.status_at(now, &self.real_traffic_health_config)
+                            == HealthStatus::Ready
+                    });
             endpoints.insert(
                 endpoint.clone(),
-                if *status == HealthStatus::Ready {
+                if *status == HealthStatus::Ready && real_ready {
                     "ready".to_string()
                 } else {
                     "notready".to_string()
@@ -113,11 +288,30 @@ impl SystemHealth {
             );
         }
 
+        let endpoint_is_ready =
+            |endpoint: &str,
+             endpoint_health: &HashMap<String, HealthStatus>,
+             endpoint_real_traffic_health: &mut HashMap<String, RealTrafficWindow>| {
+                let base_ready = endpoint_health
+                    .get(endpoint)
+                    .is_some_and(|status| *status == HealthStatus::Ready);
+                let real_ready =
+                    endpoint_real_traffic_health
+                        .get_mut(endpoint)
+                        .map_or(true, |window| {
+                            window.status_at(now, &self.real_traffic_health_config)
+                                == HealthStatus::Ready
+                        });
+                base_ready && real_ready
+            };
+
         let healthy = if !self.use_endpoint_health_status.is_empty() {
             self.use_endpoint_health_status.iter().all(|endpoint| {
-                endpoint_health
-                    .get(endpoint)
-                    .is_some_and(|status| *status == HealthStatus::Ready)
+                endpoint_is_ready(
+                    endpoint,
+                    &endpoint_health,
+                    &mut endpoint_real_traffic_health,
+                )
             })
         } else {
             // If we have registered health check targets, use them to determine health
@@ -125,9 +319,11 @@ impl SystemHealth {
                 health_check_targets
                     .iter()
                     .all(|(endpoint_subject, _target)| {
-                        endpoint_health
-                            .get(endpoint_subject)
-                            .is_some_and(|status| *status == HealthStatus::Ready)
+                        endpoint_is_ready(
+                            endpoint_subject,
+                            &endpoint_health,
+                            &mut endpoint_real_traffic_health,
+                        )
                     })
             } else {
                 // No health check targets registered, use simple system health
@@ -181,6 +377,14 @@ impl SystemHealth {
             endpoint_health
                 .entry(key.clone())
                 .or_insert(HealthStatus::NotReady);
+        }
+
+        {
+            let mut endpoint_real_traffic_health =
+                self.endpoint_real_traffic_health.write().unwrap();
+            endpoint_real_traffic_health
+                .entry(key.clone())
+                .or_insert_with(RealTrafficWindow::default);
         }
 
         if let Err(e) = self.new_endpoint_tx.send(key.clone()) {

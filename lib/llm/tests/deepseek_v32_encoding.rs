@@ -321,6 +321,38 @@ fn test_reasoning_content_survives_chat_request_parsing_and_rendering() {
     assert!(rendered.contains("</think>"));
 }
 
+#[test]
+fn test_reasoning_alias_survives_chat_request_parsing_and_rendering() {
+    let json = r#"{
+        "model": "deepseek-v3.2",
+        "messages": [
+            {"role": "user", "content": "weather tomorrow?"},
+            {
+                "role": "assistant",
+                "reasoning": "need date first",
+                "content": "I will check the current date."
+            },
+            {"role": "user", "content": "continue"}
+        ]
+    }"#;
+
+    let request: NvCreateChatCompletionRequest = serde_json::from_str(json).unwrap();
+    let messages = serde_json::to_value(request.messages()).unwrap();
+    assert_eq!(
+        messages[1]["reasoning_content"],
+        serde_json::Value::String("need date first".to_string())
+    );
+    assert!(messages[1].get("reasoning").is_none());
+
+    let formatter =
+        dynamo_llm::preprocessor::prompt::deepseek_v32::DeepSeekV32Formatter::new_thinking();
+    let rendered = formatter.render(&request).unwrap();
+
+    assert!(rendered.contains("need date first"));
+    assert!(rendered.contains("<think>"));
+    assert!(rendered.contains("</think>"));
+}
+
 // Regression test for the KV-cache flattening bug.
 //
 // Models like GLM-5 and Qwen3 (Pattern A) emit interleaved thinking:

@@ -470,6 +470,14 @@ impl OAIChatLikeRequest for UnifiedRequest {
         OAIChatLikeRequest::response_format(&self.inner)
     }
 
+    fn reasoning_budget(&self) -> Option<&serde_json::Value> {
+        OAIChatLikeRequest::reasoning_budget(&self.inner)
+    }
+
+    fn reasoning_budget_grace_period(&self) -> Option<&serde_json::Value> {
+        OAIChatLikeRequest::reasoning_budget_grace_period(&self.inner)
+    }
+
     fn should_add_generation_prompt(&self) -> bool {
         OAIChatLikeRequest::should_add_generation_prompt(&self.inner)
     }
@@ -534,6 +542,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
 

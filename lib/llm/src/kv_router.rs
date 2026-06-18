@@ -19,6 +19,7 @@ use dynamo_kv_router::{
 use dynamo_runtime::{
     component::{Client, Endpoint},
     discovery::DiscoveryQuery,
+    error::{DynamoError, ErrorType},
     pipeline::{
         AsyncEngine, AsyncEngineContextProvider, Error, ManyOut, ResponseStream, SingleIn,
         async_trait,
@@ -35,6 +36,7 @@ use validator::Validate;
 pub use dynamo_kv_router::approx;
 pub use dynamo_kv_router::protocols;
 pub use dynamo_kv_router::scheduling;
+use dynamo_kv_router::scheduling::KvSchedulerError;
 pub use dynamo_kv_router::selector;
 
 pub mod agent_controller;
@@ -337,23 +339,32 @@ where
             .await?;
         let find_matches_elapsed = start.elapsed();
 
-        let response = self
-            .scheduler
-            .schedule(
-                context_id.map(|s| s.to_string()),
-                isl_tokens,
-                maybe_seq_hashes,
-                overlap_scores,
-                router_config_override,
-                update_states,
-                lora_name,
-                priority_jump,
-                expected_output_tokens,
-                pinned_worker,
-                allowed_worker_ids,
-            )
-            .instrument(tracing::info_span!("kv_router.schedule"))
-            .await?;
+        let response =
+            self.scheduler
+                .schedule(
+                    context_id.map(|s| s.to_string()),
+                    isl_tokens,
+                    maybe_seq_hashes,
+                    overlap_scores,
+                    router_config_override,
+                    update_states,
+                    lora_name,
+                    priority_jump,
+                    expected_output_tokens,
+                    pinned_worker,
+                    allowed_worker_ids,
+                )
+                .instrument(tracing::info_span!("kv_router.schedule"))
+                .await
+                .map_err(|err| match err {
+                    KvSchedulerError::QueueFull { .. }
+                    | KvSchedulerError::QueueWaitTimeout { .. } => DynamoError::builder()
+                        .error_type(ErrorType::ResourceExhausted)
+                        .message(err.to_string())
+                        .build()
+                        .into(),
+                    err => anyhow::Error::new(err),
+                })?;
         let total_elapsed = start.elapsed();
 
         if let Some(m) = metrics::RoutingOverheadMetrics::get() {

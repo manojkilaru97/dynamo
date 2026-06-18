@@ -270,21 +270,6 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             softmax_sample(&worker_logits, temperature)
         };
 
-        if self.worker_type == "decode" {
-            tracing::info!(
-                "Selected worker: worker_type={}, worker_id={} dp_rank={:?}, logit: {:.3}",
-                self.worker_type,
-                best_worker.worker_id,
-                best_worker.dp_rank,
-                best_logit,
-            );
-            return Ok(WorkerSelectionResult {
-                worker: best_worker,
-                required_blocks: request_blocks as u64,
-                overlap_blocks: overlaps.get(&best_worker).copied().unwrap_or(0),
-            });
-        }
-
         let best_overlap = *overlaps.get(&best_worker).unwrap_or(&0);
 
         let total_blocks_info = workers

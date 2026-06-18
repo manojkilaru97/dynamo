@@ -29,6 +29,9 @@ class DynamoRouterConfig(ConfigBase):
     router_ttl_secs: float
     router_max_tree_size: int
     router_prune_target_ratio: float
+    router_queue_threshold: float | None
+    router_max_pending_per_worker: int | None
+    router_max_queue_wait_ms: int | None
     router_event_threads: int
 
     def validate(self) -> None:
@@ -190,6 +193,33 @@ class DynamoRouterArgGroup(ArgGroup):
             default=0.8,
             help="KV Router: Target size ratio after pruning (0.0-1.0). Only used when --no-router-kv-events is set. Determines how aggressively to prune the tree.",
             arg_type=float,
+        )
+
+        add_argument(
+            g,
+            flag_name="--router-queue-threshold",
+            env_var="DYN_ROUTER_QUEUE_THRESHOLD",
+            default=4.0,
+            help="KV Router: token threshold fraction for scheduler queueing.",
+            arg_type=float,
+        )
+
+        add_argument(
+            g,
+            flag_name="--router-max-pending-per-worker",
+            env_var="DYN_ROUTER_MAX_PENDING_PER_WORKER",
+            default=None,
+            help="KV Router: maximum scheduler-queued requests per eligible worker before rejecting new requests.",
+            arg_type=int,
+        )
+
+        add_argument(
+            g,
+            flag_name="--router-max-queue-wait-ms",
+            env_var="DYN_ROUTER_MAX_QUEUE_WAIT_MS",
+            default=None,
+            help="KV Router: maximum time in milliseconds a request may wait in the scheduler queue before being failed.",
+            arg_type=int,
         )
 
         add_argument(

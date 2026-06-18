@@ -263,6 +263,7 @@ impl DeltaGenerator {
             },
             refusal: None,
             reasoning_content: None,
+            token_ids: Vec::new(),
         };
 
         let choice = dynamo_protocols::types::ChatChoiceStream {
@@ -406,6 +407,7 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
 
         // Create the streaming response.
         let index = 0;
+        let generated_token_ids = delta.token_ids.clone();
         let mut stream_response = self.create_choice(
             index,
             delta.text,
@@ -413,6 +415,9 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
             logprobs,
             delta.stop_reason,
         );
+        if let Some(choice) = stream_response.inner.choices.get_mut(0) {
+            choice.delta.token_ids = generated_token_ids;
+        }
 
         // Get worker_id info from tracker (set by KvPushRouter based on phase)
         let worker_id_info = self.tracker.as_ref().and_then(|t| t.get_worker_info());
@@ -525,6 +530,8 @@ mod tests {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         }
     }

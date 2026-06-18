@@ -49,11 +49,12 @@ impl<'de> Deserialize<'de> for KvEventBatch {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[derive(Debug, Serialize, Clone, Copy)]
 #[serde(untagged)]
 pub enum BlockHashValue {
     Signed(i64),
     Unsigned(u64),
+    Bytes(u64),
 }
 
 impl BlockHashValue {
@@ -61,8 +62,64 @@ impl BlockHashValue {
         match self {
             BlockHashValue::Signed(v) => v.cast_unsigned(),
             BlockHashValue::Unsigned(v) => v,
+            BlockHashValue::Bytes(v) => v,
         }
     }
+}
+
+impl<'de> Deserialize<'de> for BlockHashValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(BlockHashValueVisitor)
+    }
+}
+
+struct BlockHashValueVisitor;
+
+impl<'de> Visitor<'de> for BlockHashValueVisitor {
+    type Value = BlockHashValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a signed int, unsigned int, or byte block hash")
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(BlockHashValue::Signed(value))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(BlockHashValue::Unsigned(value))
+    }
+
+    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(BlockHashValue::Bytes(block_hash_bytes_to_u64(value)))
+    }
+
+    fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(BlockHashValue::Bytes(block_hash_bytes_to_u64(&value)))
+    }
+}
+
+fn block_hash_bytes_to_u64(value: &[u8]) -> u64 {
+    let mut tail = [0u8; 8];
+    let start = value.len().saturating_sub(8);
+    let bytes = &value[start..];
+    tail[8 - bytes.len()..].copy_from_slice(bytes);
+    u64::from_be_bytes(tail)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -124,6 +181,25 @@ pub enum ExtraKeyItem {
     Unsigned(u64),
     Float(f64),
     Bool(bool),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum BlockMmInfosOrGroupIdx {
+    BlockMmInfos(Vec<Option<BlockExtraInfo>>),
+    SignedGroupIdx(i64),
+    UnsignedGroupIdx(u64),
+}
+
+impl BlockMmInfosOrGroupIdx {
+    fn into_block_mm_infos(self) -> Option<Vec<Option<BlockExtraInfo>>> {
+        match self {
+            BlockMmInfosOrGroupIdx::BlockMmInfos(infos) => Some(infos),
+            BlockMmInfosOrGroupIdx::SignedGroupIdx(_)
+            | BlockMmInfosOrGroupIdx::UnsignedGroupIdx(_) => None,
+        }
+    }
 }
 
 /// Convert vLLM BlockStored extra_keys to block-level MM infos.
@@ -339,8 +415,12 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 let lora_name: Option<String> = seq.next_element()?.unwrap_or(None);
                 let extra_keys: Option<Vec<Option<Vec<ExtraKeyItem>>>> =
                     seq.next_element()?.unwrap_or(None);
-                let block_mm_infos: Option<Vec<Option<BlockExtraInfo>>> =
-                    seq.next_element()?.unwrap_or(None);
+                // vLLM 0.20.x appends `group_idx` here, while some Dynamo
+                // producers used this position for `block_mm_infos`.
+                let block_mm_infos = seq
+                    .next_element::<Option<BlockMmInfosOrGroupIdx>>()?
+                    .flatten()
+                    .and_then(BlockMmInfosOrGroupIdx::into_block_mm_infos);
 
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
 
@@ -539,6 +619,23 @@ pub fn create_stored_block_from_parts(
     }
 }
 
+fn synthetic_split_block_hash(final_block_hash: u64, split_idx: usize, split_count: usize) -> u64 {
+    let mut x = final_block_hash
+        ^ 0x4459_4e41_4d4f_4b56
+        ^ (split_idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (split_count as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    if x == final_block_hash {
+        x ^ 0x517c_c1b7_2722_0a95
+    } else {
+        x
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn create_stored_blocks(
     kv_block_size: u32,
@@ -558,6 +655,48 @@ pub fn create_stored_blocks(
     for (block_idx, (num_tokens_it, block_hash_it)) in
         num_block_tokens.iter().zip(block_hashes.iter()).enumerate()
     {
+        let mm_extra_info = block_mm_infos
+            .and_then(|infos| infos.get(block_idx))
+            .and_then(|opt| opt.clone());
+
+        if *num_tokens_it > kv_block_size as u64
+            && *num_tokens_it % kv_block_size as u64 == 0
+            && !is_eagle.unwrap_or(false)
+        {
+            let split_count = (*num_tokens_it / kv_block_size as u64) as usize;
+            let end = token_offset + *num_tokens_it as usize;
+            if end > token_ids.len() {
+                if warning_count.fetch_add(1, Ordering::Relaxed) < 3 {
+                    tracing::warn!(
+                        "Block not published. token_ids too short: need {}, got {}",
+                        end,
+                        token_ids.len()
+                    );
+                }
+                break;
+            }
+
+            for split_idx in 0..split_count {
+                let split_start = token_offset + split_idx * kv_block_size as usize;
+                let split_end = split_start + kv_block_size as usize;
+                let block_hash = if split_idx + 1 == split_count {
+                    *block_hash_it
+                } else {
+                    synthetic_split_block_hash(*block_hash_it, split_idx, split_count)
+                };
+                blocks.push(create_stored_block_from_parts(
+                    kv_block_size,
+                    block_hash,
+                    &token_ids[split_start..split_end],
+                    lora_name,
+                    mm_extra_info.clone(),
+                    is_eagle,
+                ));
+            }
+            token_offset += *num_tokens_it as usize;
+            continue;
+        }
+
         if *num_tokens_it != kv_block_size as u64 {
             if warning_count.fetch_add(1, Ordering::Relaxed) < 3 {
                 tracing::warn!(
@@ -582,9 +721,6 @@ pub fn create_stored_blocks(
         }
 
         let tokens = &token_ids[token_offset..end];
-        let mm_extra_info = block_mm_infos
-            .and_then(|infos| infos.get(block_idx))
-            .and_then(|opt| opt.clone());
 
         blocks.push(create_stored_block_from_parts(
             kv_block_size,
@@ -640,6 +776,62 @@ mod tests {
     }
 
     #[test]
+    fn test_deserialize_vllm_020_block_stored_sequence_with_group_idx() {
+        let raw_event = (
+            "BlockStored",
+            vec![BlockHashValue::Unsigned(31)],
+            Option::<BlockHashValue>::None,
+            vec![10u32, 11u32],
+            2usize,
+            Option::<u64>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<Vec<Option<Vec<String>>>>::None,
+            0i64,
+        );
+        let encoded = to_vec(&raw_event).unwrap();
+        let event: RawKvEvent = from_slice(&encoded).unwrap();
+
+        match event {
+            RawKvEvent::BlockStored {
+                block_hashes,
+                token_ids,
+                block_size,
+                block_mm_infos,
+                is_eagle,
+                ..
+            } => {
+                assert_eq!(block_hashes[0].into_u64(), 31);
+                assert_eq!(token_ids, vec![10, 11]);
+                assert_eq!(block_size, 2);
+                assert!(block_mm_infos.is_none());
+                assert_eq!(is_eagle, Some(false));
+            }
+            other => panic!("expected BlockStored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_byte_block_hash_sequence() {
+        let hash_bytes: Vec<u8> = (0u8..32u8).collect();
+        let expected = u64::from_be_bytes(hash_bytes[24..32].try_into().unwrap());
+        let raw_event = (
+            "BlockRemoved",
+            vec![serde_bytes::ByteBuf::from(hash_bytes)],
+            Option::<String>::None,
+        );
+        let encoded = to_vec(&raw_event).unwrap();
+        let event: RawKvEvent = from_slice(&encoded).unwrap();
+
+        match event {
+            RawKvEvent::BlockRemoved { block_hashes, .. } => {
+                assert_eq!(block_hashes[0].into_u64(), expected);
+            }
+            other => panic!("expected BlockRemoved, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_convert_event_bigram_emits_eagle_windows() {
         let raw_event = RawKvEvent::BlockStored {
             block_hashes: vec![BlockHashValue::Unsigned(21), BlockHashValue::Unsigned(22)],
@@ -686,6 +878,70 @@ mod tests {
 
                 assert_eq!(store_data.blocks[0].tokens_hash, expected_first[0]);
                 assert_eq!(store_data.blocks[1].tokens_hash, expected_second[0]);
+            }
+            other => panic!("expected Stored event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_create_stored_blocks_splits_large_vllm_event_block() {
+        let warning_count = Arc::new(AtomicU32::new(0));
+        let token_ids: Vec<u32> = (0..64).collect();
+
+        let blocks = create_stored_blocks(
+            16,
+            &token_ids,
+            &[64],
+            &[999],
+            None,
+            &warning_count,
+            None,
+            Some(false),
+        );
+
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[3].block_hash, ExternalSequenceBlockHash(999));
+        assert_ne!(blocks[0].block_hash, ExternalSequenceBlockHash(999));
+        assert_ne!(blocks[0].block_hash, blocks[1].block_hash);
+        assert_eq!(warning_count.load(Ordering::Relaxed), 0);
+
+        for (idx, block) in blocks.iter().enumerate() {
+            let start = idx * 16;
+            let expected =
+                compute_block_hash_for_seq(&token_ids[start..start + 16], 16, Default::default());
+            assert_eq!(block.tokens_hash, expected[0]);
+        }
+    }
+
+    #[test]
+    fn test_convert_event_splits_large_event_block_and_keeps_tail_parent_hash() {
+        let raw_event = RawKvEvent::BlockStored {
+            block_hashes: vec![BlockHashValue::Unsigned(1234)],
+            parent_block_hash: Some(BlockHashValue::Unsigned(999)),
+            token_ids: (0..64).collect(),
+            block_size: 64,
+            medium: None,
+            lora_name: None,
+            block_mm_infos: None,
+            is_eagle: Some(false),
+        };
+        let warning_count = Arc::new(AtomicU32::new(0));
+        let placement_event = convert_event(
+            raw_event,
+            8,
+            16,
+            WorkerWithDpRank::new(3, 1),
+            &warning_count,
+        );
+
+        match placement_event.event.data {
+            KvCacheEventData::Stored(store_data) => {
+                assert_eq!(store_data.parent_hash, Some(ExternalSequenceBlockHash(999)));
+                assert_eq!(store_data.blocks.len(), 4);
+                assert_eq!(
+                    store_data.blocks.last().unwrap().block_hash,
+                    ExternalSequenceBlockHash(1234)
+                );
             }
             other => panic!("expected Stored event, got {other:?}"),
         }

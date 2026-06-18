@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use tokio::sync::Mutex;
 use tokio::sync::watch;
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant};
 
 use super::policy::{FcfsPolicy, SchedulingPolicy};
 use super::prefill_load::PrefillLoadEstimator;
@@ -23,6 +23,7 @@ pub const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
 /// Entry in the priority queue, ordered by key (higher key = higher priority).
 struct QueueEntry<K: Ord + Eq> {
     key: K,
+    enqueued_at: Instant,
     request: SchedulingRequest,
 }
 
@@ -69,6 +70,10 @@ pub struct SchedulerQueue<
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
     /// Cached threshold fraction; None means queueing is disabled.
     threshold_frac: Option<f64>,
+    /// Maximum number of queued requests to allow per eligible worker.
+    max_pending_per_worker: Option<usize>,
+    /// Maximum time a request may remain queued before being failed.
+    max_queue_wait: Option<Duration>,
     /// Reference instant for computing arrival offsets.
     start_time: Instant,
     block_size: u32,
@@ -88,6 +93,8 @@ impl<
         slots: Arc<ActiveSequencesMultiWorker<P>>,
         workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
         threshold_frac: Option<f64>,
+        max_pending_per_worker: Option<usize>,
+        max_queue_wait: Option<Duration>,
         block_size: u32,
         selector: Sel,
         policy: S,
@@ -95,6 +102,17 @@ impl<
     ) -> Self {
         if let Some(frac) = threshold_frac {
             tracing::info!("Router queue enabled with threshold fraction {frac}");
+        }
+        if let Some(limit) = max_pending_per_worker {
+            tracing::info!(
+                "Router queue depth limited to {limit} pending requests per eligible worker"
+            );
+        }
+        if let Some(timeout) = max_queue_wait {
+            tracing::info!(
+                timeout_ms = timeout.as_millis() as u64,
+                "Router queue wait timeout enabled"
+            );
         }
         Self {
             pending: Mutex::new(BinaryHeap::new()),
@@ -104,6 +122,8 @@ impl<
             slots,
             workers_with_configs,
             threshold_frac,
+            max_pending_per_worker,
+            max_queue_wait,
             start_time: Instant::now(),
             block_size,
             selector,
@@ -167,11 +187,27 @@ impl<
             request.pinned_worker,
             decay_now,
         ) {
+            if let Some(limit) = self
+                .current_pending_limit(request.allowed_worker_ids.as_ref(), request.pinned_worker)
+            {
+                let pending = self.pending_count();
+                if pending >= limit {
+                    request.respond(Err(super::types::KvSchedulerError::QueueFull {
+                        pending,
+                        limit,
+                    }));
+                    return;
+                }
+            }
             tracing::debug!("all workers busy, queueing request");
             let arrival_offset = self.start_time.elapsed();
             let key = self.policy.enqueue_key(arrival_offset, &request);
             let isl_tokens = request.isl_tokens;
-            self.pending.lock().await.push(QueueEntry { key, request });
+            self.pending.lock().await.push(QueueEntry {
+                key,
+                enqueued_at: Instant::now(),
+                request,
+            });
             self.pending_count.fetch_add(1, AtomicOrdering::Relaxed);
             self.pending_isl_tokens
                 .fetch_add(isl_tokens, AtomicOrdering::Relaxed);
@@ -188,6 +224,12 @@ impl<
             return;
         };
 
+        let expired = {
+            let mut heap = self.pending.lock().await;
+            self.refresh_pending_locked(&mut heap)
+        };
+        self.fail_expired(expired);
+
         if S::DYNAMIC {
             let now = self.start_time.elapsed();
             let mut heap = self.pending.lock().await;
@@ -196,6 +238,7 @@ impl<
                 .into_iter()
                 .map(|e| QueueEntry {
                     key: self.policy.rekey(now, &e.key, &e.request),
+                    enqueued_at: e.enqueued_at,
                     request: e.request,
                 })
                 .collect();
@@ -209,6 +252,15 @@ impl<
             let Some(front) = heap.peek() else {
                 break;
             };
+            if self.is_expired(front) {
+                let entry = heap.pop().expect("heap front vanished before pop");
+                drop(heap);
+                self.pending_count.fetch_sub(1, AtomicOrdering::Relaxed);
+                self.pending_isl_tokens
+                    .fetch_sub(entry.request.isl_tokens, AtomicOrdering::Relaxed);
+                self.fail_expired(vec![entry]);
+                continue;
+            }
             // TODO: This preserves head-of-line blocking for now to keep queue
             // drain overhead bounded to the heap front. A blocked pinned or
             // otherwise constrained request can temporarily stall later
@@ -343,6 +395,72 @@ impl<
     /// Sum of `isl_tokens` for requests currently parked in the pending queue (lock-free).
     pub fn pending_isl_tokens(&self) -> usize {
         self.pending_isl_tokens.load(AtomicOrdering::Relaxed)
+    }
+
+    fn current_pending_limit(
+        &self,
+        allowed: Option<&HashSet<WorkerId>>,
+        pinned_worker: Option<WorkerWithDpRank>,
+    ) -> Option<usize> {
+        let per_worker_limit = self.max_pending_per_worker?;
+        if pinned_worker.is_some() {
+            return Some(per_worker_limit);
+        }
+
+        let configs = self.workers_with_configs.borrow();
+        let eligible_workers = configs
+            .keys()
+            .filter(|worker_id| allowed.map_or(true, |ids| ids.contains(worker_id)))
+            .count();
+
+        (eligible_workers > 0).then_some(per_worker_limit.saturating_mul(eligible_workers))
+    }
+
+    fn is_expired(&self, entry: &QueueEntry<S::Key>) -> bool {
+        let Some(limit) = self.max_queue_wait else {
+            return false;
+        };
+        entry.enqueued_at.elapsed() >= limit
+    }
+
+    fn refresh_pending_locked(
+        &self,
+        heap: &mut BinaryHeap<QueueEntry<S::Key>>,
+    ) -> Vec<QueueEntry<S::Key>> {
+        let pending = std::mem::take(heap).into_vec();
+        let mut fresh = Vec::with_capacity(pending.len());
+        let mut expired = Vec::new();
+
+        for entry in pending {
+            if self.is_expired(&entry) {
+                expired.push(entry);
+            } else {
+                fresh.push(entry);
+            }
+        }
+
+        *heap = BinaryHeap::from(fresh);
+        self.pending_count
+            .store(heap.len(), AtomicOrdering::Relaxed);
+        let pending_isl_tokens = heap.iter().map(|entry| entry.request.isl_tokens).sum();
+        self.pending_isl_tokens
+            .store(pending_isl_tokens, AtomicOrdering::Relaxed);
+        expired
+    }
+
+    fn fail_expired(&self, expired: Vec<QueueEntry<S::Key>>) {
+        let limit_ms = self
+            .max_queue_wait
+            .map(|limit| limit.as_millis() as u64)
+            .unwrap_or_default();
+        for mut entry in expired {
+            entry
+                .request
+                .respond(Err(super::types::KvSchedulerError::QueueWaitTimeout {
+                    waited_ms: entry.enqueued_at.elapsed().as_millis() as u64,
+                    limit_ms,
+                }));
+        }
     }
 
     /// Check if all eligible workers are busy based on threshold.
@@ -557,6 +675,8 @@ mod tests {
             Arc::clone(&slots),
             cfg_rx,
             threshold_frac,
+            None,
+            None,
             block_size,
             selector,
             FcfsPolicy,
@@ -606,6 +726,8 @@ mod tests {
             Arc::clone(&slots),
             cfg_rx,
             threshold_frac,
+            None,
+            None,
             block_size,
             selector,
             FcfsPolicy,

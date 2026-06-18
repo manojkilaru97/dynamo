@@ -29,6 +29,9 @@ impl CompletionSample {
             common: Default::default(),
             nvext: None,
             metadata: None,
+            reasoning: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
 

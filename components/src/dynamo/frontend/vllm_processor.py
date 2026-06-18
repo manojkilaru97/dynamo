@@ -200,14 +200,6 @@ def _tighten_json_guided_decoding(
             guided_decoding = dict(guided_decoding)
             guided_decoding["json"] = _normalize_json_schema_for_xgrammar(json_schema)
 
-    if (
-        (guided_decoding.get("json") is not None or guided_decoding.get("json_object"))
-        and "disable_any_whitespace" not in guided_decoding
-        and "whitespace_pattern" not in guided_decoding
-    ):
-        guided_decoding = dict(guided_decoding)
-        guided_decoding["disable_any_whitespace"] = True
-
     return guided_decoding
 
 
@@ -224,6 +216,46 @@ def _attach_guided_decoding(
     )
     if guided:
         dynamo_preproc["sampling_options"]["guided_decoding"] = guided
+
+
+def _chat_template_disables_reasoning(chat_template_kwargs: dict[str, Any]) -> bool:
+    return (
+        chat_template_kwargs.get("enable_thinking") is False
+        or chat_template_kwargs.get("thinking") is False
+        or chat_template_kwargs.get("reasoning_effort") in {"none", "no_think"}
+    )
+
+
+def _structured_reasoning_extra_args(
+    dynamo_preproc: dict[str, Any],
+    post: StreamingPostProcessor,
+    prompt_token_ids: list[int],
+) -> dict[str, Any]:
+    guided_decoding = dynamo_preproc.get("sampling_options", {}).get(
+        "guided_decoding"
+    )
+    if not guided_decoding or post.reasoning_parser is None:
+        return {}
+
+    chat_template_kwargs = dict(getattr(post, "chat_template_kwargs", {}) or {})
+    extra: dict[str, Any] = {
+        "reasoning_parser_kwargs": {
+            "chat_template_kwargs": chat_template_kwargs,
+        }
+    }
+
+    if _chat_template_disables_reasoning(chat_template_kwargs):
+        extra["reasoning_ended"] = True
+        return extra
+
+    try:
+        extra["reasoning_ended"] = post.reasoning_parser.is_reasoning_end(
+            prompt_token_ids
+        )
+    except Exception:
+        logger.debug("Could not precompute structured-output reasoning state")
+
+    return extra
 
 
 class VllmProcessor:
@@ -483,6 +515,13 @@ class VllmProcessor:
                 mm_proc_kwargs = dynamo_preproc.get("mm_processor_kwargs")
                 if mm_proc_kwargs is not None:
                     extra_args["mm_processor_kwargs"] = mm_proc_kwargs
+                extra_args.update(
+                    _structured_reasoning_extra_args(
+                        dynamo_preproc,
+                        post,
+                        tokens,
+                    )
+                )
                 dynamo_stream = await self.router.generate(
                     token_ids=tokens,
                     model=dynamo_preproc["model"],

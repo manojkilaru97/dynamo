@@ -11,7 +11,7 @@
 //! corresponding entry to the macro invocation below to keep Python exceptions
 //! in sync.
 
-use dynamo_runtime::error::BackendError;
+use dynamo_runtime::error::{BackendError, ErrorType};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
@@ -22,7 +22,7 @@ pyo3::create_exception!(dynamo._core, DynamoException, pyo3::exceptions::PyExcep
 ///
 /// For each `(RustExceptionName, BackendError)` pair, the macro:
 /// 1. Creates a Python exception class inheriting from `DynamoException`
-/// 2. Adds it to `py_exception_to_backend_error()` for Python → `BackendError` extraction
+/// 2. Adds it to `py_exception_to_backend_error()` for Python → `ErrorType` extraction
 /// 3. Adds it to `register_exceptions()` for module registration
 ///
 /// The conversion intentionally returns a `BackendError` variant and message
@@ -35,16 +35,15 @@ macro_rules! define_dynamo_exceptions {
             pyo3::create_exception!(dynamo._core, $name, DynamoException);
         )*
 
-        /// Extract a [`BackendError`] variant from a Python exception if it is
+        /// Extract an [`ErrorType`] variant from a Python exception if it is
         /// a known Dynamo exception.
         ///
-        /// Returns `Some((BackendError, message))` if the exception is a Dynamo
-        /// exception, `None` otherwise. The caller decides how to wrap the
-        /// `BackendError` into an `ErrorType`.
+        /// Returns `Some((ErrorType, message))` if the exception is a Dynamo
+        /// exception, `None` otherwise.
         pub fn py_exception_to_backend_error(
             py: Python<'_>,
             err: &PyErr,
-        ) -> Option<(BackendError, String)> {
+        ) -> Option<(ErrorType, String)> {
             // Check specific subtypes first (most-specific match wins).
             $(
                 if err.is_instance_of::<$name>(py) {
@@ -64,7 +63,7 @@ macro_rules! define_dynamo_exceptions {
                     .str()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                return Some((BackendError::Unknown, message));
+                return Some((ErrorType::Backend(BackendError::Unknown), message));
             }
 
             None
@@ -82,7 +81,7 @@ macro_rules! define_dynamo_exceptions {
 }
 
 // ---------------------------------------------------------------------------
-// Exception definitions — one entry per BackendError variant.
+// Exception definitions — one entry per ErrorType variant exposed to Python.
 //
 // All error types are exposed to Python as exception classes. When raised by
 // Python backend code, they are interpreted as Backend* errors in Rust
@@ -93,12 +92,28 @@ macro_rules! define_dynamo_exceptions {
 // corresponding line here so that a Python exception is generated.
 // ---------------------------------------------------------------------------
 define_dynamo_exceptions!(
-    (Unknown, BackendError::Unknown),
-    (InvalidArgument, BackendError::InvalidArgument),
-    (CannotConnect, BackendError::CannotConnect),
-    (Disconnected, BackendError::Disconnected),
-    (ConnectionTimeout, BackendError::ConnectionTimeout),
-    (Cancelled, BackendError::Cancelled),
-    (EngineShutdown, BackendError::EngineShutdown),
-    (StreamIncomplete, BackendError::StreamIncomplete),
+    (Unknown, ErrorType::Backend(BackendError::Unknown)),
+    (
+        InvalidArgument,
+        ErrorType::Backend(BackendError::InvalidArgument)
+    ),
+    (
+        CannotConnect,
+        ErrorType::Backend(BackendError::CannotConnect)
+    ),
+    (Disconnected, ErrorType::Backend(BackendError::Disconnected)),
+    (
+        ConnectionTimeout,
+        ErrorType::Backend(BackendError::ConnectionTimeout)
+    ),
+    (Cancelled, ErrorType::Backend(BackendError::Cancelled)),
+    (
+        EngineShutdown,
+        ErrorType::Backend(BackendError::EngineShutdown)
+    ),
+    (
+        StreamIncomplete,
+        ErrorType::Backend(BackendError::StreamIncomplete)
+    ),
+    (ResourceExhausted, ErrorType::ResourceExhausted),
 );

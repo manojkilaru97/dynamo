@@ -122,9 +122,12 @@ pub fn tojson(value: Value, kwargs: Kwargs) -> Result<Value, Error> {
             Error::new(ErrorKind::BadSerialization, "cannot serialize to JSON").with_source(err)
         })
     } else {
-        serde_json::to_string(&value).map_err(|err| {
-            Error::new(ErrorKind::BadSerialization, "cannot serialize to JSON").with_source(err)
-        })
+        serde_json::to_string(&value)
+            .map_err(|err| {
+                Error::new(ErrorKind::BadSerialization, "cannot serialize to JSON")
+                    .with_source(err)
+            })
+            .map(|s| python_default_json_spacing(&s))
     }
     .map_err(|err| {
         Error::new(ErrorKind::InvalidOperation, "cannot serialize to JSON").with_source(err)
@@ -143,6 +146,34 @@ pub fn tojson(value: Value, kwargs: Kwargs) -> Result<Value, Error> {
         }
         Value::from_safe_string(rv)
     })
+}
+
+fn python_default_json_spacing(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for c in json.chars() {
+        out.push(c);
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if c == '"' {
+            in_string = true;
+        } else if c == ',' || c == ':' {
+            out.push(' ');
+        }
+    }
+
+    out
 }
 
 pub fn strftime_now(format_str: &str) -> Result<Value, Error> {

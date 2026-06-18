@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import socket
+import warnings
 from typing import Any, Dict, Optional
 
 from vllm.distributed.kv_events import KVEventsConfig
@@ -230,8 +231,9 @@ def update_engine_config_with_dynamo(
         engine_config.enable_prefix_caching = True
 
     if getattr(engine_config, "block_size", None) is None:
+        engine_config.block_size = 16
         logger.debug(
-            "block_size is not set in engine config. vLLM engine block_size will be determined at runtime based on the model and attention backend."
+            f"Setting reasonable default of {engine_config.block_size} for block_size"
         )
 
     if _uses_nixl_connector(engine_config):
@@ -348,7 +350,24 @@ def create_kv_events_config(
         logger.info(f"Using user-provided kv_events_config {c}")
         return c
 
-    return None
+    port = envs.DYN_VLLM_KV_EVENT_PORT
+    warnings.warn(
+        "Automatic KV events configuration is deprecated and will be removed in "
+        "the next release. To preserve current behavior, pass "
+        "--kv-events-config explicitly. For example:\n"
+        f'  --kv-events-config \'{{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:{port}"}}\'',
+        FutureWarning,
+        stacklevel=2,
+    )
+    logger.info(
+        f"Using env-var DYN_VLLM_KV_EVENT_PORT={port} to create kv_events_config"
+    )
+    dp_rank = engine_config.data_parallel_rank or 0
+    return KVEventsConfig(
+        enable_kv_cache_events=True,
+        publisher="zmq",
+        endpoint=f"tcp://*:{port - dp_rank}",
+    )
 
 
 def _uses_nixl_connector(engine_config: AsyncEngineArgs) -> bool:

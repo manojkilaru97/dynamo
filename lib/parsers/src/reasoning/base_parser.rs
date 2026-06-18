@@ -57,6 +57,7 @@ fn overlap(s: &str, delim: &str) -> usize {
 pub struct BasicReasoningParser {
     think_start_token: String,
     think_end_token: String,
+    think_end_token_ids: Vec<u32>,
     _in_reasoning: bool,
     stream_reasoning: bool,
     _buffer: String,
@@ -70,14 +71,40 @@ impl BasicReasoningParser {
         force_reasoning: bool,
         stream_reasoning: bool,
     ) -> Self {
+        Self::new_with_end_token_ids(
+            think_start_token,
+            think_end_token,
+            Vec::new(),
+            force_reasoning,
+            stream_reasoning,
+        )
+    }
+
+    pub fn new_with_end_token_ids(
+        think_start_token: String,
+        think_end_token: String,
+        think_end_token_ids: Vec<u32>,
+        force_reasoning: bool,
+        stream_reasoning: bool,
+    ) -> Self {
         Self {
             think_start_token,
             think_end_token,
+            think_end_token_ids,
             _in_reasoning: force_reasoning,
             stream_reasoning,
             _buffer: String::new(),
             stripped_think_start: false,
         }
+    }
+
+    fn find_end_token_id(&self, token_ids: &[u32]) -> Option<usize> {
+        if self.think_end_token_ids.is_empty() {
+            return None;
+        }
+        token_ids
+            .iter()
+            .position(|token_id| self.think_end_token_ids.contains(token_id))
     }
 }
 
@@ -88,6 +115,29 @@ impl ReasoningParser for BasicReasoningParser {
             // Mark the start token as already stripped so the parser doesn't
             // look for it in the stream — the template already injected it.
             self.stripped_think_start = true;
+        }
+    }
+
+    fn is_in_reasoning(&self) -> bool {
+        self._in_reasoning
+    }
+
+    fn finish_reasoning_stream(&mut self) -> ParserResult {
+        if self._buffer.is_empty() {
+            return ParserResult::default();
+        }
+
+        let pending = std::mem::take(&mut self._buffer);
+        if self._in_reasoning {
+            ParserResult {
+                normal_text: String::new(),
+                reasoning_text: pending,
+            }
+        } else {
+            ParserResult {
+                normal_text: pending,
+                reasoning_text: String::new(),
+            }
         }
     }
 
@@ -162,8 +212,33 @@ impl ReasoningParser for BasicReasoningParser {
     fn parse_reasoning_streaming_incremental(
         &mut self,
         text: &str,
-        _token_ids: &[u32],
+        token_ids: &[u32],
     ) -> ParserResult {
+        if self._in_reasoning
+            && !token_ids.is_empty()
+            && !text.contains(self.think_end_token.as_str())
+            && let Some(end_idx) = self.find_end_token_id(token_ids)
+        {
+            self._in_reasoning = false;
+            self.stripped_think_start = false;
+            if text.is_empty() {
+                return ParserResult::default();
+            }
+
+            if end_idx == 0 {
+                return ParserResult {
+                    normal_text: text.to_string(),
+                    reasoning_text: String::new(),
+                };
+            }
+            if end_idx + 1 == token_ids.len() {
+                return ParserResult {
+                    normal_text: String::new(),
+                    reasoning_text: text.to_string(),
+                };
+            }
+        }
+
         self._buffer.push_str(text);
 
         let mut accumulated_normal = String::new();

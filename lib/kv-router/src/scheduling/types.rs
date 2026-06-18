@@ -26,6 +26,12 @@ pub enum KvSchedulerError {
     #[error("pinned worker {worker_id} is not in allowed worker set")]
     PinnedWorkerNotAllowed { worker_id: WorkerId },
 
+    #[error("router queue is full: {pending} pending requests, limit {limit}")]
+    QueueFull { pending: usize, limit: usize },
+
+    #[error("router queue wait timeout after {waited_ms}ms (limit {limit_ms}ms)")]
+    QueueWaitTimeout { waited_ms: u64, limit_ms: u64 },
+
     #[error("endpoint subscriber shutdown")]
     SubscriberShutdown,
 

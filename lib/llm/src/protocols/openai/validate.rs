@@ -103,7 +103,12 @@ pub fn validate_no_unsupported_fields(
 ) -> Result<(), anyhow::Error> {
     let unsupported_fields: Vec<_> = unsupported_fields
         .keys()
-        .filter(|field| !matches!(field.as_str(), "request_id" | "reasoning_budget"))
+        .filter(|field| {
+            !matches!(
+                field.as_str(),
+                "request_id" | "reasoning_budget" | "reasoning_budget_grace_period"
+            )
+        })
         .map(|s| format!("`{}`", s))
         .collect();
 
@@ -145,7 +150,46 @@ pub fn validate_structured_outputs(
             "structured_outputs requires one constraint (`json`, `regex`, `choice`, `grammar`, `json_object`, or `structural_tag`)"
         );
     }
+    if let Some(grammar) = &params.grammar {
+        validate_guided_grammar_sanity(grammar)?;
+    }
 
+    Ok(())
+}
+
+fn validate_guided_grammar_sanity(grammar: &str) -> Result<(), anyhow::Error> {
+    let mut paren_depth = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+
+    for ch in grammar.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && (in_single_quote || in_double_quote) {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            '"' if !in_single_quote => in_double_quote = !in_double_quote,
+            '(' if !in_single_quote && !in_double_quote => paren_depth += 1,
+            ')' if !in_single_quote && !in_double_quote => {
+                paren_depth = paren_depth.checked_sub(1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Grammar error: invalid structured_outputs.grammar specification"
+                    )
+                })?;
+            }
+            _ => {}
+        }
+    }
+
+    if paren_depth != 0 || in_single_quote || in_double_quote {
+        anyhow::bail!("Grammar error: invalid structured_outputs.grammar specification");
+    }
     Ok(())
 }
 
@@ -203,10 +247,10 @@ pub fn validate_temperature(temperature: Option<f32>) -> Result<(), anyhow::Erro
 /// Validates the top_p parameter
 pub fn validate_top_p(top_p: Option<f32>) -> Result<(), anyhow::Error> {
     if let Some(p) = top_p
-        && !(MIN_TOP_P..=MAX_TOP_P).contains(&p)
+        && (p <= MIN_TOP_P || p > MAX_TOP_P)
     {
         anyhow::bail!(
-            "Top_p must be between {} and {}, got {}",
+            "Top_p must be greater than {} and less than or equal to {}, got {}",
             MIN_TOP_P,
             MAX_TOP_P,
             p

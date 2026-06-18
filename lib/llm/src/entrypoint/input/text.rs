@@ -116,6 +116,8 @@ async fn main_loop(
             chat_template_args: None,
             media_io_kwargs: None,
             structured_outputs: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         };
 

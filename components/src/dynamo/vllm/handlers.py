@@ -18,10 +18,14 @@ from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.renderers.embed_utils import safe_load_prompt_embeds
-from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.sampling_params import (
+    RequestOutputKind,
+    SamplingParams,
+    StructuredOutputsParams,
+)
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from dynamo._core import Context
+from dynamo._core import Context, ResourceExhausted
 from dynamo.common.memory.multimodal_embedding_cache_manager import (
     MultimodalEmbeddingCacheManager,
 )
@@ -60,6 +64,13 @@ from .multimodal_utils.models.qwen import (
     load_qwen_grid_params,
 )
 from .multimodal_utils.prefill_worker_utils import MultiModalEmbeddingLoader
+from .request_metrics import (
+    create_request_metrics_context,
+    record_request_failure,
+    record_request_start,
+    record_request_success,
+    record_structured_output_backend,
+)
 
 # Multimodal data dictionary keys
 IMAGE_URL_KEY: Final = "image_url"
@@ -197,6 +208,80 @@ def _cap_guided_decoding_tokens(
             max_tokens,
         )
         sampling_params.max_tokens = max_tokens
+
+
+def _merge_sampling_extra_args(
+    sampling_params: SamplingParams, extra_args: Any
+) -> None:
+    if not isinstance(extra_args, dict) or not extra_args:
+        return
+    if sampling_params.extra_args is None:
+        sampling_params.extra_args = {}
+    sampling_params.extra_args.update(extra_args)
+
+
+def _structured_reasoning_generate_kwargs(request: Dict[str, Any]) -> Dict[str, Any]:
+    extra_args = request.get("extra_args")
+    if not isinstance(extra_args, dict):
+        return {}
+
+    kwargs: Dict[str, Any] = {}
+    reasoning_ended = extra_args.get("reasoning_ended")
+    if isinstance(reasoning_ended, bool) or reasoning_ended is None:
+        if "reasoning_ended" in extra_args:
+            kwargs["reasoning_ended"] = reasoning_ended
+
+    reasoning_parser_kwargs = extra_args.get("reasoning_parser_kwargs")
+    if isinstance(reasoning_parser_kwargs, dict):
+        kwargs["reasoning_parser_kwargs"] = reasoning_parser_kwargs
+
+    return kwargs
+
+
+def _drop_generate_control_extra_args(sampling_params: SamplingParams) -> None:
+    extra_args = sampling_params.extra_args
+    if not isinstance(extra_args, dict):
+        return
+    extra_args.pop("reasoning_ended", None)
+    extra_args.pop("reasoning_parser_kwargs", None)
+    extra_args.pop("request_for_sampling", None)
+    if "reasoning_budget" not in extra_args:
+        extra_args.pop("enable_thinking", None)
+
+
+def _request_uses_tools(request: Dict[str, Any]) -> bool:
+    tools = request.get("tools")
+    if isinstance(tools, list) and tools:
+        return True
+
+    extra_args = request.get("extra_args")
+    if isinstance(extra_args, dict):
+        request_for_sampling = extra_args.get("request_for_sampling")
+        if isinstance(request_for_sampling, dict):
+            tools = request_for_sampling.get("tools")
+            if isinstance(tools, list) and tools:
+                return True
+
+    return False
+
+
+def _prefer_delta_outputs(
+    sampling_params: SamplingParams, request: Dict[str, Any]
+) -> None:
+    """Ask vLLM to return only new output tokens/text per stream update.
+
+    Dynamo's Rust postprocessor consumes deltas. Previously the worker asked
+    vLLM for cumulative outputs, then sliced those in Python. With stream
+    interval 1 that copies a growing token/text payload every tick and can
+    backpressure the engine.
+    """
+    if _request_uses_tools(request):
+        return
+
+    try:
+        sampling_params.output_kind = RequestOutputKind.DELTA
+    except Exception:
+        logger.debug("Unable to set vLLM RequestOutputKind.DELTA", exc_info=True)
 
 
 class _DeferredAbort:
@@ -530,7 +615,9 @@ def build_sampling_params(
         dynamic_default = max(1, model_max_len - input_length)
         sampling_params.max_tokens = dynamic_default
 
+    _merge_sampling_extra_args(sampling_params, request.get("extra_args"))
     _cap_guided_decoding_tokens(request, sampling_params)
+    _prefer_delta_outputs(sampling_params, request)
 
     return sampling_params
 
@@ -586,6 +673,29 @@ def build_sampling_params_openai(
     # Handle min_tokens (custom extension)
     if "min_tokens" in request and request["min_tokens"] is not None:
         sampling_params.min_tokens = request["min_tokens"]
+
+    extra_args: dict[str, Any] = {}
+    request_extra_args = request.get("extra_args")
+    if isinstance(request_extra_args, dict):
+        extra_args.update(request_extra_args)
+
+    chat_template_args = request.get("chat_template_args")
+    if not isinstance(chat_template_args, dict):
+        chat_template_args = request.get("chat_template_kwargs")
+    if not isinstance(chat_template_args, dict):
+        chat_template_args = {}
+
+    for key in ("reasoning_budget", "reasoning_budget_grace_period"):
+        value = request.get(key)
+        if value is None:
+            value = chat_template_args.get(key)
+        if value is not None:
+            extra_args[key] = value
+    if "enable_thinking" in chat_template_args:
+        extra_args["enable_thinking"] = chat_template_args["enable_thinking"]
+
+    _merge_sampling_extra_args(sampling_params, extra_args)
+    _prefer_delta_outputs(sampling_params, request)
 
     return sampling_params
 
@@ -675,6 +785,10 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         self.use_vllm_tokenizer = use_vllm_tokenizer
 
         self.dp_range = get_dp_range_for_worker(self.engine_client.vllm_config)
+        per_dp_cap = os.environ.get("DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP", "")
+        self.request_max_total_per_dp = int(per_dp_cap) if per_dp_cap else None
+        self._active_requests_by_dp: dict[int, int] = {}
+        self._admission_lock = asyncio.Lock()
         self._quiesce_controller = VllmEngineQuiesceController(self.engine_client)
         self._quiesce_lock = asyncio.Lock()
 
@@ -686,6 +800,150 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
         # Store shutdown event for graceful shutdown monitoring
         self.shutdown_event = shutdown_event
+        self._reasoning_budget_tokenizer = tokenizer
+
+    def _compute_newline_token_ids(
+        self,
+        tokenizer,
+        strings: list[str] | None = None,
+    ) -> list[int]:
+        cached = getattr(tokenizer, "_dynamo_newline_token_ids", None)
+        if isinstance(cached, list):
+            return cached
+
+        if strings is None:
+            strings = ["\n", "\r\n", "\n\n"]
+
+        newline_ids: set[int] = set()
+        for s in strings:
+            try:
+                encoded = tokenizer.encode(s, add_special_tokens=False)
+            except TypeError:
+                try:
+                    encoded = tokenizer.encode(s)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            for token_id in encoded:
+                try:
+                    newline_ids.add(int(token_id))
+                except Exception:
+                    continue
+
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if isinstance(vocab_size, int):
+            for token_id in range(min(vocab_size, 300000)):
+                try:
+                    token_text = tokenizer.decode([token_id])
+                except Exception:
+                    continue
+                if any(token_text.endswith(s) for s in strings):
+                    newline_ids.add(token_id)
+
+        ids_list = sorted(newline_ids)
+        try:
+            setattr(tokenizer, "_dynamo_newline_token_ids", ids_list)
+        except Exception:
+            pass
+        return ids_list
+
+    def _tokenizer_for_reasoning_budget(self):
+        tokenizer = getattr(self, "_reasoning_budget_tokenizer", None)
+        if tokenizer is not None:
+            return tokenizer
+
+        tokenizer = getattr(self.engine_client, "tokenizer", None)
+        if tokenizer is not None:
+            self._reasoning_budget_tokenizer = tokenizer
+            return tokenizer
+
+        model_config = self.model_config
+        tokenizer_name = getattr(model_config, "tokenizer", None) or getattr(
+            model_config, "model", None
+        )
+        if not tokenizer_name:
+            return None
+
+        try:
+            from vllm.tokenizers import get_tokenizer
+
+            tokenizer = get_tokenizer(
+                tokenizer_name,
+                tokenizer_mode=getattr(model_config, "tokenizer_mode", "auto"),
+                trust_remote_code=getattr(model_config, "trust_remote_code", False),
+                revision=getattr(model_config, "tokenizer_revision", None),
+            )
+        except Exception:
+            logger.debug("Unable to load tokenizer for reasoning_budget", exc_info=True)
+            return None
+
+        self._reasoning_budget_tokenizer = tokenizer
+        return tokenizer
+
+    def _apply_reasoning_budget_extra_args(
+        self, sampling_params: SamplingParams
+    ) -> None:
+        extra = sampling_params.extra_args
+        if not isinstance(extra, dict):
+            return
+        if "reasoning_budget" not in extra:
+            return
+
+        try:
+            budget_int = int(extra["reasoning_budget"])
+        except Exception:
+            logger.warning(
+                "Invalid reasoning_budget=%r; skipping", extra.get("reasoning_budget")
+            )
+            return
+        if budget_int == -1:
+            return
+        extra["reasoning_budget"] = budget_int
+
+        try:
+            extra["reasoning_budget_grace_period"] = int(
+                extra.get("reasoning_budget_grace_period", 0) or 0
+            )
+        except Exception:
+            extra["reasoning_budget_grace_period"] = 0
+
+        end_token_ids = extra.get("end_token_ids")
+        parsed_end_ids: list[int] = []
+        if isinstance(end_token_ids, list):
+            try:
+                parsed_end_ids = [int(tid) for tid in end_token_ids]
+            except Exception:
+                parsed_end_ids = []
+
+        if not parsed_end_ids and extra.get("think_end_token_id") is not None:
+            try:
+                parsed_end_ids = [int(extra["think_end_token_id"])]
+            except Exception:
+                parsed_end_ids = []
+
+        if not parsed_end_ids:
+            reasoning_config = getattr(self.engine_client.vllm_config, "reasoning_config", None)
+            config_end_ids = getattr(reasoning_config, "reasoning_end_token_ids", None)
+            if isinstance(config_end_ids, list):
+                try:
+                    parsed_end_ids = [int(tid) for tid in config_end_ids]
+                except Exception:
+                    parsed_end_ids = []
+
+        if parsed_end_ids:
+            extra.setdefault("think_end_token_id", parsed_end_ids[0])
+            extra.setdefault("end_token_ids", parsed_end_ids)
+
+        if "newline_token_ids" not in extra:
+            tokenizer = self._tokenizer_for_reasoning_budget()
+            if tokenizer is not None:
+                try:
+                    newline_ids = self._compute_newline_token_ids(tokenizer)
+                except Exception:
+                    newline_ids = []
+                if newline_ids:
+                    extra["newline_token_ids"] = newline_ids
 
     def init_embedding_loader(
         self, config: Config, encode_worker_client: Optional[Client] = None
@@ -1010,6 +1268,46 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             f"Converted global DP rank {dp_rank} to local DP rank {local_dp_rank}"
         )
         return local_dp_rank
+
+    @asynccontextmanager
+    async def _request_admission(self, dp_rank: int | None, request_id: str):
+        """Bound total in-flight requests per local DP rank when configured."""
+        if self.request_max_total_per_dp is None:
+            yield True
+            return
+
+        bucket = dp_rank if dp_rank is not None else -1
+        async with self._admission_lock:
+            current = self._active_requests_by_dp.get(bucket, 0)
+            if current >= self.request_max_total_per_dp:
+                logger.warning(
+                    "Rejecting request %s for dp_rank=%s: active=%d cap=%d",
+                    request_id,
+                    "auto" if dp_rank is None else dp_rank,
+                    current,
+                    self.request_max_total_per_dp,
+                )
+                yield False
+                return
+            self._active_requests_by_dp[bucket] = current + 1
+
+        try:
+            yield True
+        finally:
+            async with self._admission_lock:
+                current = self._active_requests_by_dp.get(bucket, 0)
+                if current <= 1:
+                    self._active_requests_by_dp.pop(bucket, None)
+                else:
+                    self._active_requests_by_dp[bucket] = current - 1
+
+    def _admission_error_message(self, dp_rank: int | None) -> str:
+        dp_label = "auto" if dp_rank is None else str(dp_rank)
+        return (
+            "DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP exceeded "
+            f"for dp_rank={dp_label} "
+            f"(cap={self.request_max_total_per_dp})"
+        )
 
     def _resolve_lora_request(self, model_name: str | None) -> LoRARequest | None:
         """Return a LoRARequest if model_name is a loaded adapter, else None."""
@@ -1676,6 +1974,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
     def _build_completion_usage(
         request_output: RequestOutput,
         embedding_sequence_length: int | None = None,
+        completion_tokens_override: int | None = None,
     ) -> Dict[str, Any]:
         """
         Build completion usage statistics.
@@ -1698,7 +1997,13 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         else:
             prompt_tokens = None
 
-        completion_tokens = len(request_output.outputs[0].token_ids)
+        if completion_tokens_override is not None:
+            completion_tokens = completion_tokens_override
+        else:
+            metrics = getattr(request_output, "metrics", None)
+            completion_tokens = getattr(metrics, "num_generation_tokens", None)
+            if not isinstance(completion_tokens, int) or completion_tokens < 0:
+                completion_tokens = len(request_output.outputs[0].token_ids)
 
         return {
             "prompt_tokens": prompt_tokens,
@@ -1824,6 +2129,50 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         embedding_sequence_length=None,
         trace_headers=None,
         priority=0,
+        request_metrics_context=None,
+        reasoning_ended=None,
+        reasoning_parser_kwargs=None,
+    ):
+        async with self._request_admission(data_parallel_rank, request_id) as admitted:
+            if not admitted:
+                if request_metrics_context is not None:
+                    record_request_failure(
+                        request_metrics_context,
+                        failure_type="overloaded",
+                        finish_reason="error",
+                    )
+                raise ResourceExhausted(
+                    self._admission_error_message(data_parallel_rank)
+                )
+
+            async for tok in self._generate_tokens_admitted(
+                prompt,
+                sampling_params,
+                request_id,
+                data_parallel_rank=data_parallel_rank,
+                lora_request=lora_request,
+                embedding_sequence_length=embedding_sequence_length,
+                trace_headers=trace_headers,
+                priority=priority,
+                request_metrics_context=request_metrics_context,
+                reasoning_ended=reasoning_ended,
+                reasoning_parser_kwargs=reasoning_parser_kwargs,
+            ):
+                yield tok
+
+    async def _generate_tokens_admitted(
+        self,
+        prompt,
+        sampling_params,
+        request_id,
+        data_parallel_rank=None,
+        lora_request=None,
+        embedding_sequence_length=None,
+        trace_headers=None,
+        priority=0,
+        request_metrics_context=None,
+        reasoning_ended=None,
+        reasoning_parser_kwargs=None,
     ):
         try:
             # Log LoRA usage for this generation (debug level to avoid log spam)
@@ -1840,9 +2189,15 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 data_parallel_rank=data_parallel_rank,
                 trace_headers=trace_headers,
                 priority=priority,
+                reasoning_ended=reasoning_ended,
+                reasoning_parser_kwargs=reasoning_parser_kwargs,
             )
 
             num_output_tokens_so_far = 0
+            generated_token_count = 0
+            uses_delta_outputs = (
+                getattr(sampling_params, "output_kind", None) == RequestOutputKind.DELTA
+            )
             async for res in gen:
                 # res is vllm's RequestOutput
 
@@ -1858,16 +2213,30 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                         "finish_reason": "error: No outputs from vLLM engine",
                         "token_ids": [],
                     }
+                    if request_metrics_context is not None:
+                        record_request_failure(
+                            request_metrics_context,
+                            failure_type="no_outputs",
+                            finish_reason="error",
+                        )
                     break
 
                 output = res.outputs[0]
-                next_total_toks = len(output.token_ids)
-                out = {"token_ids": output.token_ids[num_output_tokens_so_far:]}
+                if uses_delta_outputs:
+                    new_token_ids = list(output.token_ids)
+                    next_total_toks = num_output_tokens_so_far + len(new_token_ids)
+                    logprobs_offset = 0
+                else:
+                    next_total_toks = len(output.token_ids)
+                    new_token_ids = output.token_ids[num_output_tokens_so_far:]
+                    logprobs_offset = num_output_tokens_so_far
+                generated_token_count += len(new_token_ids)
+                out = {"token_ids": new_token_ids}
 
                 # Extract logprobs for new tokens if available
                 tokenizer = getattr(self.engine_client, "tokenizer", None)
                 log_probs, top_logprobs = self._extract_logprobs(
-                    output, num_output_tokens_so_far, tokenizer=tokenizer
+                    output, logprobs_offset, tokenizer=tokenizer
                 )
                 if log_probs is not None:
                     out["log_probs"] = log_probs
@@ -1879,7 +2248,13 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                     out["completion_usage"] = BaseWorkerHandler._build_completion_usage(
                         request_output=res,
                         embedding_sequence_length=embedding_sequence_length,
+                        completion_tokens_override=generated_token_count,
                     )
+                    if request_metrics_context is not None:
+                        record_request_success(
+                            request_metrics_context,
+                            finish_reason=out["finish_reason"],
+                        )
                     # Log completion with LoRA info (debug level to avoid log spam)
                     self._log_with_lora_context(
                         "Completed token generation for request {request_id}{lora_info}: "
@@ -1896,6 +2271,12 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
         except EngineDeadError as e:
             logger.error(f"vLLM EngineDeadError: {e}")
+            if request_metrics_context is not None:
+                record_request_failure(
+                    request_metrics_context,
+                    failure_type="engine_dead",
+                    finish_reason="error",
+                )
             logger.warning("Initiating Dynamo Runtime shutdown.")
             self.runtime.shutdown()
             os._exit(1)
@@ -1955,6 +2336,12 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
     async def _generate_token_mode(self, request, context, request_id):
         """Generate tokens using internal protocol format (token-in-token-out)."""
+        request_metrics_context = create_request_metrics_context(
+            request,
+            mode="decode_tokens",
+        )
+        record_request_start(request_metrics_context)
+
         # Firstly extract disaggregated params from prefill result if available
         prefill_result = request.get("prefill_result")
         if prefill_result and isinstance(prefill_result, dict):
@@ -2041,6 +2428,11 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             mm_processor_kwargs=mm_processor_kwargs,
         )
         if error is not None:
+            record_request_failure(
+                request_metrics_context,
+                failure_type="invalid_prompt",
+                finish_reason=error.get("finish_reason"),
+            )
             yield error
             return
 
@@ -2048,6 +2440,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         sampling_params = build_sampling_params(
             request, self.default_sampling_params, self.model_max_len
         )
+        generate_kwargs = _structured_reasoning_generate_kwargs(request)
+        _drop_generate_control_extra_args(sampling_params)
+        self._apply_reasoning_budget_extra_args(sampling_params)
+        record_structured_output_backend(request_metrics_context, sampling_params)
 
         if kv_params is not None:
             if sampling_params.extra_args is None:
@@ -2099,6 +2495,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         embedding_sequence_length=embedding_sequence_length,
                         trace_headers=trace_headers,
                         priority=priority,
+                        request_metrics_context=request_metrics_context,
+                        **generate_kwargs,
                     ):
                         if abort_guard is not None:
                             abort_guard.signal_first_token()
@@ -2109,12 +2507,23 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         yield tok
                 except EngineDeadError as e:
                     logger.error(f"vLLM EngineDeadError: {e}")
+                    record_request_failure(
+                        request_metrics_context,
+                        failure_type="engine_dead",
+                        finish_reason="error",
+                    )
                     logger.warning("Initiating Dynamo Runtime shutdown.")
                     self.runtime.shutdown()
                     os._exit(1)
 
     async def _generate_text_mode(self, request, context, request_id):
         """Generate text using OpenAI-compatible format (text-in-text-out)."""
+        request_metrics_context = create_request_metrics_context(
+            request,
+            mode="decode_text",
+        )
+        record_request_start(request_metrics_context)
+
         # Get text input using InputParamManager
         input_data = self.input_param_manager.get_input_param(
             request, use_tokenizer=True
@@ -2130,77 +2539,114 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         sampling_params = build_sampling_params_openai(
             request, self.default_sampling_params
         )
+        self._apply_reasoning_budget_extra_args(sampling_params)
+        record_structured_output_backend(request_metrics_context, sampling_params)
 
         routing = request.get("routing") or {}
         dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
         priority = -int(routing.get("priority", 0))
         openai_request_id = request.get("id") or request.get("request_id", request_id)
-        previous_text = ""
+        previous_text_len = 0
+        previous_token_count = 0
+        generated_token_count = 0
+        uses_delta_outputs = (
+            getattr(sampling_params, "output_kind", None) == RequestOutputKind.DELTA
+        )
 
         trace_headers = build_trace_headers(context)
 
-        async with self._abort_monitor(context, request_id):
-            try:
-                gen = self.engine_client.generate(
-                    prompt,
-                    sampling_params,
-                    request_id,
-                    data_parallel_rank=dp_rank,
-                    trace_headers=trace_headers,
-                    priority=priority,
+        async with self._request_admission(dp_rank, request_id) as admitted:
+            if not admitted:
+                record_request_failure(
+                    request_metrics_context,
+                    failure_type="overloaded",
+                    finish_reason="error",
                 )
+                raise ResourceExhausted(self._admission_error_message(dp_rank))
 
-                async for res in gen:
-                    if not res.outputs:
-                        yield {
+            async with self._abort_monitor(context, request_id):
+                try:
+                    gen = self.engine_client.generate(
+                        prompt,
+                        sampling_params,
+                        request_id,
+                        data_parallel_rank=dp_rank,
+                        trace_headers=trace_headers,
+                        priority=priority,
+                    )
+
+                    async for res in gen:
+                        if not res.outputs:
+                            record_request_failure(
+                                request_metrics_context,
+                                failure_type="no_outputs",
+                                finish_reason="error",
+                            )
+                            yield {
+                                "id": openai_request_id,
+                                "created": int(time.time()),
+                                "object": "chat.completion.chunk",
+                                "model": "unknown",
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"role": "assistant", "content": ""},
+                                        "finish_reason": "error",
+                                    }
+                                ],
+                            }
+                            return
+                        output = res.outputs[0]
+                        if uses_delta_outputs:
+                            delta_text = output.text
+                            new_token_count = len(output.token_ids)
+                        else:
+                            delta_text = output.text[previous_text_len:]
+                            previous_text_len = len(output.text)
+                            next_token_count = len(output.token_ids)
+                            new_token_count = max(0, next_token_count - previous_token_count)
+                            previous_token_count = next_token_count
+                        generated_token_count += new_token_count
+                        finish_reason = normalize_finish_reason(output.finish_reason)
+
+                        choice_data = {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": delta_text,
+                            },
+                            "finish_reason": finish_reason,
+                        }
+
+                        chunk = {
                             "id": openai_request_id,
                             "created": int(time.time()),
                             "object": "chat.completion.chunk",
-                            "model": "unknown",
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"role": "assistant", "content": ""},
-                                    "finish_reason": "error",
-                                }
-                            ],
+                            "model": request.get("model", "unknown"),
+                            "choices": [choice_data],
                         }
-                        break
 
-                    output = res.outputs[0]
-                    # Calculate the delta text (new text since last chunk)
-                    delta_text = output.text[len(previous_text) :]
-                    previous_text = output.text
+                        if output.finish_reason:
+                            chunk["usage"] = BaseWorkerHandler._build_completion_usage(
+                                request_output=res,
+                                completion_tokens_override=generated_token_count,
+                            )
+                            record_request_success(
+                                request_metrics_context,
+                                finish_reason=choice_data["finish_reason"],
+                            )
 
-                    choice_data = {
-                        "index": 0,
-                        "delta": {
-                            "role": "assistant",
-                            "content": delta_text,
-                        },
-                        "finish_reason": normalize_finish_reason(output.finish_reason),
-                    }
-
-                    chunk = {
-                        "id": openai_request_id,
-                        "created": int(time.time()),
-                        "object": "chat.completion.chunk",
-                        "model": "unknown",
-                        "choices": [choice_data],
-                    }
-
-                    if output.finish_reason:
-                        chunk["usage"] = BaseWorkerHandler._build_completion_usage(
-                            request_output=res,
-                        )
-
-                    yield chunk
-
-            except EngineDeadError as e:
-                logger.error(f"vLLM EngineDeadError: {e}")
-                logger.warning("Initiating Dynamo Runtime shutdown.")
-                self.runtime.shutdown()
-                os._exit(1)
+                        yield chunk
+                except EngineDeadError as e:
+                    logger.error(f"vLLM EngineDeadError: {e}")
+                    record_request_failure(
+                        request_metrics_context,
+                        failure_type="engine_dead",
+                        finish_reason="error",
+                    )
+                    logger.warning("Initiating Dynamo Runtime shutdown.")
+                    self.runtime.shutdown()
+                    os._exit(1)
 
 
 class PrefillWorkerHandler(BaseWorkerHandler):
@@ -2260,6 +2706,12 @@ class PrefillWorkerHandler(BaseWorkerHandler):
 
     async def _generate_token_mode(self, request, context, request_id):
         """Generate prefill using internal protocol format (token-in-token-out)."""
+        request_metrics_context = create_request_metrics_context(
+            request,
+            mode="prefill_tokens",
+        )
+        record_request_start(request_metrics_context)
+
         mm_processor_kwargs = self._get_mm_processor_kwargs(request)
 
         # Extract and decode multimodal data if present
@@ -2281,6 +2733,11 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         if error is not None:
             # Prefill errors need disaggregated_params field
             error["disaggregated_params"] = None
+            record_request_failure(
+                request_metrics_context,
+                failure_type="invalid_prompt",
+                finish_reason=error.get("finish_reason"),
+            )
             yield error
             return
 
@@ -2288,6 +2745,8 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         sampling_params = build_sampling_params(
             request, self.default_sampling_params, self.model_max_len
         )
+        self._apply_reasoning_budget_extra_args(sampling_params)
+        record_structured_output_backend(request_metrics_context, sampling_params)
 
         # Configure for prefill-only mode with remote decode
         if sampling_params.extra_args is None:
@@ -2328,57 +2787,75 @@ class PrefillWorkerHandler(BaseWorkerHandler):
 
         trace_headers = build_trace_headers(context)
 
-        async with self._abort_monitor(context, request_id, is_prefill=True):
-            try:
-                gen = self.engine_client.generate(
-                    prompt,
-                    sampling_params,
-                    request_id,
-                    data_parallel_rank=dp_rank,
-                    lora_request=lora_request,
-                    trace_headers=trace_headers,
-                    priority=priority,
+        async with self._request_admission(dp_rank, request_id) as admitted:
+            if not admitted:
+                record_request_failure(
+                    request_metrics_context,
+                    failure_type="overloaded",
+                    finish_reason="error",
                 )
-            except EngineDeadError as e:
-                logger.error(f"vLLM EngineDeadError: {e}")
-                logger.warning("Initiating Dynamo Runtime shutdown.")
-                self.runtime.shutdown()
-                os._exit(1)
+                raise ResourceExhausted(self._admission_error_message(dp_rank))
 
-            async for res in gen:
-                logger.debug(f"kv transfer params: {res.kv_transfer_params}")
+            async with self._abort_monitor(context, request_id, is_prefill=True):
+                try:
+                    gen = self.engine_client.generate(
+                        prompt,
+                        sampling_params,
+                        request_id,
+                        data_parallel_rank=dp_rank,
+                        lora_request=lora_request,
+                        trace_headers=trace_headers,
+                        priority=priority,
+                    )
+                except EngineDeadError as e:
+                    logger.error(f"vLLM EngineDeadError: {e}")
+                    record_request_failure(
+                        request_metrics_context,
+                        failure_type="engine_dead",
+                        finish_reason="error",
+                    )
+                    logger.warning("Initiating Dynamo Runtime shutdown.")
+                    self.runtime.shutdown()
+                    os._exit(1)
 
-                token_ids = res.outputs[0].token_ids if res.outputs else []
+                async for res in gen:
+                    logger.debug(f"kv transfer params: {res.kv_transfer_params}")
 
-                # For prefill worker, only one res will be generated,
-                # so we can always build embedding params here without conditionals
-                embedding_params = self._build_embedding_params(
-                    multi_modal_data or {}, res.prompt_token_ids
-                )
-                output: Dict[str, Any] = {
-                    "token_ids": list(token_ids),
-                    "disaggregated_params": self._build_disaggregated_params(
-                        res.kv_transfer_params,
-                        embedding_params,
-                    ),
-                    "completion_usage": BaseWorkerHandler._build_completion_usage(
-                        request_output=res,
-                        embedding_sequence_length=embedding_sequence_length,
-                    ),
-                }
+                    token_ids = res.outputs[0].token_ids if res.outputs else []
 
-                # Log prefill completion with LoRA info
-                self._log_with_lora_context(
-                    "Prefill completed for request {request_id}{lora_info}: "
-                    "generated {token_count} token(s), has_kv_params={has_kv_params}",
-                    request_id,
-                    lora_request,
-                    level="info" if lora_request else "debug",
-                    token_count=len(token_ids),
-                    has_kv_params=res.kv_transfer_params is not None,
-                )
+                    # For prefill worker, only one res will be generated,
+                    # so we can always build embedding params here without conditionals
+                    embedding_params = self._build_embedding_params(
+                        multi_modal_data or {}, res.prompt_token_ids
+                    )
+                    output: Dict[str, Any] = {
+                        "token_ids": list(token_ids),
+                        "disaggregated_params": self._build_disaggregated_params(
+                            res.kv_transfer_params,
+                            embedding_params,
+                        ),
+                        "completion_usage": BaseWorkerHandler._build_completion_usage(
+                            request_output=res,
+                            embedding_sequence_length=embedding_sequence_length,
+                        ),
+                    }
 
-                yield output
+                    # Log prefill completion with LoRA info
+                    self._log_with_lora_context(
+                        "Prefill completed for request {request_id}{lora_info}: "
+                        "generated {token_count} token(s), has_kv_params={has_kv_params}",
+                        request_id,
+                        lora_request,
+                        level="info" if lora_request else "debug",
+                        token_count=len(token_ids),
+                        has_kv_params=res.kv_transfer_params is not None,
+                    )
+                    record_request_success(
+                        request_metrics_context,
+                        finish_reason="prefill",
+                    )
+
+                    yield output
 
     def _build_disaggregated_params(
         self, kv_transfer_params, embedding_params=None, expanded_prompt_token_ids=None

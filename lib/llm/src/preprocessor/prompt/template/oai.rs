@@ -319,6 +319,16 @@ impl OAIChatLikeRequest for NvCreateChatCompletionRequest {
             .map(Value::from_serialize)
     }
 
+    fn reasoning_budget(&self) -> Option<&serde_json::Value> {
+        self.unsupported_fields
+            .get("reasoning_budget")
+            .or_else(|| self.reasoning.as_ref()?.as_object()?.get("max_tokens"))
+    }
+
+    fn reasoning_budget_grace_period(&self) -> Option<&serde_json::Value> {
+        self.unsupported_fields.get("reasoning_budget_grace_period")
+    }
+
     fn should_add_generation_prompt(&self) -> bool {
         // Using vLLM default behavior
         true
@@ -1111,7 +1121,7 @@ NORMAL MODE
         // Should produce clean JSON without double-encoding
         assert_eq!(
             out,
-            r#"{"format":"celsius","location":"San Francisco, CA"}"#
+            r#"{"format": "celsius", "location": "San Francisco, CA"}"#
         );
     }
 

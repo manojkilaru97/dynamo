@@ -65,6 +65,14 @@ pub trait OAIChatLikeRequest {
         None
     }
 
+    fn reasoning_budget(&self) -> Option<&serde_json::Value> {
+        None
+    }
+
+    fn reasoning_budget_grace_period(&self) -> Option<&serde_json::Value> {
+        None
+    }
+
     fn should_add_generation_prompt(&self) -> bool;
 
     /// Optional additional args to merge into the chat template context

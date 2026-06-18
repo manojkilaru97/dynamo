@@ -215,6 +215,7 @@ pub fn final_response_to_one_chunk_stream(
             function_call,
             refusal: ch.message.refusal.clone(),
             reasoning_content: ch.message.reasoning_content.clone(),
+            token_ids: Vec::new(),
         };
 
         let choice = ChatChoiceStream {

@@ -37,6 +37,7 @@ pub struct LocalModelBuilder {
     model_path: Option<PathBuf>,
     source_path: Option<PathBuf>,
     model_name: Option<String>,
+    model_aliases: Vec<String>,
     endpoint_id: Option<EndpointId>,
     context_length: Option<u32>,
     template_file: Option<PathBuf>,
@@ -72,6 +73,7 @@ impl Default for LocalModelBuilder {
             model_path: Default::default(),
             source_path: Default::default(),
             model_name: Default::default(),
+            model_aliases: Default::default(),
             endpoint_id: Default::default(),
             context_length: Default::default(),
             template_file: Default::default(),
@@ -108,6 +110,11 @@ impl LocalModelBuilder {
 
     pub fn model_name(&mut self, model_name: Option<String>) -> &mut Self {
         self.model_name = model_name;
+        self
+    }
+
+    pub fn model_aliases(&mut self, model_aliases: Vec<String>) -> &mut Self {
+        self.model_aliases = model_aliases;
         self
     }
 
@@ -251,6 +258,7 @@ impl LocalModelBuilder {
             card.runtime_config = self.runtime_config.clone();
             card.media_decoder = self.media_decoder.clone();
             card.media_fetcher = self.media_fetcher.clone();
+            card.set_aliases(self.model_aliases.clone());
 
             return Ok(LocalModel {
                 card,
@@ -305,6 +313,7 @@ impl LocalModelBuilder {
         card.runtime_config = self.runtime_config.clone();
         card.media_decoder = self.media_decoder.clone();
         card.media_fetcher = self.media_fetcher.clone();
+        card.set_aliases(self.model_aliases.clone());
 
         Ok(LocalModel {
             card,

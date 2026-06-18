@@ -25,13 +25,13 @@ fn get_reasoning_parser_map() -> &'static HashMap<&'static str, ReasoningParserT
         map.insert("gpt_oss", ReasoningParserType::GptOss);
         map.insert("qwen3", ReasoningParserType::Qwen);
         map.insert("nemotron_deci", ReasoningParserType::NemotronDeci);
+        map.insert("nemotron_nano", ReasoningParserType::NemotronV3);
+        map.insert("nemotron3", ReasoningParserType::NemotronV3);
         map.insert("kimi", ReasoningParserType::Kimi);
         map.insert("kimi_k25", ReasoningParserType::KimiK25);
         map.insert("step3", ReasoningParserType::Step3);
         map.insert("mistral", ReasoningParserType::Mistral);
         map.insert("granite", ReasoningParserType::Granite);
-        map.insert("nemotron_nano", ReasoningParserType::DeepseekR1); // nemotron nano is ...</think>
-        map.insert("nemotron3", ReasoningParserType::DeepseekR1);
         map.insert("glm45", ReasoningParserType::NemotronDeci); // GLM-4.5/5 is <think>...</think>, no force_reasoning
         map.insert(
             "minimax_append_think",
@@ -95,6 +95,19 @@ pub trait ReasoningParser: Send + std::fmt::Debug {
     fn set_in_reasoning(&mut self, _in_reasoning: bool) {
         // Default no-op for parsers that don't support per-request overrides.
     }
+
+    /// Return whether the streaming parser is currently inside a reasoning
+    /// block. This is used by callers to recover model output that stopped
+    /// before emitting the reasoning end marker.
+    fn is_in_reasoning(&self) -> bool {
+        false
+    }
+
+    /// Flush any text held by the streaming parser. Implementations should
+    /// return only text that has not already been emitted in previous deltas.
+    fn finish_reasoning_stream(&mut self) -> ParserResult {
+        ParserResult::default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +119,7 @@ pub enum ReasoningParserType {
     GptOss,
     Qwen,
     NemotronDeci,
+    NemotronV3,
     Kimi,
     KimiK25,
     Mistral,
@@ -135,6 +149,14 @@ impl ReasoningParser for ReasoningParserWrapper {
     fn set_in_reasoning(&mut self, in_reasoning: bool) {
         self.parser.set_in_reasoning(in_reasoning)
     }
+
+    fn is_in_reasoning(&self) -> bool {
+        self.parser.is_in_reasoning()
+    }
+
+    fn finish_reasoning_stream(&mut self) -> ParserResult {
+        self.parser.finish_reasoning_stream()
+    }
 }
 
 impl ReasoningParserType {
@@ -158,6 +180,15 @@ impl ReasoningParserType {
             },
             ReasoningParserType::NemotronDeci => ReasoningParserWrapper {
                 parser: Box::new(basic_parser),
+            },
+            ReasoningParserType::NemotronV3 => ReasoningParserWrapper {
+                parser: Box::new(BasicReasoningParser::new_with_end_token_ids(
+                    "<think>".into(),
+                    "</think>".into(),
+                    vec![13],
+                    true,
+                    true,
+                )),
             },
             ReasoningParserType::Kimi => ReasoningParserWrapper {
                 parser: Box::new(BasicReasoningParser::new(

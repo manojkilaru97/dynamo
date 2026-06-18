@@ -150,6 +150,19 @@ class DynamoVllmArgGroup(ArgGroup):
         # ModelExpress P2P
         add_argument(
             g,
+            flag_name="--dyn-served-model-alias",
+            env_var="DYN_SERVED_MODEL_ALIAS",
+            default=[],
+            nargs="*",
+            help=(
+                "Additional served model names that should route to the same "
+                "canonical --served-model-name. Use this instead of passing "
+                "multiple names to --served-model-name."
+            ),
+        )
+
+        add_argument(
+            g,
             flag_name="--model-express-url",
             env_var="MODEL_EXPRESS_URL",
             default=None,
@@ -269,6 +282,9 @@ class DynamoVllmConfig(ConfigBase):
 
     # Headless mode for multi-node TP/PP
     headless: bool = False
+
+    # Additional frontend-visible aliases for the canonical served model name.
+    dyn_served_model_alias: list[str]
 
     # ModelExpress P2P
     model_express_url: Optional[str] = None

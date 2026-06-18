@@ -131,6 +131,7 @@ fn create_choice_stream(
             function_call: None,
             refusal: None,
             reasoning_content: None,
+            token_ids: Vec::new(),
         },
         finish_reason,
         stop_reason,
@@ -485,7 +486,6 @@ pub struct JailedStream {
     /// when a tool_call_parser is active and the parser-aware MarkerBased path is used).
     named_tool_name: Option<String>,
     tool_definitions: Option<Vec<dynamo_parsers::tool_calling::ToolDefinition>>,
-    single_object_argument_overrides: HashMap<String, serde_json::Value>,
     emission_mode: EmissionMode,
     marker_matcher: MarkerMatcher,
     jail_mode: JailMode,
@@ -856,14 +856,10 @@ impl JailedStream {
                         (false, accumulated_content.len())
                     }
                     ToolChoiceFormat::ArrayOfTools => {
-                        // Expect array: [{"name":"search","parameters":{...}}, ...]
-                        if let Ok(value) =
-                            serde_json::from_str::<serde_json::Value>(accumulated_content)
-                            && let Some(arr) = value.as_array()
-                            && !arr.is_empty()
-                        {
-                            return (true, accumulated_content.len());
-                        }
+                        // A one-item array is a valid prefix of a later
+                        // multi-tool array. Do not unjail early here; wait for
+                        // stream completion so required tool_choice preserves
+                        // parallel/repeated calls.
                         (false, accumulated_content.len())
                     }
                 }
@@ -943,7 +939,7 @@ impl JailedStream {
                         Some(Role::Assistant),
                         normal_text.as_deref().unwrap_or(""),
                         Some(tool_call_chunks),
-                        None,
+                        base_choice.finish_reason,
                         None,
                         None,
                     );
@@ -1017,7 +1013,8 @@ impl JailedStream {
             Ok(parsed) => (parsed, json_content.to_string()),
             Err(err) => {
                 let repaired = Self::escape_json_string_control_chars(json_content);
-                let parsed = serde_json::from_str::<serde_json::Value>(&repaired).map_err(|_| err)?;
+                let parsed =
+                    serde_json::from_str::<serde_json::Value>(&repaired).map_err(|_| err)?;
                 (parsed, repaired)
             }
         };
@@ -1026,12 +1023,6 @@ impl JailedStream {
             ToolChoiceFormat::SingleObject { tool_name } => {
                 // For named tool choice: JSON is the parameters object
                 if parsed.is_object() {
-                    let mut parsed = parsed;
-                    if let Some(object) = parsed.as_object_mut() {
-                        for (key, value) in &self.single_object_argument_overrides {
-                            object.insert(key.clone(), value.clone());
-                        }
-                    }
                     let parsed_json = serde_json::to_string(&parsed)?;
                     Ok(vec![Self::create_tool_call_chunk(
                         0,
@@ -1201,7 +1192,6 @@ pub struct JailedStreamBuilder {
     /// when a tool_call_parser is active and the parser-aware MarkerBased path is used).
     named_tool_name: Option<String>,
     tool_definitions: Option<Vec<dynamo_parsers::tool_calling::ToolDefinition>>,
-    single_object_argument_overrides: HashMap<String, serde_json::Value>,
     emission_mode: EmissionMode,
     jail_mode: JailMode,
 }
@@ -1215,7 +1205,6 @@ impl JailedStreamBuilder {
             tool_call_parser: None,
             named_tool_name: None,
             tool_definitions: None,
-            single_object_argument_overrides: HashMap::new(),
             emission_mode: EmissionMode::default(),
             jail_mode: JailMode::MarkerBased,
         }
@@ -1273,15 +1262,6 @@ impl JailedStreamBuilder {
         tools: Vec<dynamo_parsers::tool_calling::ToolDefinition>,
     ) -> Self {
         self.tool_definitions = Some(tools);
-        self
-    }
-
-    /// Override named tool arguments extracted from explicit user wording.
-    pub fn single_object_argument_overrides(
-        mut self,
-        overrides: HashMap<String, serde_json::Value>,
-    ) -> Self {
-        self.single_object_argument_overrides = overrides;
         self
     }
 
@@ -1397,7 +1377,6 @@ impl JailedStreamBuilder {
             tool_call_parser: self.tool_call_parser,
             named_tool_name: self.named_tool_name,
             tool_definitions: self.tool_definitions,
-            single_object_argument_overrides: self.single_object_argument_overrides,
             emission_mode: self.emission_mode,
             marker_matcher,
             jail_mode: self.jail_mode,

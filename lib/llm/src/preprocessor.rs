@@ -19,8 +19,9 @@ use anyhow::Context;
 use anyhow::{Result, bail};
 
 use dynamo_protocols::types::{
-    ChatCompletionRequestMessage, ChatCompletionRequestUserMessageContent,
-    ChatCompletionRequestUserMessageContentPart, ChatCompletionToolChoiceOption, EncodingFormat,
+    ChatCompletionMessageContent, ChatCompletionRequestMessage,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionToolChoiceOption, EncodingFormat,
 };
 use dynamo_runtime::error::{DynamoError, ErrorType};
 use futures::Stream;
@@ -143,6 +144,28 @@ impl LLMMetricAnnotation {
 struct ReasoningState {
     stream: Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>,
     reasoning_parser: Option<Box<dyn ReasoningParser>>,
+    choices: HashMap<u32, ReasoningChoiceState>,
+}
+
+#[derive(Default)]
+struct ReasoningChoiceState {
+    reasoning_content: String,
+    emitted_content: bool,
+    emitted_tool_calls: bool,
+}
+
+const THINK_END_TOKEN: &str = "</think>";
+
+fn split_content_after_reasoning_boundary(text: String) -> (Option<String>, String) {
+    if let Some(end_idx) = text.rfind(THINK_END_TOKEN) {
+        let before = text[..end_idx].to_string();
+        let after = text[end_idx + THINK_END_TOKEN.len()..]
+            .trim_start_matches(|ch| ch == '\n' || ch == '\r')
+            .to_string();
+        (Some(before), after)
+    } else {
+        (None, text)
+    }
 }
 
 pub struct OpenAIPreprocessor {
@@ -210,6 +233,88 @@ impl OpenAIPreprocessor {
             context_length,
         }))
     }
+
+    fn request_backend_extra_args<R: OAIChatLikeRequest>(
+        &self,
+        request: &R,
+        guided_decoding_active: bool,
+    ) -> Result<serde_json::Map<String, serde_json::Value>> {
+        let mut extra_args = serde_json::Map::new();
+
+        let budget = request.reasoning_budget().or_else(|| {
+            request
+                .chat_template_args()
+                .and_then(|args| args.get("reasoning_budget"))
+        });
+        if let Some(budget) = budget {
+            extra_args.insert("reasoning_budget".to_string(), budget.clone());
+        }
+
+        let grace = request.reasoning_budget_grace_period().or_else(|| {
+            request
+                .chat_template_args()
+                .and_then(|args| args.get("reasoning_budget_grace_period"))
+        });
+        if let Some(grace) = grace {
+            extra_args.insert("reasoning_budget_grace_period".to_string(), grace.clone());
+        }
+
+        if let Some(enable_thinking) = request
+            .chat_template_args()
+            .and_then(|args| args.get("enable_thinking"))
+        {
+            extra_args.insert("enable_thinking".to_string(), enable_thinking.clone());
+        }
+
+        let mut request_for_sampling = serde_json::Map::new();
+        if let Some(tools) = request.tools() {
+            request_for_sampling.insert("tools".to_string(), serde_json::to_value(tools)?);
+        }
+        if let Some(tool_choice) = request.tool_choice() {
+            request_for_sampling.insert(
+                "tool_choice".to_string(),
+                serde_json::to_value(tool_choice)?,
+            );
+        }
+        if let Some(response_format) = request.response_format() {
+            request_for_sampling.insert(
+                "response_format".to_string(),
+                serde_json::to_value(response_format)?,
+            );
+        }
+        if !request_for_sampling.is_empty() {
+            extra_args.insert(
+                "request_for_sampling".to_string(),
+                serde_json::Value::Object(request_for_sampling),
+            );
+        }
+
+        if guided_decoding_active {
+            let reasoning_disabled = Self::is_reasoning_disabled_by_request(
+                self.runtime_config.reasoning_parser.as_deref(),
+                request.chat_template_args(),
+            );
+            extra_args.insert(
+                "reasoning_ended".to_string(),
+                serde_json::Value::Bool(reasoning_disabled),
+            );
+
+            if let Some(chat_template_args) = request.chat_template_args() {
+                let mut reasoning_parser_kwargs = serde_json::Map::new();
+                reasoning_parser_kwargs.insert(
+                    "chat_template_kwargs".to_string(),
+                    serde_json::to_value(chat_template_args)?,
+                );
+                extra_args.insert(
+                    "reasoning_parser_kwargs".to_string(),
+                    serde_json::Value::Object(reasoning_parser_kwargs),
+                );
+            }
+        }
+
+        Ok(extra_args)
+    }
+
     /// Encode a string to it's tokens
     pub fn tokenize(&self, s: &str) -> anyhow::Result<Encoding> {
         self.tokenizer.encode(s)
@@ -306,7 +411,9 @@ impl OpenAIPreprocessor {
         }
 
         builder.stop_conditions(stop_conditions);
-        builder.sampling_options(request.extract_sampling_options()?);
+        let sampling_options = request.extract_sampling_options()?;
+        let guided_decoding_active = sampling_options.guided_decoding.is_some();
+        builder.sampling_options(sampling_options);
         builder.output_options(request.extract_output_options()?);
         builder.annotations(request.annotations().unwrap_or_default());
         builder.mdc_sum(Some(self.mdcsum.clone()));
@@ -346,6 +453,11 @@ impl OpenAIPreprocessor {
 
         // Forward mm_processor_kwargs (e.g. use_audio_in_video) to the backend.
         builder.mm_processor_kwargs(request.mm_processor_kwargs().cloned());
+
+        let extra_args = self.request_backend_extra_args(request, guided_decoding_active)?;
+        if !extra_args.is_empty() {
+            builder.extra_args(Some(serde_json::Value::Object(extra_args)));
+        }
 
         Ok(builder)
     }
@@ -490,9 +602,9 @@ impl OpenAIPreprocessor {
             // workers (e.g., TRT-LLM needs messages and the template-rendered prompt with
             // <image> placeholders for embedding-path / NIXL flows).
             let messages_json = serde_json::to_value(request.messages())?;
-            let mut extra_args = serde_json::json!({
-                "messages": messages_json
-            });
+            let mut extra_args =
+                serde_json::Value::Object(self.request_backend_extra_args(request, false)?);
+            extra_args["messages"] = messages_json;
 
             // Strip redundant inline data: URLs only when frontend decoding is active
             // (media_loader decoded the images into RDMA descriptors). TRT-LLM and
@@ -756,12 +868,10 @@ impl OpenAIPreprocessor {
             );
 
         // Reasoning Content Parsing Transformation Step
-        // Current Solution:
-        // This step operates on Deltas created by the transform_postprocessor_stream function
-        // Only access to text and not token_ids - so can not support parsing based on token_ids for now
-        // Future Solution:
-        // To address the limitation if needed in future: move this step before transform_postprocessor_stream and add new field of reasoning_content to the backend output
-        // Use backend_output.reasoning_content field to fill out the deltas.
+        // This step operates on deltas created by transform_postprocessor_stream.
+        // The delta carries internal token IDs, skipped during API serialization,
+        // so parsers can detect special marker IDs even when decoded text omits
+        // those markers.
         let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if should_parse_reasoning {
             Box::pin(Self::parse_reasoning_content_from_stream(
                 stream,
@@ -785,11 +895,6 @@ impl OpenAIPreprocessor {
             request.inner.tool_choice.as_ref(),
             has_tools,
         )?;
-        let single_object_argument_overrides = Self::extract_named_tool_argument_overrides(
-            &request.inner.messages,
-            request.inner.tool_choice.as_ref(),
-        );
-
         // Convert OpenAI tools to parser ToolDefinition format before applying jail
         let tool_definitions = request.inner.tools.as_ref().map(|tools| {
             tools
@@ -807,7 +912,6 @@ impl OpenAIPreprocessor {
                 self.tool_call_parser.clone(),
                 request.inner.tool_choice.clone(),
                 tool_definitions,
-                single_object_argument_overrides,
                 stream,
             ))
         } else {
@@ -1135,59 +1239,11 @@ impl OpenAIPreprocessor {
         }
     }
 
-    fn user_message_text(message: &ChatCompletionRequestMessage) -> Option<String> {
-        let ChatCompletionRequestMessage::User(user_message) = message else {
-            return None;
-        };
-        match &user_message.content {
-            ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
-            ChatCompletionRequestUserMessageContent::Array(parts) => {
-                let text = parts
-                    .iter()
-                    .filter_map(|part| match part {
-                        ChatCompletionRequestUserMessageContentPart::Text(text_part) => {
-                            Some(text_part.text.as_str())
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                if text.is_empty() { None } else { Some(text) }
-            }
-        }
-    }
-
-    fn extract_named_tool_argument_overrides(
-        messages: &[ChatCompletionRequestMessage],
-        tool_choice: Option<&ChatCompletionToolChoiceOption>,
-    ) -> HashMap<String, serde_json::Value> {
-        if !matches!(tool_choice, Some(ChatCompletionToolChoiceOption::Named(_))) {
-            return HashMap::new();
-        }
-
-        let mut overrides = HashMap::new();
-        let Some(text) = messages.iter().rev().find_map(Self::user_message_text) else {
-            return overrides;
-        };
-        let marker = "body exactly this text:";
-        if let Some((_, body)) = text.split_once(marker) {
-            let body = body.trim();
-            if !body.is_empty() {
-                overrides.insert(
-                    "body".to_string(),
-                    serde_json::Value::String(body.to_string()),
-                );
-            }
-        }
-        overrides
-    }
-
     /// Apply tool calling jail to the stream if needed
     pub fn apply_tool_calling_jail<S>(
         tool_call_parser: Option<String>,
         tool_choice: Option<dynamo_protocols::types::ChatCompletionToolChoiceOption>,
         tool_definitions: Option<Vec<dynamo_parsers::tool_calling::ToolDefinition>>,
-        single_object_argument_overrides: HashMap<String, serde_json::Value>,
         stream: S,
     ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
     where
@@ -1202,9 +1258,6 @@ impl OpenAIPreprocessor {
             && !tool_definitions.is_empty()
         {
             builder = builder.tool_definitions(tool_definitions);
-        }
-        if !single_object_argument_overrides.is_empty() {
-            builder = builder.single_object_argument_overrides(single_object_argument_overrides);
         }
 
         // Configure jail based on tool_choice
@@ -1235,8 +1288,7 @@ impl OpenAIPreprocessor {
 
     /// Check if reasoning parsing should be disabled based on per-request parameters.
     /// For kimi_k25: disabled when chat_template_args contains "thinking": false.
-    /// For nemotron_nano: disabled when chat_template_args contains "enable_thinking": false
-    ///   or "force_nonempty_content": true.
+    /// For nemotron_nano: disabled when chat_template_args contains "enable_thinking": false.
     /// For deepseek_r1: disabled when chat_template_args contains "thinking": false
     ///   or "thinking_mode": "chat".
     fn is_reasoning_disabled_by_request(
@@ -1256,11 +1308,6 @@ impl OpenAIPreprocessor {
                 if let Some(args) = chat_template_args {
                     if let Some(enable_thinking) = args.get("enable_thinking")
                         && enable_thinking == &serde_json::Value::Bool(false)
-                    {
-                        return true;
-                    }
-                    if let Some(force_nonempty) = args.get("force_nonempty_content")
-                        && force_nonempty == &serde_json::Value::Bool(true)
                     {
                         return true;
                     }
@@ -1312,33 +1359,102 @@ impl OpenAIPreprocessor {
         let state = ReasoningState {
             stream: Box::pin(stream),
             reasoning_parser: Some(reasoning_parser),
+            choices: HashMap::new(),
         };
 
         stream::unfold(state, |mut state| async move {
             if let Some(response) = state.stream.next().await {
                 // Process the response through reasoning parser if available
                 let processed_response = if let Some(ref mut parser) = state.reasoning_parser {
-                    response.map_data(|mut data| {
+                    let mut response = response;
+                    if let Some(mut data) = response.data.take() {
                         // Process all choices, not just the first one
                         for choice in data.inner.choices.iter_mut() {
-                            // Reasoning parsing only applies to text content
-                            if let Some(
-                                dynamo_protocols::types::ChatCompletionMessageContent::Text(text),
-                            ) = choice.delta.content.as_ref()
+                            let choice_state = state.choices.entry(choice.index).or_default();
+                            if choice
+                                .delta
+                                .tool_calls
+                                .as_ref()
+                                .is_some_and(|tool_calls| !tool_calls.is_empty())
                             {
-                                let parser_result =
-                                    parser.parse_reasoning_streaming_incremental(text, &[]);
+                                choice_state.emitted_tool_calls = true;
+                            }
+                            if let Some(reasoning_content) = &choice.delta.reasoning_content
+                                && !reasoning_content.is_empty()
+                            {
+                                choice_state.reasoning_content.push_str(reasoning_content);
+                            }
 
-                                // Update this specific choice with parsed content
-                                choice.delta.content = parser_result.get_some_normal_text().map(
-                                    dynamo_protocols::types::ChatCompletionMessageContent::Text,
-                                );
-                                choice.delta.reasoning_content = parser_result.get_some_reasoning();
+                            // Reasoning parsing only applies to text content
+                            if let Some(ChatCompletionMessageContent::Text(text)) =
+                                choice.delta.content.as_ref()
+                            {
+                                let parser_result = parser
+                                    .parse_reasoning_streaming_incremental(
+                                        text,
+                                        &choice.delta.token_ids,
+                                    );
+                                let mut delta_reasoning = parser_result.reasoning_text;
+                                if !delta_reasoning.is_empty() {
+                                    choice_state.reasoning_content.push_str(&delta_reasoning);
+                                }
+
+                                let mut normal_text = parser_result.normal_text;
+                                if !normal_text.is_empty()
+                                    && !choice_state.reasoning_content.is_empty()
+                                {
+                                    let (boundary_reasoning, after_boundary) =
+                                        split_content_after_reasoning_boundary(std::mem::take(
+                                            &mut normal_text,
+                                        ));
+                                    if let Some(boundary_reasoning) = boundary_reasoning {
+                                        if !boundary_reasoning.is_empty() {
+                                            choice_state
+                                                .reasoning_content
+                                                .push_str(&boundary_reasoning);
+                                            delta_reasoning.push_str(&boundary_reasoning);
+                                        }
+                                        normal_text = after_boundary;
+                                    }
+                                }
+
+                                choice.delta.reasoning_content = if delta_reasoning.is_empty() {
+                                    None
+                                } else {
+                                    Some(delta_reasoning)
+                                };
+
+                                normal_text = if choice_state.emitted_content {
+                                    normal_text
+                                } else {
+                                    normal_text
+                                        .trim_start_matches(|ch| ch == '\n' || ch == '\r')
+                                        .to_string()
+                                };
+                                if normal_text.is_empty() {
+                                    choice.delta.content = None;
+                                } else {
+                                    choice_state.emitted_content = true;
+                                    choice.delta.content =
+                                        Some(ChatCompletionMessageContent::Text(normal_text));
+                                }
+                            }
+
+                            if choice.finish_reason.is_some()
+                                && !choice_state.emitted_content
+                                && !choice_state.emitted_tool_calls
+                                && !choice_state.reasoning_content.is_empty()
+                            {
+                                choice.delta.content = Some(ChatCompletionMessageContent::Text(
+                                    choice_state.reasoning_content.clone(),
+                                ));
+                                choice_state.emitted_content = true;
                             }
                             // For multimodal content, pass through unchanged
                         }
-                        Ok(data)
-                    })
+                        response.data = Some(data);
+                    }
+                    response
                 } else {
                     // No reasoning parser configured, pass through unchanged
                     response

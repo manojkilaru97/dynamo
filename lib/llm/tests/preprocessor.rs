@@ -260,6 +260,9 @@ impl Request {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            reasoning: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         }
     }
@@ -650,6 +653,9 @@ mod context_length_validation {
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
+            reasoning: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         }
     }

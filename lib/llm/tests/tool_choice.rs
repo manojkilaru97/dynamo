@@ -40,6 +40,9 @@ fn create_test_request() -> NvCreateChatCompletionRequest {
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,
+        reasoning: None,
+        structured_outputs: None,
+        thinking: None,
         unsupported_fields: Default::default(),
     }
 }
@@ -417,6 +420,61 @@ async fn test_streaming_required_tool_parallel() {
             .arguments
             .as_deref(),
         Some(r#"{"topic":"memory"}"#)
+    );
+}
+
+#[tokio::test]
+async fn test_streaming_required_tool_waits_for_finish() {
+    let mut request = create_test_request();
+    let tool_choice = Some(ChatCompletionToolChoiceOption::Required);
+    request.inner.tool_choice = tool_choice.clone();
+
+    let mut generator = request.response_generator("req-stream-required-finish".to_string());
+
+    let chunks = [
+        (r#"[{"name":"search","parameters":{"query":"rust"}}]"#, false),
+        ("", true),
+    ];
+
+    let mut raw_responses = Vec::new();
+    for (chunk, finish) in chunks {
+        let backend_output = BackendOutput {
+            token_ids: vec![],
+            tokens: vec![],
+            text: Some(chunk.to_string()),
+            cum_log_probs: None,
+            log_probs: None,
+            top_logprobs: None,
+            finish_reason: if finish {
+                Some(common::FinishReason::Stop)
+            } else {
+                None
+            },
+            stop_reason: None,
+            index: Some(0),
+            completion_usage: None,
+            disaggregated_params: None,
+        };
+
+        let response = generator
+            .choice_from_postprocessor(backend_output)
+            .expect("streaming chunk");
+        raw_responses.push(response);
+    }
+
+    let all_responses = apply_jail_transformation_streaming(raw_responses, tool_choice).await;
+    assert_eq!(all_responses.len(), 1);
+
+    let choice = &all_responses[0].inner.choices[0];
+    assert_eq!(
+        choice.finish_reason,
+        Some(dynamo_protocols::types::FinishReason::ToolCalls)
+    );
+    let tool_calls = choice.delta.tool_calls.as_ref().unwrap();
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(
+        tool_calls[0].function.as_ref().unwrap().name.as_deref(),
+        Some("search")
     );
 }
 

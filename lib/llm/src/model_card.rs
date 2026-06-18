@@ -253,6 +253,10 @@ pub struct ModelDeploymentCard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lora: Option<LoraInfo>,
 
+    /// Additional names this model responds to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+
     /// User-defined metadata for custom worker behavior
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_data: Option<serde_json::Value>,
@@ -486,6 +490,10 @@ impl ModelDeploymentCard {
     pub fn set_name(&mut self, name: &str) {
         self.display_name = name.to_string();
         self.slug = Slug::from_string(name);
+    }
+
+    pub fn set_aliases(&mut self, aliases: Vec<String>) {
+        self.aliases = aliases;
     }
 
     pub fn source_path(&self) -> &str {
@@ -755,6 +763,7 @@ impl ModelDeploymentCard {
             model_type: Default::default(),  // set later
             model_input: Default::default(), // set later
             lora: None,
+            aliases: Vec::new(),
             user_data: None,
             runtime_config: ModelRuntimeConfig::default(),
             media_decoder: None,

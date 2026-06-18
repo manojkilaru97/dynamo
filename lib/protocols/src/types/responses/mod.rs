@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 // Re-export all upstream response types (shared structures like ResponseUsage,
 // tool-call item types, streaming events, etc.). The types we own below
@@ -52,6 +52,24 @@ pub type Input = InputParam;
 pub type PromptConfig = Prompt;
 pub type TextConfig = ResponseTextParam;
 pub type TextResponseFormat = TextResponseFormatConfiguration;
+
+fn deserialize_response_text_param<'de, D>(
+    deserializer: D,
+) -> Result<Option<ResponseTextParam>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(mut value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if let serde_json::Value::Object(ref mut obj) = value {
+        obj.entry("format".to_string())
+            .or_insert_with(|| serde_json::json!({"type": "text"}));
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
 
 /// Stream of response events.
 pub type ResponseStream = std::pin::Pin<
@@ -328,7 +346,11 @@ pub struct CreateResponse {
     pub stream_options: Option<ResponseStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_response_text_param"
+    )]
     pub text: Option<ResponseTextParam>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoiceParam>,

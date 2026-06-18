@@ -191,6 +191,9 @@ fn create_chat_request(
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,
+        reasoning: None,
+        reasoning: None,
+        thinking: None,
         unsupported_fields: Default::default(),
     }
 }
@@ -494,6 +497,9 @@ fn create_cmpl_request(include_usage: Option<bool>, stream: bool) -> NvCreateCom
         common: Default::default(),
         nvext: None,
         metadata: None,
+        reasoning: None,
+        reasoning: None,
+        thinking: None,
         unsupported_fields: Default::default(),
     }
 }
@@ -521,6 +527,9 @@ fn create_nonstreaming_chat_request() -> NvCreateChatCompletionRequest {
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,
+        reasoning: None,
+        reasoning: None,
+        thinking: None,
         unsupported_fields: Default::default(),
     }
 }

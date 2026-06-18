@@ -57,6 +57,7 @@ reqwest = { workspace = true, optional = true }
 [dev-dependencies]
 rstest = "0.18.2"
 rstest_reuse = "0.7.0"
+serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 dynamo-tokens = { workspace = true }

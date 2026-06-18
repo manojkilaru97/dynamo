@@ -140,14 +140,6 @@ def _prepare_request(
         else None
     )
     chat_template_kwargs = dict(request_for_sampling.chat_template_kwargs or {})
-    if request_for_sampling.tools and _uses_forced_tool_choice(
-        request_for_sampling.tool_choice
-    ):
-        # Required/named tool_choice is enforced by guided JSON. Letting the
-        # template enter thinking mode can spend the stream entirely on
-        # reasoning before the JSON handoff, so force immediate tool JSON.
-        chat_template_kwargs["thinking"] = False
-        chat_template_kwargs["enable_thinking"] = False
     chat_template_kwargs["reasoning_effort"] = request_for_sampling.reasoning_effort
 
     # Mistral warns that tokenize=False is unsafe for chat templates.
@@ -248,6 +240,7 @@ class StreamingPostProcessor:
             else guided_tool_choice
         )
         self.sampling_params = sampling_params
+        self.chat_template_kwargs = chat_template_kwargs
         self.tool_parser = tool_parser
         self.reasoning_parser = (
             reasoning_parser_class(

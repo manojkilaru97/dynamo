@@ -131,6 +131,31 @@ where
     }
 }
 
+fn deserialize_reasoning_effort_opt<'de, D>(
+    deserializer: D,
+) -> Result<Option<ReasoningEffort>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = Option::<String>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.as_str() {
+        "none" => Ok(Some(ReasoningEffort::None)),
+        "minimal" => Ok(Some(ReasoningEffort::Minimal)),
+        "low" => Ok(Some(ReasoningEffort::Low)),
+        "medium" => Ok(Some(ReasoningEffort::Medium)),
+        "high" => Ok(Some(ReasoningEffort::High)),
+        "xhigh" | "max" => Ok(Some(ReasoningEffort::Xhigh)),
+        other => Err(D::Error::unknown_variant(
+            other,
+            &["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FunctionCall / FunctionCallStream — local definitions with flexible deser
 // ---------------------------------------------------------------------------
@@ -523,7 +548,7 @@ pub struct ChatCompletionRequestAssistantMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<ChatCompletionRequestAssistantMessageContent>,
     /// Reasoning content from a previous assistant turn.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<ReasoningContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
@@ -623,7 +648,11 @@ pub struct CreateChatCompletionRequest {
     pub mm_processor_kwargs: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_reasoning_effort_opt"
+    )]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -734,6 +763,10 @@ pub struct ChatCompletionStreamResponseDelta {
     /// Streaming reasoning content (DeepSeek-R1, QwQ models).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Internal generated token IDs for parser stages. This must never be
+    /// serialized in OpenAI-compatible responses.
+    #[serde(default, skip)]
+    pub token_ids: Vec<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]

@@ -86,6 +86,7 @@ impl PushEndpoint {
                 let endpoint_name: Arc<String> = Arc::clone(&endpoint_name_local);
                 let component_name: Arc<String> = Arc::clone(&component_name_local);
                 let namespace: Arc<String> = Arc::clone(&namespace_local);
+                let system_health = system_health.clone();
 
                 // increment the inflight counter
                 inflight.fetch_add(1, Ordering::SeqCst);
@@ -126,9 +127,21 @@ impl PushEndpoint {
                         .await;
                     match result {
                         Ok(_) => {
+                            system_health
+                                .lock()
+                                .record_endpoint_request_result(endpoint_name.as_ref(), true);
                             tracing::trace!(instance_id, "request handled successfully");
                         }
                         Err(e) => {
+                            if matches!(e, crate::pipeline::PipelineError::ServiceOverloaded(_)) {
+                                system_health
+                                    .lock()
+                                    .record_endpoint_request_overload(endpoint_name.as_ref());
+                            } else {
+                                system_health
+                                    .lock()
+                                    .record_endpoint_request_result(endpoint_name.as_ref(), false);
+                            }
                             tracing::warn!("Failed to handle request: {}", e.to_string());
                         }
                     }

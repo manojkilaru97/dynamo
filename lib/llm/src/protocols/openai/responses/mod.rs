@@ -9,10 +9,10 @@ use dynamo_protocols::types::responses::{
     AssistantRole, FunctionCallOutput, FunctionToolCall, IncludeEnum, InputContent, InputItem,
     InputOutputMessageContent, InputParam, InputRole, InputTokenDetails, Instructions, Item,
     MessageItem, OutputItem, OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent,
-    OutputTokenDetails, PromptCacheRetention, Reasoning, ReasoningItem, Response,
-    ResponseTextParam, ResponseUsage, Role as ResponseRole, ServiceTier, Status, SummaryPart,
-    SummaryTextContent, TextResponseFormatConfiguration, Tool, ToolChoiceOptions, ToolChoiceParam,
-    Truncation,
+    OutputTokenDetails, PromptCacheRetention, Reasoning, ReasoningItem, ReasoningTextContent,
+    Response, ResponseTextParam, ResponseUsage, Role as ResponseRole, ServiceTier, Status,
+    SummaryPart, SummaryTextContent, TextResponseFormatConfiguration, Tool, ToolChoiceOptions,
+    ToolChoiceParam, Truncation,
 };
 use dynamo_protocols::types::{
     ChatCompletionMessageToolCall, ChatCompletionNamedToolChoice,
@@ -24,7 +24,7 @@ use dynamo_protocols::types::{
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionTool, ChatCompletionToolChoiceOption, ChatCompletionToolType,
     CreateChatCompletionRequest, FunctionName, FunctionObject, FunctionType,
-    ImageDetail as ChatImageDetail, ImageUrl, ReasoningContent, ResponseFormat,
+    ImageDetail as ChatImageDetail, ImageUrl, ReasoningContent, ReasoningEffort, ResponseFormat,
     ServiceTier as ChatServiceTier,
 };
 use dynamo_runtime::protocols::annotated::AnnotationsProvider;
@@ -124,6 +124,27 @@ pub(crate) fn patch_response_for_spec(
         serde_json::json!(frequency_penalty),
     );
     obj.insert("store".into(), serde_json::json!(store));
+
+    if let Some(serde_json::Value::Array(output)) = obj.get_mut("output") {
+        for item in output {
+            let serde_json::Value::Object(item_obj) = item else {
+                continue;
+            };
+            if item_obj.get("type").and_then(serde_json::Value::as_str) != Some("reasoning") {
+                continue;
+            }
+            let Some(serde_json::Value::Array(content)) = item_obj.get_mut("content") else {
+                continue;
+            };
+            for part in content {
+                if let serde_json::Value::Object(part_obj) = part {
+                    part_obj
+                        .entry("type".to_string())
+                        .or_insert_with(|| serde_json::json!("reasoning_text"));
+                }
+            }
+        }
+    }
 }
 
 impl Serialize for NvResponse {
@@ -732,6 +753,8 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
             chat_template_args: None,
             media_io_kwargs: None,
             structured_outputs: None,
+            reasoning: None,
+            thinking: None,
             unsupported_fields: Default::default(),
         })
     }
@@ -899,6 +922,16 @@ fn make_function_call(name: String, arguments: String) -> OutputItem {
     })
 }
 
+pub(crate) fn should_emit_reasoning_output(params: &ResponseParams) -> bool {
+    !matches!(
+        params
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_ref()),
+        Some(ReasoningEffort::None)
+    )
+}
+
 /// Convert a ChatCompletion response into a Responses API response object,
 /// echoing back the actual request parameters from `params`.
 pub fn chat_completion_to_response(
@@ -930,15 +963,18 @@ pub fn chat_completion_to_response(
         }
 
         // Map reasoning_content to a Reasoning output item
-        if let Some(reasoning_text) = choice.message.reasoning_content
+        if should_emit_reasoning_output(params)
+            && let Some(reasoning_text) = choice.message.reasoning_content
             && !reasoning_text.is_empty()
         {
             output.push(OutputItem::Reasoning(ReasoningItem {
                 id: format!("rs_{}", Uuid::new_v4().simple()),
                 summary: vec![SummaryPart::SummaryText(SummaryTextContent {
-                    text: reasoning_text,
+                    text: reasoning_text.clone(),
                 })],
-                content: None,
+                content: Some(vec![ReasoningTextContent {
+                    text: reasoning_text,
+                }]),
                 encrypted_content: None,
                 status: Some(OutputStatus::Completed),
             }));
@@ -1165,6 +1201,37 @@ mod tests {
             },
             _ => panic!("expected user message"),
         }
+    }
+
+    #[test]
+    fn test_responses_tools_and_tool_choice_convert_to_chat_request() {
+        let req: NvCreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "Use the weather tool for Tokyo.",
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "description": "Get weather.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"}
+                    },
+                    "required": ["location"]
+                }
+            }],
+            "tool_choice": "required"
+        }))
+        .unwrap();
+
+        let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        let tools = chat_req.inner.tools.as_ref().expect("tools should convert");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert!(matches!(
+            chat_req.inner.tool_choice,
+            Some(ChatCompletionToolChoiceOption::Required)
+        ));
     }
 
     #[test]
