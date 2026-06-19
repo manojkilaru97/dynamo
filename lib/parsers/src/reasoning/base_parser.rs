@@ -982,6 +982,25 @@ mod tests {
         assert_eq!(r4.reasoning_text, "");
     }
 
+    #[test]
+    fn test_force_reasoning_tool_call_xml_after_split_close_tag_streaming() {
+        let mut parser =
+            BasicReasoningParser::new("<think>".to_string(), "</think>".to_string(), true, true)
+                .with_tool_start_token("<tool_call>");
+
+        let r1 = parser.parse_reasoning_streaming_incremental("We need to call the tool.", &[]);
+        assert_eq!(r1.reasoning_text, "We need to call the tool.");
+        assert_eq!(r1.normal_text, "");
+
+        let r2 = parser.parse_reasoning_streaming_incremental("</think>", &[]);
+        assert_eq!(r2.reasoning_text, "");
+        assert_eq!(r2.normal_text, "");
+
+        let r3 = parser.parse_reasoning_streaming_incremental("\n<tool_call>\n", &[]);
+        assert_eq!(r3.reasoning_text, "");
+        assert_eq!(r3.normal_text, "\n<tool_call>\n");
+    }
+
     // =========================================================================
     // Mid-string partial tag tests (overlap-based buffering)
     //

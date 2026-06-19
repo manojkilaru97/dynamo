@@ -188,6 +188,104 @@ class TestOpenAISamplingParams:
                 {},
             )
 
+    def test_internal_guided_json_required_tool_uses_qwen_structural_tag(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("DYN_DYNAMO_TOOL_CALL_PARSER", "qwen3_coder")
+        params = mod.build_sampling_params(
+            {
+                "sampling_options": {
+                    "guided_decoding": {
+                        "json": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "object"},
+                        }
+                    }
+                },
+                "stop_conditions": {},
+                "output_options": {},
+                "tool_choice": "required",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "calculate",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "expression": {"type": "string"},
+                                },
+                                "required": ["expression"],
+                            },
+                        },
+                    }
+                ],
+            },
+            {},
+        )
+
+        assert params.structured_outputs.json is None
+        structural_tag = json.loads(params.structured_outputs.structural_tag)
+        assert structural_tag["format"]["type"] == "triggered_tags"
+        assert structural_tag["format"]["triggers"] == ["<tool_call>"]
+        assert structural_tag["format"]["stop_after_first"] is False
+        tag = structural_tag["format"]["tags"][0]
+        assert tag["begin"] == "<tool_call>\n<function=calculate>\n"
+
+    def test_internal_guided_json_required_multi_tool_keeps_json_array(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("DYN_DYNAMO_TOOL_CALL_PARSER", "qwen3_coder")
+        params = mod.build_sampling_params(
+            {
+                "sampling_options": {
+                    "guided_decoding": {
+                        "json": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "object"},
+                        }
+                    }
+                },
+                "stop_conditions": {},
+                "output_options": {},
+                "tool_choice": "required",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "calculate",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "expression": {"type": "string"},
+                                },
+                                "required": ["expression"],
+                            },
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "location": {"type": "string"},
+                                },
+                                "required": ["location"],
+                            },
+                        },
+                    },
+                ],
+            },
+            {},
+        )
+
+        assert params.structured_outputs.structural_tag is None
+        assert params.structured_outputs.json["type"] == "array"
+
     def test_named_tool_choice_sets_structured_outputs(self, monkeypatch):
         monkeypatch.delenv("DYN_DYNAMO_TOOL_CALL_PARSER", raising=False)
         params = mod.build_sampling_params_openai(

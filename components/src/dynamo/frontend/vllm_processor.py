@@ -81,6 +81,8 @@ TOOL_FIELD_STRING_BUDGETS = {
     "expression": 256,
 }
 TOOL_LONG_TEXT_FIELD_NAMES = {"body", "content", "message"}
+TOOL_CHOICE_SCHEMA_MARKER = "x-dynamo-tool-choice-schema"
+QWEN_XML_STRUCTURAL_TAG_TOOL_PARSERS = {"qwen3_coder", "qwen3_xml"}
 
 
 def map_finish_reason(raw_reason: str | None) -> FinishReason | None:
@@ -97,6 +99,18 @@ def map_finish_reason(raw_reason: str | None) -> FinishReason | None:
     if mapped is None:
         logger.warning("Unknown finish_reason from router: %s", raw_reason)
     return mapped
+
+
+def _with_parser_visible_engine_text(output: Any, engine_text: str | None) -> Any:
+    if not engine_text or getattr(output, "text", None):
+        return output
+    return SimpleNamespace(
+        index=output.index,
+        token_ids=output.token_ids,
+        text=engine_text,
+        finish_reason=output.finish_reason,
+        logprobs=output.logprobs,
+    )
 
 
 def _build_reasoning_parser_metadata(
@@ -289,16 +303,21 @@ def _named_tool_choice_name(tool_choice: Any) -> str | None:
     return _get_attr_or_item(function, "name")
 
 
-def _request_has_user_structured_output(request: dict[str, Any]) -> bool:
-    if request.get("guided_json") is not None:
+def _request_has_user_structured_output(request: Any) -> bool:
+    if _get_attr_or_item(request, "guided_json") is not None:
         return True
-    structured_outputs = request.get("structured_outputs")
+    structured_outputs = _get_attr_or_item(request, "structured_outputs")
     if isinstance(structured_outputs, dict) and any(
         structured_outputs.get(key) is not None
         for key in ("json", "json_object", "regex", "choice", "grammar", "structural_tag")
     ):
         return True
-    response_format = request.get("response_format")
+    elif structured_outputs is not None and hasattr(
+        structured_outputs, "all_constraints_none"
+    ):
+        if not structured_outputs.all_constraints_none():
+            return True
+    response_format = _get_attr_or_item(request, "response_format")
     if isinstance(response_format, dict):
         return response_format.get("type") in {
             "json_schema",
@@ -321,28 +340,31 @@ def _complete_json_text(text: str) -> str | None:
     return candidate[:end]
 
 
-def _structured_tool_choice_name(request: dict[str, Any]) -> str | None:
-    if _request_has_user_structured_output(request) or not request.get("tools"):
+def _structured_tool_choice_name(request: Any) -> str | None:
+    if _request_has_user_structured_output(request) or not _get_attr_or_item(
+        request, "tools"
+    ):
         return None
-    tool_choice = request.get("tool_choice")
+    tool_choice = _get_attr_or_item(request, "tool_choice")
     if tool_choice in (None, "none", "auto", "required"):
         return None
     return _named_tool_choice_name(tool_choice)
 
 
-def _structured_tool_choice_required(request: dict[str, Any]) -> bool:
+def _structured_tool_choice_required(request: Any) -> bool:
     return (
-        bool(request.get("tools"))
+        bool(_get_attr_or_item(request, "tools"))
         and not _request_has_user_structured_output(request)
-        and request.get("tool_choice") == "required"
+        and _get_attr_or_item(request, "tool_choice") == "required"
     )
 
 
 def _structured_tool_calls_from_content(
-    request: dict[str, Any],
+    request: Any,
     content: str,
 ) -> list[dict[str, Any]] | None:
-    arguments = _complete_json_text(content)
+    _, end_marker, post_reasoning = content.rpartition("</think>")
+    arguments = _complete_json_text(post_reasoning if end_marker else content)
     if arguments is None:
         return None
 
@@ -385,7 +407,7 @@ def _structured_tool_calls_from_content(
 
 
 def _bridge_structured_tool_content_choices(
-    request: dict[str, Any],
+    request: Any,
     choices: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     if (
@@ -455,25 +477,40 @@ def _tool_choice_guided_json_schema(request: Any) -> dict[str, Any] | None:
             )
         if not any_of:
             return None
-        return _bound_tool_schema(
+        schema = _bound_tool_schema(
             {
                 "type": "array",
                 "minItems": 1,
-                "items": {"anyOf": any_of},
+                "items": {"type": "object", "anyOf": any_of},
             },
             request_text_len=request_text_len,
         )
+        schema[TOOL_CHOICE_SCHEMA_MARKER] = True
+        return schema
 
     tool_name = _named_tool_choice_name(tool_choice)
     if not tool_name:
         return None
     for tool in tools:
         if _tool_name(tool) == tool_name:
-            return _bound_tool_schema(
+            schema = _bound_tool_schema(
                 _tool_parameters(tool),
                 request_text_len=request_text_len,
             )
+            schema[TOOL_CHOICE_SCHEMA_MARKER] = True
+            return schema
     return None
+
+
+def _forced_tool_choice_uses_qwen_xml_parser(
+    request: Any,
+    tool_parser_name: str | None,
+) -> bool:
+    tool_choice = _get_attr_or_item(request, "tool_choice")
+    tools = _get_attr_or_item(request, "tools")
+    if not tools or tool_choice in (None, "none", "auto"):
+        return False
+    return (tool_parser_name or "").strip() in QWEN_XML_STRUCTURAL_TAG_TOOL_PARSERS
 
 
 def _has_structured_outputs(structured_outputs: StructuredOutputsParams | None) -> bool:
@@ -887,8 +924,26 @@ class VllmProcessor:
             v = getattr(request_for_sampling, k, None)
             if v is not None:
                 setattr(sampling_params, k, v)
+
+        reasoning_ended, reasoning_parser_kwargs = _build_reasoning_parser_metadata(
+            self.reasoning_parser_class,
+            self.tokenizer,
+            chat_template_kwargs,
+            request_for_sampling,
+            tokens,
+        )
+        skip_forced_tool_guidance_for_reasoning = (
+            reasoning_ended is False
+            and _forced_tool_choice_uses_qwen_xml_parser(
+                request_for_sampling, self.tool_parser_name
+            )
+        )
         if not _has_structured_outputs(sampling_params.structured_outputs):
-            tool_schema = _tool_choice_guided_json_schema(request_for_sampling)
+            tool_schema = (
+                None
+                if skip_forced_tool_guidance_for_reasoning
+                else _tool_choice_guided_json_schema(request_for_sampling)
+            )
             if tool_schema is not None:
                 sampling_params.structured_outputs = StructuredOutputsParams(
                     json=tool_schema
@@ -921,6 +976,10 @@ class VllmProcessor:
                 "Logprobs requested but not supported in distributed inference mode"
             )
 
+        guided_decoding = _structured_outputs_to_guided_decoding(
+            _request_structured_outputs(request_for_sampling, sampling_params)
+        )
+
         # The renderer's process_for_engine() always returns a fully processed
         # EngineInput (TokenInputs or MultiModalInputs) with a "type" key.
         # Pass it directly to process_inputs() — no need to rebuild a
@@ -945,14 +1004,6 @@ class VllmProcessor:
 
         # vLLM 0.17.0 removed EngineCoreRequest.eos_token_id. Dynamo now uses
         # tokenizer metadata for EOS ids when constructing the router payload.
-
-        reasoning_ended, reasoning_parser_kwargs = _build_reasoning_parser_metadata(
-            self.reasoning_parser_class,
-            self.tokenizer,
-            chat_template_kwargs,
-            request_for_sampling,
-            tokens,
-        )
 
         # Convert to a Python object that has fields that match our PreprocessedRequest
         sp = vllm_preproc.sampling_params
@@ -987,11 +1038,13 @@ class VllmProcessor:
             "annotations": [],
             "routing": request.get("routing"),
         }
-        guided_decoding = _structured_outputs_to_guided_decoding(
-            _request_structured_outputs(request_for_sampling, sp)
-        )
         if guided_decoding is not None:
             dynamo_preproc["sampling_options"]["guided_decoding"] = guided_decoding
+            tool_choice = _get_attr_or_item(request_for_sampling, "tool_choice")
+            tools = _get_attr_or_item(request_for_sampling, "tools")
+            if tools and tool_choice not in (None, "none", "auto"):
+                dynamo_preproc["tools"] = [_copy_jsonable(tool) for tool in tools]
+                dynamo_preproc["tool_choice"] = _copy_jsonable(tool_choice)
         if reasoning_ended is not None:
             dynamo_preproc["reasoning_ended"] = reasoning_ended
         if reasoning_parser_kwargs is not None:
@@ -1059,6 +1112,7 @@ class VllmProcessor:
                 tokens,
                 vllm_preproc,
                 post_processors,
+                request_for_sampling=request_for_sampling,
                 mm_routing_info=mm_routing_info,
             ):
                 yield item
@@ -1074,6 +1128,7 @@ class VllmProcessor:
         tokens: list[int],
         vllm_preproc: EngineCoreRequest,
         post_processors: dict[int, StreamingPostProcessor],
+        request_for_sampling: Any,
         mm_routing_info: dict[str, Any] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         sp = vllm_preproc.sampling_params
@@ -1205,6 +1260,7 @@ class VllmProcessor:
                 finish_reason = map_finish_reason(raw_finish_reason)
                 stop_reason = engine_response.get("stop_reason")
                 raw_token_ids = list(engine_response["token_ids"])
+                engine_text = engine_response.get("text") or ""
                 if os.environ.get("DYN_DEBUG_REASONING_BUDGET") == "1" and (
                     raw_finish_reason or 14 in raw_token_ids or 15 in raw_token_ids
                 ):
@@ -1248,12 +1304,14 @@ class VllmProcessor:
                 choices = []
                 if not vllm_out.request_outputs:
                     post = post_processors.get(output_idx)
-                    if post is not None and post.needs_raw_parser_delta(raw_token_ids):
+                    if post is not None and (
+                        engine_text or post.needs_raw_parser_delta(raw_token_ids)
+                    ):
                         choice = post.process_output(
                             SimpleNamespace(
                                 index=output_idx,
                                 token_ids=raw_token_ids,
-                                text=engine_response.get("text") or "",
+                                text=engine_text,
                                 finish_reason=raw_finish_reason,
                                 logprobs=None,
                             ),
@@ -1295,8 +1353,11 @@ class VllmProcessor:
                                 processed_token_ids[-32:],
                                 (output.text or "")[-240:],
                             )
+                        parser_output = _with_parser_visible_engine_text(
+                            output, engine_text
+                        )
                         choice = post.process_output(
-                            output,
+                            parser_output,
                             raw_delta_token_ids=raw_token_ids,
                         )
                         if choice:
@@ -1304,7 +1365,7 @@ class VllmProcessor:
 
                 if choices:
                     choices = _bridge_structured_tool_content_choices(
-                        request,
+                        request_for_sampling,
                         choices,
                     )
                     dynamo_out = {

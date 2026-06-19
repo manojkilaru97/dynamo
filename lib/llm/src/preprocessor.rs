@@ -2095,12 +2095,23 @@ impl OpenAIPreprocessor {
         // - harmony / gpt_oss: `<|channel|>analysis<|message|>...<|end|>`.
         // - kimi_k2: `<|tool_calls_section_begin|>` / `<|tool_calls_section_end|>`.
         // - kimi_k25: `</think>` (special token id 163607).
-        // - nemotron_nano/nemotron3/nemotron_v3: `</think>` is a special
-        //   token in the Nano tokenizer, and Dynamo's Rust postprocessor
-        //   parses reasoning from decoded text after backend conversion.
+        // - qwen3_coder/qwen3_xml: XML-style `<tool_call>` / `</tool_call>`
+        //   markers are parser input, not user-visible output.
+        // - nemotron_nano/nemotron3/nemotron_v3: `<think>` / `</think>` and
+        //   `<tool_call>` / `</tool_call>` are special tokens in Nemotron 3
+        //   tokenizers, and Dynamo's Rust postprocessor parses reasoning and
+        //   tools from decoded text after backend conversion.
         matches!(
             tool_call_parser,
-            Some("gemma4") | Some("gemma-4") | Some("harmony") | Some("kimi_k2")
+            Some("gemma4")
+                | Some("gemma-4")
+                | Some("harmony")
+                | Some("kimi_k2")
+                | Some("qwen3_coder")
+                | Some("qwen3_xml")
+                | Some("nemotron_nano")
+                | Some("nemotron3")
+                | Some("nemotron_v3")
         ) || matches!(
             reasoning_parser,
             Some(
@@ -2330,8 +2341,8 @@ impl OpenAIPreprocessor {
                                                 .push_str(&boundary_reasoning);
                                             delta_reasoning.push_str(&boundary_reasoning);
                                         }
-                                        normal_text = after_boundary;
                                     }
+                                    normal_text = after_boundary;
                                 }
 
                                 choice.delta.reasoning_content = if delta_reasoning.is_empty() {
@@ -3043,6 +3054,24 @@ mod tests {
                 true,
                 "kimi_k2 tool-call only → required \
                  (`<|tool_calls_section_begin|>` / `<|tool_calls_section_end|>` are special)",
+            ),
+            (
+                Some("qwen3_coder"),
+                None,
+                true,
+                "qwen3_coder tool-call only → required (`<tool_call>` XML markers are parser input)",
+            ),
+            (
+                Some("qwen3_xml"),
+                None,
+                true,
+                "qwen3_xml tool-call only → required (`<tool_call>` XML markers are parser input)",
+            ),
+            (
+                Some("nemotron_nano"),
+                None,
+                true,
+                "nemotron_nano tool-call only → required (`<tool_call>` is a special token)",
             ),
             (None, None, false, "no parsers → not required"),
         ];
