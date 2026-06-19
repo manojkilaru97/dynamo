@@ -289,21 +289,20 @@ impl NvCreateChatCompletionRequest {
             self.inner.tool_choice.as_ref(),
             Some(dynamo_protocols::types::ChatCompletionToolChoiceOption::Required)
         );
+        let tools = self.inner.tools.as_deref().unwrap_or(&[]);
+
         if has_named_tool_choice
             && tools::named_tool_choice_has_freeform_text_field(
                 self.inner.tool_choice.as_ref(),
-                self.inner.tools.as_deref(),
+                Some(tools),
             )
         {
             return false;
         }
-        if !(has_named_tool_choice || has_required_tool_choice)
-            || !self
-                .inner
-                .tools
-                .as_ref()
-                .is_some_and(|tools| !tools.is_empty())
-        {
+        if !(has_named_tool_choice || has_required_tool_choice) || tools.is_empty() {
+            return false;
+        }
+        if has_required_tool_choice && tools.len() != 1 {
             return false;
         }
 
@@ -1209,18 +1208,18 @@ mod tests {
             serde_json::from_value(json_str).expect("Failed to deserialize request");
 
         with_tool_parser("hermes", || {
-	            assert_eq!(
-	                request.get_guided_json(),
-	                Some(json!({
-	                    "type": "object",
-	                    "properties": {
-	                        "location": {"type": "string", "maxLength": 1024}
-	                    },
-	                    "required": ["location"],
-	                    "additionalProperties": false,
-	                    "x-dynamo-tool-choice-schema": true
-	                }))
-	            );
+            assert_eq!(
+                request.get_guided_json(),
+                Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string", "maxLength": 1024}
+                    },
+                    "required": ["location"],
+                    "additionalProperties": false,
+                    "x-dynamo-tool-choice-schema": true
+                }))
+            );
         });
     }
 
@@ -1306,18 +1305,18 @@ mod tests {
 
         with_tool_parser("qwen3_coder", || {
             assert!(request.get_guided_structural_tag().is_none());
-	            assert_eq!(
-	                request.get_guided_json(),
-	                Some(json!({
-	                    "type": "object",
-	                    "properties": {
-	                        "body": {"type": "string", "maxLength": 256}
-	                    },
-	                    "required": ["body"],
-	                    "additionalProperties": false,
-	                    "x-dynamo-tool-choice-schema": true
-	                }))
-	            );
+            assert_eq!(
+                request.get_guided_json(),
+                Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "body": {"type": "string", "maxLength": 256}
+                    },
+                    "required": ["body"],
+                    "additionalProperties": false,
+                    "x-dynamo-tool-choice-schema": true
+                }))
+            );
         });
     }
 
@@ -1351,18 +1350,18 @@ mod tests {
 
         with_tool_parser("hermes", || {
             assert!(request.get_guided_structural_tag().is_none());
-	            assert_eq!(
-	                request.get_guided_json(),
-	                Some(json!({
-	                    "type": "object",
-	                    "properties": {
-	                        "body": {"type": "string", "maxLength": 256}
-	                    },
-	                    "required": ["body"],
-	                    "additionalProperties": false,
-	                    "x-dynamo-tool-choice-schema": true
-	                }))
-	            );
+            assert_eq!(
+                request.get_guided_json(),
+                Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "body": {"type": "string", "maxLength": 256}
+                    },
+                    "required": ["body"],
+                    "additionalProperties": false,
+                    "x-dynamo-tool-choice-schema": true
+                }))
+            );
         });
     }
 
@@ -1478,6 +1477,57 @@ mod tests {
             assert_eq!(format["at_least_one"], json!(true));
             assert_eq!(format["stop_after_first"], json!(true));
             assert_eq!(format["tags"].as_array().unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn test_required_multi_tool_choice_nemotron_model_keeps_json_array_schema() {
+        let json_str = json!({
+            "model": "nvidia/nemotron-3-nano-30b-a3b",
+            "messages": [{"role": "user", "content": "Call the needed tools"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "calculate",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "expression": {"type": "string"}
+                            },
+                            "required": ["expression"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"}
+                            },
+                            "required": ["location"]
+                        }
+                    }
+                }
+            ],
+            "tool_choice": "required"
+        });
+
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+
+        with_tool_parser("qwen3_coder", || {
+            assert!(request.get_guided_structural_tag().is_none());
+            let guided_json = request.get_guided_json().expect("guided json");
+            assert_eq!(guided_json["type"], json!("array"));
+            assert_eq!(guided_json["x-dynamo-tool-choice-schema"], json!(true));
+            assert_eq!(
+                guided_json["items"]["anyOf"].as_array().unwrap().len(),
+                2
+            );
         });
     }
 

@@ -210,8 +210,15 @@ def _prepare_request(
         and not has_structured_output
         and tool_choice in (None, "auto")
     )
-    if should_parse_tools:
+    should_parse_tools_without_adjustment = (
+        tool_parser_class
+        and has_tools
+        and not has_structured_output
+        and tool_choice not in (None, "none", "auto")
+    )
+    if should_parse_tools or should_parse_tools_without_adjustment:
         tool_parser = tool_parser_class(tokenizer, request_for_sampling.tools)
+    if should_parse_tools:
         request_for_sampling = tool_parser.adjust_request(request_for_sampling)
 
     # Strip tools from the template when tool_choice=none so the model doesn't
@@ -347,6 +354,11 @@ class StreamingPostProcessor:
         self._structured_required_tool_choice = (
             self._structured_required_tool_choice_from_request()
         )
+        if self.tool_parser is not None and not self._structured_outputs_active(
+            getattr(self.sampling_params, "structured_outputs", None)
+        ):
+            self._structured_tool_call_name = None
+            self._structured_required_tool_choice = False
         self._fast_plain_text = (
             (
                 self.tool_parser is None
@@ -455,6 +467,17 @@ class StreamingPostProcessor:
             or getattr(structured_outputs, "json_object", None) is not None
         )
 
+    @staticmethod
+    def _structured_outputs_active(structured_outputs: Any) -> bool:
+        if structured_outputs is None:
+            return False
+        fields = ("json", "regex", "choice", "grammar", "json_object", "structural_tag")
+        if isinstance(structured_outputs, dict):
+            return any(structured_outputs.get(field) is not None for field in fields)
+        return any(
+            getattr(structured_outputs, field, None) is not None for field in fields
+        )
+
     @property
     def structured_json_complete(self) -> bool:
         return self._structured_json_guard and self._structured_json_emitted
@@ -463,10 +486,12 @@ class StreamingPostProcessor:
     def structured_tool_complete(self) -> bool:
         return self._structured_tool_json_emitted
 
-    def _structured_json_delta(self, delta_text: str) -> str | None:
+    def _structured_json_delta(self, delta_text: str, *, finished: bool) -> str | None:
         if self._structured_json_emitted:
             return None
         self._structured_json_buffer += delta_text
+        if not finished:
+            return None
         candidate = self._structured_json_buffer.lstrip()
         if not candidate:
             return None
@@ -474,19 +499,27 @@ class StreamingPostProcessor:
             _, end = json.JSONDecoder().raw_decode(candidate)
         except json.JSONDecodeError:
             return None
+        if candidate[end:].strip():
+            return None
         self._structured_json_emitted = True
         return candidate[:end]
 
-    def _structured_tool_json_delta(self, delta_text: str) -> str | None:
+    def _structured_tool_json_delta(
+        self, delta_text: str, *, finished: bool
+    ) -> str | None:
         if self._structured_tool_json_emitted:
             return None
         self._structured_tool_json_buffer += delta_text
+        if not finished:
+            return None
         candidate = self._structured_tool_json_buffer.lstrip()
         if not candidate:
             return None
         try:
             _, end = json.JSONDecoder().raw_decode(candidate)
         except json.JSONDecodeError:
+            return None
+        if candidate[end:].strip():
             return None
         self._structured_tool_json_emitted = True
         return candidate[:end]
@@ -708,7 +741,100 @@ class StreamingPostProcessor:
                 saved_reasoning, extracted.content or None
             )
 
+        structured_calls, structured_reasoning = (
+            self._extract_post_reasoning_structured_tool_calls(text)
+        )
+        if structured_calls:
+            for index, tool_call in enumerate(structured_calls):
+                self.in_progress_tool_calls[index] = tool_call
+            return self._compose_delta_message(
+                saved_reasoning if saved_reasoning is not None else structured_reasoning,
+                None,
+            )
+
         return self._compose_delta_message(saved_reasoning, extracted.content or None)
+
+    def _post_reasoning_text_and_reasoning(
+        self, text: str
+    ) -> tuple[str, str | None]:
+        end_token = getattr(self.reasoning_parser, "end_token", None)
+        if not end_token or end_token not in text:
+            return text, None
+        reasoning_text, _, post_text = text.rpartition(end_token)
+        start_token = getattr(self.reasoning_parser, "start_token", None)
+        if start_token and start_token in reasoning_text:
+            reasoning_text = reasoning_text.rpartition(start_token)[2]
+        reasoning_text = reasoning_text.strip()
+        return post_text, reasoning_text or None
+
+    @staticmethod
+    def _complete_json_text(text: str) -> str | None:
+        candidate = text.strip()
+        if not candidate:
+            return None
+        try:
+            _, end = json.JSONDecoder().raw_decode(candidate)
+        except json.JSONDecodeError:
+            return None
+        if candidate[end:].strip():
+            return None
+        return candidate[:end]
+
+    def _extract_post_reasoning_structured_tool_calls(
+        self, text: str
+    ) -> tuple[list[DeltaToolCall] | None, str | None]:
+        if _has_user_structured_output_constraint(self.request_for_sampling):
+            return None, None
+        tool_choice = getattr(self.request_for_sampling, "tool_choice", None)
+        if tool_choice in (None, "none", "auto"):
+            return None, None
+
+        post_text, reasoning = self._post_reasoning_text_and_reasoning(text)
+        arguments = self._complete_json_text(post_text)
+        if arguments is None:
+            return None, None
+
+        named_tool = _named_tool_choice_name(tool_choice)
+        if named_tool is not None:
+            return [
+                DeltaToolCall(
+                    index=0,
+                    type="function",
+                    id=make_tool_call_id(),
+                    function=DeltaFunctionCall(
+                        name=named_tool,
+                        arguments=arguments,
+                    ),
+                )
+            ], reasoning
+
+        if tool_choice != "required":
+            return None, None
+        try:
+            decoded = json.loads(arguments)
+        except json.JSONDecodeError:
+            return None, None
+        items = decoded if isinstance(decoded, list) else [decoded]
+        tool_calls: list[DeltaToolCall] = []
+        for index, item in enumerate(items):
+            name = _value_from_mapping_or_object(item, "name")
+            parameters = _value_from_mapping_or_object(item, "parameters", {})
+            if not isinstance(name, str):
+                continue
+            if not isinstance(parameters, str):
+                parameters = json.dumps(parameters, ensure_ascii=False)
+            tool_calls.append(
+                DeltaToolCall(
+                    index=index,
+                    type="function",
+                    id=make_tool_call_id(),
+                    function=DeltaFunctionCall(
+                        name=name,
+                        arguments=parameters,
+                    ),
+                )
+            )
+        return tool_calls or None, reasoning
 
     def _extract_tool_calls_streaming(
         self,
@@ -731,7 +857,10 @@ class StreamingPostProcessor:
         )
 
     def _extract_buffered_post_reasoning_tool_calls(
-        self, output: Any
+        self,
+        output: Any,
+        *,
+        extra_candidates: Sequence[str] | None = None,
     ) -> DeltaMessage | None:
         if (
             not self._should_parse_tools()
@@ -746,11 +875,13 @@ class StreamingPostProcessor:
             return None
 
         buffered_text = ""
-        for candidate in (
+        candidates = (
             self._raw_tool_text_buffer,
             self._post_reasoning_raw_text_buffer,
             self._post_reasoning_text_buffer,
-        ):
+            *(extra_candidates or ()),
+        )
+        for candidate in candidates:
             if (
                 candidate
                 and tool_call_start in candidate
@@ -770,6 +901,18 @@ class StreamingPostProcessor:
         )
 
         if not buffered_text:
+            if not output.finish_reason:
+                return None
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                delta_message = self._extract_tool_calls_from_text(candidate)
+                if self.in_progress_tool_calls:
+                    self._raw_tool_text_buffer = ""
+                    self._raw_tool_capture_started = False
+                    self._post_reasoning_text_buffer = ""
+                    self._post_reasoning_raw_text_buffer = ""
+                    return delta_message
             return None
 
         self._raw_tool_text_buffer = ""
@@ -842,10 +985,11 @@ class StreamingPostProcessor:
             return delta_message, None
 
         content = delta_message.content or ""
-        if not content:
+        finished = bool(output.finish_reason)
+        if not content and not finished:
             return delta_message, None
 
-        arguments = self._structured_tool_json_delta(content)
+        arguments = self._structured_tool_json_delta(content, finished=finished)
         if arguments is None:
             return self._compose_delta_message(delta_message.reasoning, None), None
 
@@ -969,7 +1113,9 @@ class StreamingPostProcessor:
         if self._fast_plain_text:
             content = delta_text
             if self._structured_json_guard:
-                content = self._structured_json_delta(delta_text)
+                content = self._structured_json_delta(
+                    delta_text, finished=bool(output.finish_reason)
+                )
             if content:
                 delta = {
                     "role": "assistant",
@@ -1177,7 +1323,10 @@ class StreamingPostProcessor:
                     )
                     had_tool_calls = bool(self.in_progress_tool_calls)
                     fallback_message = (
-                        self._extract_buffered_post_reasoning_tool_calls(output)
+                        self._extract_buffered_post_reasoning_tool_calls(
+                            output,
+                            extra_candidates=(current_text,),
+                        )
                     )
                     if fallback_message is not None or (
                         not had_tool_calls and self.in_progress_tool_calls
@@ -1185,7 +1334,10 @@ class StreamingPostProcessor:
                         delta_message = fallback_message
 
         if self._should_parse_tools() and not self.in_progress_tool_calls:
-            fallback_message = self._extract_buffered_post_reasoning_tool_calls(output)
+            fallback_message = self._extract_buffered_post_reasoning_tool_calls(
+                output,
+                extra_candidates=(current_text,),
+            )
             if fallback_message is not None or self.in_progress_tool_calls:
                 delta_message = fallback_message
 

@@ -16,6 +16,7 @@ from _routed_engine_fakes import FakeRoutedEngine as _FakeRoutedEngine
 from transformers import AutoTokenizer
 
 from dynamo.frontend.prepost import StreamingPostProcessor, _prepare_request
+from dynamo.frontend.vllm_processor import _with_parser_visible_engine_text
 
 # NOTE: dynamo.frontend.vllm_processor is imported lazily inside the tests that
 # need it. Importing it at module top level would run its `from vllm.tasks import ...`

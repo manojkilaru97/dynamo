@@ -108,6 +108,21 @@ impl DecoderParams {
     }
 }
 
+fn select_output_text(
+    skip_special_tokens: bool,
+    engine_text: Option<String>,
+    decoded_text: Option<String>,
+) -> Option<String> {
+    let engine_text = engine_text.filter(|text| !text.is_empty());
+    let decoded_text = decoded_text.filter(|text| !text.is_empty());
+
+    if skip_special_tokens {
+        engine_text.or(decoded_text)
+    } else {
+        decoded_text.or(engine_text)
+    }
+}
+
 impl Backend {
     pub fn from_tokenizer(tokenizer: Tokenizer) -> Arc<Self> {
         Arc::new(Self {
@@ -204,7 +219,14 @@ impl
                     let data = output.data.as_ref().unwrap();
                     let choice_idx = data.index.unwrap_or(0);
                     let engine_text = if !state.validate_engine_decode {
-                        data.text.clone()
+                        match data.text.as_ref() {
+                            // vLLM may emit an empty decoded string for chunks whose
+                            // token_ids contain parser-visible markers. Let Dynamo's
+                            // tokenizer decode those tokens instead of treating the
+                            // empty engine text as authoritative.
+                            Some(text) if text.is_empty() && !data.token_ids.is_empty() => None,
+                            _ => data.text.clone(),
+                        }
                     } else {
                         None
                     };
@@ -342,7 +364,9 @@ impl
                         data.finish_reason = finish_reason;
                         data.stop_reason = stop_reason.or(data.stop_reason);
                     }
-                    data.text = engine_text.or(text);
+                    let selected_text =
+                        select_output_text(state.skip_special_tokens, engine_text, text);
+                    data.text = selected_text;
                     data.tokens = Some(tokens);
 
                     // Per-entry decode is O(positions * top_k) per delta. Bounded in
@@ -753,6 +777,22 @@ mod tests {
         Decoder::maybe_drain_to_max_bytes(&mut s, max_bytes);
         assert!(s.is_char_boundary(0)); // front of jail string on valid char boundary
         assert_eq!(s, "ñworld");
+    }
+
+    #[test]
+    fn test_select_output_text_preserves_engine_marker_when_decode_is_empty() {
+        assert_eq!(
+            select_output_text(false, Some("<tool_call>".to_string()), Some(String::new())),
+            Some("<tool_call>".to_string())
+        );
+        assert_eq!(
+            select_output_text(false, Some("<tool_call>".to_string()), Some("x".to_string())),
+            Some("x".to_string())
+        );
+        assert_eq!(
+            select_output_text(true, Some("<tool_call>".to_string()), Some("x".to_string())),
+            Some("<tool_call>".to_string())
+        );
     }
 
     /// A mock tokenizer that always returns Err from decode().

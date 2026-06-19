@@ -34,6 +34,7 @@ from typing import (
 import torch
 from vllm import PoolingParams
 from vllm.config import ModelConfig, VllmConfig
+from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
@@ -136,7 +137,7 @@ TOOL_FIELD_STRING_BUDGETS = {
 TOOL_LONG_TEXT_FIELD_NAMES = {"body", "content", "message"}
 SERVICE_OVERLOADED_ERROR_TYPE: Final = "service_overloaded"
 QWEN_XML_STRUCTURAL_TAG_TOOL_PARSERS = {"qwen3_coder", "qwen3_xml"}
-FORCED_TOOL_STRUCTURAL_TAG_TRIGGERS = [""]
+FORCED_TOOL_STRUCTURAL_TAG_TRIGGERS = ["<tool_call>"]
 PARSER_VISIBLE_MARKER_TOKENS: Final = (
     "<think>",
     "</think>",
@@ -1251,6 +1252,89 @@ def _named_tool_choice_name(tool_choice: Any) -> str | None:
     return _value_from_mapping_or_object(function, "name")
 
 
+def _complete_json_text(text: str) -> str | None:
+    candidate = text.strip()
+    if not candidate:
+        return None
+    try:
+        _, end = json.JSONDecoder().raw_decode(candidate)
+    except json.JSONDecodeError:
+        return None
+    if candidate[end:].strip():
+        return None
+    return candidate[:end]
+
+
+def _forced_tool_calls_from_post_reasoning_json(
+    request: Dict[str, Any],
+    content: str,
+) -> list[dict[str, Any]] | None:
+    tools = request.get("tools")
+    tool_choice = request.get("tool_choice")
+    if not tools or tool_choice in (None, "none", "auto"):
+        return None
+    if any(
+        request.get(key) is not None
+        for key in (
+            "guided_json",
+            "guided_regex",
+            "guided_choice",
+            "guided_grammar",
+            "structured_outputs",
+            "response_format",
+        )
+    ):
+        return None
+
+    _, end_marker, post_reasoning = content.rpartition("</think>")
+    arguments = _complete_json_text(post_reasoning if end_marker else content)
+    if arguments is None:
+        return None
+
+    named_tool = _named_tool_choice_name(tool_choice)
+    if named_tool is not None:
+        return [
+            {
+                "index": 0,
+                "id": make_tool_call_id(),
+                "type": "function",
+                "function": {
+                    "name": named_tool,
+                    "arguments": arguments,
+                },
+            }
+        ]
+
+    if tool_choice != "required":
+        return None
+    try:
+        decoded = json.loads(arguments)
+    except json.JSONDecodeError:
+        return None
+
+    items = decoded if isinstance(decoded, list) else [decoded]
+    tool_calls: list[dict[str, Any]] = []
+    for index, item in enumerate(items):
+        name = _value_from_mapping_or_object(item, "name")
+        parameters = _value_from_mapping_or_object(item, "parameters", {})
+        if not isinstance(name, str):
+            continue
+        if not isinstance(parameters, str):
+            parameters = json.dumps(parameters, ensure_ascii=False)
+        tool_calls.append(
+            {
+                "index": index,
+                "id": make_tool_call_id(),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": parameters,
+                },
+            }
+        )
+    return tool_calls or None
+
+
 def _schema_for_required_tool_choice(
     tools: list[Any],
     request_text_len: int | None = None,
@@ -1386,31 +1470,15 @@ def _qwen_xml_structural_tag_for_tool_choice(
         ]
         if not tags:
             raise ValueError("tool_choice='required' needs at least one named tool")
-        if len(tags) == 1:
-            structural_tag = {
-                "type": "structural_tag",
-                "format": {
-                    "type": "tags_with_separator",
-                    "tags": tags,
-                    "triggers": FORCED_TOOL_STRUCTURAL_TAG_TRIGGERS,
-                    "separator": "",
-                    "at_least_one": True,
-                    "stop_after_first": True,
-                },
-            }
-            return StructuredOutputsParams(structural_tag=json.dumps(structural_tag))
-        max_tags = min(len(tags), DEFAULT_TOOL_CALL_MAX_ARRAY_ITEMS)
+        if len(tags) != 1:
+            return None
         structural_tag = {
             "type": "structural_tag",
             "format": {
-                "type": "repeat",
-                "min": 1,
-                "max": max_tags,
+                "type": "triggered_tags",
+                "tags": tags[:DEFAULT_TOOL_CALL_MAX_ARRAY_ITEMS],
                 "triggers": FORCED_TOOL_STRUCTURAL_TAG_TRIGGERS,
-                "content": {
-                    "type": "or",
-                    "elements": tags,
-                },
+                "stop_after_first": False,
             },
         }
         return StructuredOutputsParams(structural_tag=json.dumps(structural_tag))
@@ -1425,11 +1493,9 @@ def _qwen_xml_structural_tag_for_tool_choice(
             structural_tag = {
                 "type": "structural_tag",
                 "format": {
-                    "type": "tags_with_separator",
+                    "type": "triggered_tags",
                     "tags": [_qwen_xml_tool_tag(tool, request_text_len)],
                     "triggers": FORCED_TOOL_STRUCTURAL_TAG_TRIGGERS,
-                    "separator": "",
-                    "at_least_one": True,
                     "stop_after_first": True,
                 },
             }
@@ -1502,8 +1568,14 @@ def _structured_outputs_from_fields(fields: Any) -> StructuredOutputsParams | No
 
     params: dict[str, Any] = {}
     if fields.get("json") is not None:
-        _validate_structured_json_schema(fields["json"])
-        params["json"] = bound_json_schema_for_constrained_decoding(fields["json"])
+        schema = fields["json"]
+        _validate_structured_json_schema(schema)
+        if isinstance(schema, dict) and schema.get(TOOL_CHOICE_SCHEMA_MARKER) is True:
+            params["json"] = bound_json_schema_for_constrained_decoding(schema)
+        else:
+            # User structured-output schemas should stay equivalent to vLLM's
+            # OpenAI path. Tool-choice schemas are explicitly marked above.
+            params["json"] = schema
     for key in ("regex", "choice", "grammar", "json_object"):
         if fields.get(key) is not None:
             if key == "regex":
@@ -4515,12 +4587,29 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         if structured_json_complete and finish_reason is None:
                             finish_reason = "stop"
 
-                        choice_data = {
-                            "index": output_idx,
-                            "delta": {
+                        tool_calls = (
+                            _forced_tool_calls_from_post_reasoning_json(
+                                request,
+                                delta_text,
+                            )
+                            if output.finish_reason
+                            else None
+                        )
+                        if tool_calls:
+                            delta = {
+                                "role": "assistant",
+                                "tool_calls": tool_calls,
+                            }
+                            finish_reason = "tool_calls"
+                        else:
+                            delta = {
                                 "role": "assistant",
                                 "content": delta_text,
-                            },
+                            }
+
+                        choice_data = {
+                            "index": output_idx,
+                            "delta": delta,
                             "finish_reason": finish_reason,
                         }
 
