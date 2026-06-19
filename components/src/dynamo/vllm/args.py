@@ -111,6 +111,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     dynamo_config.model = vllm_args.model
 
     engine_config = AsyncEngineArgs.from_cli_args(vllm_args)
+    _sync_structured_outputs_reasoning_parser(engine_config)
 
     cross_validate_config(dynamo_config, engine_config)
     update_dynamo_config_with_engine(dynamo_config, engine_config)

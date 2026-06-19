@@ -740,6 +740,16 @@ async def register_vllm_model(
         config.frontend_decoding
     )
 
+    register_kwargs = {
+        "context_length": vllm_config.model_config.max_model_len,
+        "kv_cache_block_size": runtime_values["kv_event_block_size"],
+        "runtime_config": runtime_config,
+        "custom_template_path": config.custom_jinja_template,
+        "media_decoder": media_decoder,
+        "media_fetcher": media_fetcher,
+    }
+    if config.dyn_served_model_alias:
+        register_kwargs["model_aliases"] = config.dyn_served_model_alias
     await register_model(
         model_input,
         model_type,

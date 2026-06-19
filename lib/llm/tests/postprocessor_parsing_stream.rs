@@ -159,7 +159,6 @@ async fn postprocessor_parsing_stream_replays_unit_test_fixture() {
 
     let output_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> =
         output_stream.collect().await;
-
     assert_eq!(output_chunks.len(), expected_stream_json.len());
 
     for (idx, (output, expected)) in output_chunks
@@ -215,7 +214,6 @@ async fn postprocessor_parsing_stream_replays_interval_20_fixture() {
 
     let output_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> =
         output_stream.collect().await;
-
     let mut reasoning = String::new();
     let mut all_content = String::new();
     let mut finish_reasons = Vec::new();
@@ -505,7 +503,6 @@ async fn postprocessor_parsing_stream_deepseek_v4_tool_continuation_keeps_inject
 
     let output_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> =
         output_stream.collect().await;
-
     let mut reasoning = String::new();
     let mut content = String::new();
     for output in &output_chunks {
