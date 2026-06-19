@@ -128,7 +128,6 @@ async fn postprocessor_parsing_stream_replays_unit_test_fixture() {
 
     let output_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> =
         output_stream.collect().await;
-
     assert_eq!(output_chunks.len(), expected_stream_json.len());
 
     for (idx, (output, expected)) in output_chunks
@@ -184,7 +183,6 @@ async fn postprocessor_parsing_stream_replays_interval_20_fixture() {
 
     let output_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> =
         output_stream.collect().await;
-
     let mut reasoning = String::new();
     let mut all_content = String::new();
     let mut finish_reasons = Vec::new();
@@ -431,7 +429,6 @@ async fn postprocessor_parsing_stream_deepseek_v4_tool_continuation_keeps_inject
 
     let output_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> =
         output_stream.collect().await;
-
     let mut reasoning = String::new();
     let mut content = String::new();
     for output in &output_chunks {
@@ -1147,5 +1144,102 @@ async fn postprocessor_parsing_stream_minimax_named_bare_parameters() {
     assert_eq!(
         args,
         serde_json::json!({"location": "Paris", "unit": "celsius"})
+    );
+}
+
+/// Regression: Nemotron v3 can emit Qwen3-style XML tool calls after a forced
+/// reasoning segment. `tool_choice=auto` must preserve the XML as normal text
+/// for the downstream tool parser; the reasoning fallback must not replay the
+/// thinking text as final content when a tool call is present.
+#[tokio::test]
+async fn postprocessor_parsing_stream_nemotron_v3_auto_qwen_xml_after_reasoning() {
+    let preprocessor = build_preprocessor(Some("nemotron_v3"), Some("qwen3_coder"));
+
+    let mut request: NvCreateChatCompletionRequest = serde_json::from_str(REQUEST_JSON).unwrap();
+    let tools: Vec<dynamo_protocols::types::ChatCompletionTool> =
+        serde_json::from_value(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "name_a_color",
+                "description": "Return color names for a hex color.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"color_hex": {"type": "string"}},
+                    "required": ["color_hex"]
+                }
+            }
+        }]))
+        .unwrap();
+    request.inner.tools = Some(tools);
+    request.inner.tool_choice = Some(ChatCompletionToolChoiceOption::Auto);
+
+    let input_chunks = vec![
+        mock_content_chunk("We need to call the color tool."),
+        mock_content_chunk("</think>"),
+        mock_content_chunk("\n<tool_call>\n"),
+        mock_content_chunk("<function=name_a_color>\n"),
+        mock_content_chunk("<parameter=color_hex>\n"),
+        mock_content_chunk("#ff00ee\n"),
+        mock_content_chunk("</parameter>\n"),
+        mock_content_chunk("</function>\n"),
+        mock_content_chunk("</tool_call>"),
+        mock_final_chunk(),
+    ];
+
+    let input_stream = stream::iter(input_chunks.into_iter().map(Annotated::from_data));
+    let output_stream = preprocessor
+        .postprocessor_parsing_stream(input_stream, &request, true)
+        .expect("postprocessor_parsing_stream should build");
+
+    let output_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> =
+        output_stream.collect().await;
+
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    let mut merged_tool_calls: BTreeMap<u32, MergedToolCall> = BTreeMap::new();
+    let mut finish_reasons = Vec::new();
+
+    for output in &output_chunks {
+        let Some(data) = output.data.as_ref() else {
+            continue;
+        };
+        for choice in &data.inner.choices {
+            if let Some(r) = &choice.delta.reasoning_content {
+                reasoning.push_str(r);
+            }
+            if let Some(c) = &choice.delta.content {
+                content.push_str(get_text(c));
+            }
+            if let Some(tcs) = &choice.delta.tool_calls {
+                for tc in tcs {
+                    merged_tool_calls
+                        .entry(tc.index)
+                        .or_default()
+                        .merge_from(tc);
+                }
+            }
+            if let Some(fr) = choice.finish_reason {
+                finish_reasons.push(fr);
+            }
+        }
+    }
+
+    assert!(
+        reasoning.contains("We need to call the color tool."),
+        "expected reasoning content to be preserved, got: {reasoning:?}"
+    );
+    assert!(
+        !content.contains("<tool_call>") && !content.contains("We need to call the color tool."),
+        "raw tool XML or fallback reasoning leaked into content: {content:?}"
+    );
+
+    let tool_calls: Vec<MergedToolCall> = merged_tool_calls.values().cloned().collect();
+    assert_eq!(tool_calls.len(), 1, "expected one parsed tool call");
+    assert_eq!(tool_calls[0].name.as_deref(), Some("name_a_color"));
+    let args: Value = serde_json::from_str(&tool_calls[0].arguments).unwrap();
+    assert_eq!(args, serde_json::json!({"color_hex": "#ff00ee"}));
+    assert!(
+        finish_reasons.contains(&FinishReason::ToolCalls),
+        "expected ToolCalls finish_reason, got: {finish_reasons:?}"
     );
 }

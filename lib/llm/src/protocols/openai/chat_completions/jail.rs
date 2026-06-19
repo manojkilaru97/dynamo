@@ -282,6 +282,10 @@ impl ChoiceJailState {
         ) && self.emitted_tool_calls_count > 0
     }
 
+    fn should_suppress_post_tool_whitespace(&self, content: &str) -> bool {
+        self.emitted_tool_calls_count > 0 && content.trim().is_empty()
+    }
+
     fn should_guard_required_duplicates(&self, jail_stream: &JailedStream) -> bool {
         matches!(
             &jail_stream.jail_mode,
@@ -404,7 +408,10 @@ impl ChoiceJailState {
                     ..
                 } => {
                     // Emit prefix if any
-                    if !prefix.is_empty() && !self.should_suppress_non_tool_trailing(jail_stream) {
+                    if !prefix.is_empty()
+                        && !self.should_suppress_non_tool_trailing(jail_stream)
+                        && !self.should_suppress_post_tool_whitespace(&prefix)
+                    {
                         #[allow(deprecated)]
                         let prefix_choice = create_choice_stream(
                             choice.index,
@@ -455,6 +462,9 @@ impl ChoiceJailState {
                                 self.accumulated_content = trailing_part.to_string();
                                 // No logprobs to seed here — they were already emitted with the tool call
                                 self.accumulated_logprobs = None;
+                            } else if self.should_suppress_post_tool_whitespace(trailing_part) {
+                                // Drop whitespace emitted after a parsed tool call. Non-streaming
+                                // aggregation already removes this, and streaming should match it.
                             } else if self.should_suppress_non_tool_trailing(jail_stream) {
                                 self.is_jailed = true;
                                 self.accumulated_content = trailing_part.to_string();
@@ -489,7 +499,10 @@ impl ChoiceJailState {
                     possible_patterns,
                 } => {
                     // Emit the safe prefix
-                    if !prefix.is_empty() && !self.should_suppress_non_tool_trailing(jail_stream) {
+                    if !prefix.is_empty()
+                        && !self.should_suppress_non_tool_trailing(jail_stream)
+                        && !self.should_suppress_post_tool_whitespace(&prefix)
+                    {
                         #[allow(deprecated)]
                         let prefix_choice = create_choice_stream(
                             choice.index,
@@ -527,6 +540,8 @@ impl ChoiceJailState {
                         self.accumulated_content = combined_content;
                         // Seed accumulated logprobs with this chunk's logprobs
                         self.accumulated_logprobs = choice.logprobs.clone();
+                        self.partial_match_buffer.clear();
+                    } else if self.should_suppress_post_tool_whitespace(&content) {
                         self.partial_match_buffer.clear();
                     } else if self.should_suppress_non_tool_trailing(jail_stream) {
                         self.is_jailed = true;
@@ -597,6 +612,9 @@ impl ChoiceJailState {
                     if jail_stream.should_start_jail(&trailing_owned) {
                         self.is_jailed = true;
                         self.accumulated_content = trailing_owned;
+                    } else if self.should_suppress_post_tool_whitespace(&trailing_owned) {
+                        // Drop whitespace emitted after a parsed tool call. Non-streaming
+                        // aggregation already removes this, and streaming should match it.
                     } else if self.should_suppress_non_tool_trailing(jail_stream) {
                         self.is_jailed = true;
                         self.accumulated_content = trailing_owned;
@@ -808,7 +826,12 @@ impl JailedStream {
 
                     // Process each choice independently using the new architecture
                     for choice in &chat_response.inner.choices {
-                        if choice.delta.tool_calls.is_some() {
+                        if choice
+                            .delta
+                            .tool_calls
+                            .as_ref()
+                            .is_some_and(|tool_calls| !tool_calls.is_empty())
+                        {
                             let choice_state = choice_states.get_or_create_state(choice.index, false);
                             if choice.finish_reason.is_some() {
                                 choice_state.stream_finish_reason = choice.finish_reason;
@@ -1878,6 +1901,20 @@ impl JailedStreamBuilder {
 
     /// Build the configured JailedStream
     pub fn build(mut self) -> JailedStream {
+        if let JailMode::Immediate {
+            format:
+                ToolChoiceFormat::ArrayOfTools {
+                    terminal_after_first,
+                },
+        } = &mut self.jail_mode
+            && self
+                .tool_definitions
+                .as_ref()
+                .is_some_and(|tools| tools.len() == 1)
+        {
+            *terminal_after_first = true;
+        }
+
         // Auto-populate jail sequences from parser config if not manually configured
         if let Some(ref parser_name) = self.tool_call_parser {
             let parser_map = get_tool_parser_map();
@@ -1898,20 +1935,6 @@ impl JailedStreamBuilder {
                         .collect();
                 }
             }
-        }
-
-        if let JailMode::Immediate {
-            format:
-                ToolChoiceFormat::ArrayOfTools {
-                    terminal_after_first,
-                },
-        } = &mut self.jail_mode
-            && self
-                .tool_definitions
-                .as_ref()
-                .is_some_and(|tools| tools.len() == 1)
-        {
-            *terminal_after_first = true;
         }
 
         // Collect all possible marker patterns for the MarkerMatcher
@@ -1990,6 +2013,14 @@ mod tests {
     /// Helper: build a single-choice stream chunk with text content
     #[allow(deprecated)]
     fn text_chunk(text: &str) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        text_chunk_with_tool_calls(text, None)
+    }
+
+    #[allow(deprecated)]
+    fn text_chunk_with_tool_calls(
+        text: &str,
+        tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
         let choice = ChatChoiceStream {
             index: 0,
             delta: ChatCompletionStreamResponseDelta {
@@ -1997,12 +2028,49 @@ mod tests {
                 content: Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(
                     text.to_string(),
                 )),
-                tool_calls: None,
+                tool_calls,
                 function_call: None,
                 refusal: None,
                 reasoning_content: None,
             },
             finish_reason: None,
+            logprobs: None,
+        };
+
+        Annotated {
+            data: Some(NvCreateChatCompletionStreamResponse {
+                inner: CreateChatCompletionStreamResponse {
+                    id: "id-42".to_string(),
+                    object: "chat.completion.chunk".to_string(),
+                    created: 0,
+                    model: "test-model".to_string(),
+                    choices: vec![choice],
+                    usage: None,
+                    service_tier: None,
+                    system_fingerprint: None,
+                },
+                nvext: None,
+            }),
+            id: None,
+            event: None,
+            comment: None,
+            error: None,
+        }
+    }
+
+    #[allow(deprecated)]
+    fn finish_chunk(finish_reason: FinishReason) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        let choice = ChatChoiceStream {
+            index: 0,
+            delta: ChatCompletionStreamResponseDelta {
+                role: Some(Role::Assistant),
+                content: None,
+                tool_calls: None,
+                function_call: None,
+                refusal: None,
+                reasoning_content: None,
+            },
+            finish_reason: Some(finish_reason),
             logprobs: None,
         };
 
@@ -2090,6 +2158,119 @@ mod tests {
         assert_eq!(tool_calls[0].0, "get_weather");
         assert_eq!(tool_calls[0].1, "{\"location\":{\"city\":\"Paris\"}}");
         assert_eq!(collect_text_content(&responses).trim(), "");
+    }
+
+    #[tokio::test]
+    async fn test_marker_jail_parses_content_with_empty_tool_calls_delta() {
+        let jail = JailedStream::builder()
+            .tool_call_parser("qwen3_coder")
+            .tool_definitions(vec![dynamo_parsers::tool_calling::ToolDefinition {
+                name: "name_a_color".to_string(),
+                parameters: None,
+            }])
+            .build();
+
+        let native_call = concat!(
+            "<tool_call>\n",
+            "<function=name_a_color>\n",
+            "<parameter=color_hex>\n#ff00ee\n</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        );
+
+        let input_stream = Box::pin(stream::iter(vec![text_chunk_with_tool_calls(
+            native_call,
+            Some(Vec::new()),
+        )]));
+        let output_stream = jail.apply_with_finish_reason(input_stream);
+
+        let responses: Vec<_> = output_stream.collect().await;
+        let tool_calls = collect_tool_calls(&responses);
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].0, "name_a_color");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool_calls[0].1).unwrap()["color_hex"],
+            "#ff00ee"
+        );
+        assert_eq!(collect_text_content(&responses).trim(), "");
+    }
+
+    #[tokio::test]
+    async fn test_marker_jail_drops_whitespace_after_tool_call() {
+        let jail = JailedStream::builder()
+            .tool_call_parser("qwen3_coder")
+            .tool_definitions(vec![dynamo_parsers::tool_calling::ToolDefinition {
+                name: "name_a_color".to_string(),
+                parameters: None,
+            }])
+            .build();
+
+        let native_call = concat!(
+            "<tool_call>\n",
+            "<function=name_a_color>\n",
+            "<parameter=color_hex>\n#ff00ee\n</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        );
+
+        let input_stream = Box::pin(stream::iter(vec![
+            text_chunk(native_call),
+            text_chunk("\n"),
+            finish_chunk(FinishReason::Stop),
+        ]));
+        let output_stream = jail.apply_with_finish_reason(input_stream);
+
+        let responses: Vec<_> = output_stream.collect().await;
+        let tool_calls = collect_tool_calls(&responses);
+
+        assert_eq!(tool_calls.len(), 1, "responses: {responses:#?}");
+        assert_eq!(tool_calls[0].0, "name_a_color");
+        assert_eq!(collect_text_content(&responses), "");
+    }
+
+    #[tokio::test]
+    async fn test_marker_jail_parses_split_qwen_xml_before_stop_chunk() {
+        let jail = JailedStream::builder()
+            .tool_call_parser("qwen3_coder")
+            .tool_definitions(vec![dynamo_parsers::tool_calling::ToolDefinition {
+                name: "name_a_color".to_string(),
+                parameters: None,
+            }])
+            .build();
+
+        let input_stream = Box::pin(stream::iter(vec![
+            text_chunk("<tool_call>"),
+            text_chunk("\n<function=name_a_color>"),
+            text_chunk("\n<parameter=color_hex>"),
+            text_chunk("\n#"),
+            text_chunk("ff"),
+            text_chunk("00"),
+            text_chunk("ee"),
+            text_chunk("\n</parameter>"),
+            text_chunk("\n</function>"),
+            text_chunk("\n</tool_call>"),
+            finish_chunk(FinishReason::Stop),
+        ]));
+        let output_stream = jail.apply_with_finish_reason(input_stream);
+
+        let responses: Vec<_> = output_stream.collect().await;
+        let tool_calls = collect_tool_calls(&responses);
+
+        assert_eq!(tool_calls.len(), 1, "responses: {responses:#?}");
+        assert_eq!(tool_calls[0].0, "name_a_color");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool_calls[0].1).unwrap()["color_hex"],
+            "#ff00ee"
+        );
+        assert_eq!(collect_text_content(&responses).trim(), "");
+        assert!(
+            responses
+                .iter()
+                .flat_map(|r| r.data.iter())
+                .flat_map(|d| d.inner.choices.iter())
+                .any(|choice| choice.finish_reason == Some(FinishReason::ToolCalls))
+        );
     }
 
     #[tokio::test]

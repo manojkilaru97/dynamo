@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -82,6 +82,24 @@ pub(super) fn get_body_limit() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .map(|mb| mb * 1024 * 1024)
         .unwrap_or(45 * 1024 * 1024)
+}
+
+fn configured_max_output_tokens() -> Option<u32> {
+    static CAP: OnceLock<Option<u32>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("DYN_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0)
+    })
+}
+
+fn clamp_max_output_tokens(value: &mut Option<u32>) {
+    if let (Some(cap), Some(value)) = (configured_max_output_tokens(), value.as_mut())
+        && *value > cap
+    {
+        *value = cap;
+    }
 }
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
@@ -634,6 +652,8 @@ async fn completions(
 
     // return a 503 if the service is not ready
     check_ready(&state)?;
+
+    clamp_max_output_tokens(&mut request.inner.max_tokens);
 
     // Validate stream_options is only used when streaming (NVBug 5662680)
     validate_completion_stream_options(&request)?;
@@ -1404,6 +1424,11 @@ async fn chat_completions(
             request.inner.max_completion_tokens = Some(template.max_completion_tokens);
         }
     }
+    clamp_max_output_tokens(&mut request.inner.max_completion_tokens);
+    #[allow(deprecated)]
+    {
+        clamp_max_output_tokens(&mut request.inner.max_tokens);
+    }
 
     // Capture the resolved model after template application for metrics and engine lookup
     // todo - make the protocols be optional for model name
@@ -1942,6 +1967,7 @@ async fn responses(
             request.inner.max_output_tokens = Some(template.max_completion_tokens);
         }
     }
+    clamp_max_output_tokens(&mut request.inner.max_output_tokens);
     tracing::trace!("Received responses request: {:?}", request.inner);
 
     let model = state

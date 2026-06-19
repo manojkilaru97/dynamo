@@ -430,6 +430,22 @@ def test_setup_vllm_engine_reuses_engine_config_model_config(monkeypatch):
 
     assert default_sampling_params == {"temperature": 0.7}
 
+def test_reasoning_parser_propagates_to_structured_outputs(mock_vllm_cli):
+    """Tool/JSON constraints must not apply while a reasoning model is thinking."""
+    mock_vllm_cli(
+        "--model",
+        "Qwen/Qwen3-0.6B",
+        "--reasoning-parser",
+        "nemotron_v3",
+    )
+
+    config = parse_args()
+
+    assert config.engine_args.reasoning_parser == "nemotron_v3"
+    assert (
+        config.engine_args.structured_outputs_config.reasoning_parser == "nemotron_v3"
+    )
+
 
 # --disaggregation-mode tests
 

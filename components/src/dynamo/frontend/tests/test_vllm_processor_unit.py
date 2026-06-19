@@ -17,6 +17,7 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
 
 from dynamo.frontend.prepost import StreamingPostProcessor, _prepare_request
+from dynamo.frontend.vllm_processor import _with_parser_visible_engine_text
 
 # Needs vllm packages (gpu_1 container).  No need for parallel marker.
 pytestmark = [
@@ -481,6 +482,33 @@ class TestReasoningParserMetadata:
         }
 
 
+class TestVllmProcessorParserTextBridge:
+    def test_parser_visible_engine_text_fills_empty_vllm_delta(self):
+        output = SimpleNamespace(
+            index=0,
+            token_ids=[14],
+            text="",
+            finish_reason=None,
+            logprobs=None,
+        )
+
+        bridged = _with_parser_visible_engine_text(output, "<tool_call>")
+
+        assert bridged.text == "<tool_call>"
+        assert bridged.token_ids == [14]
+
+    def test_parser_visible_engine_text_does_not_replace_visible_content(self):
+        output = SimpleNamespace(
+            index=0,
+            token_ids=[42],
+            text="hello",
+            finish_reason=None,
+            logprobs=None,
+        )
+
+        assert _with_parser_visible_engine_text(output, "<tool_call>") is output
+
+
 OBJECT_TYPED_TOOL_REQUEST = {
     "model": MODEL,
     "messages": [{"role": "user", "content": "set my profile"}],
@@ -753,6 +781,82 @@ class TestStreamingPostProcessorToolFallback:
         assert choices[1]["delta"]["tool_calls"][0]["function"]["name"] == "Read"
         assert "ignored continuation" not in json.dumps(choices)
         assert choices[-1]["finish_reason"] == "tool_calls"
+
+    def test_split_raw_tool_body_with_marker_text_only(self):
+        post = StreamingPostProcessor(
+            tokenizer=_RawToolTokenizer(),
+            request_for_sampling=SimpleNamespace(tool_choice="auto"),
+            sampling_params=SamplingParams(max_tokens=128),
+            prompt_token_ids=[],
+            tool_parser=_FallbackToolParser(),
+            reasoning_parser_class=_FallbackReasoningParser,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+
+        chunks = [
+            SimpleNamespace(
+                index=0,
+                token_ids=[1],
+                text="Need the file.",
+                finish_reason=None,
+                logprobs=None,
+            ),
+            SimpleNamespace(
+                index=0,
+                token_ids=[13],
+                text="</think>",
+                finish_reason=None,
+                logprobs=None,
+            ),
+            SimpleNamespace(
+                index=0,
+                token_ids=[14],
+                text="<tool_call>",
+                finish_reason=None,
+                logprobs=None,
+            ),
+            SimpleNamespace(
+                index=0,
+                token_ids=[20],
+                text="",
+                finish_reason=None,
+                logprobs=None,
+            ),
+            SimpleNamespace(
+                index=0,
+                token_ids=[21],
+                text="",
+                finish_reason=None,
+                logprobs=None,
+            ),
+            SimpleNamespace(
+                index=0,
+                token_ids=[15],
+                text="</tool_call>",
+                finish_reason=None,
+                logprobs=None,
+            ),
+            SimpleNamespace(
+                index=0,
+                token_ids=[99],
+                text="",
+                finish_reason="stop",
+                logprobs=None,
+            ),
+        ]
+
+        choices = [choice for chunk in chunks if (choice := post.process_output(chunk))]
+        tool_choice = next(
+            choice for choice in choices if "tool_calls" in choice["delta"]
+        )
+        final_choice = choices[-1]
+
+        assert final_choice["finish_reason"] == "tool_calls"
+        tool_calls = tool_choice["delta"]["tool_calls"]
+        assert tool_calls[0]["function"]["name"] == "Read"
+        assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+            "path": "package.json"
+        }
 
     def test_final_chunk_recovers_buffered_post_reasoning_tool_call(self):
         post = StreamingPostProcessor(

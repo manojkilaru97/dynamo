@@ -3,7 +3,7 @@
 
 //based on: https://github.com/EricLBuehler/mistral.rs/blob/d970bb5feb863acf8e8ec90de97e18221fb959f1/mistralrs-core/src/pipeline/chat_template.rs
 
-use std::collections::HashMap;
+use std::{collections::HashMap, io};
 
 use chrono::{DateTime, Local};
 use either::Either;
@@ -122,7 +122,13 @@ pub fn tojson(value: Value, kwargs: Kwargs) -> Result<Value, Error> {
             Error::new(ErrorKind::BadSerialization, "cannot serialize to JSON").with_source(err)
         })
     } else {
-        serde_json::to_string(&value).map_err(|err| {
+        let mut buf = Vec::new();
+        let formatter = PythonDefaultJsonFormatter;
+        let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
+        value.serialize(&mut serializer).map_err(|err| {
+            Error::new(ErrorKind::BadSerialization, "cannot serialize to JSON").with_source(err)
+        })?;
+        String::from_utf8(buf).map_err(|err| {
             Error::new(ErrorKind::BadSerialization, "cannot serialize to JSON").with_source(err)
         })
     }
@@ -145,9 +151,74 @@ pub fn tojson(value: Value, kwargs: Kwargs) -> Result<Value, Error> {
     })
 }
 
+/// Match Python `json.dumps` defaults used by HuggingFace/Jinja chat templates:
+/// comma+space between items and colon+space between object keys and values.
+struct PythonDefaultJsonFormatter;
+
+impl serde_json::ser::Formatter for PythonDefaultJsonFormatter {
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if !first {
+            writer.write_all(b", ")?;
+        }
+        Ok(())
+    }
+
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if !first {
+            writer.write_all(b", ")?;
+        }
+        Ok(())
+    }
+
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        writer.write_all(b": ")
+    }
+}
+
 pub fn strftime_now(format_str: &str) -> Result<Value, Error> {
     let local: DateTime<Local> = Local::now();
     Ok(Value::from_safe_string(
         local.format(format_str).to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tojson;
+    use minijinja::{Environment, context};
+
+    #[test]
+    fn tojson_matches_python_default_spacing() {
+        let mut env = Environment::new();
+        env.add_filter("tojson", tojson);
+        env.add_template(
+            "t",
+            "{{ array | tojson }}\n{{ object | tojson }}\n{{ nested | tojson }}",
+        )
+        .unwrap();
+
+        let out = env
+            .get_template("t")
+            .unwrap()
+            .render(context! {
+                array => serde_json::json!(["Harry James Potter", "Hermione Jean Granger"]),
+                object => serde_json::json!({"a": 1, "b": 2}),
+                nested => serde_json::json!({"items": ["x", "y"]}),
+            })
+            .unwrap();
+
+        assert_eq!(
+            out,
+            "[\"Harry James Potter\", \"Hermione Jean Granger\"]\n{\"a\": 1, \"b\": 2}\n{\"items\": [\"x\", \"y\"]}"
+        );
+    }
 }

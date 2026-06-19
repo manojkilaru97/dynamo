@@ -534,6 +534,7 @@ impl OAIPromptFormatter for HfTokenizerConfigJsonFormatter {
         let ctx = context! {
             messages => messages_for_template,
             tools => tools,
+            tool_choice => req.tool_choice(),
             bos_token => self.config.bos_tok(),
             eos_token => self.config.eos_tok(),
             unk_token => self.config.unk_tok(),
@@ -1571,6 +1572,36 @@ NORMAL_MODE
         assert!(
             result.contains("TOOL_MODE"),
             "With exclude_tools=false and tool_choice=none, tools should NOT be stripped. Got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_tool_choice_is_available_to_chat_template() {
+        let template = r#"
+{%- set tools_available = tools is iterable and tools | length > 0 %}
+{%- set tool_use_enabled = tools_available and not (tool_choice is defined and tool_choice == "none") %}
+{%- if tool_use_enabled %}
+TOOL_MODE tool_choice={{ tool_choice }}
+{%- else %}
+NORMAL_MODE
+{%- endif %}"#;
+
+        let chat_template: super::tokcfg::ChatTemplate =
+            serde_json::from_value(serde_json::json!({ "chat_template": template })).unwrap();
+        let formatter = HfTokenizerConfigJsonFormatter::with_options(
+            chat_template,
+            ContextMixins::new(&[]),
+            false,
+        )
+        .unwrap();
+        let request = request_with_tool_choice("auto");
+
+        let result = formatter.render(&request).unwrap();
+
+        assert!(
+            result.contains("TOOL_MODE tool_choice=auto"),
+            "tool_choice must be visible to tool-aware templates. Got: {}",
             result
         );
     }
