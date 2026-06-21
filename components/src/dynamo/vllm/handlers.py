@@ -121,15 +121,17 @@ _GENERATE_REASONING_SUPPORT_CACHE_ATTR = "_dynamo_generate_reasoning_support"
 
 
 def _build_token_error_response(message: str) -> dict[str, Any]:
+    # newtype form: Rust FinishReason::Error(String)
     return {
-        "finish_reason": f"error: {message}",
+        "finish_reason": {"error": message},
         "token_ids": [],
     }
 
 
 def _build_prefill_error_response(message: str) -> dict[str, Any]:
+    # newtype form: Rust FinishReason::Error(String)
     return {
-        "finish_reason": f"error: {message}",
+        "finish_reason": {"error": message},
         "token_ids": [],
         "disaggregated_params": None,
         "completion_usage": None,
@@ -1329,7 +1331,7 @@ def _structured_outputs_from_openai_request(
     if isinstance(response_format, dict):
         response_type = response_format.get("type")
         if response_type == "json_object":
-            return StructuredOutputsParams(json={"type": "object"})
+            return StructuredOutputsParams(json_object=True)
         if response_type == "json_schema":
             json_schema = response_format.get("json_schema") or {}
             schema = json_schema.get("schema")
@@ -3554,13 +3556,16 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 # res is vllm's RequestOutput
 
                 if not res.outputs:
+                    # MTP/spec-decode: a non-finished step can yield no outputs
+                    # (all draft tokens rejected). Transient -> skip, not fatal.
+                    if not getattr(res, "finished", False):
+                        continue
                     self._log_with_lora_context(
                         "Request {request_id}{lora_info} returned no outputs",
                         request_id,
                         lora_request,
                     )
-                    # Use string format "error: message" for consistency with vLLM's string-based finish_reason
-                    # Rust will parse this into FinishReason::Error(message)
+                    # string form parsed by Rust into FinishReason::Error(message)
                     yield {
                         "finish_reason": "error: No outputs from vLLM engine",
                         "index": 0,
@@ -3610,6 +3615,16 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                             request_output=res,
                             embedding_sequence_length=embedding_sequence_length,
                         )
+                        for _ctx_key in (
+                            "spec_decode",
+                            "scheduler_snapshot",
+                            "request_throughput",
+                        ):
+                            _ctx_val = getattr(output, _ctx_key, None)
+                            if _ctx_val:
+                                extra_args = out.get("extra_args") or {}
+                                extra_args[_ctx_key] = _ctx_val
+                                out["extra_args"] = extra_args
                         # Log completion with LoRA info (debug level to avoid log spam)
                         self._log_with_lora_context(
                             "Completed token generation for request {request_id}{lora_info}: "

@@ -349,6 +349,10 @@ impl CommonExtProvider for UnifiedRequest {
         CommonExtProvider::get_guided_json(&self.inner)
     }
 
+    fn get_guided_json_object(&self) -> Option<bool> {
+        CommonExtProvider::get_guided_json_object(&self.inner)
+    }
+
     fn get_guided_regex(&self) -> Option<String> {
         self.inner.common.guided_regex.clone()
     }
@@ -493,6 +497,10 @@ impl OAIChatLikeRequest for UnifiedRequest {
 
     fn chat_template_args(&self) -> Option<&HashMap<String, serde_json::Value>> {
         self.inner.chat_template_args.as_ref()
+    }
+
+    fn uses_pure_json_structured_output(&self) -> bool {
+        self.inner.uses_pure_json_structured_output()
     }
 
     fn media_io_kwargs(&self) -> Option<&MediaDecoder> {

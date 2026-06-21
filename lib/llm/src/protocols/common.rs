@@ -42,7 +42,7 @@ pub trait OutputOptionsProvider {
     fn extract_output_options(&self) -> Result<OutputOptions>;
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
     #[serde(rename = "eos")]
     EoS,
@@ -61,6 +61,58 @@ pub enum FinishReason {
 
     #[serde(rename = "content_filter")]
     ContentFilter,
+}
+
+// Lenient deserialize: worker emits finish_reason as a bare string
+// ("stop", "error: msg") or the tagged map form ({"error": "msg"}).
+// Never reject; an unrecognized value degrades to Stop so one bad chunk
+// can't 500 the whole stream.
+impl<'de> Deserialize<'de> for FinishReason {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(s) => match s.as_str() {
+                "eos" => Ok(FinishReason::EoS),
+                "length" => Ok(FinishReason::Length),
+                "stop" => Ok(FinishReason::Stop),
+                "cancelled" | "abort" => Ok(FinishReason::Cancelled),
+                "content_filter" => Ok(FinishReason::ContentFilter),
+                other if other.starts_with("error") => {
+                    let msg = other
+                        .strip_prefix("error: ")
+                        .or_else(|| other.strip_prefix("error:"))
+                        .unwrap_or("")
+                        .to_string();
+                    Ok(FinishReason::Error(msg))
+                }
+                _ => Ok(FinishReason::Stop),
+            },
+            serde_json::Value::Object(map) => {
+                let err = map.get("error").or_else(|| map.get("Error"));
+                if let Some(v) = err {
+                    Ok(FinishReason::Error(
+                        v.as_str().unwrap_or_default().to_string(),
+                    ))
+                } else if map.contains_key("eos") {
+                    Ok(FinishReason::EoS)
+                } else if map.contains_key("length") {
+                    Ok(FinishReason::Length)
+                } else if map.contains_key("stop") {
+                    Ok(FinishReason::Stop)
+                } else if map.contains_key("cancelled") || map.contains_key("abort") {
+                    Ok(FinishReason::Cancelled)
+                } else if map.contains_key("content_filter") {
+                    Ok(FinishReason::ContentFilter)
+                } else {
+                    Ok(FinishReason::Stop)
+                }
+            }
+            _ => Ok(FinishReason::Stop),
+        }
+    }
 }
 
 impl std::fmt::Display for FinishReason {
@@ -347,12 +399,17 @@ pub struct SamplingOptions {
 
 /// Guided Decoding Options
 ///
-/// Only one of `json`, `regex`, `choice`, `grammar`, or `structural_tag` should be set.
+/// Only one of `json`, `json_object`, `regex`, `choice`, `grammar`, or `structural_tag`
+/// should be set.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct GuidedDecodingOptions {
     /// If specified, the output will follow the JSON schema. Can be a string, an object, or null.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json: Option<serde_json::Value>,
+
+    /// If true, the output will be a free-form JSON object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json_object: Option<bool>,
 
     /// If specified, the output will follow the regex pattern. Can be a string or null.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -391,6 +448,7 @@ impl GuidedDecodingOptions {
     ) -> Self {
         Self {
             json,
+            json_object: None,
             regex,
             choice,
             grammar,
@@ -444,8 +502,33 @@ impl GuidedDecodingOptions {
         backend: Option<String>,
         whitespace_pattern: Option<String>,
     ) -> Result<Option<Self>> {
+        Self::from_optional_with_json_object_and_structural_tag(
+            json,
+            None,
+            regex,
+            choice,
+            grammar,
+            structural_tag,
+            backend,
+            whitespace_pattern,
+        )
+    }
+
+    /// Construct only if one field is Some, including json_object and structural tag (fallible).
+    pub fn from_optional_with_json_object_and_structural_tag(
+        json: Option<serde_json::Value>,
+        json_object: Option<bool>,
+        regex: Option<String>,
+        choice: Option<Vec<String>>,
+        grammar: Option<String>,
+        structural_tag: Option<serde_json::Value>,
+        backend: Option<String>,
+        whitespace_pattern: Option<String>,
+    ) -> Result<Option<Self>> {
         let is_empty_choice = choice.as_ref().is_none_or(|v| v.is_empty());
+        let has_json_object = json_object.unwrap_or(false);
         if json.is_none()
+            && !has_json_object
             && regex.is_none()
             && is_empty_choice
             && grammar.is_none()
@@ -455,6 +538,7 @@ impl GuidedDecodingOptions {
             return Ok(None);
         }
         let mut instance = Self::new(json, regex, choice, grammar, backend, whitespace_pattern);
+        instance.json_object = json_object;
         instance.structural_tag = structural_tag;
         instance.validate()?;
         Ok(Some(instance))
@@ -465,6 +549,7 @@ impl GuidedDecodingOptions {
     pub fn validate(&self) -> Result<()> {
         let count = [
             self.json.is_some(),
+            self.json_object.unwrap_or(false),
             self.regex.is_some(),
             self.choice.as_ref().is_some_and(|v| !v.is_empty()),
             self.grammar.is_some(),
@@ -477,7 +562,7 @@ impl GuidedDecodingOptions {
 
         if count > 1 {
             return Err(anyhow::anyhow!(
-                "Only one of json, regex, choice, grammar, structural_tag, or whitespace_pattern can be set, but multiple are specified: {:?}",
+                "Only one of json, json_object, regex, choice, grammar, structural_tag, or whitespace_pattern can be set, but multiple are specified: {:?}",
                 self
             ));
         }
@@ -786,6 +871,23 @@ mod tests {
         assert_eq!(opts.backend, backend);
         assert!(opts.whitespace_pattern.is_none());
 
+        // Only json_object set
+        let opts = GuidedDecodingOptions::from_optional_with_json_object_and_structural_tag(
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(opts.is_ok());
+        let opts = opts.unwrap().unwrap();
+        assert_eq!(opts.json_object, Some(true));
+        assert!(opts.json.is_none());
+        assert!(opts.regex.is_none());
+
         // Only regex set
         let regex = Some(r"\d+".to_string());
         let opts = GuidedDecodingOptions::validated(None, regex.clone(), None, None, None, None);
@@ -841,6 +943,18 @@ mod tests {
         let opts = GuidedDecodingOptions::validated(
             Some(serde_json::json!({})),
             Some(r"\d+".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(opts.is_err());
+
+        let opts = GuidedDecodingOptions::from_optional_with_json_object_and_structural_tag(
+            Some(serde_json::json!({})),
+            Some(true),
+            None,
+            None,
             None,
             None,
             None,

@@ -94,6 +94,10 @@ pub trait OAIChatLikeRequest {
         None
     }
 
+    fn uses_pure_json_structured_output(&self) -> bool {
+        false
+    }
+
     /// Returns the type of input for the prompt. Default is Text.
     fn prompt_input_type(&self) -> PromptInput {
         PromptInput::Text(TextInput::Single(String::new()))

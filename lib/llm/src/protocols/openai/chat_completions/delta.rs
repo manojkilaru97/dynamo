@@ -186,6 +186,14 @@ impl DeltaGenerator {
         self.tracker.clone()
     }
 
+    pub fn set_structured_json_guard(&mut self, enabled: bool) {
+        self.options.structured_json_guard = enabled;
+        if !enabled {
+            self.structured_json_buffers.clear();
+            self.structured_json_completed.clear();
+        }
+    }
+
     /// Updates the prompt token usage count.
     ///
     /// # Arguments
@@ -389,7 +397,7 @@ impl DeltaGenerator {
     }
 }
 
-fn first_complete_json_value(input: &str) -> Option<String> {
+pub(crate) fn first_complete_json_value(input: &str) -> Option<String> {
     let trimmed = input.trim_start();
     if trimmed.is_empty() {
         return None;
@@ -519,6 +527,23 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
                     "Injected token_ids into chat completion nvext: {} tokens",
                     tokens.len()
                 );
+            }
+        }
+
+        // Per-request context telemetry rides nvext (ungated) for audit logging.
+        for ctx_key in ["spec_decode", "scheduler_snapshot", "request_throughput"] {
+            if let Some(ctx) = delta
+                .extra_args
+                .as_ref()
+                .and_then(|e| e.get(ctx_key))
+                .cloned()
+            {
+                let nvext_val = stream_response
+                    .nvext
+                    .get_or_insert_with(|| serde_json::json!({}));
+                if let Some(obj) = nvext_val.as_object_mut() {
+                    obj.insert(ctx_key.to_string(), ctx);
+                }
             }
         }
 

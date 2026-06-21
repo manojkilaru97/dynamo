@@ -202,6 +202,18 @@ impl CommonExtProvider for NvCreateCompletionRequest {
         })
     }
 
+    fn get_guided_json_object(&self) -> Option<bool> {
+        if self.common.guided_json.is_some() {
+            return None;
+        }
+
+        self.common
+            .structured_outputs
+            .as_ref()
+            .and_then(|structured| structured.json_object)
+            .filter(|value| *value)
+    }
+
     fn get_guided_regex(&self) -> Option<String> {
         self.common.guided_regex.clone().or_else(|| {
             self.common

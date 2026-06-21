@@ -486,6 +486,19 @@ impl DeltaAggregator {
             }
         }
 
+        // Repair a duplicate opening brace leaked at the reasoning->answer
+        // boundary under speculative decoding (guided output + thinking). Only
+        // rewrites content that is invalid JSON made valid by dropping a stray
+        // leading brace; airtight, off the streaming hot path (non-stream only).
+        for choice in self.choices.values_mut() {
+            if !choice.text.is_empty()
+                && let Some(repaired) =
+                    dynamo_parsers::reasoning::repair_boundary_brace_leak(&choice.text)
+            {
+                choice.text = repaired;
+            }
+        }
+
         // Extract aggregated choices and sort them by index.
         let mut choices: Vec<_> = self
             .choices
