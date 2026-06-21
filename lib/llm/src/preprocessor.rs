@@ -177,6 +177,130 @@ struct ReasoningState {
     guided_json_bypass_decision: Option<bool>,
 }
 
+fn first_complete_repaired_boundary_json(input: &str) -> Option<String> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+
+    const MAX_STRUCTURAL_PREFIX: usize = 8;
+    const MAX_PARTIAL_KEY_PREFIX: usize = 32;
+    for (i, c) in trimmed.char_indices() {
+        if c != '{' || i == 0 {
+            continue;
+        }
+        if i > MAX_PARTIAL_KEY_PREFIX {
+            break;
+        }
+        let prefix = &trimmed[..i];
+        let structural_prefix = prefix
+            .chars()
+            .all(|c| matches!(c, '{' | '}' | '"' | ',' | ' ' | '\t' | '\n' | '\r'));
+        if (structural_prefix && i > MAX_STRUCTURAL_PREFIX)
+            || (!structural_prefix && !is_partial_object_key_prefix(prefix))
+        {
+            break;
+        }
+        if let Some(json) = first_complete_json_value(&trimmed[i..]) {
+            return Some(json);
+        }
+    }
+
+    dynamo_parsers::reasoning::repair_boundary_brace_leak(input)
+}
+
+fn is_partial_object_key_prefix(prefix: &str) -> bool {
+    const MAX_PARTIAL_KEY_PREFIX: usize = 32;
+    if prefix.len() > MAX_PARTIAL_KEY_PREFIX {
+        return false;
+    }
+
+    let Some(rest) = prefix.strip_prefix('{') else {
+        return false;
+    };
+    let rest = rest.trim_start().strip_prefix('"').unwrap_or(rest);
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' '))
+}
+
+fn parse_first_json_object_key(input: &str) -> Option<String> {
+    let after_open = input.trim_start().strip_prefix('{')?.trim_start();
+    let (key, literal_len) = parse_json_string_literal(after_open)?;
+    if after_open[literal_len..].trim_start().starts_with(':') {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+fn parse_json_string_literal(input: &str) -> Option<(String, usize)> {
+    if !input.starts_with('"') {
+        return None;
+    }
+
+    let mut escaped = false;
+    for (idx, ch) in input.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '"' => {
+                let end = idx + ch.len_utf8();
+                let key = serde_json::from_str::<String>(&input[..end]).ok()?;
+                return Some((key, end));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn complete_json_object(candidate: String) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&candidate)
+        .ok()
+        .filter(|value| value.is_object())
+        .map(|_| candidate)
+}
+
+fn repair_escaped_object_key_boundary_leak(input: &str) -> Option<String> {
+    let key = parse_first_json_object_key(input)?;
+    let unescaped_key = key.replace("\\\"", "\"");
+
+    for key in [key.as_str(), unescaped_key.as_str()] {
+        let base = if key.starts_with('{') {
+            key.to_string()
+        } else if key.starts_with('"') {
+            format!("{{{key}")
+        } else {
+            format!("{{\"{key}")
+        };
+
+        if let Some(repaired) =
+            complete_json_object(base.clone()).or_else(|| complete_json_object(format!("{base}}}")))
+        {
+            return Some(repaired);
+        }
+    }
+
+    None
+}
+
+fn first_complete_structured_json_content(input: &str) -> Option<String> {
+    first_complete_repaired_boundary_json(input)
+        .or_else(|| repair_escaped_object_key_boundary_leak(input))
+        .or_else(|| first_complete_json_value(input))
+}
+
+fn finalize_structured_json_content(buffered: String) -> String {
+    first_complete_structured_json_content(&buffered).unwrap_or(buffered)
+}
+
 /// Per-image routing payload accumulated by `gather_multi_modal_data` and
 /// consumed by `gather_mm_exact_routing_info`.
 #[derive(Debug, Clone, Copy)]
@@ -2132,6 +2256,28 @@ impl OpenAIPreprocessor {
                 None
             };
 
+        (
+            should_parse_reasoning,
+            should_strip_disabled_reasoning_start,
+        )
+    }
+
+    pub fn postprocessor_parsing_stream<S>(
+        &self,
+        stream: S,
+        request: &NvCreateChatCompletionRequest,
+        prompt_injected_reasoning: bool,
+    ) -> anyhow::Result<
+        impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    >
+    where
+        S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    {
+        let (should_parse_reasoning, should_strip_disabled_reasoning_start) =
+            self.reasoning_stream_modes(request);
+        let structured_json_guard_after_reasoning =
+            should_parse_reasoning && request.uses_pure_json_structured_output();
+
         // Reasoning Content Parsing Transformation Step
         // Current Solution:
         // This step operates on Deltas created by the transform_postprocessor_stream function
@@ -2165,6 +2311,13 @@ impl OpenAIPreprocessor {
             ))
         } else {
             Box::pin(stream)
+        };
+
+        let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if structured_json_guard_after_reasoning
+        {
+            Box::pin(Self::guard_structured_json_content_from_stream(stream))
+        } else {
+            stream
         };
 
         // Check if tools are present and if we should apply jail
@@ -2257,6 +2410,7 @@ impl OpenAIPreprocessor {
             finish_reason_sent: bool,
             usage_chunk_sent: bool,
             finished: bool,
+            pending_response: Option<Annotated<Resp>>,
             trace_tokens_enabled: bool,
             trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
         }
@@ -2270,6 +2424,7 @@ impl OpenAIPreprocessor {
             finish_reason_sent: false,
             usage_chunk_sent: false,
             finished: false,
+            pending_response: None,
             trace_tokens_enabled,
             trace_finish_reason_metadata,
         };
@@ -2278,6 +2433,10 @@ impl OpenAIPreprocessor {
 
         stream::unfold(state, |mut inner| {
             async move {
+                if let Some(response) = inner.pending_response.take() {
+                    return Some((response, inner));
+                }
+
                 // If already finished, return None immediately
                 if inner.finished {
                     return None;
@@ -2293,10 +2452,6 @@ impl OpenAIPreprocessor {
                     );
 
                     if inner.cancelled {
-                        tracing::debug!(
-                            request_id = inner.context.id(),
-                            "Cancellation issued last message; closing stream"
-                        );
                         // inner.finished = true; // Mark as finished
                         return None;
                     }
@@ -2411,6 +2566,13 @@ impl OpenAIPreprocessor {
                     // Mark if we've seen a finish_reason
                     if has_finish_reason {
                         inner.finish_reason_sent = true;
+                        if !inner.usage_chunk_sent {
+                            inner.usage_chunk_sent = true;
+                            inner.pending_response = Some(Self::create_usage_annotation(
+                                inner.response_generator.as_ref(),
+                                inner.trace_tokens_enabled,
+                            ));
+                        }
                     }
 
                     tracing::trace!(
@@ -2514,6 +2676,83 @@ impl OpenAIPreprocessor {
             }
         })
         .fuse()
+    }
+
+    fn create_usage_annotation<Resp>(
+        response_generator: &dyn DeltaGeneratorExt<Resp>,
+        trace_tokens_enabled: bool,
+    ) -> Annotated<Resp>
+    where
+        Resp: Send + 'static + std::fmt::Debug,
+    {
+        let usage = response_generator.get_usage();
+        let tracker = response_generator.tracker();
+        let cached_tokens = usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens.map(|c| c as usize));
+        let prefill_worker_id = tracker.as_ref().and_then(|t| t.prefill_worker_id());
+        let prefill_dp_rank = tracker.as_ref().and_then(|t| t.prefill_dp_rank());
+        let prefill_worker_type = tracker
+            .as_ref()
+            .and_then(|t| t.prefill_worker_type())
+            .map(String::from);
+        let decode_worker_id = tracker.as_ref().and_then(|t| t.decode_worker_id());
+        let decode_dp_rank = tracker.as_ref().and_then(|t| t.decode_dp_rank());
+        let decode_worker_type = tracker
+            .as_ref()
+            .and_then(|t| t.decode_worker_type())
+            .map(String::from);
+        let llm_metrics = LLMMetricAnnotation {
+            input_tokens: usage.prompt_tokens as usize,
+            output_tokens: usage.completion_tokens as usize,
+            chunk_tokens: 0,
+            cached_tokens,
+            prefill_worker_id,
+            prefill_dp_rank,
+            prefill_worker_type,
+            decode_worker_id,
+            decode_dp_rank,
+            decode_worker_type,
+            tokenize_latency: tracker.as_ref().and_then(|t| t.tokenize_latency()),
+            detokenize_total_latency: tracker.as_ref().and_then(|t| t.detokenize_total_latency()),
+            detokenize_count: tracker.as_ref().map(|t| t.detokenize_count()),
+        };
+        if trace_tokens_enabled {
+            crate::agents::trace::record_llm_metric_tokens(
+                tracker.as_deref(),
+                Some(usage.prompt_tokens as usize),
+                usage.completion_tokens as usize,
+                cached_tokens,
+            );
+        }
+
+        // Flush final detokenize totals.
+        if let Some(t) = tracker.as_ref() {
+            if let Some(total) = t.detokenize_total_latency() {
+                DETOKENIZE_TOTAL_US.inc_by(total.as_micros() as f64);
+            }
+            DETOKENIZE_TOKEN_COUNT.inc_by(t.detokenize_count() as f64);
+        }
+
+        let annotation = llm_metrics.to_annotation::<()>().unwrap_or_else(|e| {
+            tracing::warn!("Failed to serialize metrics: {}", e);
+            Annotated::<()>::from_data(())
+        });
+
+        let data = if response_generator.is_usage_enabled() {
+            Some(response_generator.create_usage_chunk())
+        } else {
+            None
+        };
+
+        Annotated::<Resp> {
+            id: None,
+            data,
+            event: Some(ANNOTATION_LLM_METRICS.to_string()),
+            comment: annotation.comment,
+            error: None,
+        }
     }
 
     /// Transform engine embedding output stream to OpenAI embedding response stream
@@ -2940,6 +3179,21 @@ impl OpenAIPreprocessor {
         }
     }
 
+    fn reasoning_engine_initial_state(
+        reasoning_parser: &str,
+        chat_template_args: Option<&std::collections::HashMap<String, serde_json::Value>>,
+        prompt_injected_reasoning: bool,
+        uses_pure_json_structured_output: bool,
+    ) -> Option<bool> {
+        if Self::is_reasoning_disabled_by_request(Some(reasoning_parser), chat_template_args) {
+            Some(true)
+        } else if prompt_injected_reasoning || uses_pure_json_structured_output {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     fn attach_reasoning_engine_extra_args<R: OAIChatLikeRequest>(
         &self,
         common_request: &mut PreprocessedRequest,
@@ -2953,12 +3207,15 @@ impl OpenAIPreprocessor {
         let chat_template_args = request.chat_template_args();
         let mut updates = serde_json::Map::new();
 
-        if Self::is_reasoning_disabled_by_request(Some(reasoning_parser), chat_template_args) {
-            updates.insert("reasoning_ended".to_string(), serde_json::Value::Bool(true));
-        } else if prompt_injected_reasoning {
+        if let Some(reasoning_ended) = Self::reasoning_engine_initial_state(
+            reasoning_parser,
+            chat_template_args,
+            prompt_injected_reasoning,
+            request.uses_pure_json_structured_output(),
+        ) {
             updates.insert(
                 "reasoning_ended".to_string(),
-                serde_json::Value::Bool(false),
+                serde_json::Value::Bool(reasoning_ended),
             );
         }
 
@@ -3147,6 +3404,71 @@ impl OpenAIPreprocessor {
             } else {
                 None
             }
+        })
+        .fuse()
+    }
+
+    fn guard_structured_json_content_from_stream<S>(
+        stream: S,
+    ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
+    where
+        S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    {
+        struct StructuredJsonGuardState {
+            stream:
+                Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>,
+            choices: HashMap<u32, StructuredJsonChoiceState>,
+        }
+
+        let state = StructuredJsonGuardState {
+            stream: Box::pin(stream),
+            choices: HashMap::new(),
+        };
+
+        stream::unfold(state, |mut state| async move {
+            let mut response = state.stream.next().await?;
+
+            if let Some(mut data) = response.data.take() {
+                for choice in data.inner.choices.iter_mut() {
+                    let choice_state = state.choices.entry(choice.index).or_default();
+                    let mut content = match choice.delta.content.take() {
+                        Some(ChatCompletionMessageContent::Text(text)) => Some(text),
+                        other => {
+                            choice.delta.content = other;
+                            None
+                        }
+                    };
+
+                    if choice_state.completed {
+                        content = None;
+                    } else if let Some(text) = content {
+                        choice_state.buffer.push_str(&text);
+                        if let Some(json) =
+                            first_complete_structured_json_content(&choice_state.buffer)
+                        {
+                            choice_state.completed = true;
+                            choice_state.buffer.clear();
+                            content = Some(json);
+                        } else if choice.finish_reason.is_some() && !choice_state.buffer.is_empty()
+                        {
+                            let buffered = std::mem::take(&mut choice_state.buffer);
+                            content = Some(finalize_structured_json_content(buffered));
+                            choice_state.completed = true;
+                        } else {
+                            content = None;
+                        }
+                    } else if choice.finish_reason.is_some() && !choice_state.buffer.is_empty() {
+                        let buffered = std::mem::take(&mut choice_state.buffer);
+                        content = Some(finalize_structured_json_content(buffered));
+                        choice_state.completed = true;
+                    }
+
+                    choice.delta.content = content.map(ChatCompletionMessageContent::Text);
+                }
+                response.data = Some(data);
+            }
+
+            Some((response, state))
         })
         .fuse()
     }
@@ -3384,6 +3706,12 @@ impl
 
         // Attach the timing tracker to the request so downstream components can record metrics
         common_request.tracker = tracker;
+
+        let structured_json_guard_after_reasoning =
+            request.uses_pure_json_structured_output() && self.reasoning_stream_modes(&request).0;
+        if structured_json_guard_after_reasoning {
+            response_generator.set_structured_json_guard(false);
+        }
 
         let mut response_generator = Box::new(response_generator);
 
@@ -3687,6 +4015,107 @@ mod strip_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::{StreamExt, stream};
+    use std::collections::HashMap;
+
+    fn structured_json_guard_delta(
+        text: &str,
+        finish_reason: Option<dynamo_protocols::types::FinishReason>,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        let delta = dynamo_protocols::types::ChatCompletionStreamResponseDelta {
+            content: Some(ChatCompletionMessageContent::Text(text.to_string())),
+            function_call: None,
+            tool_calls: None,
+            role: Some(dynamo_protocols::types::Role::Assistant),
+            refusal: None,
+            reasoning_content: None,
+        };
+        let choice = dynamo_protocols::types::ChatChoiceStream {
+            index: 0,
+            delta,
+            finish_reason,
+            logprobs: None,
+        };
+        let data = NvCreateChatCompletionStreamResponse {
+            inner: dynamo_protocols::types::CreateChatCompletionStreamResponse {
+                id: "test_id".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 0,
+                model: "test-model".to_string(),
+                system_fingerprint: None,
+                choices: vec![choice],
+                usage: None,
+                service_tier: None,
+            },
+            nvext: None,
+        };
+
+        Annotated {
+            id: Some("test_id".to_string()),
+            data: Some(data),
+            event: None,
+            comment: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn structured_json_thinking_starts_with_reasoning_unfinished() {
+        let mut args = HashMap::new();
+        args.insert("enable_thinking".to_string(), serde_json::json!(true));
+
+        assert_eq!(
+            OpenAIPreprocessor::reasoning_engine_initial_state(
+                "nemotron_v3",
+                Some(&args),
+                false,
+                true,
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn structured_json_disabled_thinking_starts_with_reasoning_finished() {
+        let mut args = HashMap::new();
+        args.insert("enable_thinking".to_string(), serde_json::json!(false));
+
+        assert_eq!(
+            OpenAIPreprocessor::reasoning_engine_initial_state(
+                "nemotron_v3",
+                Some(&args),
+                false,
+                true,
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn unconstrained_non_injected_reasoning_state_is_inferred_by_engine() {
+        let mut args = HashMap::new();
+        args.insert("enable_thinking".to_string(), serde_json::json!(true));
+
+        assert_eq!(
+            OpenAIPreprocessor::reasoning_engine_initial_state(
+                "nemotron_v3",
+                Some(&args),
+                false,
+                false,
+            ),
+            None
+        );
+    }
+
+    fn first_choice_text(
+        response: Annotated<NvCreateChatCompletionStreamResponse>,
+    ) -> Option<String> {
+        let data = response.data?;
+        match data.inner.choices.first()?.delta.content.as_ref()? {
+            ChatCompletionMessageContent::Text(text) => Some(text.clone()),
+            ChatCompletionMessageContent::Parts(_) => None,
+        }
+    }
 
     #[test]
     fn routing_priorities_keep_strict_tier_independent() {
@@ -3701,6 +4130,89 @@ mod tests {
             (Some(0.0), Some(7), Some(-3))
         );
         assert_eq!(routing_priorities(None), (None, None, None));
+    }
+
+    #[test]
+    fn structured_json_content_repairs_boundary_prefix() {
+        assert_eq!(
+            first_complete_structured_json_content(r#"{"{"a":1} trailing"#).as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+    }
+
+    #[test]
+    fn structured_json_content_repairs_escaped_object_key() {
+        assert_eq!(
+            first_complete_structured_json_content(r#"{"a\":1}":""}"#).as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+        assert_eq!(
+            first_complete_structured_json_content(r#"{"\"a\":1}":""}"#).as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+        assert_eq!(
+            first_complete_structured_json_content(r#"{"a\\\":1}":""}"#).as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+        assert_eq!(
+            first_complete_structured_json_content(
+                r#"{"location\":\"Boston\",\"temperature\":22,\"conditions\":\"sunny\",\"unit\":\"celsius\",\"readings\":[{\"t\":20,\"ts\":\"2025-09-24T08:00:00Z\"},{\"t\":22,\"ts\":\"2025-09-24T12:00:00Z\"},{\"t\":21,\"ts\":\"2025-09-24T16:00:00Z\"}]}":null}"#
+            )
+            .as_deref(),
+            Some(
+                r#"{"location":"Boston","temperature":22,"conditions":"sunny","unit":"celsius","readings":[{"t":20,"ts":"2025-09-24T08:00:00Z"},{"t":22,"ts":"2025-09-24T12:00:00Z"},{"t":21,"ts":"2025-09-24T16:00:00Z"}]}"#
+            )
+        );
+        assert_eq!(
+            first_complete_structured_json_content(
+                r#"{"location\":\"Boston\",\"temperature\":2,\"conditions\":\"cloudy\",\"unit\":\"celsius\",\"readings\":[{\"t\":1,\"ts\":\"2025-09-24T12:00:00Z\"},{\"t\":2,\"ts\":\"2025-09-24T15:00:00Z\"},{\"t\":0,\"ts\":\"2025-09-24T18:00:00Z\"}]}": ""}"#
+            )
+            .as_deref(),
+            Some(
+                r#"{"location":"Boston","temperature":2,"conditions":"cloudy","unit":"celsius","readings":[{"t":1,"ts":"2025-09-24T12:00:00Z"},{"t":2,"ts":"2025-09-24T15:00:00Z"},{"t":0,"ts":"2025-09-24T18:00:00Z"}]}"#
+            )
+        );
+        assert_eq!(
+            first_complete_structured_json_content(
+                r#"{"location\":\"Boston\",\"temperature\":23,\"conditions\":\"cloudy\",\"unit\":\"celsius\",\"readings\":[{\"t\":22,\"ts\":\"2025-09-24T12:00:00Z\"},{\"t\":23,\"ts\":\"2025-09-24T15:00:00Z\"},{\"t\":21,\"ts\":\"2025-09-24T18:00:00Z\"}]}": "Boston"}"#
+            )
+            .as_deref(),
+            Some(
+                r#"{"location":"Boston","temperature":23,"conditions":"cloudy","unit":"celsius","readings":[{"t":22,"ts":"2025-09-24T12:00:00Z"},{"t":23,"ts":"2025-09-24T15:00:00Z"},{"t":21,"ts":"2025-09-24T18:00:00Z"}]}"#
+            )
+        );
+        assert_eq!(
+            first_complete_structured_json_content(
+                r#"{"location\":\"Boston\",\"temperature\":15,\"conditions\":\"cloudy\",\"unit\":\"celsius\",\"readings\":[{\"t\":14,\"ts\":\"2025-09-26T08:00:00Z\"},{\"t\":15,\"ts\":\"2025-09-26T11:00:00Z\"},{\"t\":16,\"ts\":\"2025-09-26T14:00:00Z\"}]}": {"temperature": 15, "conditions": "cloudy"}}"#
+            )
+            .as_deref(),
+            Some(
+                r#"{"location":"Boston","temperature":15,"conditions":"cloudy","unit":"celsius","readings":[{"t":14,"ts":"2025-09-26T08:00:00Z"},{"t":15,"ts":"2025-09-26T11:00:00Z"},{"t":16,"ts":"2025-09-26T14:00:00Z"}]}"#
+            )
+        );
+    }
+
+    #[test]
+    fn structured_json_content_repairs_partial_key_prefix() {
+        assert_eq!(
+            first_complete_structured_json_content(r#"{"partial{"a":1}"#).as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_json_guard_repairs_escaped_key_on_finish_chunk() {
+        let input = r#"{"location\":\"Boston\",\"temperature\":23,\"conditions\":\"cloudy\",\"unit\":\"celsius\",\"readings\":[{\"t\":22,\"ts\":\"2025-09-24T12:00:00Z\"},{\"t\":23,\"ts\":\"2025-09-24T15:00:00Z\"},{\"t\":21,\"ts\":\"2025-09-24T18:00:00Z\"}]}": "Boston"}"#;
+        let expected = r#"{"location":"Boston","temperature":23,"conditions":"cloudy","unit":"celsius","readings":[{"t":22,"ts":"2025-09-24T12:00:00Z"},{"t":23,"ts":"2025-09-24T15:00:00Z"},{"t":21,"ts":"2025-09-24T18:00:00Z"}]}"#;
+        let stream = stream::iter(vec![structured_json_guard_delta(
+            input,
+            Some(dynamo_protocols::types::FinishReason::Stop),
+        )]);
+        let mut guarded =
+            Box::pin(OpenAIPreprocessor::guard_structured_json_content_from_stream(stream));
+        let response = guarded.next().await.expect("guarded response");
+
+        assert_eq!(first_choice_text(response).as_deref(), Some(expected));
     }
 
     /// PRE.1 — `skip_special_tokens` default. See `lib/llm/PREPROCESSOR_CASES.md`.

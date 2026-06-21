@@ -140,6 +140,7 @@ impl<T: OpenAISamplingOptionsProvider + CommonExtProvider> SamplingOptionsProvid
 
         let guided_decoding_backend = self.get_guided_decoding_backend();
         let guided_json = self.get_guided_json();
+        let guided_json_object = self.get_guided_json_object();
         let guided_regex = self.get_guided_regex();
         let guided_grammar = self.get_guided_grammar();
         let guided_choice = self.get_guided_choice();

@@ -26,6 +26,7 @@ pub mod tool_parser_v2;
 
 pub use aggregator::DeltaAggregator;
 pub use delta::DeltaGenerator;
+pub(crate) use delta::first_complete_json_value;
 
 use dynamo_parsers::tool_calling::{ToolCallResponse, ToolCallResponseChunk};
 use dynamo_protocols::types::{
@@ -583,9 +584,7 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
             use dynamo_protocols::types::ResponseFormat;
             match response_format {
                 ResponseFormat::Text => {}
-                ResponseFormat::JsonObject => {
-                    return Some(json_object_schema());
-                }
+                ResponseFormat::JsonObject => {}
                 ResponseFormat::JsonSchema { json_schema } => {
                     // validate_response_format ensures schema is present when type=json_schema
                     if let Some(schema) = json_schema.schema.clone() {
@@ -596,6 +595,61 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
         }
 
         None
+    }
+
+    fn get_guided_json_object(&self) -> Option<bool> {
+        if self.uses_qwen_xml_tool_structural_tag() {
+            return None;
+        }
+
+        if self.common.guided_json.is_some() {
+            return None;
+        }
+
+        let has_explicit_structural_tag = self
+            .common
+            .structured_outputs
+            .as_ref()
+            .is_some_and(|structured| structured.structural_tag.is_some());
+        if !has_explicit_structural_tag
+            && let (Some(tool_choice), Some(tools)) =
+                (self.inner.tool_choice.as_ref(), self.inner.tools.as_deref())
+            && matches!(
+                tools::get_json_schema_from_tools(
+                    Some(tool_choice),
+                    Some(tools),
+                    self.request_text_len()
+                ),
+                Ok(Some(_))
+            )
+        {
+            return None;
+        }
+
+        if self
+            .common
+            .structured_outputs
+            .as_ref()
+            .is_some_and(|structured| structured.json.is_some())
+        {
+            return None;
+        }
+
+        if self
+            .common
+            .structured_outputs
+            .as_ref()
+            .and_then(|structured| structured.json_object)
+            .unwrap_or(false)
+        {
+            return Some(true);
+        }
+
+        matches!(
+            self.inner.response_format.as_ref(),
+            Some(dynamo_protocols::types::ResponseFormat::JsonObject)
+        )
+        .then_some(true)
     }
 
     fn get_guided_structural_tag(&self) -> Option<serde_json::Value> {
@@ -998,6 +1052,18 @@ mod tests {
     }
 
     #[test]
+    fn test_response_format_json_object_is_pure_json_structured_output() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Answer as JSON"}],
+            "response_format": {"type": "json_object"}
+        }))
+        .unwrap();
+
+        assert!(request.uses_pure_json_structured_output());
+    }
+
+    #[test]
     fn test_template_thinking_alias_sets_enable_thinking() {
         let mut request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
             "model": "test-model",
@@ -1076,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn test_structured_outputs_json_object_maps_to_bounded_object_schema() {
+    fn test_structured_outputs_json_object_maps_to_json_object_flag() {
         let json_str = json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "Answer as JSON"}],
@@ -1085,11 +1151,9 @@ mod tests {
 
         let request: NvCreateChatCompletionRequest =
             serde_json::from_value(json_str).expect("Failed to deserialize request");
-        let guided = request.get_guided_json().expect("guided json");
 
-        assert_eq!(guided["type"], json!("object"));
-        assert_eq!(guided["minProperties"], json!(1));
-        assert_eq!(guided["maxProperties"], json!(64));
+        assert_eq!(request.get_guided_json(), None);
+        assert_eq!(request.get_guided_json_object(), Some(true));
     }
 
     #[test]
@@ -1524,10 +1588,7 @@ mod tests {
             let guided_json = request.get_guided_json().expect("guided json");
             assert_eq!(guided_json["type"], json!("array"));
             assert_eq!(guided_json["x-dynamo-tool-choice-schema"], json!(true));
-            assert_eq!(
-                guided_json["items"]["anyOf"].as_array().unwrap().len(),
-                2
-            );
+            assert_eq!(guided_json["items"]["anyOf"].as_array().unwrap().len(), 2);
         });
     }
 

@@ -216,7 +216,17 @@ impl OtelSink {
             AuditEventType::Response => "openai.response",
         };
 
-        let payload = self.payload_value(rec);
+        let mut payload = self.payload_value(rec);
+        // Lift per-request context telemetry from nvext to top-level payload fields.
+        if rec.event_type == AuditEventType::Response {
+            for ctx_key in ["spec_decode", "scheduler_snapshot", "request_throughput"] {
+                if let Some(ctx) = payload.get("nvext").and_then(|n| n.get(ctx_key)).cloned()
+                    && let Some(obj) = payload.as_object_mut()
+                {
+                    obj.insert(ctx_key.to_string(), ctx);
+                }
+            }
+        }
         let payload_suppressed = payload
             .get("payload_suppressed")
             .and_then(Value::as_bool)
@@ -246,6 +256,13 @@ impl OtelSink {
         }
         if rec.event_type == AuditEventType::Request {
             add_request_shape_attrs(&mut attrs, &payload);
+        }
+        for ctx_key in ["spec_decode", "scheduler_snapshot", "request_throughput"] {
+            if let Some(ctx) = payload.get(ctx_key).and_then(Value::as_object) {
+                for (k, v) in ctx {
+                    attrs.push(kv(format!("{ctx_key}.{k}"), json_to_any(v.clone())));
+                }
+            }
         }
 
         let now = unix_nanos();

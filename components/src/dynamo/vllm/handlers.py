@@ -174,15 +174,17 @@ def _rl_init_weights_timeout_s() -> float:
 
 
 def _build_token_error_response(message: str) -> dict[str, Any]:
+    # newtype form: Rust FinishReason::Error(String)
     return {
-        "finish_reason": f"error: {message}",
+        "finish_reason": {"error": message},
         "token_ids": [],
     }
 
 
 def _build_prefill_error_response(message: str) -> dict[str, Any]:
+    # newtype form: Rust FinishReason::Error(String)
     return {
-        "finish_reason": f"error: {message}",
+        "finish_reason": {"error": message},
         "token_ids": [],
         "disaggregated_params": None,
         "completion_usage": None,
@@ -1748,7 +1750,7 @@ def _structured_outputs_from_openai_request(
     if isinstance(response_format, dict):
         response_type = response_format.get("type")
         if response_type == "json_object":
-            return StructuredOutputsParams(json={"type": "object"})
+            return StructuredOutputsParams(json_object=True)
         if response_type == "json_schema":
             json_schema = response_format.get("json_schema") or {}
             schema = json_schema.get("schema")
@@ -4043,13 +4045,16 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                     )
 
                 if not res.outputs:
+                    # MTP/spec-decode: a non-finished step can yield no outputs
+                    # (all draft tokens rejected). Transient -> skip, not fatal.
+                    if not getattr(res, "finished", False):
+                        continue
                     self._log_with_lora_context(
                         "Request {request_id}{lora_info} returned no outputs",
                         request_id,
                         lora_request,
                     )
-                    # Use string format "error: message" for consistency with vLLM's string-based finish_reason
-                    # Rust will parse this into FinishReason::Error(message)
+                    # string form parsed by Rust into FinishReason::Error(message)
                     yield {
                         "finish_reason": "error: No outputs from vLLM engine",
                         "index": 0,

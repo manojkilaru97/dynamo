@@ -2001,6 +2001,11 @@ async fn chat_completions(
 
     let annotations = request.annotations();
     let frontend_stream_tool_jail = forced_tool_choice_stream_jail_config(&request);
+    let frontend_stream_include_usage = request
+        .inner
+        .stream_options
+        .as_ref()
+        .is_some_and(|opts| opts.include_usage);
     let http_audit_headers = request
         .get::<serde_json::Value>(AUDIT_HTTP_HEADERS_KEY)
         .ok();
@@ -2047,10 +2052,11 @@ async fn chat_completions(
             Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>,
         > = if let Some((tool_choice, tool_definitions)) = frontend_stream_tool_jail {
             Box::pin(
-                crate::preprocessor::OpenAIPreprocessor::apply_tool_calling_jail(
+                crate::preprocessor::OpenAIPreprocessor::apply_tool_calling_jail_with_usage_defer(
                     None,
                     Some(tool_choice),
                     Some(tool_definitions),
+                    frontend_stream_include_usage,
                     stream,
                 ),
             )

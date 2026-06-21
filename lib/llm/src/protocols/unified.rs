@@ -349,6 +349,10 @@ impl CommonExtProvider for UnifiedRequest {
         CommonExtProvider::get_guided_json(&self.inner)
     }
 
+    fn get_guided_json_object(&self) -> Option<bool> {
+        CommonExtProvider::get_guided_json_object(&self.inner)
+    }
+
     fn get_guided_regex(&self) -> Option<String> {
         self.inner.common.guided_regex.clone()
     }
