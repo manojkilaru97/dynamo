@@ -139,28 +139,31 @@ impl<T: OpenAISamplingOptionsProvider + CommonExtProvider> SamplingOptionsProvid
 
         let guided_decoding_backend = self.get_guided_decoding_backend();
         let guided_json = self.get_guided_json();
+        let guided_json_object = self.get_guided_json_object();
         let guided_regex = self.get_guided_regex();
         let guided_grammar = self.get_guided_grammar();
         let guided_choice = self.get_guided_choice();
         let guided_structural_tag = self.get_guided_structural_tag();
         let guided_whitespace_pattern = self.get_guided_whitespace_pattern();
 
-        let guided_decoding = match common::GuidedDecodingOptions::from_optional_with_structural_tag(
-            guided_json,
-            guided_regex,
-            guided_choice,
-            guided_grammar,
-            guided_structural_tag,
-            guided_decoding_backend,
-            guided_whitespace_pattern,
-        ) {
-            Ok(options) => options,
-            Err(e) => {
-                // Handle the validation error (log, return error, etc.)
-                tracing::error!("Invalid guided decoding options: {:?}", e);
-                return Err(e);
-            }
-        };
+        let guided_decoding =
+            match common::GuidedDecodingOptions::from_optional_with_json_object_and_structural_tag(
+                guided_json,
+                guided_json_object,
+                guided_regex,
+                guided_choice,
+                guided_grammar,
+                guided_structural_tag,
+                guided_decoding_backend,
+                guided_whitespace_pattern,
+            ) {
+                Ok(options) => options,
+                Err(e) => {
+                    // Handle the validation error (log, return error, etc.)
+                    tracing::error!("Invalid guided decoding options: {:?}", e);
+                    return Err(e);
+                }
+            };
 
         Ok(common::SamplingOptions {
             n,

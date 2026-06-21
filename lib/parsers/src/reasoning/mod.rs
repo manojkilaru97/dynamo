@@ -16,6 +16,100 @@ pub use gpt_oss_parser::GptOssReasoningParser;
 pub use granite_parser::GraniteReasoningParser;
 pub use minimax_append_think_parser::MiniMaxAppendThinkParser;
 
+/// Repair a stray prefix leaked at the reasoning->answer boundary under
+/// speculative decoding (e.g. `{\n{"a":1}`, `{"{"code":1}`, `{ {"a":1}`). When
+/// `</think>` plus the first answer token(s) land in one accepted spec batch,
+/// a few structural chars can leak ungrammared before the real JSON object.
+///
+/// Airtight: rewrites only when the original content is NOT valid JSON, the
+/// leaked prefix is pure structural junk (`{`, `}`, `"`, `,`, whitespace -- never
+/// letters/digits/values, so real content is never truncated) and short, AND the
+/// remainder parses as a complete valid JSON value. Returns the repaired string
+/// or None. Off the streaming hot path (non-stream aggregation only).
+pub fn repair_boundary_brace_leak(content: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    if serde_json::from_str::<serde_json::Value>(trimmed.trim_end()).is_ok() {
+        return None; // already valid; do not touch
+    }
+    const MAX_PREFIX: usize = 8; // a real leak is 1-3 tokens
+    // Try each later '{' as the true object start; first one whose tail is valid
+    // JSON and whose stripped prefix is pure structural junk wins.
+    for (i, c) in trimmed.char_indices() {
+        if c != '{' || i == 0 {
+            continue;
+        }
+        if i > MAX_PREFIX {
+            break;
+        }
+        let prefix = &trimmed[..i];
+        if !prefix
+            .chars()
+            .all(|c| matches!(c, '{' | '}' | '"' | ',' | ' ' | '\t' | '\n' | '\r'))
+        {
+            break;
+        }
+        let candidate = trimmed[i..].trim_end();
+        if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod brace_leak_tests {
+    use super::repair_boundary_brace_leak;
+
+    #[test]
+    fn repairs_leaked_prefix_variants() {
+        // brace + newline
+        assert_eq!(
+            repair_boundary_brace_leak("{\n{\"a\":1}").as_deref(),
+            Some("{\"a\":1}")
+        );
+        // brace + newline + space
+        assert_eq!(
+            repair_boundary_brace_leak("{\n {\"x\":\"y\",\"z\":1}").as_deref(),
+            Some("{\"x\":\"y\",\"z\":1}")
+        );
+        // brace + quote (observed with guided_grammar)
+        assert_eq!(
+            repair_boundary_brace_leak("{\"{\"code\":\"AB\",\"value\":123}").as_deref(),
+            Some("{\"code\":\"AB\",\"value\":123}")
+        );
+        // brace + space
+        assert_eq!(
+            repair_boundary_brace_leak("{ {\"a\":1}").as_deref(),
+            Some("{\"a\":1}")
+        );
+        // trailing whitespace tolerated
+        assert_eq!(
+            repair_boundary_brace_leak("{\n{\"a\":1}\n").as_deref(),
+            Some("{\"a\":1}")
+        );
+    }
+
+    #[test]
+    fn leaves_valid_json_untouched() {
+        assert_eq!(repair_boundary_brace_leak("{\"a\":1}"), None);
+        assert_eq!(repair_boundary_brace_leak("{\"a\":{\"b\":1}}"), None);
+        assert_eq!(repair_boundary_brace_leak("{\"a\":1}\n"), None);
+    }
+
+    #[test]
+    fn leaves_non_repairable_untouched() {
+        assert_eq!(repair_boundary_brace_leak("hello world"), None);
+        // remainder not valid JSON -> untouched
+        assert_eq!(repair_boundary_brace_leak("{ {nested} } trailing"), None);
+        assert_eq!(repair_boundary_brace_leak(""), None);
+        // prefix contains a real letter (not pure junk) -> untouched
+        assert_eq!(repair_boundary_brace_leak("{x{\"a\":1}"), None);
+    }
+}
+
 /// Kimi-K2/K2.5 tool-call section marker. Shared between the `kimi_k25` reasoning-parser
 /// registration and its test fixtures so both stay in sync. Mirrors
 /// `KimiK2ParserConfig::default().section_start` in `crate::tool_calling::config`.

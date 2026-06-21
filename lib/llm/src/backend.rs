@@ -758,7 +758,11 @@ mod tests {
             Some("<tool_call>".to_string())
         );
         assert_eq!(
-            select_output_text(false, Some("<tool_call>".to_string()), Some("x".to_string())),
+            select_output_text(
+                false,
+                Some("<tool_call>".to_string()),
+                Some("x".to_string())
+            ),
             Some("x".to_string())
         );
         assert_eq!(

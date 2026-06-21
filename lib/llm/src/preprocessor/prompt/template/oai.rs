@@ -405,6 +405,10 @@ impl OAIChatLikeRequest for NvCreateChatCompletionRequest {
         self.chat_template_args.as_ref()
     }
 
+    fn uses_pure_json_structured_output(&self) -> bool {
+        NvCreateChatCompletionRequest::uses_pure_json_structured_output(self)
+    }
+
     fn media_io_kwargs(&self) -> Option<&MediaDecoder> {
         self.media_io_kwargs.as_ref()
     }

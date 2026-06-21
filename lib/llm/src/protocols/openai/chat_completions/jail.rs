@@ -635,6 +635,48 @@ impl ChoiceJailState {
             }
             // If not unjailing, don't emit anything (still accumulating)
         }
+
+        // create_tool_call_choice drops finish_reason; the worker may also put it on a
+        // suppressed post-tool whitespace chunk. Ensure the chunk's finish_reason rides
+        // the last emission, or emit a terminal chunk if none. tool_calls -> ToolCalls.
+        // Ensure the chunk's finish_reason is not dropped. create_tool_call_choice
+        // omits it, and the worker may put it on a suppressed post-tool whitespace
+        // chunk. tool_calls -> ToolCalls.
+        if let Some(fr) = choice.finish_reason {
+            let fr = if self.emitted_tool_calls_count > 0 {
+                FinishReason::ToolCalls
+            } else {
+                fr
+            };
+            if let Some(last) = emissions.last_mut() {
+                // Auto/marker path: ride finish on the last emission. Terminal
+                // tool-choice modes emit their own finish + break, so don't double.
+                if matches!(jail_stream.jail_mode, JailMode::MarkerBased) {
+                    last.choice_mut().finish_reason = Some(fr);
+                    let keep = emissions.len() - 1;
+                    for e in emissions.iter_mut().take(keep) {
+                        e.choice_mut().finish_reason = None;
+                    }
+                }
+            } else {
+                // Finish on a suppressed chunk (no emission). Terminal modes break
+                // before here, so a terminal finish chunk is safe for any mode.
+                emissions.push(ChoiceEmission::PassThrough(ChatChoiceStream {
+                    index: choice.index,
+                    delta: ChatCompletionStreamResponseDelta {
+                        role: Some(Role::Assistant),
+                        content: None,
+                        tool_calls: None,
+                        function_call: None,
+                        refusal: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason: Some(fr),
+                    logprobs: None,
+                }));
+            }
+        }
+
         emissions
     }
 
@@ -684,10 +726,18 @@ impl ChoiceJailState {
 
             // Determine emission type
             if final_choice.delta.tool_calls.is_some() {
+                // EOF-jailed tool call: ensure terminal finish_reason=tool_calls.
+                if final_choice.finish_reason.is_none() {
+                    final_choice.finish_reason = Some(FinishReason::ToolCalls);
+                }
                 Some(ChoiceEmission::ToolCall(final_choice))
             } else if self.terminate_after_tool_call {
                 None
             } else {
+                // Preserve worker finish_reason for finalized content.
+                if final_choice.finish_reason.is_none() {
+                    final_choice.finish_reason = self.stream_finish_reason;
+                }
                 Some(ChoiceEmission::Content(final_choice))
             }
         } else {
@@ -758,6 +808,7 @@ pub struct JailedStream {
     emission_mode: EmissionMode,
     marker_matcher: MarkerMatcher,
     jail_mode: JailMode,
+    defer_terminal_until_usage: bool,
 }
 
 impl JailedStream {
@@ -802,6 +853,7 @@ impl JailedStream {
             let mut last_stream_id = String::new();
             let mut last_stream_model = String::new();
             let mut last_stream_created: u32 = 0;
+            let mut waiting_for_usage_after_terminal = false;
 
             // Pin the stream for iteration (stack pinning is more efficient)
             tokio::pin!(stream);
@@ -818,9 +870,17 @@ impl JailedStream {
                     let mut forced_terminal_indices = Vec::new();
 
                     if chat_response.inner.choices.is_empty() {
+                        let is_usage_chunk = chat_response.inner.usage.is_some();
                         // No choices processed (e.g., usage-only chunk)
                         // Pass through as-is to preserve usage and other metadata
                         yield response;
+                        if waiting_for_usage_after_terminal && is_usage_chunk {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if waiting_for_usage_after_terminal {
                         continue;
                     }
 
@@ -999,6 +1059,10 @@ impl JailedStream {
                                 comment: response.comment.clone(),
                                 error: None,
                             };
+                            if self.defer_terminal_until_usage {
+                                waiting_for_usage_after_terminal = true;
+                                continue;
+                            }
                             break;
                         }
 
@@ -1049,6 +1113,10 @@ impl JailedStream {
                             comment: response.comment.clone(),
                             error: None,
                         };
+                        if self.defer_terminal_until_usage {
+                            waiting_for_usage_after_terminal = true;
+                            continue;
+                        }
                         break;
                     }
                 } else {
@@ -1733,6 +1801,9 @@ impl JailedStream {
         stream! {
             tokio::pin!(input_stream);
             let mut has_tool_calls_per_choice: HashMap<u32, bool> = HashMap::new();
+            let mut finish_seen: HashMap<u32, bool> = HashMap::new();
+            let mut last_inner: Option<dynamo_protocols::types::CreateChatCompletionStreamResponse> = None;
+            let mut last_ann: (Option<String>, Option<String>, Option<Vec<String>>) = (None, None, None);
 
             while let Some(mut response) = input_stream.next().await {
                 // Track if any choice emitted tool calls
@@ -1772,10 +1843,54 @@ impl JailedStream {
                             }
                             // Length and ContentFilter are preserved as-is
                         }
+                        if choice.finish_reason.is_some() {
+                            finish_seen.insert(choice.index, true);
+                        }
                     }
+                    last_inner = Some(data.inner.clone());
+                    last_ann = (response.id.clone(), response.event.clone(), response.comment.clone());
                 }
 
                 yield response;
+            }
+
+            // Safety net: a choice that emitted tool calls but never a finish_reason
+            // (some MTP chunk patterns drop the terminal chunk) must still terminate
+            // with finish_reason=tool_calls. Fires only when no finish was seen, so it
+            // cannot duplicate an existing terminal chunk.
+            if let Some(mut inner) = last_inner {
+                let mut missing: Vec<u32> = Vec::new();
+                for (idx, has) in has_tool_calls_per_choice.iter() {
+                    if *has && !finish_seen.get(idx).copied().unwrap_or(false) {
+                        missing.push(*idx);
+                    }
+                }
+                if !missing.is_empty() {
+                    inner.choices = missing
+                        .into_iter()
+                        .map(|index| ChatChoiceStream {
+                            index,
+                            delta: ChatCompletionStreamResponseDelta {
+                                role: Some(Role::Assistant),
+                                content: None,
+                                tool_calls: None,
+                                function_call: None,
+                                refusal: None,
+                                reasoning_content: None,
+                            },
+                            finish_reason: Some(FinishReason::ToolCalls),
+                            logprobs: None,
+                        })
+                        .collect();
+                    inner.usage = None;
+                    yield Annotated {
+                        data: Some(NvCreateChatCompletionStreamResponse { inner, nvext: None }),
+                        id: last_ann.0,
+                        event: last_ann.1,
+                        comment: last_ann.2,
+                        error: None,
+                    };
+                }
             }
         }
     }
@@ -1792,6 +1907,7 @@ pub struct JailedStreamBuilder {
     tool_definitions: Option<Vec<dynamo_parsers::tool_calling::ToolDefinition>>,
     emission_mode: EmissionMode,
     jail_mode: JailMode,
+    defer_terminal_until_usage: bool,
 }
 
 impl JailedStreamBuilder {
@@ -1805,6 +1921,7 @@ impl JailedStreamBuilder {
             tool_definitions: None,
             emission_mode: EmissionMode::default(),
             jail_mode: JailMode::MarkerBased,
+            defer_terminal_until_usage: false,
         }
     }
 
@@ -1896,6 +2013,11 @@ impl JailedStreamBuilder {
                 terminal_after_first: false,
             },
         };
+        self
+    }
+
+    pub fn defer_terminal_until_usage(mut self, enabled: bool) -> Self {
+        self.defer_terminal_until_usage = enabled;
         self
     }
 
@@ -1994,6 +2116,7 @@ impl JailedStreamBuilder {
             emission_mode: self.emission_mode,
             marker_matcher,
             jail_mode: self.jail_mode,
+            defer_terminal_until_usage: self.defer_terminal_until_usage,
         }
     }
 }
@@ -2059,7 +2182,9 @@ mod tests {
     }
 
     #[allow(deprecated)]
-    fn finish_chunk(finish_reason: FinishReason) -> Annotated<NvCreateChatCompletionStreamResponse> {
+    fn finish_chunk(
+        finish_reason: FinishReason,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
         let choice = ChatChoiceStream {
             index: 0,
             delta: ChatCompletionStreamResponseDelta {
@@ -2083,6 +2208,37 @@ mod tests {
                     model: "test-model".to_string(),
                     choices: vec![choice],
                     usage: None,
+                    service_tier: None,
+                    system_fingerprint: None,
+                },
+                nvext: None,
+            }),
+            id: None,
+            event: None,
+            comment: None,
+            error: None,
+        }
+    }
+
+    fn usage_chunk(
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        Annotated {
+            data: Some(NvCreateChatCompletionStreamResponse {
+                inner: CreateChatCompletionStreamResponse {
+                    id: "id-42".to_string(),
+                    object: "chat.completion.chunk".to_string(),
+                    created: 0,
+                    model: "test-model".to_string(),
+                    choices: vec![],
+                    usage: Some(dynamo_protocols::types::CompletionUsage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                        prompt_tokens_details: None,
+                        completion_tokens_details: None,
+                    }),
                     service_tier: None,
                     system_fingerprint: None,
                 },
@@ -2158,6 +2314,40 @@ mod tests {
         assert_eq!(tool_calls[0].0, "get_weather");
         assert_eq!(tool_calls[0].1, "{\"location\":{\"city\":\"Paris\"}}");
         assert_eq!(collect_text_content(&responses).trim(), "");
+    }
+
+    #[tokio::test]
+    async fn test_immediate_named_tool_choice_preserves_usage_chunk() {
+        let jail = JailedStream::builder()
+            .tool_choice_named("get_weather".to_string())
+            .defer_terminal_until_usage(true)
+            .build();
+
+        let chunks = vec![
+            text_chunk("{\"location\":{\"city\":\"Paris\"}}"),
+            usage_chunk(11, 7),
+        ];
+
+        let input_stream = Box::pin(stream::iter(chunks));
+        let output_stream = jail.apply_with_finish_reason(input_stream);
+
+        let responses: Vec<_> = output_stream.collect().await;
+        let tool_calls = collect_tool_calls(&responses);
+        let usage = responses
+            .iter()
+            .filter_map(|r| r.data.as_ref())
+            .find_map(|d| d.inner.usage.as_ref())
+            .expect("usage chunk should pass through after terminal tool call");
+
+        assert_eq!(tool_calls.len(), 1, "Expected named tool call");
+        assert_eq!(usage.completion_tokens, 7);
+        assert!(
+            responses
+                .iter()
+                .flat_map(|r| r.data.iter())
+                .flat_map(|d| d.inner.choices.iter())
+                .any(|choice| choice.finish_reason == Some(FinishReason::ToolCalls))
+        );
     }
 
     #[tokio::test]
