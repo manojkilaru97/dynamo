@@ -1504,15 +1504,28 @@ async fn handler_chat_completions(
         .to_string();
     let payload_suppression = payload_suppression_from_headers(&headers);
 
-    emit_openai_request_log(
-        &request_id,
-        &raw_model,
-        "chat_completions",
-        streaming,
-        header_map_to_json(&headers),
-        payload_value.clone(),
-        &payload_suppression,
-    );
+    // Emit the request payload log OFF the hot path. Building the OTLP record
+    // (recursive JSON->AnyValue conversion of the full ~10K-token payload) is
+    // non-trivial CPU work; doing it synchronously here blocked every request
+    // before dispatch. The response log path is already spawned the same way.
+    if log_payloads_enabled() {
+        let request_id_log = request_id.clone();
+        let raw_model_log = raw_model.clone();
+        let headers_log = header_map_to_json(&headers);
+        let payload_log = payload_value.clone();
+        let payload_suppression_log = payload_suppression.clone();
+        tokio::spawn(async move {
+            emit_openai_request_log(
+                &request_id_log,
+                &raw_model_log,
+                "chat_completions",
+                streaming,
+                headers_log,
+                payload_log,
+                &payload_suppression_log,
+            );
+        });
+    }
 
     let mut request: NvCreateChatCompletionRequest = serde_json::from_value(payload_value)
         .map_err(|e| {

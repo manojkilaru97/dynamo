@@ -14,6 +14,63 @@ pub use gpt_oss_parser::GptOssReasoningParser;
 pub use granite_parser::GraniteReasoningParser;
 pub use minimax_append_think_parser::MiniMaxAppendThinkParser;
 
+/// Repair a duplicate opening brace leaked at the reasoning->answer boundary
+/// under speculative decoding (e.g. `{\n{"a":1}`). Valid JSON never starts with
+/// `{` immediately followed by `{` (object keys are strings), so this is
+/// airtight: it returns a repaired string only when the original is invalid
+/// JSON and dropping the stray leading brace yields valid JSON. Otherwise None.
+pub fn repair_boundary_brace_leak(content: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+    let mut chars = trimmed.char_indices();
+    match chars.next() {
+        Some((_, '{')) => {}
+        _ => return None,
+    }
+    let second_idx = match chars.find(|(_, c)| !c.is_whitespace()) {
+        Some((i, '{')) => i,
+        _ => return None,
+    };
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return None; // already valid; do not touch
+    }
+    let candidate = &trimmed[second_idx..];
+    if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod brace_leak_tests {
+    use super::repair_boundary_brace_leak;
+
+    #[test]
+    fn repairs_leaked_duplicate_brace() {
+        assert_eq!(
+            repair_boundary_brace_leak("{\n{\"a\":1}").as_deref(),
+            Some("{\"a\":1}")
+        );
+        assert_eq!(
+            repair_boundary_brace_leak("{\n {\"x\":\"y\",\"z\":1}").as_deref(),
+            Some("{\"x\":\"y\",\"z\":1}")
+        );
+    }
+
+    #[test]
+    fn leaves_valid_json_untouched() {
+        assert_eq!(repair_boundary_brace_leak("{\"a\":1}"), None);
+        assert_eq!(repair_boundary_brace_leak("{\"a\":{\"b\":1}}"), None);
+    }
+
+    #[test]
+    fn leaves_non_repairable_untouched() {
+        assert_eq!(repair_boundary_brace_leak("hello world"), None);
+        assert_eq!(repair_boundary_brace_leak("{ {nested} } trailing"), None);
+        assert_eq!(repair_boundary_brace_leak(""), None);
+    }
+}
+
 static REASONING_PARSER_MAP: OnceLock<HashMap<&'static str, ReasoningParserType>> = OnceLock::new();
 
 /// Initialize the global reasoning parser map

@@ -1414,8 +1414,16 @@ impl OpenAIPreprocessor {
                                                 .push_str(&boundary_reasoning);
                                             delta_reasoning.push_str(&boundary_reasoning);
                                         }
-                                        normal_text = after_boundary;
                                     }
+                                    // Always restore normal_text from the split result.
+                                    // split_content_after_reasoning_boundary returns
+                                    // (None, original_text) when there is no embedded
+                                    // </think>; previously normal_text was only reassigned
+                                    // inside the Some(..) branch, so post-reasoning content
+                                    // (tool-call markers, JSON) was silently dropped once
+                                    // reasoning_content was non-empty, triggering the
+                                    // force-nonempty-content fallback and losing tool calls.
+                                    normal_text = after_boundary;
                                 }
 
                                 choice.delta.reasoning_content = if delta_reasoning.is_empty() {

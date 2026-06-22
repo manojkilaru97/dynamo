@@ -249,35 +249,24 @@ def _drop_generate_control_extra_args(sampling_params: SamplingParams) -> None:
         extra_args.pop("enable_thinking", None)
 
 
-def _request_uses_tools(request: Dict[str, Any]) -> bool:
-    tools = request.get("tools")
-    if isinstance(tools, list) and tools:
-        return True
-
-    extra_args = request.get("extra_args")
-    if isinstance(extra_args, dict):
-        request_for_sampling = extra_args.get("request_for_sampling")
-        if isinstance(request_for_sampling, dict):
-            tools = request_for_sampling.get("tools")
-            if isinstance(tools, list) and tools:
-                return True
-
-    return False
-
-
 def _prefer_delta_outputs(
     sampling_params: SamplingParams, request: Dict[str, Any]
 ) -> None:
     """Ask vLLM to return only new output tokens/text per stream update.
 
-    Dynamo's Rust postprocessor consumes deltas. Previously the worker asked
-    vLLM for cumulative outputs, then sliced those in Python. With stream
-    interval 1 that copies a growing token/text payload every tick and can
-    backpressure the engine.
-    """
-    if _request_uses_tools(request):
-        return
+    Dynamo's Rust postprocessor (reasoning parser + tool-call jail) consumes
+    deltas. Previously the worker asked vLLM for cumulative outputs, then
+    sliced those in Python. With stream interval 1 that copies a growing
+    token/text payload every tick and can backpressure the engine.
 
+    This must apply to *all* requests, including tool/auto-tool requests. An
+    earlier patch excluded tool requests on the theory that the parser needed
+    full cumulative marker text; that is false (the jail buffers deltas and
+    reassembles markers itself). Leaving tool requests on vLLM's default
+    CUMULATIVE output made the delta-consuming postprocessor double-count text
+    and drop the post-`</think>` `<tool_call>` block, and forced the slow
+    growing-copy path onto exactly the agentic/tool requests that gate TTFT/E2E.
+    """
     try:
         sampling_params.output_kind = RequestOutputKind.DELTA
     except Exception:

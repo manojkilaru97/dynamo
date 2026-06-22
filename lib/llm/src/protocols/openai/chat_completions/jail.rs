@@ -604,12 +604,6 @@ impl JailedStream {
                             if choice.finish_reason.is_some() {
                                 choice_state.stream_finish_reason = choice.finish_reason;
                             }
-                            if let Some(reasoning_content) = &choice.delta.reasoning_content {
-                                let pending = choice_state
-                                    .pending_reasoning_content
-                                    .get_or_insert_with(String::new);
-                                pending.push_str(reasoning_content);
-                            }
                             let was_ever_jailed = !choice_state.accumulated_content.is_empty() || choice_state.is_jailed;
 
                             let should_emit = if starts_jailed
@@ -624,6 +618,9 @@ impl JailedStream {
                             }; // Always pass through if never jailed
 
                             if should_emit {
+                                // The cloned delta carries reasoning_content through, so do NOT
+                                // also stash it into pending_reasoning_content (that double-emits
+                                // reasoning: once here and again when pending is later attached).
                                 let pass_through_choice = ChatChoiceStream {
                                     index: choice.index,
                                     delta: choice.delta.clone(),
@@ -632,6 +629,13 @@ impl JailedStream {
                                     logprobs: choice.logprobs.clone(),
                                 };
                                 all_emissions.push(ChoiceEmission::PassThrough(pass_through_choice));
+                            } else if let Some(reasoning_content) = &choice.delta.reasoning_content {
+                                // Not emitting this delta (deferred while jailed). Stash reasoning
+                                // so it can be attached to a later emission instead of being lost.
+                                let pending = choice_state
+                                    .pending_reasoning_content
+                                    .get_or_insert_with(String::new);
+                                pending.push_str(reasoning_content);
                             }
                         }
                     }

@@ -1293,9 +1293,14 @@ pub fn emit_payload_log(body: &'static str, target: &'static str, fields: serde_
     }
 
     logger.emit(record);
-    if let Some(provider) = PAYLOAD_LOGGER_PROVIDER.get() {
-        let _ = provider.force_flush();
-    }
+    // NOTE: do NOT force_flush() here. PAYLOAD_LOGGER_PROVIDER is built with a
+    // batch exporter (see with_batch_exporter above), whose background processor
+    // flushes on its own schedule/size. Calling force_flush() per emit made
+    // payload logging SYNCHRONOUS on the request hot path: it blocked every
+    // request (and every non-streaming response) on an OTLP export to the
+    // collector — catastrophic when the collector is slow or absent (e.g. nothing
+    // listening on the OTLP endpoint), adding seconds of TTFT/E2E latency. The
+    // batch processor handles delivery asynchronously; records are still exported.
 }
 
 fn load_config() -> LoggingConfig {
