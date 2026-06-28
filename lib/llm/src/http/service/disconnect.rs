@@ -228,6 +228,10 @@ fn monitor_for_disconnects_with_timeout(
         // Recreating it for every token repeatedly clones a receiver and churns Notify state.
         let stopped = context.stopped();
         tokio::pin!(stopped);
+        // context.stopped() fires on NORMAL completion, not only disconnect; once
+        // stopped, drain the stream to its end so the trailing usage chunk + [DONE]
+        // aren't lost to the select! race.
+        let mut engine_stopped = false;
         loop {
             tokio::select! {
                 event = stream.next() => {
@@ -273,21 +277,11 @@ fn monitor_for_disconnects_with_timeout(
                         }
                     }
                 }
-                _ = &mut stopped => {
-                    // Mark as cancelled when context is stopped (client disconnect or timeout)
-                    inflight_guard.mark_error(ErrorType::Cancelled);
-                    // Token counts (input_tokens, output_tokens) are recorded on
-                    // the enclosing span by ResponseMetricCollector::Drop.
-                    tracing::warn!(
-                        request_id = %inflight_guard.request_id(),
-                        model = %inflight_guard.model(),
-                        endpoint = %inflight_guard.endpoint(),
-                        request_type = %inflight_guard.request_type(),
-                        error_type = "cancelled",
-                        elapsed_ms = %inflight_guard.elapsed_ms(),
-                        "request cancelled"
-                    );
-                    break;
+                // Only abort early on a true mid-stream stop. Once stopped, stop
+                // racing stream.next(): keep draining so the trailing usage chunk
+                // and [DONE] are delivered (stream.next()->None then marks ok).
+                _ = &mut stopped, if !engine_stopped => {
+                    engine_stopped = true;
                 }
                 // Circuit breaker for zombie backend workers: if the backend holds a live TCP
                 // connection but produces no output for `inactivity_timeout`, kill the engine
