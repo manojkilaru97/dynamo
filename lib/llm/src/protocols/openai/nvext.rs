@@ -27,8 +27,9 @@ const UNSET_DP_RANK_SENTINEL: u32 = u32::MAX;
 /// - `x-prefill-dp-rank` -> `prefill_dp_rank`
 /// - `x-billing-request-priority` -> `agent_hints.priority`
 ///
-/// Headers take priority over existing nvext values when present.
-/// If no headers are present, returns the original nvext unchanged.
+/// Priority is authoritative from the header ONLY: any client-supplied body
+/// priority (`agent_hints.priority`/`latency_sensitivity`) is stripped so
+/// callers cannot self-elevate. Other routing headers override nvext when present.
 pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap) -> Option<NvExt> {
     let worker_id = headers
         .get(HEADER_WORKER_INSTANCE_ID)
@@ -55,11 +56,19 @@ pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_billing_request_priority);
 
+    // Body priority is never trusted: if the client set any, we must enter to strip it.
+    let body_priority_present = nvext
+        .as_ref()
+        .and_then(|n| n.agent_hints.as_ref())
+        .map(|h| h.priority.is_some() || h.latency_sensitivity.is_some())
+        .unwrap_or(false);
+
     if worker_id.is_none()
         && prefill_id.is_none()
         && dp_rank.is_none()
         && prefill_dp_rank.is_none()
         && priority.is_none()
+        && !body_priority_present
     {
         return nvext;
     }
@@ -77,6 +86,11 @@ pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap)
     }
     if let Some(rank) = prefill_dp_rank {
         ext.prefill_dp_rank = Some(rank);
+    }
+    // Strip any client-supplied priority, then set it solely from the header.
+    if let Some(hints) = ext.agent_hints.as_mut() {
+        hints.priority = None;
+        hints.latency_sensitivity = None;
     }
     if let Some(priority) = priority {
         ext.agent_hints
@@ -716,6 +730,31 @@ mod tests {
             result.agent_hints.as_ref().and_then(|h| h.priority),
             Some(0)
         );
+    }
+
+    #[test]
+    fn test_body_priority_stripped_without_header() {
+        use axum::http::HeaderMap;
+
+        let headers = HeaderMap::new();
+        let nvext = NvExt::builder()
+            .agent_hints(AgentHints {
+                priority: Some(9),
+                latency_sensitivity: Some(1.0),
+                osl: Some(128),
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+
+        let result = apply_header_routing_overrides(Some(nvext), &headers).unwrap();
+        let hints = result.agent_hints.as_ref().unwrap();
+        assert_eq!(hints.priority, None, "body priority must not self-elevate");
+        assert_eq!(
+            hints.latency_sensitivity, None,
+            "alias must be stripped too"
+        );
+        assert_eq!(hints.osl, Some(128), "non-priority hints preserved");
     }
 
     #[test]
