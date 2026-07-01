@@ -3398,7 +3398,6 @@ weather forecasting
                     "content": {"type": "string"}
                 }
             })),
-            strict: None,
         }];
 
         let (result, _) = detect_and_parse_tool_call(input, Some("poolside_v1"), Some(&tools))
@@ -3423,7 +3422,6 @@ weather forecasting
                     "filters": {"type": "object"}
                 }
             })),
-            strict: None,
         }];
 
         let (result, _) = detect_and_parse_tool_call(input, Some("poolside_v1"), Some(&tools))
@@ -3455,7 +3453,6 @@ weather forecasting
                     "optional": {"type": "null"}
                 }
             })),
-            strict: None,
         }];
 
         let (result, content) =
@@ -3491,7 +3488,6 @@ weather forecasting
                     "content": {"type": "string"}
                 }
             })),
-            strict: None,
         }];
 
         let (result, content) =
@@ -3517,7 +3513,6 @@ weather forecasting
                     "content": {"type": "string"}
                 }
             })),
-            strict: None,
         }];
 
         let (result, content) =
@@ -3546,7 +3541,6 @@ weather forecasting
                     "optional": {"type": "null"}
                 }
             })),
-            strict: None,
         }];
 
         let (result, content) =

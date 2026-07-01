@@ -506,7 +506,6 @@ impl ToolCallConfig {
                 decode_xml_entities: false,
                 ..Default::default()
             }),
-            structural_tag_builder: None,
         }
     }
 
