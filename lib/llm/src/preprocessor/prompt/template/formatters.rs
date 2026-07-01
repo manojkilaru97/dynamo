@@ -86,6 +86,10 @@ fn remove_known_non_jinja2_tags(template: &str) -> String {
     template
         .replace("{% generation %}", "")
         .replace("{% endgeneration %}", "")
+        // Jinja whitespace control is common in tokenizer templates. The tags
+        // remain metadata-only regardless of the surrounding `-` markers.
+        .replace("{%- generation -%}", "")
+        .replace("{%- endgeneration -%}", "")
 }
 
 impl JinjaEnvironment {
@@ -256,6 +260,12 @@ mod tests {
         let template = "Start {% generation %}Part 1{% endgeneration %} middle {% generation %}Part 2{% endgeneration %}";
         let result = remove_known_non_jinja2_tags(template);
         assert_eq!(result, "Start Part 1 middle Part 2");
+    }
+
+    #[test]
+    fn test_remove_known_non_jinja2_tags_with_whitespace_control() {
+        let template = "before{%- generation -%}reply{%- endgeneration -%}after";
+        assert_eq!(remove_known_non_jinja2_tags(template), "beforereplyafter");
     }
 
     #[test]
