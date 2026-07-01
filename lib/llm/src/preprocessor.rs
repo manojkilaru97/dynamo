@@ -2247,10 +2247,8 @@ impl OpenAIPreprocessor {
                     builder = builder.tool_call_parser(parser);
                 }
             }
-            Some(ChatCompletionToolChoiceOption::Auto)
-            | Some(ChatCompletionToolChoiceOption::None)
-            | None => {
-                // Traditional marker-based jail for auto/none/unspecified
+            Some(ChatCompletionToolChoiceOption::Auto) | None => {
+                // Traditional marker-based jail for auto/unspecified.
                 if let Some(parser) = tool_call_parser {
                     if matches!(parser.as_str(), "qwen3_coder" | "nemotron_nano") {
                         builder = builder
@@ -2261,10 +2259,10 @@ impl OpenAIPreprocessor {
                     }
                     builder = builder.tool_call_parser(parser);
                 }
-                Some(ChatCompletionToolChoiceOption::None) => {
-                    // vLLM-style tool parsers are disabled when the request
-                    // explicitly says tool_choice="none".
-                }
+            }
+            Some(ChatCompletionToolChoiceOption::None) => {
+                // vLLM-style tool parsers are disabled when the request
+                // explicitly says tool_choice="none".
             }
         }
 

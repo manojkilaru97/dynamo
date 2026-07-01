@@ -659,7 +659,6 @@ fn create_choice_stream_optional_content(
     content: Option<String>,
     tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
     finish_reason: Option<FinishReason>,
-    stop_reason: Option<dynamo_protocols::types::StopReason>,
     logprobs: Option<ChatChoiceLogprobs>,
 ) -> ChatChoiceStream {
     #[allow(deprecated)]
@@ -672,10 +671,8 @@ fn create_choice_stream_optional_content(
             function_call: None,
             refusal: None,
             reasoning_content: None,
-            token_ids: Vec::new(),
         },
         finish_reason,
-        stop_reason,
         logprobs,
     }
 }
@@ -1160,7 +1157,6 @@ impl ChoiceJailState {
                 content,
                 None,
                 choice.finish_reason,
-                choice.stop_reason.clone(),
                 choice.logprobs.clone(),
             ))];
         }
@@ -1180,7 +1176,6 @@ impl ChoiceJailState {
             parsed.content,
             has_tool_calls.then_some(parsed.tool_calls),
             choice.finish_reason,
-            choice.stop_reason.clone(),
             choice.logprobs.clone(),
         );
 
@@ -1201,7 +1196,6 @@ impl ChoiceJailState {
                 Some(content),
                 None,
                 self.stream_finish_reason,
-                None,
                 None,
             );
             return Some(ChoiceEmission::Content(final_choice));
