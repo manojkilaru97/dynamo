@@ -221,4 +221,43 @@ mod tests {
             "[\"Harry James Potter\", \"Hermione Jean Granger\"]\n{\"a\": 1, \"b\": 2}\n{\"items\": [\"x\", \"y\"]}"
         );
     }
+
+    #[test]
+    fn tojson_preserves_caller_object_order() {
+        let mut env = Environment::new();
+        env.add_filter("tojson", tojson);
+        env.add_template("t", "{{ tool | tojson }}").unwrap();
+
+        // Tool definitions are prompt text. Keep the incoming JSON order so
+        // templates render the same prompt as Hugging Face/vLLM.
+        let tool: serde_json::Value = serde_json::from_str(
+            r#"{
+                "type": "function",
+                "function": {
+                    "name": "execute_sql",
+                    "description": "Run SQL",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "dialect": {"type": "string"}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let out = env
+            .get_template("t")
+            .unwrap()
+            .render(context! { tool => tool })
+            .unwrap();
+
+        assert_eq!(
+            out,
+            r#"{"type": "function", "function": {"name": "execute_sql", "description": "Run SQL", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "dialect": {"type": "string"}}, "required": ["query"]}}}"#
+        );
+    }
 }

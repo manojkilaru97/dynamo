@@ -1506,6 +1506,17 @@ async fn chat_completions(
         parsing_options.tool_names = Some(tool_names);
         parsing_options.parse_bare_json_tool_calls = true;
     }
+    // `tool_choice: "none"` keeps tools visible to the chat template when the
+    // model configuration requests that behavior, but it must never reinterpret
+    // model-emitted tool markup as OpenAI tool calls.
+    if matches!(
+        request.inner.tool_choice,
+        Some(dynamo_protocols::types::ChatCompletionToolChoiceOption::None)
+    ) {
+        parsing_options.tool_call_parser = None;
+        parsing_options.tool_names = None;
+        parsing_options.parse_bare_json_tool_calls = false;
+    }
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
