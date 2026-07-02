@@ -2338,7 +2338,10 @@ impl OpenAIPreprocessor {
     /// For deepseek_r1 / deepseek_v4: disabled when chat_template_args contains
     ///   "thinking": false or "thinking_mode": "chat" — matches the V4 formatter's
     ///   `resolve_thinking_mode` convention, so the parser and the prompt stay in sync.
-    /// For gemma4: disabled when chat_template_args contains "enable_thinking": false.
+    /// For gemma4 and poolside_v1: disabled when chat_template_args contains
+    /// "enable_thinking": false. Poolside's template ends its non-thinking
+    /// generation prompt with `</think>`, so xgrammar must start constraining
+    /// from the first generated token.
     ///   Gemma 4's chat template injects `<|think|>` only when `enable_thinking is
     ///   defined and enable_thinking` (truthy), so when callers explicitly set the
     ///   flag false the model emits no `<|channel>` markers and the parser would
@@ -2380,7 +2383,7 @@ impl OpenAIPreprocessor {
                 }
                 false
             }
-            Some("gemma4") | Some("gemma-4") => {
+            Some("gemma4") | Some("gemma-4") | Some("poolside_v1") => {
                 if let Some(enabled) =
                     crate::preprocessor::prompt::thinking_bool_from_args(chat_template_args)
                 {
@@ -3296,6 +3299,38 @@ mod tests {
                 true,
             ),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn poolside_structured_json_disabled_thinking_starts_with_reasoning_finished() {
+        let mut args = HashMap::new();
+        args.insert("enable_thinking".to_string(), serde_json::json!(false));
+
+        assert_eq!(
+            OpenAIPreprocessor::reasoning_engine_initial_state(
+                "poolside_v1",
+                Some(&args),
+                false,
+                true,
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn poolside_structured_json_enabled_thinking_starts_with_reasoning_unfinished() {
+        let mut args = HashMap::new();
+        args.insert("enable_thinking".to_string(), serde_json::json!(true));
+
+        assert_eq!(
+            OpenAIPreprocessor::reasoning_engine_initial_state(
+                "poolside_v1",
+                Some(&args),
+                false,
+                true,
+            ),
+            Some(false)
         );
     }
 
