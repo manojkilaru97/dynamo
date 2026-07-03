@@ -896,6 +896,52 @@ def test_build_sampling_params_reasoning_budget_syncs_hidden_eos_stop_ids():
     assert {7, 11}.issubset(sp.all_stop_token_ids)
 
 
+def test_build_sampling_params_keeps_hidden_model_eos_out_of_vllm_stops():
+    from dynamo.vllm.handlers import build_sampling_params
+
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {},
+        "stop_conditions": {"stop_token_ids_hidden": [11, 12]},
+        "output_options": {},
+    }
+    sp = build_sampling_params(request, default_sampling_params={})
+
+    assert 11 not in (sp.stop_token_ids or [])
+    assert 12 not in sp.all_stop_token_ids
+
+
+def test_build_sampling_params_forwards_output_skip_special_tokens():
+    from dynamo.vllm.handlers import build_sampling_params
+
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {},
+        "stop_conditions": {},
+        "output_options": {"skip_special_tokens": False},
+    }
+    sp = build_sampling_params(request, default_sampling_params={})
+
+    assert sp.skip_special_tokens is False
+
+
+def test_build_sampling_params_normalizes_greedy_sampling_after_mapping():
+    from dynamo.vllm.handlers import build_sampling_params
+
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {"temperature": 0.0, "top_k": -1, "min_p": 0.5},
+        "stop_conditions": {},
+        "output_options": {},
+    }
+    sp = build_sampling_params(request, default_sampling_params={})
+
+    assert sp.temperature == 0.0
+    assert sp.top_k == 0
+    assert sp.top_p == 1.0
+    assert sp.min_p == 0.0
+
+
 def test_build_sampling_params_openai_forwards_reasoning_budget_extra_args():
     from dynamo.vllm.handlers import build_sampling_params_openai
 
@@ -960,7 +1006,9 @@ def test_apply_reasoning_budget_derives_end_token_ids():
     handler.engine_client = SimpleNamespace(
         tokenizer=FakeTokenizer(),
         vllm_config=SimpleNamespace(
-            reasoning_config=SimpleNamespace(reasoning_end_str="</think>")
+            reasoning_config=SimpleNamespace(
+                enabled=True, reasoning_end_str="</think>"
+            )
         ),
     )
     handler.config = SimpleNamespace(engine_args=SimpleNamespace(reasoning_parser=None))
@@ -973,6 +1021,49 @@ def test_apply_reasoning_budget_derives_end_token_ids():
     assert sp.extra_args["think_end_token_id"] == 13
     assert sp.extra_args["end_token_ids"] == [13]
     assert 10 in sp.extra_args["newline_token_ids"]
+
+
+def test_apply_reasoning_budget_skips_engine_without_reasoning_config():
+    from vllm.sampling_params import SamplingParams
+
+    from dynamo.vllm.handlers import BaseWorkerHandler
+
+    class FakeHandler(BaseWorkerHandler):
+        def generate(self, request, context):
+            raise NotImplementedError
+
+    handler = object.__new__(FakeHandler)
+    handler.engine_client = SimpleNamespace(
+        vllm_config=SimpleNamespace(reasoning_config=None)
+    )
+
+    sp = SamplingParams(extra_args={"reasoning_budget": "8"})
+    sp.thinking_token_budget = 8
+    handler._apply_reasoning_budget_extra_args(sp)
+
+    assert sp.thinking_token_budget is None
+    assert sp.extra_args["reasoning_budget"] == "8"
+
+
+def test_apply_reasoning_budget_skips_inactive_reasoning_config():
+    from vllm.sampling_params import SamplingParams
+
+    from dynamo.vllm.handlers import BaseWorkerHandler
+
+    class FakeHandler(BaseWorkerHandler):
+        def generate(self, request, context):
+            raise NotImplementedError
+
+    handler = object.__new__(FakeHandler)
+    handler.engine_client = SimpleNamespace(
+        vllm_config=SimpleNamespace(reasoning_config=SimpleNamespace(enabled=False))
+    )
+
+    sp = SamplingParams(extra_args={"reasoning_budget": "8"})
+    sp.thinking_token_budget = 8
+    handler._apply_reasoning_budget_extra_args(sp)
+
+    assert sp.thinking_token_budget is None
 
 
 def _make_fake_worker_handler():
