@@ -587,10 +587,11 @@ def build_sampling_params(
             and value is not None
             and hasattr(sampling_params, "stop_token_ids")
         ):
-            sampling_params.stop_token_ids = _merge_stop_token_ids(
-                sampling_params.stop_token_ids, value
-            )
-            _sync_all_stop_token_ids(sampling_params, value)
+            # These are Dynamo's model EOS tokens, retained for frontend
+            # decoding so they are not emitted to the client. vLLM receives
+            # its model EOS configuration directly from the engine; forwarding
+            # them as request-level stops changes its OpenAI semantics.
+            continue
         # Dynamo's StopConditions uses `max_thinking_tokens`; vLLM 0.20+ exposes
         # the same concept as `thinking_token_budget` on SamplingParams and
         # enforces it via the builtin thinking-budget logits processor.
@@ -619,6 +620,10 @@ def build_sampling_params(
     # Apply output_options (logprobs, prompt_logprobs, etc.)
     output_options = request.get("output_options", {})
     if output_options:
+        skip_special_tokens = output_options.get("skip_special_tokens")
+        if skip_special_tokens is not None:
+            sampling_params.skip_special_tokens = bool(skip_special_tokens)
+
         # Handle logprobs - vLLM expects this as an integer or None
         logprobs_value = output_options.get("logprobs")
         if logprobs_value is not None and logprobs_value != "":
@@ -659,6 +664,11 @@ def build_sampling_params(
         # Ensure at least 1 token generation by default when possible
         dynamic_default = max(1, model_max_len - input_length)
         sampling_params.max_tokens = dynamic_default
+
+    # SamplingParams normalizes greedy sampling after construction. Dynamo
+    # maps structured output and sampling fields afterwards, so apply the same
+    # finalization once all request fields are present.
+    sampling_params.__post_init__()
 
     return sampling_params
 
@@ -1406,6 +1416,8 @@ def build_sampling_params_openai(
 
     _merge_sampling_extra_args(sampling_params, _reasoning_budget_extra_args(request))
 
+    sampling_params.__post_init__()
+
     return sampling_params
 
 
@@ -1984,6 +1996,19 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         if "reasoning_budget" not in extra:
             return
 
+        # vLLM rejects thinking_token_budget unless engine-level reasoning is
+        # active. Match its OpenAI frontend and ignore a request-local budget
+        # when no usable reasoning configuration exists.
+        reasoning_config = getattr(
+            getattr(self.engine_client, "vllm_config", None),
+            "reasoning_config",
+            None,
+        )
+        if reasoning_config is None or not getattr(reasoning_config, "enabled", False):
+            if hasattr(sampling_params, "thinking_token_budget"):
+                sampling_params.thinking_token_budget = None
+            return
+
         try:
             budget_int = int(extra["reasoning_budget"])
         except Exception:
@@ -2017,9 +2042,6 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 parsed_end_ids = []
 
         if not parsed_end_ids:
-            reasoning_config = getattr(
-                self.engine_client.vllm_config, "reasoning_config", None
-            )
             config_end_ids = getattr(reasoning_config, "reasoning_end_token_ids", None)
             if isinstance(config_end_ids, list):
                 try:
