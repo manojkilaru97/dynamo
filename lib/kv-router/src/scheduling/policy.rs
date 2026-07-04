@@ -134,6 +134,7 @@ mod tests {
         SchedulingRequest {
             maybe_request_id: None,
             token_seq: None,
+            block_hashes: None,
             isl_tokens,
             tier_overlap_blocks: Default::default(),
             effective_overlap_blocks,

@@ -8,7 +8,9 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::config::RouterConfigOverride;
-use crate::protocols::{DpRank, SharedCacheHits, WorkerConfigLike, WorkerId, WorkerWithDpRank};
+use crate::protocols::{
+    DpRank, LocalBlockHash, SharedCacheHits, WorkerConfigLike, WorkerId, WorkerWithDpRank,
+};
 use crate::sequences::PrefillTokenDeltas;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -61,6 +63,9 @@ pub struct SchedulingRequest {
     // Request identity and payload.
     pub maybe_request_id: Option<String>,
     pub token_seq: Option<Vec<SequenceHash>>,
+    /// Local block hashes retained only when the queue supports dequeue-time
+    /// overlap refresh; used to re-query the indexer for waited requests.
+    pub block_hashes: Option<Vec<LocalBlockHash>>,
     pub isl_tokens: usize,
     pub lora_name: Option<String>,
     pub expected_output_tokens: Option<u32>,
@@ -161,6 +166,13 @@ impl SchedulingRequest {
             .get(&worker)
             .copied()
             .unwrap_or(default_prefill_tokens)
+    }
+
+    /// Worker's active prefill backlog, excluding this request's own tokens.
+    /// `raw_prefill_tokens_for` projects backlog + full ISL, so subtract ISL.
+    pub(crate) fn active_prefill_tokens_for(&self, worker: WorkerWithDpRank) -> usize {
+        self.raw_prefill_tokens_for(worker)
+            .saturating_sub(self.isl_tokens)
     }
 
     /// Prompt-side load before applying this request's cache-hit credits.

@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use rmp_serde::{from_slice, to_vec};
 
 use crate::protocols::{
     BlockExtraInfo, BlockHashOptions, BlockMmObjectInfo, ExternalSequenceBlockHash,
-    KvCacheEventData, WorkerWithDpRank, compute_block_hash_for_seq,
+    KvCacheEventData, StorageTier, WorkerWithDpRank, compute_block_hash_for_seq,
 };
 
 use super::filter::KvCacheSpecKind;
@@ -469,6 +469,44 @@ fn test_normalizer_does_not_learn_metadata_from_remove_events() {
 }
 
 #[test]
+fn test_cpu_offload_remove_routes_to_host_pinned_tier_not_device() {
+    // Mirrors vLLM's OffloadingConnector CPU-eviction event: byte block hash,
+    // medium="CPU", no group metadata. Regression: "CPU" used to fall through
+    // to StorageTier::Device, so CPU-cache evictions were applied to the
+    // primary device index and erased live GPU block ownership.
+    let hash_bytes: Vec<u8> = (100u8..132u8).collect();
+    let expected_hash = u64::from_be_bytes(hash_bytes[24..32].try_into().unwrap());
+    let encoded = to_vec(&(
+        "BlockRemoved",
+        vec![serde_bytes::ByteBuf::from(hash_bytes)],
+        Some("CPU"),
+    ))
+    .unwrap();
+    let raw: RawKvEvent = from_slice(&encoded).expect("valid CPU offload remove event");
+
+    let mut normalizer = ZmqEventNormalizer::new(2);
+    let worker = WorkerWithDpRank::new(7, 0);
+    // Metadata-less events pass the group filter.
+    let raw = normalizer
+        .preprocess(raw, worker)
+        .expect("CPU offload remove passes group filter");
+    let placement = normalizer
+        .normalize_preprocessed(raw, 1, worker)
+        .expect("CPU offload remove converts");
+
+    assert_eq!(placement.placement.tier, StorageTier::HostPinned);
+    match placement.event.data {
+        KvCacheEventData::Removed(ref removed) => {
+            assert_eq!(
+                removed.block_hashes,
+                vec![ExternalSequenceBlockHash(expected_hash)]
+            );
+        }
+        ref other => panic!("expected Removed event, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_normalizer_ignores_non_main_attention_kind_with_group_idx_zero() {
     let raw_event: RawKvEvent = from_slice(&sequence_with_cache_spec_kind(
         TestEventKind::BlockStored,
@@ -538,4 +576,84 @@ fn test_convert_event_bigram_emits_eagle_windows() {
         }
         other => panic!("expected Stored event, got {other:?}"),
     }
+}
+
+struct CpuBlockStoredFixture<'a> {
+    block_hashes: &'a [u64],
+    token_ids: &'a [u32],
+    block_size: usize,
+    parent_block_hash: Option<u64>,
+}
+
+fn cpu_block_stored(fixture: CpuBlockStoredFixture<'_>) -> RawKvEvent {
+    RawKvEvent::BlockStored {
+        block_hashes: fixture
+            .block_hashes
+            .iter()
+            .copied()
+            .map(BlockHashValue::Unsigned)
+            .collect(),
+        parent_block_hash: fixture.parent_block_hash.map(BlockHashValue::Unsigned),
+        token_ids: fixture.token_ids.to_vec(),
+        block_size: fixture.block_size,
+        medium: Some("CPU".to_string()),
+        lora_name: None,
+        block_mm_infos: None,
+        is_eagle: None,
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+    }
+}
+
+#[test]
+fn cpu_event_with_placeholder_payload_is_dropped_safely() {
+    let raw = cpu_block_stored(CpuBlockStoredFixture {
+        block_hashes: &[201, 202, 203],
+        token_ids: &[],
+        block_size: 0,
+        parent_block_hash: None,
+    });
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let placement = convert_event(raw, 42, 16, WorkerWithDpRank::new(7, 0), &warning_count).unwrap();
+
+    assert_eq!(placement.placement.tier, StorageTier::HostPinned);
+    match placement.event.data {
+        KvCacheEventData::Stored(store_data) => {
+            assert!(store_data.parent_hash.is_none());
+            assert!(store_data.blocks.is_empty());
+        }
+        other => panic!("expected Stored event, got {other:?}"),
+    }
+    assert!(warning_count.load(Ordering::Relaxed) >= 1);
+}
+
+#[test]
+fn cpu_event_with_full_payload_is_indexable() {
+    let raw = cpu_block_stored(CpuBlockStoredFixture {
+        block_hashes: &[201, 202],
+        token_ids: &[10, 11, 12, 13, 14, 15, 16, 17],
+        block_size: 4,
+        parent_block_hash: Some(200),
+    });
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let placement = convert_event(raw, 43, 4, WorkerWithDpRank::new(7, 0), &warning_count).unwrap();
+
+    assert_eq!(placement.placement.tier, StorageTier::HostPinned);
+    match placement.event.data {
+        KvCacheEventData::Stored(store_data) => {
+            assert_eq!(store_data.parent_hash, Some(ExternalSequenceBlockHash(200)));
+            assert_eq!(store_data.blocks.len(), 2);
+            assert_eq!(
+                store_data.blocks[0].block_hash,
+                ExternalSequenceBlockHash(201)
+            );
+            assert_eq!(
+                store_data.blocks[1].block_hash,
+                ExternalSequenceBlockHash(202)
+            );
+        }
+        other => panic!("expected Stored event, got {other:?}"),
+    }
+    assert_eq!(warning_count.load(Ordering::Relaxed), 0);
 }

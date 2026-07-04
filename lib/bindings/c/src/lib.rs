@@ -592,6 +592,9 @@ fn kv_router_config_from_env() -> KvRouterConfig {
     if let Some(v) = env_f64("DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT") {
         cfg.overlap_score_credit = v;
     }
+    if let Some(v) = env_f64("DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT_DECAY") {
+        cfg.overlap_score_credit_decay = v;
+    }
     if let Some(v) = env_f64("DYN_ROUTER_PREFILL_LOAD_SCALE") {
         cfg.prefill_load_scale = v;
     }
