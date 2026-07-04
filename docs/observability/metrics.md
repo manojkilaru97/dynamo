@@ -388,6 +388,8 @@ All metrics carry the standard hierarchy labels (`dynamo_namespace`, `dynamo_com
 | `dynamo_component_router_input_sequence_tokens` | Histogram | Input sequence length (tokens) |
 | `dynamo_component_router_output_sequence_tokens` | Histogram | Output sequence length (tokens) |
 | `dynamo_component_router_kv_hit_rate` | Histogram | Predicted KV cache hit rate at routing time (0.0-1.0) |
+| `dynamo_component_router_kv_max_available_hit_rate` | Histogram | Maximum predicted KV cache hit rate among eligible workers (0.0-1.0) |
+| `dynamo_component_router_kv_selection_efficiency` | Histogram | Selected overlap divided by maximum eligible overlap; observed when reusable overlap exists (0.0-1.0) |
 
 #### Per-Request Routing Overhead (`dynamo_router_overhead_*`)
 

@@ -196,6 +196,12 @@ pub mod frontend_service {
     /// Predicted KV cache hit rate at routing time (0.0-1.0)
     pub const KV_HIT_RATE: &str = "kv_hit_rate";
 
+    /// Maximum predicted KV cache hit rate among eligible workers (0.0-1.0)
+    pub const KV_MAX_AVAILABLE_HIT_RATE: &str = "kv_max_available_hit_rate";
+
+    /// Selected overlap divided by maximum eligible overlap (0.0-1.0)
+    pub const KV_SELECTION_EFFICIENCY: &str = "kv_selection_efficiency";
+
     /// Upper-bound estimation of KV cache transfer latency in disaggregated serving (seconds)
     pub const KV_TRANSFER_ESTIMATED_LATENCY_SECONDS: &str = "kv_transfer_estimated_latency_seconds";
 

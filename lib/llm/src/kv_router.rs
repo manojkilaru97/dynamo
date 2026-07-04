@@ -105,6 +105,22 @@ struct CacheHitEstimates {
     cached_tokens: HashMap<WorkerWithDpRank, usize>,
 }
 
+fn max_eligible_overlap_blocks(
+    estimates: &CacheHitEstimates,
+    pinned_worker: Option<WorkerWithDpRank>,
+    allowed_worker_ids: Option<&HashSet<WorkerId>>,
+) -> f64 {
+    estimates
+        .effective_overlap_blocks
+        .iter()
+        .filter(|(worker, _)| {
+            pinned_worker.is_none_or(|pinned| **worker == pinned)
+                && allowed_worker_ids.is_none_or(|ids| ids.contains(&worker.worker_id))
+        })
+        .map(|(_, overlap)| *overlap)
+        .fold(0.0, f64::max)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BestMatchDetails {
     pub worker: WorkerWithDpRank,
@@ -553,6 +569,11 @@ where
 
         let tier_overlap_blocks = tier_overlap_blocks_from_tiered_matches(&tiered_matches);
         let cache_hit_estimates = self.cache_hit_estimates_from_tiered_matches(&tiered_matches);
+        let max_available_overlap_blocks = max_eligible_overlap_blocks(
+            &cache_hit_estimates,
+            pinned_worker,
+            allowed_worker_ids.as_ref(),
+        );
         let find_matches_elapsed = start.elapsed();
 
         // Capture shared cache info for metrics before moving into schedule().
@@ -599,6 +620,21 @@ where
                 find_matches_elapsed,
                 total_elapsed,
             );
+        }
+
+        if let Some(m) = metrics::RouterRequestMetrics::get() {
+            let request_blocks = isl_tokens.div_ceil(self.block_size as usize);
+            if request_blocks > 0 {
+                m.kv_max_available_hit_rate.observe(
+                    (max_available_overlap_blocks / request_blocks as f64).clamp(0.0, 1.0),
+                );
+            }
+            if max_available_overlap_blocks > 0.0 {
+                m.kv_selection_efficiency.observe(
+                    (response.effective_overlap_blocks / max_available_overlap_blocks)
+                        .clamp(0.0, 1.0),
+                );
+            }
         }
 
         // Observe per-request shared cache metrics.
@@ -998,6 +1034,30 @@ mod tests {
             Some(&0.75)
         );
         assert_eq!(estimates.cached_tokens.get(&worker_2), Some(&12));
+    }
+
+    #[test]
+    fn max_eligible_overlap_respects_worker_constraints() {
+        let worker_1 = WorkerWithDpRank::new(1, 0);
+        let worker_2 = WorkerWithDpRank::new(2, 0);
+        let estimates = CacheHitEstimates {
+            effective_overlap_blocks: HashMap::from([(worker_1, 3.0), (worker_2, 7.0)]),
+            cached_tokens: HashMap::new(),
+        };
+
+        assert_eq!(max_eligible_overlap_blocks(&estimates, None, None), 7.0);
+        assert_eq!(
+            max_eligible_overlap_blocks(
+                &estimates,
+                None,
+                Some(&HashSet::from([worker_1.worker_id])),
+            ),
+            3.0
+        );
+        assert_eq!(
+            max_eligible_overlap_blocks(&estimates, Some(worker_1), None),
+            3.0
+        );
     }
 
     struct FakeSharedCache {
