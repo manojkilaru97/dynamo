@@ -61,7 +61,10 @@ pub use sticky_sessions::StickySessionRouter;
 use crate::{
     discovery::RuntimeConfigWatch,
     kv_router::{
-        scheduler::{DefaultWorkerSelector, KvScheduler, PotentialLoad},
+        scheduler::{
+            DefaultWorkerSelector, KvScheduler, OverlapScoresRefresh, PotentialLoad,
+            RefreshedOverlap,
+        },
         sequence::{SequenceError, SequenceRequest},
     },
     local_model::runtime_config::ModelRuntimeConfig,
@@ -250,6 +253,63 @@ fn tier_overlap_blocks_from_tiered_matches(
     tier_overlap_blocks
 }
 
+/// Re-queries the indexer to refresh stale overlap scores for requests that have been
+/// waiting in the scheduler queue. Wired into the scheduler's
+/// [`OverlapScoresRefresh`] slot at router startup.
+///
+/// `Remote` and `None` indexer variants intentionally don't get a refresher: remote
+/// indexer queries are too expensive to repeat per request, and `None` has nothing to query.
+struct KvRouterOverlapRefresher {
+    indexer: Indexer,
+    kv_router_config: KvRouterConfig,
+    block_size: u32,
+}
+
+impl KvRouterOverlapRefresher {
+    fn for_indexer(
+        indexer: Indexer,
+        kv_router_config: KvRouterConfig,
+        block_size: u32,
+    ) -> Option<Self> {
+        match &indexer {
+            Indexer::KvIndexer { .. } | Indexer::Concurrent { .. } => Some(Self {
+                indexer,
+                kv_router_config,
+                block_size,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[async_trait]
+impl OverlapScoresRefresh for KvRouterOverlapRefresher {
+    async fn refresh(&self, block_hashes: &[LocalBlockHash]) -> Option<RefreshedOverlap> {
+        let tiered = match self
+            .indexer
+            .find_matches_by_tier(block_hashes.to_vec())
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = ?e, "overlap refresh: find_matches_by_tier failed");
+                return None;
+            }
+        };
+        let tier_overlap_blocks = tier_overlap_blocks_from_tiered_matches(&tiered);
+        let estimates = cache_hit_estimates_from_tiered_matches(
+            &self.kv_router_config,
+            self.block_size,
+            &tiered,
+        );
+        Some(RefreshedOverlap {
+            tier_overlap_blocks,
+            effective_overlap_blocks: estimates.effective_overlap_blocks,
+            effective_cached_tokens: estimates.cached_tokens,
+        })
+    }
+}
+
 /// Generates a dp_rank-specific endpoint name for the worker KV indexer query service.
 /// Each dp_rank has its own LocalKvIndexer and query endpoint to ensure per-dp_rank monotonicity.
 pub fn worker_kv_indexer_query_endpoint(dp_rank: DpRank) -> String {
@@ -365,6 +425,13 @@ where
                 })?;
         }
 
+        let overlap_scores_refresh = KvRouterOverlapRefresher::for_indexer(
+            indexer.clone(),
+            kv_router_config.clone(),
+            block_size,
+        )
+        .map(|refresher| Arc::new(refresher) as Arc<dyn OverlapScoresRefresh>);
+
         let scheduler = KvScheduler::start(
             component.clone(),
             block_size,
@@ -373,6 +440,7 @@ where
             &kv_router_config,
             prefill_load_estimator.clone(),
             worker_type,
+            overlap_scores_refresh,
         )
         .await?;
 
@@ -519,6 +587,12 @@ where
         });
         let seq_hash_elapsed = start.elapsed();
 
+        // Retain hashes only when the queue can use them for dequeue-time overlap refresh.
+        let block_hashes_for_refresh = self
+            .scheduler
+            .supports_overlap_refresh()
+            .then(|| block_hashes.clone());
+
         // Query indexer (tiered) and shared cache in parallel when shared cache is configured.
         // Time each independently so metrics can separate indexer vs shared cache latency.
         let (tiered_matches, shared_cache_hits, indexer_duration, shared_cache_duration) =
@@ -584,10 +658,11 @@ where
 
         let response = self
             .scheduler
-            .schedule(
+            .schedule_with_block_hashes(
                 context_id.map(|s| s.to_string()),
                 isl_tokens,
                 maybe_seq_hashes,
+                block_hashes_for_refresh,
                 tier_overlap_blocks,
                 cache_hit_estimates.effective_overlap_blocks,
                 cache_hit_estimates.cached_tokens,

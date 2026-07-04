@@ -159,6 +159,7 @@ impl PendingRequest {
         SchedulingRequest {
             maybe_request_id: Some(self.request_id()),
             token_seq: self.token_seq.clone(),
+            block_hashes: None,
             isl_tokens: self.isl_tokens,
             tier_overlap_blocks: TierOverlapBlocks::default(),
             effective_overlap_blocks,

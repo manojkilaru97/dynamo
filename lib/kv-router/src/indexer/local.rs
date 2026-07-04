@@ -213,6 +213,9 @@ pub struct LocalKvIndexer {
     /// This stays separate from `event_buffer` so dump wait/build state can be
     /// managed on the async path without holding the buffer lock across `.await`.
     recovery_cache: Arc<RecoverySnapshotCache>,
+    /// Shared metrics handle, also wired into lazily created lower-tier
+    /// indexers so HostPinned/Disk/External traffic is counted too.
+    metrics: Arc<KvIndexerMetrics>,
     /// Maximum number of events to keep in buffer
     max_buffer_size: usize, // Router sets this to WORKER_KV_INDEXER_BUFFER_SIZE
     #[cfg(test)]
@@ -230,7 +233,8 @@ impl LocalKvIndexer {
         max_buffer_size: usize,
     ) -> Self {
         Self {
-            indexer: KvIndexer::new(token, kv_block_size, metrics),
+            indexer: KvIndexer::new(token, kv_block_size, metrics.clone()),
+            metrics,
             lower_tier_indexers: Arc::new(Mutex::new(HashMap::new())),
             event_buffer: Mutex::new(VecDeque::with_capacity(max_buffer_size)),
             recovery_cache: Arc::new(RecoverySnapshotCache::new()),
@@ -669,10 +673,11 @@ impl LocalKvIndexer {
         indexers
             .entry(storage_tier)
             .or_insert_with(|| {
-                Arc::new(ThreadPoolIndexer::new(
+                Arc::new(ThreadPoolIndexer::new_with_metrics(
                     LowerTierIndexer::new(),
                     1,
                     self.block_size(),
+                    Some(self.metrics.clone()),
                 ))
             })
             .clone()
@@ -783,8 +788,9 @@ mod tests {
     use super::LocalKvIndexer;
     use crate::indexer::{KvIndexerInterface, KvIndexerMetrics, LowerTierContinuation};
     use crate::protocols::{
-        ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheStoreData,
-        KvCacheStoredBlockData, LocalBlockHash, RouterEvent, StorageTier, WorkerWithDpRank,
+        ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheRemoveData,
+        KvCacheStoreData, KvCacheStoredBlockData, LocalBlockHash, RouterEvent, StorageTier,
+        WorkerWithDpRank,
     };
 
     fn lower_tier_store_event(
@@ -932,6 +938,75 @@ mod tests {
         assert_eq!(
             lower_tier_hits(&indexer, StorageTier::Disk, 19, 0, 1000, 31),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn lower_tier_remove_does_not_erase_device_ownership() {
+        // Regression for the CPU-offload eviction path: a worker's device
+        // index entry must survive a remove for the same external hash that
+        // arrives on a non-device tier (vLLM OffloadingConnector CPU LRU churn).
+        let indexer = LocalKvIndexer::new(
+            CancellationToken::new(),
+            4,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
+            16,
+        );
+
+        indexer
+            .apply_event_with_buffer(RouterEvent::new(
+                7,
+                KvCacheEvent {
+                    event_id: 1,
+                    data: KvCacheEventData::Stored(KvCacheStoreData {
+                        parent_hash: None,
+                        start_position: None,
+                        blocks: vec![KvCacheStoredBlockData {
+                            block_hash: ExternalSequenceBlockHash(101),
+                            tokens_hash: LocalBlockHash(11),
+                            mm_extra_info: None,
+                        }],
+                    }),
+                    dp_rank: 0,
+                },
+            ))
+            .await
+            .unwrap();
+        let _ = indexer.flush().await;
+
+        let overlap = indexer
+            .find_matches(vec![LocalBlockHash(11)])
+            .await
+            .unwrap();
+        assert_eq!(
+            overlap.scores.get(&WorkerWithDpRank::new(7, 0)).copied(),
+            Some(1)
+        );
+
+        indexer
+            .apply_event_with_buffer(RouterEvent::with_storage_tier(
+                7,
+                KvCacheEvent {
+                    event_id: 2,
+                    data: KvCacheEventData::Removed(KvCacheRemoveData {
+                        block_hashes: vec![ExternalSequenceBlockHash(101)],
+                    }),
+                    dp_rank: 0,
+                },
+                StorageTier::HostPinned,
+            ))
+            .await
+            .unwrap();
+        let _ = indexer.flush().await;
+
+        let overlap = indexer
+            .find_matches(vec![LocalBlockHash(11)])
+            .await
+            .unwrap();
+        assert_eq!(
+            overlap.scores.get(&WorkerWithDpRank::new(7, 0)).copied(),
+            Some(1),
+            "host-pinned remove must not touch the device index"
         );
     }
 

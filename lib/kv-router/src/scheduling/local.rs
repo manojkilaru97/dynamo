@@ -10,6 +10,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use super::overlap_refresh::OverlapScoresRefresh;
 use super::policy::{RouterSchedulingPolicy, SchedulingPolicy};
 use super::prefill_load::PrefillLoadEstimator;
 use super::queue::SchedulerQueue;
@@ -17,7 +18,7 @@ use super::selector::{DefaultWorkerSelector, WorkerSelector};
 use super::types::{
     KvSchedulerError, PotentialLoad, SchedulingRequest, SchedulingResponse, TierOverlapBlocks,
 };
-use crate::protocols::{WorkerConfigLike, WorkerId, WorkerWithDpRank};
+use crate::protocols::{LocalBlockHash, WorkerConfigLike, WorkerId, WorkerWithDpRank};
 use crate::sequences::{
     ActiveSequencesMultiWorker, PrefillTokenDeltas, SequenceError, SequencePublisher,
     SequenceRequest,
@@ -74,6 +75,45 @@ where
         worker_type: &'static str,
         monitor_worker_configs: bool,
     ) -> Self {
+        Self::new_with_overlap_refresh(
+            slots,
+            workers_with_configs,
+            threshold_frac,
+            max_pending_per_worker,
+            max_queue_wait,
+            block_size,
+            selector,
+            policy,
+            prefill_load_estimator,
+            recheck_interval,
+            track_prefill_tokens_default,
+            cancellation_token,
+            worker_type,
+            monitor_worker_configs,
+            None,
+        )
+    }
+
+    /// Like [`Self::new`], additionally wiring an [`OverlapScoresRefresh`] into the
+    /// queue so long-waiting requests are re-scored at dequeue time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_overlap_refresh(
+        slots: Arc<ActiveSequencesMultiWorker<P>>,
+        workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
+        threshold_frac: Option<f64>,
+        max_pending_per_worker: Option<usize>,
+        max_queue_wait: Option<Duration>,
+        block_size: u32,
+        selector: Sel,
+        policy: S,
+        prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
+        recheck_interval: Duration,
+        track_prefill_tokens_default: bool,
+        cancellation_token: CancellationToken,
+        worker_type: &'static str,
+        monitor_worker_configs: bool,
+        overlap_scores_refresh: Option<Arc<dyn OverlapScoresRefresh>>,
+    ) -> Self {
         if monitor_worker_configs {
             let slots_monitor = Arc::clone(&slots);
             let mut monitor_rx = workers_with_configs.clone();
@@ -108,17 +148,20 @@ where
             });
         }
 
-        let queue = Arc::new(SchedulerQueue::new(
-            Arc::clone(&slots),
-            workers_with_configs,
-            threshold_frac,
-            max_pending_per_worker,
-            max_queue_wait,
-            block_size,
-            selector,
-            policy,
-            prefill_load_estimator,
-        ));
+        let queue = Arc::new(
+            SchedulerQueue::new(
+                Arc::clone(&slots),
+                workers_with_configs,
+                threshold_frac,
+                max_pending_per_worker,
+                max_queue_wait,
+                block_size,
+                selector,
+                policy,
+                prefill_load_estimator,
+            )
+            .with_overlap_refresh(overlap_scores_refresh),
+        );
         let (queue_updates, _) = watch::channel(());
         let queue_remote_updates = Arc::clone(&queue);
         let queue_periodic_updates = Arc::clone(&queue);
@@ -191,6 +234,51 @@ where
         allowed_worker_ids: Option<HashSet<WorkerId>>,
         shared_cache_hits: Option<crate::SharedCacheHits>,
     ) -> Result<SchedulingResponse, KvSchedulerError> {
+        self.schedule_with_block_hashes(
+            maybe_request_id,
+            isl_tokens,
+            token_seq,
+            None,
+            tier_overlap_blocks,
+            effective_overlap_blocks,
+            effective_cached_tokens,
+            router_config_override,
+            update_states,
+            lora_name,
+            priority_jump,
+            expected_output_tokens,
+            pinned_worker,
+            allowed_worker_ids,
+            shared_cache_hits,
+        )
+        .await
+    }
+
+    pub fn supports_overlap_refresh(&self) -> bool {
+        self.queue.supports_overlap_refresh()
+    }
+
+    /// Like [`Self::schedule`], additionally retaining the request's local block
+    /// hashes so the queue can re-score overlap at dequeue time.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn schedule_with_block_hashes(
+        &self,
+        maybe_request_id: Option<String>,
+        isl_tokens: usize,
+        token_seq: Option<Vec<SequenceHash>>,
+        block_hashes: Option<Vec<LocalBlockHash>>,
+        tier_overlap_blocks: TierOverlapBlocks,
+        effective_overlap_blocks: HashMap<WorkerWithDpRank, f64>,
+        effective_cached_tokens: HashMap<WorkerWithDpRank, usize>,
+        router_config_override: Option<&super::config::RouterConfigOverride>,
+        update_states: bool,
+        lora_name: Option<String>,
+        priority_jump: f64,
+        expected_output_tokens: Option<u32>,
+        pinned_worker: Option<WorkerWithDpRank>,
+        allowed_worker_ids: Option<HashSet<WorkerId>>,
+        shared_cache_hits: Option<crate::SharedCacheHits>,
+    ) -> Result<SchedulingResponse, KvSchedulerError> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let track_prefill_tokens = router_config_override
             .and_then(|cfg| cfg.track_prefill_tokens)
@@ -198,6 +286,7 @@ where
         let request = SchedulingRequest {
             maybe_request_id,
             token_seq,
+            block_hashes,
             isl_tokens,
             tier_overlap_blocks,
             effective_overlap_blocks,

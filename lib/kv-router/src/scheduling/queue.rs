@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant};
 
+use super::overlap_refresh::{OverlapScoresRefresh, read_overlap_refresh_after, refresh_overlap};
 use super::policy::{FcfsPolicy, SchedulingPolicy};
 use super::prefill_load::PrefillLoadEstimator;
 use super::selector::{DefaultWorkerSelector, WorkerSelector};
@@ -80,6 +81,10 @@ pub struct SchedulerQueue<
     selector: Sel,
     policy: S,
     prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
+    /// Re-queries overlap for requests that waited in the queue; None disables refresh.
+    overlap_refresher: Option<Arc<dyn OverlapScoresRefresh>>,
+    /// Minimum queue wait before a dequeued request is re-scored.
+    overlap_refresh_after: Option<Duration>,
 }
 
 impl<
@@ -127,7 +132,49 @@ impl<
             selector,
             policy,
             prefill_load_estimator,
+            overlap_refresher: None,
+            overlap_refresh_after: None,
         }
+    }
+
+    /// Enable dequeue-time overlap refresh for requests that waited at least
+    /// `DYN_ROUTER_OVERLAP_REFRESH_AFTER_SECS` (default 10s; `0` disables).
+    pub fn with_overlap_refresh(
+        mut self,
+        refresher: Option<Arc<dyn OverlapScoresRefresh>>,
+    ) -> Self {
+        self.overlap_refresh_after = if refresher.is_some() {
+            let configured = read_overlap_refresh_after();
+            match configured {
+                Some(d) => tracing::info!(
+                    "Router queue overlap-score refresh enabled after {:.1}s wait",
+                    d.as_secs_f64()
+                ),
+                None => tracing::info!(
+                    "Router queue overlap-score refresh disabled via DYN_ROUTER_OVERLAP_REFRESH_AFTER_SECS"
+                ),
+            }
+            configured
+        } else {
+            None
+        };
+        self.overlap_refresher = refresher;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_overlap_refresh_for_test(
+        mut self,
+        refresher: Arc<dyn OverlapScoresRefresh>,
+        refresh_after: Duration,
+    ) -> Self {
+        self.overlap_refresher = Some(refresher);
+        self.overlap_refresh_after = Some(refresh_after);
+        self
+    }
+
+    pub fn supports_overlap_refresh(&self) -> bool {
+        self.overlap_refresher.is_some() && self.overlap_refresh_after.is_some()
     }
 
     /// Register externally-provided workers in the slot tracker.
@@ -269,7 +316,22 @@ impl<
                 continue;
             }
             tracing::debug!("scheduling request from pending queue");
-            self.admit_one(entry.request, decay_now).await;
+            let mut request = entry.request;
+            if let Some(refreshed) = refresh_overlap(
+                self.overlap_refresher.as_deref(),
+                self.overlap_refresh_after,
+                request.block_hashes.as_deref(),
+                entry.enqueued_at,
+                decay_now,
+            )
+            .await
+            {
+                tracing::debug!("refreshed overlap scores for queued request at dequeue");
+                request.tier_overlap_blocks = refreshed.tier_overlap_blocks;
+                request.effective_overlap_blocks = refreshed.effective_overlap_blocks;
+                request.effective_cached_tokens = refreshed.effective_cached_tokens;
+            }
+            self.admit_one(request, decay_now).await;
         }
     }
 
@@ -802,6 +864,7 @@ mod tests {
         let req = SchedulingRequest {
             maybe_request_id: Some(request_id.to_string()),
             token_seq: None,
+            block_hashes: None,
             isl_tokens,
             tier_overlap_blocks: Default::default(),
             effective_overlap_blocks: HashMap::new(),
@@ -820,6 +883,150 @@ mod tests {
             resp_tx: Some(tx),
         };
         (req, rx)
+    }
+
+    /// Gate-8 queued-owner churn regression: a request whose overlap snapshot
+    /// went stale while parked must be re-scored at dequeue. Without a
+    /// refresher the scheduler picks the stale owner A; with one it must pick
+    /// the new live owner B and report B's full overlap.
+    #[tokio::test]
+    async fn test_queued_request_overlap_refreshes_at_dequeue() {
+        use crate::scheduling::overlap_refresh::{OverlapScoresRefresh, RefreshedOverlap};
+        use async_trait::async_trait;
+        use std::sync::atomic::AtomicUsize;
+
+        struct SwitchableRefresher {
+            refreshed: StdMutex<Option<RefreshedOverlap>>,
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl OverlapScoresRefresh for SwitchableRefresher {
+            async fn refresh(
+                &self,
+                _block_hashes: &[crate::protocols::LocalBlockHash],
+            ) -> Option<RefreshedOverlap> {
+                self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+                self.refreshed.lock().unwrap().clone()
+            }
+        }
+
+        let block_size = 16u32;
+        let isl = 160usize; // 10 blocks
+        let worker_a = WorkerWithDpRank::from_worker_id(0);
+        let worker_b = WorkerWithDpRank::from_worker_id(1);
+
+        let run_case = |refresher: Option<Arc<SwitchableRefresher>>| async move {
+            let dp_range: HashMap<u64, (u32, u32)> = (0..2u64).map(|id| (id, (0, 1))).collect();
+            let slots = Arc::new(ActiveSequencesMultiWorker::new(
+                NoopSequencePublisher,
+                block_size as usize,
+                dp_range,
+                false,
+                0,
+                "test",
+            ));
+            let mut configs: HashMap<u64, SimpleWorkerConfig> = HashMap::new();
+            for id in 0..2u64 {
+                configs.insert(
+                    id,
+                    SimpleWorkerConfig {
+                        max_num_batched_tokens: Some(isl as u64),
+                        ..Default::default()
+                    },
+                );
+            }
+            let (_cfg_tx, cfg_rx) = watch::channel(configs);
+            let queue = SchedulerQueue::new(
+                Arc::clone(&slots),
+                cfg_rx,
+                Some(0.0),
+                None,
+                None,
+                block_size,
+                DefaultWorkerSelector::new(None, "test"),
+                FcfsPolicy,
+                None,
+            );
+            let queue = match &refresher {
+                Some(r) => Arc::new(queue.with_overlap_refresh_for_test(
+                    Arc::clone(r) as Arc<dyn OverlapScoresRefresh>,
+                    Duration::ZERO,
+                )),
+                None => Arc::new(queue),
+            };
+
+            // Occupy both workers so the probe request parks in the queue.
+            let mut occupier_rx = Vec::new();
+            for i in 0..2 {
+                let (req, rx) = make_request(&format!("occupier-{i}"), isl);
+                queue.enqueue(req).await;
+                occupier_rx.push(rx);
+            }
+            for rx in &mut occupier_rx {
+                rx.try_recv()
+                    .expect("occupier admitted")
+                    .expect("occupier scheduled");
+            }
+
+            // Enqueue probe C with enqueue-time overlap A=8, B=2 blocks.
+            let (mut probe, probe_rx) = make_request("probe", isl);
+            probe.block_hashes = Some(vec![crate::protocols::LocalBlockHash(42)]);
+            probe.effective_overlap_blocks =
+                HashMap::from([(worker_a, 8.0), (worker_b, 2.0)]);
+            probe.effective_cached_tokens = HashMap::from([
+                (worker_a, 8 * block_size as usize),
+                (worker_b, 2 * block_size as usize),
+            ]);
+            queue.enqueue(probe).await;
+            assert_eq!(queue.pending_count(), 1, "probe must park while busy");
+
+            // While C waits, ownership churns: A drops to 1, B rises to 9.
+            if let Some(r) = &refresher {
+                *r.refreshed.lock().unwrap() = Some(RefreshedOverlap {
+                    tier_overlap_blocks: Default::default(),
+                    effective_overlap_blocks: HashMap::from([
+                        (worker_a, 1.0),
+                        (worker_b, 9.0),
+                    ]),
+                    effective_cached_tokens: HashMap::from([
+                        (worker_a, block_size as usize),
+                        (worker_b, 9 * block_size as usize),
+                    ]),
+                });
+            }
+
+            // Release capacity and drain the queue.
+            for i in 0..2 {
+                slots
+                    .mark_prefill_completed(&format!("occupier-{i}"), decay_now())
+                    .unwrap();
+                slots.free(&format!("occupier-{i}"), decay_now()).unwrap();
+            }
+            queue.update().await;
+
+            probe_rx.await.expect("probe response").expect("probe scheduled")
+        };
+
+        // Without refresh: dispatch uses the stale snapshot and picks old owner A.
+        let stale = run_case(None).await;
+        assert_eq!(stale.best_worker, worker_a, "stale snapshot selects A");
+        assert_eq!(stale.effective_overlap_blocks, 8.0);
+
+        // With refresh: dequeue re-scores and picks the new live owner B.
+        let refresher = Arc::new(SwitchableRefresher {
+            refreshed: StdMutex::new(None),
+            calls: AtomicUsize::new(0),
+        });
+        let fresh = run_case(Some(Arc::clone(&refresher))).await;
+        assert_eq!(fresh.best_worker, worker_b, "refreshed overlap selects B");
+        assert_eq!(fresh.effective_overlap_blocks, 9.0);
+        assert_eq!(
+            fresh.cached_tokens,
+            9 * block_size as usize,
+            "cached tokens must come from the refreshed estimate"
+        );
+        assert_eq!(refresher.calls.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1268,6 +1475,7 @@ mod tests {
         let req = SchedulingRequest {
             maybe_request_id: Some("filter-0".to_string()),
             token_seq: None,
+            block_hashes: None,
             isl_tokens: isl,
             tier_overlap_blocks: Default::default(),
             effective_overlap_blocks: HashMap::new(),
