@@ -349,7 +349,8 @@ if [ "$DEVICE" = "cuda" ]; then
 
     echo "\n=== Installing EP Kernels (PPLX and DeepEP) ==="
     cd ep_kernels/
-    # TODO we will be able to specify which pplx and deepep commit we want in future
-    TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" bash install_python_libraries.sh
+    # Best-effort: DeepEP needs NCCL GIN headers absent on arm64; Ultra does not use EP.
+    TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" bash install_python_libraries.sh \
+        || echo "⚠ EP kernels install failed; continuing without PPLX/DeepEP"
 fi
 echo "\n✅ All installations completed successfully!"
