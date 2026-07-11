@@ -84,18 +84,37 @@ pub(super) fn get_body_limit() -> usize {
         .unwrap_or(45 * 1024 * 1024)
 }
 
-fn configured_max_output_tokens() -> Option<u32> {
+pub(crate) fn configured_max_output_tokens() -> Option<u32> {
     static CAP: OnceLock<Option<u32>> = OnceLock::new();
     *CAP.get_or_init(|| {
+        // DYN_MAX_OUTPUT_LEN is the production alias used alongside DYN_MAX_OUTPUT_TOKENS.
         std::env::var("DYN_MAX_OUTPUT_TOKENS")
             .ok()
+            .or_else(|| std::env::var("DYN_MAX_OUTPUT_LEN").ok())
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value > 0)
     })
 }
 
+fn apply_max_output_token_cap(value: &mut Option<u32>, cap: Option<u32>) {
+    let Some(cap) = cap else {
+        return;
+    };
+    match value {
+        Some(v) if *v > cap => *v = cap,
+        None => *value = Some(cap),
+        _ => {}
+    }
+}
+
+/// Clamp oversized values and fill omitted (None) with the configured cap.
 fn clamp_max_output_tokens(value: &mut Option<u32>) {
-    if let (Some(cap), Some(value)) = (configured_max_output_tokens(), value.as_mut())
+    apply_max_output_token_cap(value, configured_max_output_tokens());
+}
+
+/// Clamp a required (non-Option) max_tokens; Anthropic Messages path.
+pub(crate) fn clamp_required_max_output_tokens(value: &mut u32) {
+    if let Some(cap) = configured_max_output_tokens()
         && *value > cap
     {
         *value = cap;
@@ -1960,8 +1979,7 @@ async fn responses(
     check_ready(&state)?;
 
     // Apply template values if present. When no template and no client-supplied
-    // max_output_tokens, leave it as None and let the underlying engine apply its
-    // own default — matching the chat completions path.
+    // max_output_tokens, clamp_max_output_tokens fills the configured cap (if set).
     if let Some(template) = template {
         if request.inner.model.as_deref().unwrap_or("").is_empty() {
             request.inner.model = Some(template.model.clone());
@@ -2375,9 +2393,7 @@ async fn list_models_openai(
     let cw_override: Option<u64> = std::env::var("DYN_CONTEXT_WINDOW")
         .ok()
         .and_then(|v| v.parse().ok());
-    let mot_override: Option<u64> = std::env::var("DYN_MAX_OUTPUT_TOKENS")
-        .ok()
-        .and_then(|v| v.parse().ok());
+    let mot_override: Option<u64> = configured_max_output_tokens().map(|v| v as u64);
 
     let mut data = Vec::new();
 
@@ -2518,9 +2534,7 @@ async fn get_model_openai(
         .ok()
         .and_then(|v| v.parse().ok())
         .or(context_length);
-    let max_output_tokens: Option<u64> = std::env::var("DYN_MAX_OUTPUT_TOKENS")
-        .ok()
-        .and_then(|v| v.parse().ok());
+    let max_output_tokens: Option<u64> = configured_max_output_tokens().map(|v| v as u64);
 
     Ok(Json(ModelListing {
         id: model_id.to_string(),
@@ -3093,6 +3107,55 @@ mod tests {
     };
 
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
+
+    #[test]
+    fn test_apply_max_output_token_cap_fills_omitted() {
+        let mut value = None;
+        apply_max_output_token_cap(&mut value, Some(64));
+        assert_eq!(value, Some(64));
+    }
+
+    #[test]
+    fn test_apply_max_output_token_cap_clamps_oversized() {
+        let mut value = Some(1_000_000);
+        apply_max_output_token_cap(&mut value, Some(131_072));
+        assert_eq!(value, Some(131_072));
+    }
+
+    #[test]
+    fn test_apply_max_output_token_cap_preserves_within_cap() {
+        let mut value = Some(32);
+        apply_max_output_token_cap(&mut value, Some(64));
+        assert_eq!(value, Some(32));
+    }
+
+    #[test]
+    fn test_apply_max_output_token_cap_noop_without_cap() {
+        let mut value = None;
+        apply_max_output_token_cap(&mut value, None);
+        assert_eq!(value, None);
+        let mut oversized = Some(1_000_000);
+        apply_max_output_token_cap(&mut oversized, None);
+        assert_eq!(oversized, Some(1_000_000));
+    }
+
+    #[test]
+    fn test_apply_max_output_token_cap_preserves_exact_cap() {
+        let mut value = Some(131_072);
+        apply_max_output_token_cap(&mut value, Some(131_072));
+        assert_eq!(value, Some(131_072));
+    }
+
+    #[test]
+    fn test_apply_max_output_token_cap_stream_agnostic() {
+        // Normalize-layer cap is independent of stream vs unary.
+        let mut stream_omitted = None;
+        let mut unary_omitted = None;
+        apply_max_output_token_cap(&mut stream_omitted, Some(64));
+        apply_max_output_token_cap(&mut unary_omitted, Some(64));
+        assert_eq!(stream_omitted, unary_omitted);
+        assert_eq!(stream_omitted, Some(64));
+    }
 
     fn http_error_from_engine(code: u16) -> Result<(), anyhow::Error> {
         Err(HttpError {

@@ -910,6 +910,32 @@ def test_build_sampling_params_openai_forwards_reasoning_budget_extra_args():
     assert sp.extra_args["enable_thinking"] is False
 
 
+def test_build_sampling_params_caps_omitted_max_tokens(monkeypatch):
+    from dynamo.vllm.handlers import build_sampling_params
+
+    monkeypatch.setenv("DYN_MAX_OUTPUT_TOKENS", "128")
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {},
+        "stop_conditions": {},
+        "output_options": {},
+    }
+    sp = build_sampling_params(
+        request, default_sampling_params={}, model_max_len=1_000_000
+    )
+    assert sp.max_tokens == 128
+
+
+def test_build_sampling_params_openai_caps_oversized_max_tokens(monkeypatch):
+    from dynamo.vllm.handlers import build_sampling_params_openai
+
+    monkeypatch.setenv("DYN_MAX_OUTPUT_LEN", "64")
+    sp = build_sampling_params_openai(
+        {"max_tokens": 1_000_000}, default_sampling_params={}
+    )
+    assert sp.max_tokens == 64
+
+
 def test_apply_reasoning_budget_derives_end_token_ids():
     from vllm.sampling_params import SamplingParams
 
@@ -980,6 +1006,60 @@ async def test_worker_admission_rejects_at_total_request_limit():
     assert handler._pending_request_admissions == 0
 
 
+@pytest.mark.asyncio
+async def test_worker_admission_fails_closed_when_unfinished_count_unavailable():
+    handler = _make_fake_worker_handler()
+    handler.max_total_requests = 4
+    handler.engine_client = SimpleNamespace(output_processor=None)
+
+    reserved, current, limit = await handler._try_reserve_request_slot("req-1", {})
+
+    assert reserved is False
+    assert current is None
+    assert limit == 4
+    assert handler._pending_request_admissions == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_fails_closed_when_unfinished_getter_raises():
+    handler = _make_fake_worker_handler()
+    handler.max_total_requests = 4
+
+    def _boom():
+        raise RuntimeError("output processor unavailable")
+
+    handler.engine_client = SimpleNamespace(
+        output_processor=SimpleNamespace(get_num_unfinished_requests=_boom)
+    )
+
+    reserved, current, limit = await handler._try_reserve_request_slot("req-2", {})
+
+    assert reserved is False
+    assert current is None
+    assert limit == 4
+    assert handler._pending_request_admissions == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_releases_on_stream_error_before_first_item():
+    handler = _make_fake_worker_handler()
+    handler.max_total_requests = 4
+    handler.engine_client = SimpleNamespace(abort=None)
+    handler._pending_request_admissions = 1
+
+    async def stream():
+        raise RuntimeError("engine enqueue failed")
+        yield  # pragma: no cover
+
+    with pytest.raises(RuntimeError, match="engine enqueue failed"):
+        async for _ in handler._iterate_engine_stream(
+            stream(), "req-err", release_request_admission=True
+        ):
+            pass
+
+    assert handler._pending_request_admissions == 0
+
+
 def test_worker_admission_ignores_per_dp_limit_for_single_local_rank(monkeypatch):
     handler = _make_fake_worker_handler()
     handler.engine_client = SimpleNamespace(
@@ -1042,3 +1122,19 @@ async def test_worker_admission_releases_on_first_engine_item():
 
     assert observed == ["first", "second"]
     assert handler._pending_request_admissions == 0
+
+
+def test_configured_max_output_tokens_env_prefers_tokens(monkeypatch):
+    from dynamo.vllm import handlers as handlers_mod
+
+    monkeypatch.setenv("DYN_MAX_OUTPUT_TOKENS", "64")
+    monkeypatch.setenv("DYN_MAX_OUTPUT_LEN", "128")
+    assert handlers_mod._configured_max_output_tokens_env() == 64
+
+
+def test_configured_max_output_tokens_env_falls_back_to_len(monkeypatch):
+    from dynamo.vllm import handlers as handlers_mod
+
+    monkeypatch.delenv("DYN_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.setenv("DYN_MAX_OUTPUT_LEN", "131072")
+    assert handlers_mod._configured_max_output_tokens_env() == 131072

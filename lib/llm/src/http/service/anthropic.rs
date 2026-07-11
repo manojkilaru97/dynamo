@@ -204,6 +204,7 @@ async fn anthropic_messages(
             request.max_tokens = template.max_completion_tokens;
         }
     }
+    super::openai::clamp_required_max_output_tokens(&mut request.max_tokens);
 
     // Strip Claude Code billing preamble from system prompt if enabled
     if env_is_truthy(env_llm::DYN_STRIP_ANTHROPIC_PREAMBLE) {
@@ -524,16 +525,7 @@ fn model_env_overrides() -> (Option<u64>, Option<u64>) {
         },
         Err(_) => None,
     };
-    let max_output_tokens = match std::env::var("DYN_MAX_OUTPUT_TOKENS") {
-        Ok(v) => match v.parse::<u64>() {
-            Ok(val) => Some(val),
-            Err(_) => {
-                tracing::warn!("Invalid DYN_MAX_OUTPUT_TOKENS value '{}', ignoring", v);
-                None
-            }
-        },
-        Err(_) => None,
-    };
+    let max_output_tokens = super::openai::configured_max_output_tokens().map(|v| v as u64);
     (context_window, max_output_tokens)
 }
 

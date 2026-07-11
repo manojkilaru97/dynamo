@@ -660,7 +660,29 @@ def build_sampling_params(
         dynamic_default = max(1, model_max_len - input_length)
         sampling_params.max_tokens = dynamic_default
 
+    # Defense-in-depth: honor DYN_MAX_OUTPUT_TOKENS / DYN_MAX_OUTPUT_LEN.
+    output_cap = _configured_max_output_tokens_env()
+    if output_cap is not None:
+        current = getattr(sampling_params, "max_tokens", None)
+        if current is None or current > output_cap:
+            sampling_params.max_tokens = output_cap
+
     return sampling_params
+
+
+def _configured_max_output_tokens_env() -> int | None:
+    for name in ("DYN_MAX_OUTPUT_TOKENS", "DYN_MAX_OUTPUT_LEN"):
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        try:
+            parsed = int(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid %s=%r", name, raw)
+            continue
+        if parsed > 0:
+            return parsed
+    return None
 
 
 def _value_from_mapping_or_object(obj: Any, key: str, default: Any = None) -> Any:
@@ -1386,6 +1408,12 @@ def build_sampling_params_openai(
     if "max_tokens" in request and request["max_tokens"] is not None:
         sampling_params.max_tokens = request["max_tokens"]
 
+    output_cap = _configured_max_output_tokens_env()
+    if output_cap is not None:
+        current = getattr(sampling_params, "max_tokens", None)
+        if current is None or current > output_cap:
+            sampling_params.max_tokens = output_cap
+
     # Handle stop sequences
     if "stop" in request and request["stop"] is not None:
         sampling_params.stop = request["stop"]
@@ -1716,8 +1744,15 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
         async with self._request_admission_lock:
             current_total = self._current_total_local_requests()
+            # Fail closed: a configured limit is useless if we cannot observe load.
             if current_total is None:
-                return True, None, limit
+                logger.warning(
+                    "Rejecting request %s: unfinished request count unavailable "
+                    "with total request limit %s configured",
+                    request_id,
+                    limit,
+                )
+                return False, None, limit
 
             observed_total = current_total + self._pending_request_admissions
             if observed_total >= limit:
