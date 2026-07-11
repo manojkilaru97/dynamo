@@ -53,7 +53,7 @@ pub fn backend_stream_timeout() -> Option<Duration> {
         .map(|secs| Duration::from_secs(secs.saturating_mul(2)))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum ConnectionStatus {
     Disabled,
     ClosedUnexpectedly,
@@ -182,6 +182,48 @@ async fn connection_monitor(
     }
 }
 
+/// Exactly-once cleanup when auth fails at the Dynamo HTTP boundary (NVCF JWT is outside).
+pub fn release_lifecycle_on_auth_failure(
+    mut inflight_guard: InflightGuard,
+    mut stream_handle: ConnectionHandle,
+    context: Arc<dyn AsyncEngineContext>,
+) {
+    // 401s map to Validation in openai::classify_error_for_metrics.
+    inflight_guard.mark_error(ErrorType::Validation);
+    stream_handle.disarm();
+    tracing::warn!(
+        request_id = %inflight_guard.request_id(),
+        model = %inflight_guard.model(),
+        endpoint = %inflight_guard.endpoint(),
+        "auth failure at Dynamo HTTP boundary; releasing inflight/stream lifecycle"
+    );
+    context.kill();
+    drop(inflight_guard);
+}
+
+/// Disarm stream handle on pre-stream errors so connection_monitor does not see a disconnect.
+pub fn release_stream_handle_on_prestream_error(mut stream_handle: ConnectionHandle) {
+    stream_handle.disarm();
+}
+
+/// End unary aggregation as soon as the engine context is killed (client disconnect).
+pub fn until_context_killed<S, T>(
+    stream: S,
+    context: Arc<dyn AsyncEngineContext>,
+) -> impl Stream<Item = T>
+where
+    S: Stream<Item = T>,
+{
+    stream.take_until(async move { context.killed().await })
+}
+
+/// Dev/test hook: `DYN_HTTP_INJECT_AUTH_FAILURE=1` exercises auth-failure cleanup locally.
+pub fn auth_failure_injection_enabled() -> bool {
+    std::env::var("DYN_HTTP_INJECT_AUTH_FAILURE")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 /// This method will consume a stream of SSE events and monitor for disconnects or context cancellation.
 ///
 /// Uses `tokio::select!` to choose between receiving events from the source stream or detecting when
@@ -211,12 +253,24 @@ pub fn monitor_for_disconnects(
 
     async_stream::try_stream! {
         tokio::pin!(stream);
-        // context.stopped() fires on NORMAL completion, not only disconnect; once
-        // stopped, drain the stream to its end so the trailing usage chunk + [DONE]
-        // aren't lost to the select! race.
+        // Graceful stop(): drain trailing usage+[DONE]. Kill: break immediately (no drain).
         let mut engine_stopped = false;
         loop {
             tokio::select! {
+                biased;
+
+                // Kill (disconnect/auth cancel): do not drain — draining holds InflightGuard.
+                _ = context.killed() => {
+                    inflight_guard.mark_error(ErrorType::Cancelled);
+                    stream_handle.disarm();
+                    tracing::debug!(
+                        request_id = %inflight_guard.request_id(),
+                        model = %inflight_guard.model(),
+                        "engine context killed; releasing inflight gauge without draining"
+                    );
+                    break;
+                }
+
                 event = stream.next() => {
                     match event {
                         Some(Ok(event)) => {
@@ -256,9 +310,7 @@ pub fn monitor_for_disconnects(
                         }
                     }
                 }
-                // Only abort early on a true mid-stream stop. Once stopped, stop
-                // racing stream.next(): keep draining so the trailing usage chunk
-                // and [DONE] are delivered (stream.next()->None then marks ok).
+                // Graceful stop only: drain trailing usage + [DONE]. Kill is handled above.
                 _ = context.stopped(), if !engine_stopped => {
                     engine_stopped = true;
                 }
@@ -347,6 +399,20 @@ mod tests {
             for i in 0..count {
                 tokio::time::sleep(interval).await;
                 yield axum::response::sse::Event::default().data(format!("token-{i}"));
+            }
+        }
+    }
+
+    /// Keeps producing tokens forever — models a backend that ignores cancel until kill breaks the monitor.
+    fn endless_token_stream(
+        interval: Duration,
+    ) -> impl futures::Stream<Item = Result<axum::response::sse::Event, axum::Error>> {
+        async_stream::try_stream! {
+            let mut i = 0u64;
+            loop {
+                tokio::time::sleep(interval).await;
+                yield axum::response::sse::Event::default().data(format!("token-{i}"));
+                i += 1;
             }
         }
     }
@@ -595,6 +661,194 @@ mod tests {
             !text.contains("event: error\n: "),
             "[{case}] body contains bare `event: error\\n: <comment>` trailer (pre-fix bug). Body:\n{text}"
         );
+    }
+
+    /// Kill mid-stream must release InflightGuard without draining (Mode A zombie).
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_context_kill_releases_inflight_without_draining() {
+        use dynamo_runtime::pipeline::context::Controller;
+
+        let model = "auth-cancel-model";
+        let metrics = Arc::new(Metrics::new());
+        let guard = metrics.clone().create_inflight_guard(
+            model,
+            Endpoint::ChatCompletions,
+            true,
+            "req-auth-cancel",
+        );
+        assert_eq!(metrics.get_inflight_count(model), 1);
+
+        let controller = Arc::new(Controller::default());
+        let context: Arc<dyn AsyncEngineContext> = controller.clone();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let handle = ConnectionHandle::create_disabled(tx);
+        // Timeout off: cleanup must come from kill, not the inactivity safety net.
+        unsafe { std::env::set_var(BACKEND_STREAM_TIMEOUT_ENV, "0") };
+
+        let monitored = monitor_for_disconnects(
+            endless_token_stream(Duration::from_millis(50)),
+            context,
+            guard,
+            handle,
+        );
+        tokio::pin!(monitored);
+
+        tokio::time::advance(Duration::from_millis(120)).await;
+        let _ = monitored.next().await;
+        controller.kill();
+
+        let completed = tokio::time::timeout(Duration::from_secs(2), async move {
+            while monitored.next().await.is_some() {}
+        })
+        .await;
+
+        cleanup_env();
+
+        completed.expect("stream did not terminate after context.kill() — Mode A zombie leak");
+        assert_eq!(
+            metrics.get_inflight_count(model),
+            0,
+            "inflight gauge leaked after auth/disconnect kill"
+        );
+        assert_eq!(
+            metrics.get_request_counter(
+                model,
+                &Endpoint::ChatCompletions,
+                &RequestType::Stream,
+                &Status::Error,
+                &ErrorType::Cancelled,
+            ),
+            1,
+            "kill must record Cancelled, not Success/Internal"
+        );
+    }
+
+    /// SSE body drop must release InflightGuard with inactivity timeout disabled.
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_stream_drop_releases_inflight_gauge() {
+        let model = "client-drop-model";
+        let (metrics, guard, context, handle) = setup_test(model, "req-drop", "0");
+        assert_eq!(metrics.get_inflight_count(model), 1);
+
+        let monitored = monitor_for_disconnects(
+            endless_token_stream(Duration::from_secs(1)),
+            context,
+            guard,
+            handle,
+        );
+        tokio::pin!(monitored);
+
+        // Partial poll then drop — simulates proxy/client closing after mid-flight 401.
+        let _ = tokio::time::timeout(Duration::from_millis(10), monitored.next()).await;
+        drop(monitored);
+
+        cleanup_env();
+
+        assert_eq!(
+            metrics.get_inflight_count(model),
+            0,
+            "inflight gauge leaked after SSE stream drop"
+        );
+        assert_eq!(
+            metrics.get_request_counter(
+                model,
+                &Endpoint::ChatCompletions,
+                &RequestType::Stream,
+                &Status::Error,
+                &ErrorType::Cancelled,
+            ),
+            1,
+            "stream drop must record pre-marked Cancelled"
+        );
+    }
+
+    /// Injected 401 at the Dynamo boundary must drop inflight exactly once.
+    #[tokio::test]
+    #[serial]
+    async fn test_auth_failure_lifecycle_releases_inflight_gauge() {
+        let model = "auth-fail-model";
+        let metrics = Arc::new(Metrics::new());
+        let guard = metrics.clone().create_inflight_guard(
+            model,
+            Endpoint::ChatCompletions,
+            true,
+            "req-401",
+        );
+        assert_eq!(metrics.get_inflight_count(model), 1);
+
+        let context: Arc<dyn AsyncEngineContext> = Arc::new(MockContext::new());
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let handle = ConnectionHandle::create_armed(tx);
+
+        release_lifecycle_on_auth_failure(guard, handle, context);
+
+        assert_eq!(
+            metrics.get_inflight_count(model),
+            0,
+            "inflight gauge leaked after injected auth failure"
+        );
+        assert_eq!(
+            metrics.get_request_counter(
+                model,
+                &Endpoint::ChatCompletions,
+                &RequestType::Stream,
+                &Status::Error,
+                &ErrorType::Validation,
+            ),
+            1,
+            "auth failure must record Validation (401 classification)"
+        );
+    }
+
+    /// Pre-stream error must disarm the stream handle (ClosedGracefully, not disconnect).
+    #[tokio::test]
+    #[serial]
+    async fn test_prestream_error_disarms_stream_handle() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = ConnectionHandle::create_armed(tx);
+        release_stream_handle_on_prestream_error(handle);
+        match rx.await {
+            Ok(ConnectionStatus::ClosedGracefully) => {}
+            other => panic!("expected ClosedGracefully after prestream disarm, got {other:?}"),
+        }
+    }
+
+    /// Unary fold must stop when the engine context is killed (no forever hang).
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_until_context_killed_ends_stream() {
+        use dynamo_runtime::pipeline::context::Controller;
+
+        let controller = Arc::new(Controller::default());
+        let context: Arc<dyn AsyncEngineContext> = controller.clone();
+        let stream = until_context_killed(
+            endless_token_stream(Duration::from_millis(50)),
+            context,
+        );
+        tokio::pin!(stream);
+
+        tokio::time::advance(Duration::from_millis(120)).await;
+        let _ = stream.next().await;
+        controller.kill();
+
+        let completed = tokio::time::timeout(Duration::from_secs(2), async move {
+            while stream.next().await.is_some() {}
+        })
+        .await;
+        completed.expect("until_context_killed did not end after kill");
+    }
+
+    #[test]
+    #[serial]
+    fn test_auth_failure_injection_env_gate() {
+        unsafe { std::env::remove_var("DYN_HTTP_INJECT_AUTH_FAILURE") };
+        assert!(!auth_failure_injection_enabled());
+        unsafe { std::env::set_var("DYN_HTTP_INJECT_AUTH_FAILURE", "1") };
+        assert!(auth_failure_injection_enabled());
+        unsafe { std::env::remove_var("DYN_HTTP_INJECT_AUTH_FAILURE") };
+        assert!(!auth_failure_injection_enabled());
     }
 
     /// Upstream worker killed mid-stream → mpsc channel reports `Disconnected` to the

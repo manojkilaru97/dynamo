@@ -33,7 +33,11 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     RouteDoc,
-    disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
+    disconnect::{
+        ConnectionHandle, auth_failure_injection_enabled, create_connection_monitor,
+        monitor_for_disconnects, release_lifecycle_on_auth_failure,
+        release_stream_handle_on_prestream_error, until_context_killed,
+    },
     error::HttpError,
     metrics::{
         CancellationLabels, Endpoint, ErrorType, EventConverter,
@@ -804,6 +808,9 @@ async fn completions_single(
         );
         Ok(response)
     } else {
+        // Unary: stream handle unused; disarm so connection_monitor is not held open.
+        release_stream_handle_on_prestream_error(stream_handle);
+
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = stream.inspect(move |response| {
@@ -814,6 +821,7 @@ async fn completions_single(
                 &mut http_queue_guard,
             );
         });
+        let stream = until_context_killed(stream, ctx.clone());
 
         let response = NvCreateCompletionResponse::from_annotated_stream(stream, parsing_options)
             .await
@@ -989,6 +997,9 @@ async fn completions_batch(
         );
         Ok(response)
     } else {
+        // Unary: stream handle unused; disarm so connection_monitor is not held open.
+        release_stream_handle_on_prestream_error(stream_handle);
+
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = merged_stream.inspect(move |response| {
@@ -999,6 +1010,7 @@ async fn completions_batch(
                 &mut http_queue_guard,
             );
         });
+        let stream = until_context_killed(stream, ctx.clone());
 
         let response = NvCreateCompletionResponse::from_annotated_stream(stream, parsing_options)
             .await
@@ -1468,6 +1480,16 @@ async fn chat_completions(
         &request_id,
     );
 
+    // Injectable auth-failure at the Dynamo HTTP boundary (NVCF JWT is cluster-only).
+    if auth_failure_injection_enabled() {
+        release_lifecycle_on_auth_failure(inflight_guard, stream_handle, request.context());
+        return Err(ErrorMessage::from_http_error(HttpError {
+            code: StatusCode::UNAUTHORIZED.as_u16(),
+            message: "The provided authorization token is invalid or has expired"
+                .to_string(),
+        }));
+    }
+
     // Handle unsupported fields - if Some(resp) is returned by
     // validate_chat_completion_unsupported_fields,
     // then a field was used that is unsupported. We will log an error message
@@ -1475,6 +1497,7 @@ async fn chat_completions(
     if let Err(err_response) = validate_chat_completion_unsupported_fields(&request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         emit_chat_validation_error_audit(&request, &err_response);
+        stream_handle.disarm();
         return Err(err_response);
     }
 
@@ -1482,6 +1505,7 @@ async fn chat_completions(
     if let Err(err_response) = validate_chat_completion_required_fields(&request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         emit_chat_validation_error_audit(&request, &err_response);
+        stream_handle.disarm();
         return Err(err_response);
     }
 
@@ -1489,6 +1513,7 @@ async fn chat_completions(
     if let Err(err_response) = validate_chat_completion_stream_options(&request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         emit_chat_validation_error_audit(&request, &err_response);
+        stream_handle.disarm();
         return Err(err_response);
     }
 
@@ -1496,6 +1521,7 @@ async fn chat_completions(
     if let Err(err_response) = validate_chat_completion_fields_generic(&request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         emit_chat_validation_error_audit(&request, &err_response);
+        stream_handle.disarm();
         return Err(err_response);
     }
 
@@ -1513,14 +1539,16 @@ async fn chat_completions(
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
-    let (engine, mut parsing_options) = state
-        .manager()
-        .get_chat_completions_engine_with_parsing(&model)
-        .map_err(|e| {
-            let err_response = ErrorMessage::from_model_error(&e);
-            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-            err_response
-        })?;
+    let (engine, mut parsing_options) =
+        match state.manager().get_chat_completions_engine_with_parsing(&model) {
+            Ok(v) => v,
+            Err(e) => {
+                let err_response = ErrorMessage::from_model_error(&e);
+                inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+                release_stream_handle_on_prestream_error(stream_handle);
+                return Err(err_response);
+            }
+        };
     if let Some(tool_names) = bare_json_auto_tool_parse_names(&request) {
         parsing_options.tool_names = Some(tool_names);
         parsing_options.parse_bare_json_tool_calls = true;
@@ -1542,16 +1570,20 @@ async fn chat_completions(
         .map(|handle| handle.with_headers(http_audit_headers));
 
     // issue the generate call on the engine
-    let stream = engine.generate(request).await.map_err(|e| {
-        if super::metrics::request_was_rejected(e.as_ref()) {
-            state
-                .metrics_clone()
-                .inc_rejection(&model, super::metrics::Endpoint::ChatCompletions);
+    let stream = match engine.generate(request).await {
+        Ok(s) => s,
+        Err(e) => {
+            if super::metrics::request_was_rejected(e.as_ref()) {
+                state
+                    .metrics_clone()
+                    .inc_rejection(&model, super::metrics::Endpoint::ChatCompletions);
+            }
+            let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
+            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+            release_stream_handle_on_prestream_error(stream_handle);
+            return Err(err_response);
         }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-        err_response
-    })?;
+    };
 
     // capture the context to cancel the stream if the client disconnects
     let ctx = stream.context();
@@ -1669,6 +1701,9 @@ async fn chat_completions(
         );
         Ok(response)
     } else {
+        // Unary: stream handle unused; disarm so connection_monitor is not held open.
+        release_stream_handle_on_prestream_error(stream_handle);
+
         // Check first event for backend errors before aggregating (non-streaming only)
         let stream_with_check =
             check_for_backend_error(stream)
@@ -1688,6 +1723,8 @@ async fn chat_completions(
                 &mut http_queue_guard,
             );
         });
+        // Client disconnect kills the request context — stop folding so InflightGuard drops.
+        let stream = until_context_killed(stream, ctx.clone());
 
         let response =
             NvCreateChatCompletionResponse::from_annotated_stream(stream, parsing_options.clone())
@@ -2236,6 +2273,7 @@ async fn responses(
         Ok(response)
     } else {
         // Non-streaming path: aggregate stream into single response
+        release_stream_handle_on_prestream_error(stream_handle);
 
         // Check first event for backend errors before aggregating (non-streaming only)
         let stream_with_check =
@@ -2255,6 +2293,7 @@ async fn responses(
                 &mut http_queue_guard,
             );
         });
+        let stream = until_context_killed(stream, ctx.clone());
 
         let response =
             NvCreateChatCompletionResponse::from_annotated_stream(stream, parsing_options.clone())
