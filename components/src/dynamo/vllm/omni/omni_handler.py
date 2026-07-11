@@ -181,6 +181,17 @@ class OmniHandler(BaseOmniHandler):
         if inputs.sampling_params_list is not None:
             generate_kwargs["sampling_params_list"] = inputs.sampling_params_list
 
+        reserved, current_total_requests, total_request_limit = (
+            await self._try_reserve_request_slot(request_id, request)
+        )
+        if not reserved:
+            message = (
+                f"Worker local total request limit reached "
+                f"({current_total_requests}/{total_request_limit})"
+            )
+            yield self._error_chunk(request_id, message, inputs.request_type)
+            return
+
         previous_text = ""
 
         async with self._abort_monitor(context, request_id):
@@ -213,6 +224,9 @@ class OmniHandler(BaseOmniHandler):
             except Exception as e:
                 logger.error(f"Error during generation for request {request_id}: {e}")
                 yield self._error_chunk(request_id, str(e), inputs.request_type)
+            finally:
+                if reserved:
+                    await self._release_request_slot_reservation()
 
     async def build_engine_inputs(
         self,

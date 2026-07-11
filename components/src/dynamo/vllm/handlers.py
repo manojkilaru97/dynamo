@@ -1744,7 +1744,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
         async with self._request_admission_lock:
             current_total = self._current_total_local_requests()
-            # Fail closed: a configured limit is useless if we cannot observe load.
+            # Fail closed when the engine count is unreadable — never admit unboundedly.
             if current_total is None:
                 logger.warning(
                     "Rejecting request %s: unfinished request count unavailable "
@@ -1754,7 +1754,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 )
                 return False, None, limit
 
-            observed_total = current_total + self._pending_request_admissions
+            # Reservations are held for the full request life; use max() so the
+            # same in-flight request is not double-counted as unfinished+pending.
+            observed_total = max(current_total, self._pending_request_admissions)
             if observed_total >= limit:
                 logger.info(
                     "Rejecting request %s due to local total request limit: %s/%s",
@@ -1815,7 +1817,8 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 await release_admission_once()
                 raise
             else:
-                await release_admission_once()
+                # Hold the reservation until stream end/error so waiting+running
+                # cannot exceed the limit after the first engine yield.
                 yield item
 
     async def _raise_decode_timeout(

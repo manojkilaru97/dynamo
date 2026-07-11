@@ -1104,7 +1104,7 @@ async def test_worker_admission_health_check_bypasses_limit():
 
 
 @pytest.mark.asyncio
-async def test_worker_admission_releases_on_first_engine_item():
+async def test_worker_admission_holds_until_stream_ends():
     handler = _make_fake_worker_handler()
     handler.max_total_requests = 4
     handler.engine_client = SimpleNamespace(abort=None)
@@ -1119,9 +1119,33 @@ async def test_worker_admission_releases_on_first_engine_item():
         stream(), "req-1", release_request_admission=True
     ):
         observed.append(item)
+        # Reservation must still be held mid-stream (waiting+running bound).
+        assert handler._pending_request_admissions == 1
 
     assert observed == ["first", "second"]
     assert handler._pending_request_admissions == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_counts_pending_against_limit():
+    handler = _make_fake_worker_handler()
+    handler.max_total_requests = 2
+    handler._pending_request_admissions = 1
+    handler.engine_client = SimpleNamespace(
+        output_processor=SimpleNamespace(get_num_unfinished_requests=lambda: 0)
+    )
+
+    reserved, current, limit = await handler._try_reserve_request_slot("req-2", {})
+
+    assert reserved is True
+    assert current == 2
+    assert limit == 2
+    assert handler._pending_request_admissions == 2
+
+    reserved2, current2, _ = await handler._try_reserve_request_slot("req-3", {})
+    assert reserved2 is False
+    assert current2 == 2
+    assert handler._pending_request_admissions == 2
 
 
 def test_configured_max_output_tokens_env_prefers_tokens(monkeypatch):
