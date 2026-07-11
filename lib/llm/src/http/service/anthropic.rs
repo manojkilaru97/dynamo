@@ -31,7 +31,10 @@ use tracing::Instrument;
 
 use super::{
     RouteDoc,
-    disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
+    disconnect::{
+        ConnectionHandle, create_connection_monitor, monitor_for_disconnects,
+        release_stream_handle_on_prestream_error, until_context_killed,
+    },
     metrics::{CancellationLabels, Endpoint, process_response_and_observe_metrics},
     service_v2,
 };
@@ -432,7 +435,8 @@ async fn anthropic_messages(
 
         Ok(sse_stream.into_response())
     } else {
-        // Non-streaming path: aggregate stream into single response
+        // Non-streaming: disarm unused SSE handle; stop fold on client kill.
+        release_stream_handle_on_prestream_error(stream_handle);
 
         // Check first event for backend errors using the openai helper
         let stream_with_check = super::openai::check_for_backend_error(engine_stream)
@@ -454,6 +458,7 @@ async fn anthropic_messages(
                 &mut http_queue_guard,
             );
         });
+        let stream = until_context_killed(stream, ctx.clone());
 
         let chat_response =
             NvCreateChatCompletionResponse::from_annotated_stream(stream, parsing_options.clone())
@@ -473,7 +478,11 @@ async fn anthropic_messages(
             anthropic_ctx.as_ref(),
         );
 
-        inflight_guard.mark_ok();
+        if ctx.is_killed() {
+            inflight_guard.mark_error(super::metrics::ErrorType::Cancelled);
+        } else {
+            inflight_guard.mark_ok();
+        }
 
         Ok(Json(response).into_response())
     }

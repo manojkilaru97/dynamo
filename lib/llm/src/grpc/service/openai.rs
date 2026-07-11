@@ -21,7 +21,10 @@ use super::kserve::inference;
 // [gluo NOTE] These are common utilities that should be shared between frontends
 use crate::http::service::{
     disconnect::{ConnectionHandle, create_connection_monitor},
-    metrics::{CancellationLabels, Endpoint, InflightGuard, process_response_and_observe_metrics},
+    metrics::{
+        CancellationLabels, Endpoint, ErrorType, InflightGuard,
+        process_response_and_observe_metrics,
+    },
 };
 use dynamo_protocols::types::{CompletionFinishReason, CreateCompletionRequest, Prompt};
 
@@ -176,26 +179,38 @@ pub fn grpc_monitor_for_disconnects<T>(
     mut stream_handle: ConnectionHandle,
 ) -> impl Stream<Item = Annotated<T>> {
     stream_handle.arm();
+    // Default Cancelled: unexpected drop reports cancelled, not internal.
+    inflight_guard.mark_error(ErrorType::Cancelled);
     async_stream::stream! {
         tokio::pin!(stream);
+        let mut engine_stopped = false;
         loop {
             tokio::select! {
+                biased;
+
+                // Kill (disconnect): do not drain — draining holds InflightGuard.
+                _ = context.killed() => {
+                    inflight_guard.mark_error(ErrorType::Cancelled);
+                    stream_handle.disarm();
+                    tracing::debug!("gRPC context killed; releasing inflight without drain");
+                    break;
+                }
+
                 event = stream.next() => {
                     match event {
                         Some(response) => {
                             yield response;
                         }
                         None => {
-                            // Stream ended normally
                             inflight_guard.mark_ok();
                             stream_handle.disarm();
                             break;
                         }
                     }
                 }
-                _ = context.stopped() => {
-                    tracing::trace!("Context stopped; breaking stream");
-                    break;
+                // Graceful stop: drain remaining items then exit via None arm.
+                _ = context.stopped(), if !engine_stopped => {
+                    engine_stopped = true;
                 }
             }
         }

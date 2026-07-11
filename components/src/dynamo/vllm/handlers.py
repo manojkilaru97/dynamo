@@ -680,7 +680,16 @@ def build_sampling_params(
     return sampling_params
 
 
+_OUTPUT_CAP_ENV_UNSET = object()
+_OUTPUT_CAP_ENV_CACHE: int | None | object = _OUTPUT_CAP_ENV_UNSET
+
+
 def _configured_max_output_tokens_env() -> int | None:
+    """Cached process-wide output cap (matches Rust OnceLock)."""
+    global _OUTPUT_CAP_ENV_CACHE
+    if _OUTPUT_CAP_ENV_CACHE is not _OUTPUT_CAP_ENV_UNSET:
+        return _OUTPUT_CAP_ENV_CACHE  # type: ignore[return-value]
+    result: int | None = None
     for name in ("DYN_MAX_OUTPUT_TOKENS", "DYN_MAX_OUTPUT_LEN"):
         raw = os.environ.get(name)
         if not raw:
@@ -691,8 +700,16 @@ def _configured_max_output_tokens_env() -> int | None:
             logger.warning("Ignoring invalid %s=%r", name, raw)
             continue
         if parsed > 0:
-            return parsed
-    return None
+            result = parsed
+            break
+    _OUTPUT_CAP_ENV_CACHE = result
+    return result
+
+
+def _clear_configured_max_output_tokens_env_cache() -> None:
+    """Test helper: allow monkeypatched env to take effect."""
+    global _OUTPUT_CAP_ENV_CACHE
+    _OUTPUT_CAP_ENV_CACHE = _OUTPUT_CAP_ENV_UNSET
 
 
 def _value_from_mapping_or_object(obj: Any, key: str, default: Any = None) -> Any:
@@ -1666,7 +1683,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         # Request-id set is the source of truth (no counter drift on double-release).
         self._admitted_request_ids: set[str] = set()
         self._pending_request_admissions = 0  # len(_admitted_request_ids); tests/compat
-        self.max_total_requests = self._configured_max_total_requests()
+        self.max_total_requests = self._configured_max_total_requests(
+            log_ignored_per_dp=True
+        )
 
     @staticmethod
     def _get_positive_float_env(name: str) -> float | None:
@@ -1714,14 +1733,14 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             return None
         return parsed
 
-    def _configured_max_total_requests(self) -> int | None:
+    def _configured_max_total_requests(self, *, log_ignored_per_dp: bool = False) -> int | None:
         per_dp_limit = self._get_positive_int_env("DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP")
         total_limit = self._get_positive_int_env("DYN_REQUEST_MAX_TOTAL_REQUESTS")
         local_dp_size = self.dp_range[1] if len(self.dp_range) > 1 else 1
 
         if per_dp_limit is not None and local_dp_size > 1:
             return per_dp_limit
-        if per_dp_limit is not None and local_dp_size <= 1:
+        if per_dp_limit is not None and local_dp_size <= 1 and log_ignored_per_dp:
             logger.info(
                 "Ignoring DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP=%s because this "
                 "worker manages a single local DP rank",
@@ -1752,16 +1771,19 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         if self._is_health_check_request(request):
             return True, None, None
 
-        # Prefer live env/default; fall back to instance value (tests / init).
-        limit = self._configured_max_total_requests()
-        if limit is not None:
-            self.max_total_requests = limit
-        else:
-            limit = self.max_total_requests
+        # Cached at init (and test overrides via self.max_total_requests).
+        limit = self.max_total_requests
         if limit is None:
             return True, None, None
 
         async with self._request_admission_lock:
+            if request_id in self._admitted_request_ids:
+                logger.debug(
+                    "Rejecting duplicate request_id %s still holding an admission slot",
+                    request_id,
+                )
+                return False, len(self._admitted_request_ids), limit
+
             current_total = self._current_total_local_requests()
             # Fail closed when the engine count is unreadable — never admit unboundedly.
             if current_total is None:
@@ -1773,31 +1795,29 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 )
                 return False, None, limit
 
-            # Held admissions are authoritative. Engine unfinished is a backstop for
-            # zombies that outlived a reservation.
+            # held + engine zombies (engine unfinished not covered by held).
+            # Equals max(held, engine) when one set contains the other.
             held = len(self._admitted_request_ids)
-            if held >= limit or current_total >= limit:
-                logger.info(
+            observed = held + max(0, current_total - held)
+            if observed >= limit:
+                logger.debug(
                     "Rejecting request %s due to local total request limit: %s/%s "
                     "(held=%s engine_unfinished=%s)",
                     request_id,
-                    max(held, current_total),
+                    observed,
                     limit,
                     held,
                     current_total,
                 )
-                return False, max(held, current_total), limit
+                return False, observed, limit
 
             self._admitted_request_ids.add(request_id)
             self._pending_request_admissions = len(self._admitted_request_ids)
             return True, self._pending_request_admissions, limit
 
-    async def _release_request_slot_reservation(
-        self, request_id: str | None = None
-    ) -> None:
+    async def _release_request_slot_reservation(self, request_id: str) -> None:
         async with self._request_admission_lock:
-            if request_id is not None:
-                self._admitted_request_ids.discard(request_id)
+            self._admitted_request_ids.discard(request_id)
             self._pending_request_admissions = len(self._admitted_request_ids)
 
     async def _iterate_engine_stream(
@@ -1847,6 +1867,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         finally:
             # CancelledError/GeneratorExit bypass except Exception — always release.
             await release_admission_once()
+
     async def _raise_decode_timeout(
         self,
         request_id: str,

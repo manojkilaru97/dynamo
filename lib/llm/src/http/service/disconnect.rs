@@ -219,9 +219,23 @@ where
 
 /// Dev/test hook: `DYN_HTTP_INJECT_AUTH_FAILURE=1` exercises auth-failure cleanup locally.
 pub fn auth_failure_injection_enabled() -> bool {
-    std::env::var("DYN_HTTP_INJECT_AUTH_FAILURE")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    // Tests flip the env under #[serial]; keep live reads so unit tests stay valid.
+    #[cfg(test)]
+    {
+        return std::env::var("DYN_HTTP_INJECT_AUTH_FAILURE")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            std::env::var("DYN_HTTP_INJECT_AUTH_FAILURE")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        })
+    }
 }
 
 /// This method will consume a stream of SSE events and monitor for disconnects or context cancellation.

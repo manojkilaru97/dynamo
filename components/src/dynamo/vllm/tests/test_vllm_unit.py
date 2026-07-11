@@ -957,8 +957,10 @@ def test_build_sampling_params_openai_forwards_reasoning_budget_extra_args():
 
 
 def test_build_sampling_params_caps_omitted_max_tokens(monkeypatch):
+    from dynamo.vllm import handlers as handlers_mod
     from dynamo.vllm.handlers import build_sampling_params
 
+    handlers_mod._clear_configured_max_output_tokens_env_cache()
     monkeypatch.setenv("DYN_MAX_OUTPUT_TOKENS", "128")
     request = {
         "token_ids": [1, 2, 3],
@@ -973,8 +975,10 @@ def test_build_sampling_params_caps_omitted_max_tokens(monkeypatch):
 
 
 def test_build_sampling_params_openai_caps_oversized_max_tokens(monkeypatch):
+    from dynamo.vllm import handlers as handlers_mod
     from dynamo.vllm.handlers import build_sampling_params_openai
 
+    handlers_mod._clear_configured_max_output_tokens_env_cache()
     monkeypatch.setenv("DYN_MAX_OUTPUT_LEN", "64")
     sp = build_sampling_params_openai(
         {"max_tokens": 1_000_000}, default_sampling_params={}
@@ -1248,12 +1252,10 @@ async def test_worker_admission_counts_pending_against_limit():
 
 
 @pytest.mark.asyncio
-async def test_worker_admission_rejects_when_engine_reports_zero_but_held_full(
-    monkeypatch,
-):
+async def test_worker_admission_rejects_when_engine_reports_zero_but_held_full():
     """Prod failure mode: engine unfinished undercounts while Waiting is huge."""
     handler = _make_fake_worker_handler()
-    monkeypatch.setenv("DYN_REQUEST_MAX_TOTAL_REQUESTS", "16")
+    handler.max_total_requests = 16
     handler.engine_client = SimpleNamespace(
         output_processor=SimpleNamespace(get_num_unfinished_requests=lambda: 0),
         vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=16)),
@@ -1266,6 +1268,25 @@ async def test_worker_admission_rejects_when_engine_reports_zero_but_held_full(
     assert current == 16
     assert limit == 16
     assert len(handler._admitted_request_ids) == 16
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_rejects_duplicate_request_id():
+    handler = _make_fake_worker_handler()
+    handler.max_total_requests = 4
+    handler._admitted_request_ids = {"req-dup"}
+    handler._pending_request_admissions = 1
+    handler.engine_client = SimpleNamespace(
+        output_processor=SimpleNamespace(get_num_unfinished_requests=lambda: 0)
+    )
+
+    reserved, current, limit = await handler._try_reserve_request_slot("req-dup", {})
+
+    assert reserved is False
+    assert current == 1
+    assert limit == 4
+    assert handler._admitted_request_ids == {"req-dup"}
+    assert handler._pending_request_admissions == 1
 
 
 @pytest.mark.asyncio
@@ -1293,6 +1314,7 @@ async def test_worker_admission_releases_on_cancelled_error():
 def test_configured_max_output_tokens_env_prefers_tokens(monkeypatch):
     from dynamo.vllm import handlers as handlers_mod
 
+    handlers_mod._clear_configured_max_output_tokens_env_cache()
     monkeypatch.setenv("DYN_MAX_OUTPUT_TOKENS", "64")
     monkeypatch.setenv("DYN_MAX_OUTPUT_LEN", "128")
     assert handlers_mod._configured_max_output_tokens_env() == 64
@@ -1301,6 +1323,7 @@ def test_configured_max_output_tokens_env_prefers_tokens(monkeypatch):
 def test_configured_max_output_tokens_env_falls_back_to_len(monkeypatch):
     from dynamo.vllm import handlers as handlers_mod
 
+    handlers_mod._clear_configured_max_output_tokens_env_cache()
     monkeypatch.delenv("DYN_MAX_OUTPUT_TOKENS", raising=False)
     monkeypatch.setenv("DYN_MAX_OUTPUT_LEN", "131072")
     assert handlers_mod._configured_max_output_tokens_env() == 131072

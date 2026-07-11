@@ -260,7 +260,7 @@ async def test_local_file_allowed_under_prefix(tmp_path) -> None:
     )
     image = await loader.load_image(img_path.as_uri())
     assert image.size == (2, 2)
-    assert str(img_path).lower() in loader._image_cache
+    assert str(img_path) in loader._image_cache
 
 
 async def test_local_file_rejected_without_prefix(tmp_path) -> None:
