@@ -226,7 +226,7 @@ class OmniHandler(BaseOmniHandler):
                 yield self._error_chunk(request_id, str(e), inputs.request_type)
             finally:
                 if reserved:
-                    await self._release_request_slot_reservation()
+                    await self._release_request_slot_reservation(request_id)
 
     async def build_engine_inputs(
         self,

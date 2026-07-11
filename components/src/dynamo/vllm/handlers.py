@@ -1651,7 +1651,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             "DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS"
         )
         self._request_admission_lock = asyncio.Lock()
-        self._pending_request_admissions = 0
+        # Request-id set is the source of truth (no counter drift on double-release).
+        self._admitted_request_ids: set[str] = set()
+        self._pending_request_admissions = 0  # len(_admitted_request_ids); tests/compat
         self.max_total_requests = self._configured_max_total_requests()
 
     @staticmethod
@@ -1738,7 +1740,12 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         if self._is_health_check_request(request):
             return True, None, None
 
-        limit = self.max_total_requests
+        # Prefer live env/default; fall back to instance value (tests / init).
+        limit = self._configured_max_total_requests()
+        if limit is not None:
+            self.max_total_requests = limit
+        else:
+            limit = self.max_total_requests
         if limit is None:
             return True, None, None
 
@@ -1754,25 +1761,32 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 )
                 return False, None, limit
 
-            # Reservations are held for the full request life; use max() so the
-            # same in-flight request is not double-counted as unfinished+pending.
-            observed_total = max(current_total, self._pending_request_admissions)
-            if observed_total >= limit:
+            # Held admissions are authoritative. Engine unfinished is a backstop for
+            # zombies that outlived a reservation.
+            held = len(self._admitted_request_ids)
+            if held >= limit or current_total >= limit:
                 logger.info(
-                    "Rejecting request %s due to local total request limit: %s/%s",
+                    "Rejecting request %s due to local total request limit: %s/%s "
+                    "(held=%s engine_unfinished=%s)",
                     request_id,
-                    observed_total,
+                    max(held, current_total),
                     limit,
+                    held,
+                    current_total,
                 )
-                return False, observed_total, limit
+                return False, max(held, current_total), limit
 
-            self._pending_request_admissions += 1
-            return True, observed_total + 1, limit
+            self._admitted_request_ids.add(request_id)
+            self._pending_request_admissions = len(self._admitted_request_ids)
+            return True, self._pending_request_admissions, limit
 
-    async def _release_request_slot_reservation(self) -> None:
+    async def _release_request_slot_reservation(
+        self, request_id: str | None = None
+    ) -> None:
         async with self._request_admission_lock:
-            if self._pending_request_admissions > 0:
-                self._pending_request_admissions -= 1
+            if request_id is not None:
+                self._admitted_request_ids.discard(request_id)
+            self._pending_request_admissions = len(self._admitted_request_ids)
 
     async def _iterate_engine_stream(
         self,
@@ -1793,34 +1807,34 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             nonlocal admission_released
             if not admission_released:
                 admission_released = True
-                await self._release_request_slot_reservation()
+                await self._release_request_slot_reservation(request_id)
 
-        while True:
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    await release_admission_once()
-                    await self._raise_decode_timeout(request_id, abort_guard=abort_guard)
-                next_item = asyncio.wait_for(gen.__anext__(), timeout=remaining)
-            else:
-                next_item = gen.__anext__()
+        try:
+            while True:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        await self._raise_decode_timeout(
+                            request_id, abort_guard=abort_guard
+                        )
+                    next_item = asyncio.wait_for(gen.__anext__(), timeout=remaining)
+                else:
+                    next_item = gen.__anext__()
 
-            try:
-                item = await next_item
-            except StopAsyncIteration:
-                await release_admission_once()
-                break
-            except asyncio.TimeoutError:
-                await release_admission_once()
-                await self._raise_decode_timeout(request_id, abort_guard=abort_guard)
-            except Exception:
-                await release_admission_once()
-                raise
-            else:
-                # Hold the reservation until stream end/error so waiting+running
-                # cannot exceed the limit after the first engine yield.
-                yield item
-
+                try:
+                    item = await next_item
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    await self._raise_decode_timeout(
+                        request_id, abort_guard=abort_guard
+                    )
+                else:
+                    # Hold reservation for the full stream so Running+Waiting <= limit.
+                    yield item
+        finally:
+            # CancelledError/GeneratorExit bypass except Exception — always release.
+            await release_admission_once()
     async def _raise_decode_timeout(
         self,
         request_id: str,
@@ -3733,14 +3747,14 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
         except EngineDeadError as e:
             if release_request_admission and not admission_handed_to_iterator:
-                await self._release_request_slot_reservation()
+                await self._release_request_slot_reservation(request_id)
             logger.error(f"vLLM EngineDeadError: {e}")
             logger.warning("Initiating Dynamo Runtime shutdown.")
             self.runtime.shutdown()
             os._exit(1)
         except Exception:
             if release_request_admission and not admission_handed_to_iterator:
-                await self._release_request_slot_reservation()
+                await self._release_request_slot_reservation(request_id)
             raise
 
 
@@ -4195,14 +4209,14 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 yield _build_text_error_chunk(str(e), openai_request_id)
             except EngineDeadError as e:
                 if reserved and not admission_handed_to_iterator:
-                    await self._release_request_slot_reservation()
+                    await self._release_request_slot_reservation(request_id)
                 logger.error(f"vLLM EngineDeadError: {e}")
                 logger.warning("Initiating Dynamo Runtime shutdown.")
                 self.runtime.shutdown()
                 os._exit(1)
             except Exception:
                 if reserved and not admission_handed_to_iterator:
-                    await self._release_request_slot_reservation()
+                    await self._release_request_slot_reservation(request_id)
                 raise
 
 
@@ -4371,14 +4385,14 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 admission_handed_to_iterator = True
             except EngineDeadError as e:
                 if reserved and not admission_handed_to_iterator:
-                    await self._release_request_slot_reservation()
+                    await self._release_request_slot_reservation(request_id)
                 logger.error(f"vLLM EngineDeadError: {e}")
                 logger.warning("Initiating Dynamo Runtime shutdown.")
                 self.runtime.shutdown()
                 os._exit(1)
             except Exception:
                 if reserved and not admission_handed_to_iterator:
-                    await self._release_request_slot_reservation()
+                    await self._release_request_slot_reservation(request_id)
                 raise
 
             async for res in self._iterate_engine_stream(
