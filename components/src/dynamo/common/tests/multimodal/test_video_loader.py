@@ -50,6 +50,33 @@ async def test_load_video_uses_vllm_media_connector():
     assert loaded_metadata == metadata
 
 
+def test_create_vllm_video_io_uses_model_media_kwargs():
+    loader = VideoLoader(
+        media_io_kwargs={
+            "num_frames": 256,
+            "fps": 2,
+            "video_backend": "nemotron_vl",
+        }
+    )
+    video_media_io = MagicMock()
+    image_media_io = MagicMock()
+
+    with patch.object(
+        video_loader_module,
+        "_require_vllm_video_media",
+        return_value=(MagicMock(), video_media_io, image_media_io),
+    ):
+        loader._create_vllm_video_io()
+
+    image_media_io.assert_called_once_with(image_mode="RGB")
+    video_media_io.assert_called_once_with(
+        image_media_io.return_value,
+        num_frames=256,
+        fps=2,
+        video_backend="nemotron_vl",
+    )
+
+
 @pytest.mark.asyncio
 async def test_load_video_batch_uses_url_loader():
     loader = VideoLoader()

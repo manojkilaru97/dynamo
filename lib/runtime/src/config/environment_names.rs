@@ -72,6 +72,17 @@ pub mod logging {
 
         /// Service name for OTLP traces and logs
         pub const OTEL_SERVICE_NAME: &str = "OTEL_SERVICE_NAME";
+
+        /// Generic OTLP endpoint (fallback for logs/traces if signal-specific unset)
+        pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+        /// OTLP protocol for logs (e.g. http/protobuf)
+        pub const OTEL_EXPORTER_OTLP_LOGS_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL";
+        /// OTLP export timeout for logs (ms)
+        pub const OTEL_EXPORTER_OTLP_LOGS_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT";
+        /// Generic OTLP protocol (fallback)
+        pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+        /// Generic OTLP export timeout (ms, fallback)
+        pub const OTEL_EXPORTER_OTLP_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TIMEOUT";
     }
 }
 
@@ -305,6 +316,30 @@ pub mod kvbm {
 
 /// LLM (Language Model) inference environment variables
 pub mod llm {
+    /// Audit sink configuration (ported from Super for the OTLP payload sink).
+    pub mod audit {
+        /// Audit sink selection. Comma-separated: `stderr`, `nats`, `otel`.
+        pub const DYN_AUDIT_SINKS: &str = "DYN_AUDIT_SINKS";
+        /// Force audit emission even when the request `store` flag is `false`.
+        pub const DYN_AUDIT_FORCE_LOGGING: &str = "DYN_AUDIT_FORCE_LOGGING";
+        /// In-process audit bus capacity.
+        pub const DYN_AUDIT_CAPACITY: &str = "DYN_AUDIT_CAPACITY";
+        /// Maximum serialized payload bytes emitted to OTEL before marker fallback.
+        pub const DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES: &str = "DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES";
+        /// NATS subject the JetStream audit sink publishes to.
+        pub const DYN_AUDIT_NATS_SUBJECT: &str = "DYN_AUDIT_NATS_SUBJECT";
+        /// Local output path for audit records (jsonl sinks).
+        pub const DYN_AUDIT_OUTPUT_PATH: &str = "DYN_AUDIT_OUTPUT_PATH";
+        /// JSONL audit sink buffer size in bytes.
+        pub const DYN_AUDIT_JSONL_BUFFER_BYTES: &str = "DYN_AUDIT_JSONL_BUFFER_BYTES";
+        /// JSONL audit sink periodic flush interval in milliseconds.
+        pub const DYN_AUDIT_JSONL_FLUSH_INTERVAL_MS: &str = "DYN_AUDIT_JSONL_FLUSH_INTERVAL_MS";
+        /// Rotating gzip JSONL audit sink roll threshold in uncompressed bytes.
+        pub const DYN_AUDIT_JSONL_GZ_ROLL_BYTES: &str = "DYN_AUDIT_JSONL_GZ_ROLL_BYTES";
+        /// Rotating gzip JSONL audit sink roll threshold in record lines.
+        pub const DYN_AUDIT_JSONL_GZ_ROLL_LINES: &str = "DYN_AUDIT_JSONL_GZ_ROLL_LINES";
+    }
+
     /// HTTP body size limit in MB
     pub const DYN_HTTP_BODY_LIMIT_MB: &str = "DYN_HTTP_BODY_LIMIT_MB";
 

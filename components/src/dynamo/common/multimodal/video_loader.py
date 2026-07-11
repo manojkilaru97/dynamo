@@ -55,9 +55,12 @@ class VideoLoader:
         num_frames: int = NUM_FRAMES_DEFAULT,
         enable_frontend_decoding: bool = False,
         url_policy: UrlValidationPolicy | None = None,
+        media_io_kwargs: Dict[str, Any] | None = None,
     ) -> None:
+        video_io_kwargs = dict(media_io_kwargs or {})
         self._http_timeout = int(http_timeout)
-        self._num_frames = num_frames
+        self._num_frames = int(video_io_kwargs.pop("num_frames", num_frames))
+        self._video_io_kwargs = video_io_kwargs
         self._enable_frontend_decoding = enable_frontend_decoding
         self._url_policy = url_policy or UrlValidationPolicy.from_env()
         self._nixl_connector = None
@@ -83,6 +86,7 @@ class VideoLoader:
         return VideoMediaIO(
             ImageMediaIO(image_mode="RGB"),
             num_frames=self._num_frames,
+            **self._video_io_kwargs,
         )
 
     async def _load_video_with_vllm(
