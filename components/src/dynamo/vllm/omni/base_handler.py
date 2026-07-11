@@ -64,6 +64,7 @@ class BaseOmniHandler(BaseWorkerHandler[Dict[str, Any], Dict[str, Any]]):
         self.shutdown_event = shutdown_event
         self.dp_range = (0, 1)
         self._request_admission_lock = asyncio.Lock()
+        self._admitted_request_ids: set[str] = set()
         self._pending_request_admissions = 0
         self.max_total_requests = self._get_positive_int_env(
             "DYN_REQUEST_MAX_TOTAL_REQUESTS"
@@ -72,8 +73,8 @@ class BaseOmniHandler(BaseWorkerHandler[Dict[str, Any], Dict[str, Any]]):
         logger.info(f"{self.__class__.__name__} initialized successfully")
 
     def _current_total_local_requests(self) -> int | None:
-        # AsyncOmni has no vLLM output_processor; held reservations are the count.
-        return self._pending_request_admissions
+        # AsyncOmni has no vLLM output_processor; held admissions are the count.
+        return len(self._admitted_request_ids)
 
     def _build_omni_kwargs(self, config) -> Dict[str, Any]:
         """Build keyword arguments for AsyncOmni constructor."""

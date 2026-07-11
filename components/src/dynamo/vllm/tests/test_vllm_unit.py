@@ -1075,6 +1075,7 @@ def _make_fake_worker_handler():
 
     handler = object.__new__(FakeHandler)
     handler._request_admission_lock = asyncio.Lock()
+    handler._admitted_request_ids = set()
     handler._pending_request_admissions = 0
     handler.max_decode_wall_clock_secs = None
     handler.dp_range = (0, 1)
@@ -1136,6 +1137,7 @@ async def test_worker_admission_releases_on_stream_error_before_first_item():
     handler = _make_fake_worker_handler()
     handler.max_total_requests = 4
     handler.engine_client = SimpleNamespace(abort=None)
+    handler._admitted_request_ids = {"req-err"}
     handler._pending_request_admissions = 1
 
     async def stream():
@@ -1149,6 +1151,7 @@ async def test_worker_admission_releases_on_stream_error_before_first_item():
             pass
 
     assert handler._pending_request_admissions == 0
+    assert handler._admitted_request_ids == set()
 
 
 def test_worker_admission_ignores_per_dp_limit_for_single_local_rank(monkeypatch):
@@ -1199,6 +1202,7 @@ async def test_worker_admission_holds_until_stream_ends():
     handler = _make_fake_worker_handler()
     handler.max_total_requests = 4
     handler.engine_client = SimpleNamespace(abort=None)
+    handler._admitted_request_ids = {"req-1"}
     handler._pending_request_admissions = 1
 
     async def stream():
@@ -1212,15 +1216,18 @@ async def test_worker_admission_holds_until_stream_ends():
         observed.append(item)
         # Reservation must still be held mid-stream (waiting+running bound).
         assert handler._pending_request_admissions == 1
+        assert "req-1" in handler._admitted_request_ids
 
     assert observed == ["first", "second"]
     assert handler._pending_request_admissions == 0
+    assert handler._admitted_request_ids == set()
 
 
 @pytest.mark.asyncio
 async def test_worker_admission_counts_pending_against_limit():
     handler = _make_fake_worker_handler()
     handler.max_total_requests = 2
+    handler._admitted_request_ids = {"req-1"}
     handler._pending_request_admissions = 1
     handler.engine_client = SimpleNamespace(
         output_processor=SimpleNamespace(get_num_unfinished_requests=lambda: 0)
@@ -1232,11 +1239,55 @@ async def test_worker_admission_counts_pending_against_limit():
     assert current == 2
     assert limit == 2
     assert handler._pending_request_admissions == 2
+    assert handler._admitted_request_ids == {"req-1", "req-2"}
 
     reserved2, current2, _ = await handler._try_reserve_request_slot("req-3", {})
     assert reserved2 is False
     assert current2 == 2
     assert handler._pending_request_admissions == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_rejects_when_engine_reports_zero_but_held_full(
+    monkeypatch,
+):
+    """Prod failure mode: engine unfinished undercounts while Waiting is huge."""
+    handler = _make_fake_worker_handler()
+    monkeypatch.setenv("DYN_REQUEST_MAX_TOTAL_REQUESTS", "16")
+    handler.engine_client = SimpleNamespace(
+        output_processor=SimpleNamespace(get_num_unfinished_requests=lambda: 0),
+        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=16)),
+    )
+    handler._admitted_request_ids = {f"req-{i}" for i in range(16)}
+    handler._pending_request_admissions = 16
+
+    reserved, current, limit = await handler._try_reserve_request_slot("req-17", {})
+    assert reserved is False
+    assert current == 16
+    assert limit == 16
+    assert len(handler._admitted_request_ids) == 16
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_releases_on_cancelled_error():
+    handler = _make_fake_worker_handler()
+    handler.max_total_requests = 4
+    handler.engine_client = SimpleNamespace(abort=None)
+    handler._admitted_request_ids = {"req-cancel"}
+    handler._pending_request_admissions = 1
+
+    async def stream():
+        yield "first"
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in handler._iterate_engine_stream(
+            stream(), "req-cancel", release_request_admission=True
+        ):
+            pass
+
+    assert handler._pending_request_admissions == 0
+    assert handler._admitted_request_ids == set()
 
 
 def test_configured_max_output_tokens_env_prefers_tokens(monkeypatch):
