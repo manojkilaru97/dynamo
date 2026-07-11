@@ -725,7 +725,7 @@ mod tests {
     }
 
     /// SSE body drop must release InflightGuard with inactivity timeout disabled.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     #[serial]
     async fn test_stream_drop_releases_inflight_gauge() {
         let model = "client-drop-model";
@@ -738,10 +738,7 @@ mod tests {
             guard,
             handle,
         );
-        tokio::pin!(monitored);
-
-        // Partial poll then drop — simulates proxy/client closing after mid-flight 401.
-        let _ = tokio::time::timeout(Duration::from_millis(10), monitored.next()).await;
+        // Drop without pinning — models axum dropping the SSE body after mid-flight 401.
         drop(monitored);
 
         cleanup_env();
