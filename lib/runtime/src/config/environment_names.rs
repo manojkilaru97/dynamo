@@ -72,17 +72,6 @@ pub mod logging {
 
         /// Service name for OTLP traces and logs
         pub const OTEL_SERVICE_NAME: &str = "OTEL_SERVICE_NAME";
-
-        /// Generic OTLP endpoint (fallback for logs/traces if signal-specific unset)
-        pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
-        /// OTLP protocol for logs (e.g. http/protobuf)
-        pub const OTEL_EXPORTER_OTLP_LOGS_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL";
-        /// OTLP export timeout for logs (ms)
-        pub const OTEL_EXPORTER_OTLP_LOGS_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT";
-        /// Generic OTLP protocol (fallback)
-        pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
-        /// Generic OTLP export timeout (ms, fallback)
-        pub const OTEL_EXPORTER_OTLP_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TIMEOUT";
     }
 }
 
