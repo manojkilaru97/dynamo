@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::{bus, config};
@@ -9,24 +9,38 @@ use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
 };
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditEventType {
+    Request,
+    Response,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct AuditRecord {
     pub schema_version: u32,
+    pub event_type: AuditEventType,
     pub request_id: String,
     pub requested_streaming: bool,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request: Option<Arc<NvCreateChatCompletionRequest>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_request: Option<Arc<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<Arc<NvCreateChatCompletionResponse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_response: Option<Arc<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<Arc<serde_json::Value>>,
 }
 
+#[derive(Clone)]
 pub struct AuditHandle {
     requested_streaming: bool,
     request_id: String,
     model: String,
-    req_full: Option<Arc<NvCreateChatCompletionRequest>>,
-    resp_full: Option<Arc<NvCreateChatCompletionResponse>>,
+    headers: Option<Arc<serde_json::Value>>,
 }
 
 impl AuditHandle {
@@ -34,22 +48,60 @@ impl AuditHandle {
         self.requested_streaming
     }
 
-    pub fn set_request(&mut self, req: Arc<NvCreateChatCompletionRequest>) {
-        self.req_full = Some(req);
-    }
-    pub fn set_response(&mut self, resp: Arc<NvCreateChatCompletionResponse>) {
-        self.resp_full = Some(resp);
+    pub fn with_headers(mut self, headers: Option<Arc<serde_json::Value>>) -> Self {
+        self.headers = headers;
+        self
     }
 
-    /// Emit exactly once (publishes to the bus; sinks do I/O).
-    pub fn emit(self) {
+    pub fn emit_request(
+        &self,
+        request: Option<Arc<NvCreateChatCompletionRequest>>,
+        raw_request: Option<Arc<serde_json::Value>>,
+        headers: Option<Arc<serde_json::Value>>,
+    ) {
         let rec = AuditRecord {
             schema_version: 1,
+            event_type: AuditEventType::Request,
+            request_id: self.request_id.clone(),
+            requested_streaming: self.requested_streaming,
+            model: self.model.clone(),
+            request,
+            raw_request,
+            response: None,
+            raw_response: None,
+            headers: headers.or_else(|| self.headers.clone()),
+        };
+        bus::publish(rec);
+    }
+
+    pub fn emit_response(self, response: Arc<NvCreateChatCompletionResponse>) {
+        let rec = AuditRecord {
+            schema_version: 1,
+            event_type: AuditEventType::Response,
             request_id: self.request_id,
             requested_streaming: self.requested_streaming,
             model: self.model,
-            request: self.req_full,
-            response: self.resp_full,
+            request: None,
+            raw_request: None,
+            response: Some(response),
+            raw_response: None,
+            headers: self.headers,
+        };
+        bus::publish(rec);
+    }
+
+    pub fn emit_raw_response(self, response: Arc<serde_json::Value>) {
+        let rec = AuditRecord {
+            schema_version: 1,
+            event_type: AuditEventType::Response,
+            request_id: self.request_id,
+            requested_streaming: self.requested_streaming,
+            model: self.model,
+            request: None,
+            raw_request: None,
+            response: None,
+            raw_response: Some(response),
+            headers: self.headers,
         };
         bus::publish(rec);
     }
@@ -71,14 +123,66 @@ pub fn create_handle(req: &NvCreateChatCompletionRequest, request_id: &str) -> O
         requested_streaming,
         request_id: request_id.to_string(),
         model,
-        req_full: None,
-        resp_full: None,
+        headers: None,
     })
+}
+
+pub fn emit_raw_request_response(
+    request_id: &str,
+    model: String,
+    requested_streaming: bool,
+    raw_request: Option<Arc<serde_json::Value>>,
+    headers: Option<Arc<serde_json::Value>>,
+    raw_response: Arc<serde_json::Value>,
+) {
+    if !should_emit_raw_request_response(raw_request.as_deref()) {
+        return;
+    }
+
+    bus::publish(AuditRecord {
+        schema_version: 1,
+        event_type: AuditEventType::Request,
+        request_id: request_id.to_string(),
+        requested_streaming,
+        model: model.clone(),
+        request: None,
+        raw_request,
+        response: None,
+        raw_response: None,
+        headers: headers.clone(),
+    });
+    bus::publish(AuditRecord {
+        schema_version: 1,
+        event_type: AuditEventType::Response,
+        request_id: request_id.to_string(),
+        requested_streaming,
+        model,
+        request: None,
+        raw_request: None,
+        response: None,
+        raw_response: Some(raw_response),
+        headers,
+    });
+}
+
+pub fn should_emit_raw_request_response(raw_request: Option<&serde_json::Value>) -> bool {
+    let policy = config::policy();
+    if !policy.enabled {
+        return false;
+    }
+    if policy.force_logging {
+        return true;
+    }
+    raw_request
+        .and_then(|request| request.get("store"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use temp_env::with_vars;
 
     fn create_test_request(model: &str, store: bool) -> NvCreateChatCompletionRequest {
@@ -88,6 +192,41 @@ mod tests {
             "store": store
         });
         serde_json::from_value(json).expect("Failed to create test request")
+    }
+
+    fn create_test_request_with_agent_context() -> NvCreateChatCompletionRequest {
+        let json = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "test"}],
+            "store": true,
+            "nvext": {
+                "agent_context": {
+                    "session_type_id": "deep_research",
+                    "session_id": "run-123",
+                    "trajectory_id": "run-123:researcher",
+                    "parent_trajectory_id": "run-123:planner"
+                }
+            }
+        });
+        serde_json::from_value(json).expect("Failed to create test request")
+    }
+
+    fn create_test_response(content: &str) -> NvCreateChatCompletionResponse {
+        let json = serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        serde_json::from_value(json).expect("Failed to create test response")
     }
 
     /// Test that DYN_AUDIT_FORCE_LOGGING=true bypasses store=false
@@ -109,6 +248,37 @@ mod tests {
                     "When DYN_AUDIT_FORCE_LOGGING=true, handle should be created even with store=false"
                 );
             },
+        );
+    }
+
+    #[test]
+    fn audit_record_serializes_agent_context_and_response_content() {
+        let record = AuditRecord {
+            schema_version: 1,
+            event_type: AuditEventType::Response,
+            request_id: "req-123".to_string(),
+            requested_streaming: true,
+            model: "test-model".to_string(),
+            request: Some(Arc::new(create_test_request_with_agent_context())),
+            raw_request: None,
+            response: Some(Arc::new(create_test_response("final answer"))),
+            raw_response: None,
+            headers: None,
+        };
+
+        let value = serde_json::to_value(record).unwrap();
+
+        assert_eq!(
+            value["request"]["nvext"]["agent_context"]["session_id"],
+            "run-123"
+        );
+        assert_eq!(
+            value["request"]["nvext"]["agent_context"]["trajectory_id"],
+            "run-123:researcher"
+        );
+        assert_eq!(
+            value["response"]["choices"][0]["message"]["content"],
+            "final answer"
         );
     }
 }

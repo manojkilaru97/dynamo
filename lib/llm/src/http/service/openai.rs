@@ -557,6 +557,22 @@ fn emit_openai_request_log(
     payload: serde_json::Value,
     suppression: &PayloadSuppression,
 ) {
+    // Audit sink path (off hot path: this fn runs in a spawned task). Publish the
+    // RAW request to the audit bus; the otel sink redacts multimodal + suppresses NCA.
+    if crate::audit::config::policy().enabled {
+        crate::audit::bus::publish(crate::audit::handle::AuditRecord {
+            schema_version: 1,
+            event_type: crate::audit::handle::AuditEventType::Request,
+            request_id: request_id.to_string(),
+            requested_streaming: streaming,
+            model: model.to_string(),
+            request: None,
+            raw_request: Some(std::sync::Arc::new(payload.clone())),
+            response: None,
+            raw_response: None,
+            headers: Some(std::sync::Arc::new(headers.clone())),
+        });
+    }
     if !log_payloads_enabled() {
         return;
     }
@@ -634,6 +650,21 @@ fn emit_openai_response_log(
     payload: serde_json::Value,
     suppression: &PayloadSuppression,
 ) {
+    // Audit sink path (off hot path): publish RAW response to the bus.
+    if crate::audit::config::policy().enabled {
+        crate::audit::bus::publish(crate::audit::handle::AuditRecord {
+            schema_version: 1,
+            event_type: crate::audit::handle::AuditEventType::Response,
+            request_id: request_id.to_string(),
+            requested_streaming: streaming,
+            model: model.to_string(),
+            request: None,
+            raw_request: None,
+            response: None,
+            raw_response: Some(std::sync::Arc::new(payload.clone())),
+            headers: None,
+        });
+    }
     if !log_payloads_enabled() {
         return;
     }
@@ -1508,7 +1539,8 @@ async fn handler_chat_completions(
     // (recursive JSON->AnyValue conversion of the full ~10K-token payload) is
     // non-trivial CPU work; doing it synchronously here blocked every request
     // before dispatch. The response log path is already spawned the same way.
-    if log_payloads_enabled() {
+    // Fire when audit is enabled too (audit bus-publish lives inside the fn).
+    if log_payloads_enabled() || crate::audit::config::policy().enabled {
         let request_id_log = request_id.clone();
         let raw_model_log = raw_model.clone();
         let headers_log = header_map_to_json(&headers);
@@ -2149,7 +2181,8 @@ async fn chat_completions(
         let reasoning_dispatch_enabled = state.streaming_reasoning_dispatch_enabled();
         let mut reasoning_buffer: HashMap<u32, String> = HashMap::new();
         let mut dispatched_tool_ids: HashSet<String> = HashSet::new();
-        let log_payloads = log_payloads_enabled();
+        // Stream response-log must also fire for the audit sink (bus-publish lives in the fn).
+        let log_payloads = log_payloads_enabled() || crate::audit::config::policy().enabled;
         let parsing_options_for_log = parsing_options.clone();
         let mut payload_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> = Vec::new();
         let request_id_for_log = request_id.clone();

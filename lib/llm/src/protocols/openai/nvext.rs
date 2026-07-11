@@ -13,6 +13,7 @@ pub const HEADER_WORKER_INSTANCE_ID: &str = "x-worker-instance-id";
 pub const HEADER_PREFILL_INSTANCE_ID: &str = "x-prefill-instance-id";
 pub const HEADER_DP_RANK: &str = "x-dp-rank";
 pub const HEADER_PREFILL_DP_RANK: &str = "x-prefill-dp-rank";
+pub const HEADER_BILLING_REQUEST_PRIORITY: &str = "x-billing-request-priority";
 const UNSET_DP_RANK_SENTINEL: u32 = u32::MAX;
 
 /// Apply routing overrides from HTTP headers to nvext.
@@ -47,7 +48,25 @@ pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap)
         .and_then(|s| s.parse::<u32>().ok());
     let prefill_dp_rank = prefill_dp_rank.filter(|rank| *rank != UNSET_DP_RANK_SENTINEL);
 
-    if worker_id.is_none() && prefill_id.is_none() && dp_rank.is_none() && prefill_dp_rank.is_none()
+    // `x-billing-request-priority` -> agent_hints.priority. Authoritative from the
+    // header ONLY; any client body priority/latency_sensitivity is stripped so
+    // callers cannot self-elevate.
+    let priority = headers
+        .get(HEADER_BILLING_REQUEST_PRIORITY)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_billing_request_priority);
+    let body_priority_present = nvext
+        .as_ref()
+        .and_then(|n| n.agent_hints.as_ref())
+        .map(|h| h.priority.is_some() || h.latency_sensitivity.is_some())
+        .unwrap_or(false);
+
+    if worker_id.is_none()
+        && prefill_id.is_none()
+        && dp_rank.is_none()
+        && prefill_dp_rank.is_none()
+        && priority.is_none()
+        && !body_priority_present
     {
         return nvext;
     }
@@ -66,7 +85,30 @@ pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap)
     if let Some(rank) = prefill_dp_rank {
         ext.prefill_dp_rank = Some(rank);
     }
+    if let Some(hints) = ext.agent_hints.as_mut() {
+        hints.priority = None;
+        hints.latency_sensitivity = None;
+    }
+    if let Some(priority) = priority {
+        ext.agent_hints
+            .get_or_insert_with(AgentHints::default)
+            .priority = Some(priority);
+    }
     Some(ext)
+}
+
+/// Map the `x-billing-request-priority` header to an engine priority (higher = sooner).
+fn parse_billing_request_priority(value: &str) -> Option<i32> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "high" | "priority" | "premium" => Some(1),
+        "normal" | "standard" | "default" => Some(0),
+        "low" | "background" => Some(-1),
+        _ => value.parse::<i32>().ok(),
+    }
 }
 
 pub trait NvExtProvider {

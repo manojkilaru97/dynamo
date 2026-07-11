@@ -142,6 +142,9 @@ utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 tonic = { version = "0.13.1" }
 # Request prost specifically so tonic-build properly compiles protobuf message
 prost = { version = "0.13.5" }
+# audit OTLP payload sink (ported from Super): direct protobuf OTLP export
+prost014 = { package = "prost", version = "0.14" }
+opentelemetry-proto = { version = "0.31.0", default-features = false, features = ["gen-tonic-messages", "logs"] }
 
 # tokenizers
 tokenizers = { version = "0.21.4", default-features = false, features = [

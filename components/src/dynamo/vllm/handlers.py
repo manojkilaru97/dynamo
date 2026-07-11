@@ -766,8 +766,16 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         self.audio_loader = AudioLoader(
             enable_frontend_decoding=enable_frontend_decoding
         )
+        video_io_kwargs = None
+        multimodal_config = getattr(model_config, "multimodal_config", None)
+        media_io_kwargs = getattr(multimodal_config, "media_io_kwargs", None)
+        if isinstance(media_io_kwargs, dict):
+            configured_video_kwargs = media_io_kwargs.get("video")
+            if isinstance(configured_video_kwargs, dict):
+                video_io_kwargs = configured_video_kwargs
         self.video_loader = VideoLoader(
-            enable_frontend_decoding=enable_frontend_decoding
+            enable_frontend_decoding=enable_frontend_decoding,
+            media_io_kwargs=video_io_kwargs,
         )
         self.embedding_loader = self.init_embedding_loader(config, encode_worker_client)
 

@@ -1502,15 +1502,12 @@ impl
         let (mut request, context) = request.into_parts();
 
         // Preserve original inbound streaming flag before any internal overrides
-        let request_id = context.id().to_string();
+        let _request_id = context.id().to_string();
         let original_stream_flag = request.inner.stream.unwrap_or(false);
 
-        // Build audit handle (None if no DYN_AUDIT_SINKS)
-        let mut audit_handle = crate::audit::handle::create_handle(&request, &request_id);
-
-        if let Some(ref mut h) = audit_handle {
-            h.set_request(std::sync::Arc::new(request.clone()));
-        }
+        // Audit is emitted at the HTTP frontend (openai.rs) with the RAW request +
+        // headers, off the hot path. Skip preprocessor-side audit to avoid double-emit.
+        let audit_handle: Option<crate::audit::handle::AuditHandle> = None;
 
         // For non-streaming requests (stream=false), enable usage by default
         // This ensures compliance with OpenAI API spec where non-streaming responses
@@ -1569,7 +1566,7 @@ impl
         // Apply audit aggregation strategy.
         // The audit branch already returns Pin<Box<...>> from scan/fold_aggregate_with_future,
         // while the non-audit branch boxes the impl Stream from postprocessor_parsing_stream.
-        let final_stream = if let Some(mut audit) = audit_handle {
+        let final_stream = if let Some(audit) = audit_handle {
             let (stream, agg_fut) = if audit.streaming() {
                 // Streaming: apply scan (pass-through + parallel aggregation)
                 crate::audit::stream::scan_aggregate_with_future(transformed_stream)
@@ -1581,8 +1578,7 @@ impl
             // Spawn audit task
             tokio::spawn(async move {
                 let final_resp = agg_fut.await;
-                audit.set_response(Arc::new(final_resp));
-                audit.emit();
+                audit.emit_response(Arc::new(final_resp));
             });
 
             stream
