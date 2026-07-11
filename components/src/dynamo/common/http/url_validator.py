@@ -208,8 +208,7 @@ async def validate_media_url(url: str, policy: UrlValidationPolicy) -> str:
     Bare filesystem paths and ``file://`` URIs go through
     ``validate_local_path`` and come back as a resolved ``file://`` URI.
     Everything else goes through ``validate_url`` and is returned
-    unchanged. Callers can still reject the result afterwards —
-    ``ImageLoader``, for example, refuses local files regardless.
+    unchanged.
 
     Raises ``UrlValidationError`` on any policy violation.
     """

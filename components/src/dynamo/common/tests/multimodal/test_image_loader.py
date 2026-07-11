@@ -245,3 +245,31 @@ async def test_cache_is_lru_not_fifo(loader: ImageLoader) -> None:
     assert "https://example.com/b.png" not in loader._image_cache
     assert "https://example.com/c.png" in loader._image_cache
     assert "https://example.com/d.png" in loader._image_cache
+
+
+# --- Local file:// under DYN_MM_LOCAL_PATH ---
+
+
+async def test_local_file_allowed_under_prefix(tmp_path) -> None:
+    img_path = tmp_path / "dog.png"
+    img_path.write_bytes(PNG_BYTES)
+    loader = ImageLoader(
+        cache_size=4,
+        http_timeout=30.0,
+        url_policy=_permissive_policy(allowed_local_path=str(tmp_path)),
+    )
+    image = await loader.load_image(img_path.as_uri())
+    assert image.size == (2, 2)
+    assert str(img_path).lower() in loader._image_cache
+
+
+async def test_local_file_rejected_without_prefix(tmp_path) -> None:
+    img_path = tmp_path / "dog.png"
+    img_path.write_bytes(PNG_BYTES)
+    loader = ImageLoader(
+        cache_size=4,
+        http_timeout=30.0,
+        url_policy=_permissive_policy(allowed_local_path=None),
+    )
+    with pytest.raises(Exception, match="Local media paths are not permitted"):
+        await loader.load_image(img_path.as_uri())

@@ -8,8 +8,9 @@ import logging
 import os
 from collections import OrderedDict
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Dict, Final, List
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from PIL import Image
 
@@ -141,15 +142,44 @@ class ImageLoader:
         # the existing numpy buffer without copying pixel data.
         return Image.fromarray(arr)
 
+    async def _load_local_and_cache(self, key: str, path: Path) -> Image.Image:
+        """Read local image bytes, decode, cache, then clear inflight."""
+        try:
+            with _nvtx.annotate("mm:img:local_read", color="lime"):
+                content = await asyncio.to_thread(path.read_bytes)
+            if not content:
+                raise ValueError(f"Empty image file: {path}")
+            image = await self._open_image(BytesIO(content))
+            self._cache_put(key, image)
+            return image
+        finally:
+            self._inflight.pop(key, None)
+
+    async def _load_local_file(self, file_url: str) -> Image.Image:
+        """Load a validated file:// URL from disk (prefix gated by DYN_MM_LOCAL_PATH)."""
+        path = Path(unquote(urlparse(file_url).path))
+        key = str(path).lower()
+        if key in self._image_cache:
+            self._image_cache.move_to_end(key)
+            return self._image_cache[key]
+
+        if key not in self._inflight:
+            task = asyncio.create_task(self._load_local_and_cache(key, path))
+            task.add_done_callback(
+                lambda t: t.exception() if not t.cancelled() else None
+            )
+            self._inflight[key] = task
+
+        return await asyncio.shield(self._inflight[key])
+
     @_nvtx.annotate("mm:img:load_image", color="lime")
     async def load_image(self, image_url: str) -> Image.Image:
-        parsed_url = urlparse(image_url)
-        if parsed_url.scheme in ("", "file"):
-            raise ValueError(
-                "Invalid image source scheme: local file access is not allowed"
-            )
+        # validate_media_url enforces DYN_MM_LOCAL_PATH for file:// / bare paths.
         normalized_url = await validate_media_url(image_url, self._url_policy)
         parsed_url = urlparse(normalized_url)
+
+        if parsed_url.scheme == "file":
+            return await self._load_local_file(normalized_url)
 
         if parsed_url.scheme in ("http", "https"):
             key = normalized_url.lower()
@@ -189,7 +219,6 @@ class ImageLoader:
                 logger.error(f"{type(e).__name__} decoding image: '{image_url}': {e}")
                 raise ValueError(f"Failed to decoding image: '{image_url}': {e}") from e
 
-        # It's not file:, http:, https:, or data:
         raise ValueError(f"Invalid image source scheme: {parsed_url.scheme}")
 
     async def load_image_batch(
