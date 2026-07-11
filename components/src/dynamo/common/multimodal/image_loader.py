@@ -158,7 +158,7 @@ class ImageLoader:
     async def _load_local_file(self, file_url: str) -> Image.Image:
         """Load a validated file:// URL from disk (prefix gated by DYN_MM_LOCAL_PATH)."""
         path = Path(unquote(urlparse(file_url).path))
-        key = str(path).lower()
+        key = str(path)
         if key in self._image_cache:
             self._image_cache.move_to_end(key)
             return self._image_cache[key]

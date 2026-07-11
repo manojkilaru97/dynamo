@@ -66,8 +66,8 @@ class BaseOmniHandler(BaseWorkerHandler[Dict[str, Any], Dict[str, Any]]):
         self._request_admission_lock = asyncio.Lock()
         self._admitted_request_ids: set[str] = set()
         self._pending_request_admissions = 0
-        self.max_total_requests = self._get_positive_int_env(
-            "DYN_REQUEST_MAX_TOTAL_REQUESTS"
+        self.max_total_requests = self._configured_max_total_requests(
+            log_ignored_per_dp=True
         )
 
         logger.info(f"{self.__class__.__name__} initialized successfully")
