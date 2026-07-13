@@ -705,7 +705,7 @@ class TestConsolidatorRouterE2E:
         self, test_directory, runtime_services, engine_type
     ):
         """
-        Test REMOVE event deduplication across G1 (engine GPU), G2 (KVBM CPU), G3 (KVBM disk):
+        Test REMOVE / demotion behavior across G1 (engine GPU), G2 (KVBM CPU), G3 (KVBM disk):
 
         When blocks are stored in G1 (GPU), they are AUTOMATICALLY
         replicated to G2 (CPU) and G3 (Disk) simultaneously.
@@ -713,12 +713,13 @@ class TestConsolidatorRouterE2E:
         Test Scenario:
         1. Configure very small GPU cache (30 blocks) and slightly larger KVBM caches (50 blocks each)
         2. Send 25 requests with 100 tokens each → blocks stored in G1 AND offloaded to G2/G3
-        3. GPU fills up (30 blocks) → blocks evicted from G1 → consolidator receives REMOVE from engine
-           → consolidator sees blocks still exist in G2/G3 → does NOT publish REMOVE to router
-        4. Some blocks only exist in G1 (not replicated) → when evicted → published to router
+        3. GPU fills up → blocks evicted from G1 → consolidator demotes Device → HostPinned
+           so the router keeps offloaded-tier affinity (Device REMOVE + HostPinned STORE)
+        4. KVBM-only eviction while the engine still holds a block is suppressed on the wire
+        5. Final REMOVE is published only when the block leaves the last remaining source
 
-        This verifies: REMOVE is only sent to router when a block is removed from ALL sources.
-        Deduplication prevents unnecessary REMOVE events when blocks are still cached in G2/G3.
+        This verifies: router state tracks offloaded ownership after GPU eviction, and
+        end-of-life REMOVE still fires only when no source retains the block.
         """
 
         engine = engine_type
@@ -946,12 +947,20 @@ class TestConsolidatorRouterE2E:
                 logger.info("Phase 2: Analyzing consolidator deduplication behavior")
                 log_content = worker_log.read_text()
 
-                # Count blocks removed but still in another source (deduplication working!)
-                # Order-agnostic: checks for any removal where block still exists in another source
+                # Count blocks removed but still in another source (KVBM→engine
+                # order: wire publish suppressed because Device view remains).
                 # Pattern: "removed from source X, still in Y source(s): [sources]"
                 removes_but_still_in_other_source = len(
                     re.findall(
                         r"removed from source \w+, still in \d+ source\(s\)",
+                        log_content,
+                    )
+                )
+
+                # Count Device→HostPinned demotions (engine→KVBM order).
+                demotions = len(
+                    re.findall(
+                        r"demoted Device -> \w+ after engine release \(still in KVBM\)",
                         log_content,
                     )
                 )
@@ -971,20 +980,23 @@ class TestConsolidatorRouterE2E:
                 )
 
                 logger.info(
-                    f"Blocks removed but still in another source (deduplication working): {removes_but_still_in_other_source}"
+                    f"Blocks removed but still in another source (suppressed): {removes_but_still_in_other_source}"
                 )
+                logger.info(f"Blocks demoted Device -> lower tier: {demotions}")
                 logger.info(
                     f"Blocks removed from last source (will publish): {removes_from_last_source}"
                 )
                 logger.info(f"REMOVE events published to router: {published_removes}")
 
                 # Assertions:
-                # 1. We should see removals where blocks still exist in another source
-                #    This proves deduplication is working (REMOVE not sent to router yet)
-                #    Order doesn't matter - could be engine→KVBM or KVBM→engine
+                # 1. Multi-source lifetime must show either suppressed KVBM-first
+                #    removes or engine-first demotions (or both).
                 assert (
-                    removes_but_still_in_other_source > 0
-                ), f"Expected removals where blocks still exist in another source (deduplication working) for {engine.upper()}"
+                    removes_but_still_in_other_source > 0 or demotions > 0
+                ), (
+                    f"Expected multi-source remove suppression and/or Device→HostPinned "
+                    f"demotion for {engine.upper()}"
+                )
 
                 # 2. REMOVE events should be published for last-source removals
                 #    Order doesn't matter - could be engine or KVBM as last source

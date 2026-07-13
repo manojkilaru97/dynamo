@@ -275,6 +275,11 @@ def update_engine_config_with_dynamo(
         f"(use_kv_events={dynamo_config.use_kv_events})"
     )
 
+    # OffloadingConnector placeholder CPU events are not indexable by the KV
+    # router. When KV events are on, opt the connector into self-describing
+    # payloads so HostPinned stores carry tokens/hashes for lower-tier routing.
+    _ensure_self_describing_offload_events(engine_config, dynamo_config)
+
     if envs.is_set("DYN_FORWARDPASS_METRIC_PORT"):
         existing_cls = getattr(engine_config, "scheduler_cls", None)
         if existing_cls is None:
@@ -409,6 +414,86 @@ def _uses_dynamo_connector(engine_config: AsyncEngineArgs) -> bool:
             ):
                 return True
     return False
+
+
+def _iter_kv_transfer_connector_dicts(engine_config: AsyncEngineArgs):
+    """Yield mutable connector config dicts from kv_transfer_config.
+
+    Yields the top-level config object as a simple namespace-like accessor via
+    a (container, key) pattern is awkward; instead mutate
+    ``kv_connector_extra_config`` in place on the top-level config and on any
+    nested PdConnector/MultiConnector entries.
+    """
+    kv_cfg = getattr(engine_config, "kv_transfer_config", None)
+    if kv_cfg is None:
+        return
+    yield kv_cfg
+    extra = getattr(kv_cfg, "kv_connector_extra_config", None) or {}
+    for entry in extra.get("connectors", []):
+        if isinstance(entry, dict):
+            yield entry
+
+
+def _uses_offloading_connector(engine_config: AsyncEngineArgs) -> bool:
+    """True when OffloadingConnector is configured (direct or nested)."""
+    for entry in _iter_kv_transfer_connector_dicts(engine_config):
+        name = (
+            entry.get("kv_connector")
+            if isinstance(entry, dict)
+            else getattr(entry, "kv_connector", None)
+        )
+        if name == "OffloadingConnector":
+            return True
+    return False
+
+
+def _ensure_self_describing_offload_events(
+    engine_config: AsyncEngineArgs, dynamo_config: Config
+) -> None:
+    """Enable self_describing_kv_events for OffloadingConnector when KV events are on.
+
+    Without this, CPU offload stores emit placeholder payloads (empty tokens /
+    block_size=0) that Dynamo's ZMQ normalizer cannot index, so the router loses
+    affinity the moment blocks leave GPU — external prefix hits stay at 0%.
+    """
+    if not dynamo_config.use_kv_events:
+        return
+    if not _uses_offloading_connector(engine_config):
+        return
+
+    for entry in _iter_kv_transfer_connector_dicts(engine_config):
+        if isinstance(entry, dict):
+            if entry.get("kv_connector") != "OffloadingConnector":
+                continue
+            extra = entry.setdefault("kv_connector_extra_config", {})
+            if not isinstance(extra, dict):
+                continue
+            if extra.get("self_describing_kv_events"):
+                continue
+            extra["self_describing_kv_events"] = True
+            logger.info(
+                "Enabled self_describing_kv_events for nested OffloadingConnector "
+                "so CPU offload stores are indexable by the KV router"
+            )
+        else:
+            if getattr(entry, "kv_connector", None) != "OffloadingConnector":
+                continue
+            extra = getattr(entry, "kv_connector_extra_config", None)
+            if extra is None:
+                entry.kv_connector_extra_config = {"self_describing_kv_events": True}
+                logger.info(
+                    "Enabled self_describing_kv_events for OffloadingConnector "
+                    "so CPU offload stores are indexable by the KV router"
+                )
+                continue
+            if isinstance(extra, dict):
+                if extra.get("self_describing_kv_events"):
+                    continue
+                extra["self_describing_kv_events"] = True
+                logger.info(
+                    "Enabled self_describing_kv_events for OffloadingConnector "
+                    "so CPU offload stores are indexable by the KV router"
+                )
 
 
 def _connector_to_kv_transfer_json(connectors: list[str]) -> str:

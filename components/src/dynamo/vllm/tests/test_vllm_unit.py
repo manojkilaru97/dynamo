@@ -17,9 +17,11 @@ import pytest
 
 from dynamo.vllm.args import (
     _connector_to_kv_transfer_json,
+    _ensure_self_describing_offload_events,
     _is_routable,
     _uses_dynamo_connector,
     _uses_nixl_connector,
+    _uses_offloading_connector,
     ensure_side_channel_host,
     get_host_ip,
     parse_args,
@@ -292,6 +294,40 @@ def test_uses_dynamo_connector_direct_and_nested():
     )
     assert _uses_dynamo_connector(_make_engine_cfg("NixlConnector")) is False
     assert _uses_dynamo_connector(_make_engine_cfg()) is False
+
+
+def test_uses_offloading_connector_direct_and_nested():
+    assert _uses_offloading_connector(_make_engine_cfg("OffloadingConnector")) is True
+    nested = {
+        "connectors": [
+            {"kv_connector": "OffloadingConnector", "kv_role": "kv_both"},
+            {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
+        ]
+    }
+    assert _uses_offloading_connector(_make_engine_cfg("PdConnector", nested)) is True
+    assert _uses_offloading_connector(_make_engine_cfg("DynamoConnector")) is False
+    assert _uses_offloading_connector(_make_engine_cfg()) is False
+
+
+def test_ensure_self_describing_offload_events_when_kv_events_enabled():
+    engine = _make_engine_cfg(
+        "OffloadingConnector",
+        {"cpu_bytes_to_use": 1_000_000},
+    )
+    dynamo_cfg = SimpleNamespace(use_kv_events=True)
+    _ensure_self_describing_offload_events(engine, dynamo_cfg)
+    extra = engine.kv_transfer_config.kv_connector_extra_config
+    assert extra["self_describing_kv_events"] is True
+    assert extra["cpu_bytes_to_use"] == 1_000_000
+
+
+def test_ensure_self_describing_offload_events_noop_without_kv_events():
+    engine = _make_engine_cfg("OffloadingConnector", {})
+    dynamo_cfg = SimpleNamespace(use_kv_events=False)
+    _ensure_self_describing_offload_events(engine, dynamo_cfg)
+    assert "self_describing_kv_events" not in (
+        engine.kv_transfer_config.kv_connector_extra_config or {}
+    )
 
 
 def test_headless_namespace_has_required_fields(mock_vllm_cli):
