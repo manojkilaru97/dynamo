@@ -12,11 +12,8 @@
 //! - Deduplication: Uses SequenceHash as the key
 //!   - Always computes sequence hash using KVBM's xxHash3 method, regardless of source
 //!   - SequenceHash = first block: Hash(tokens), subsequent: Hash([parent_seq_hash, block_hash])
-//! - Emit Store: When a block is first stored from ANY source (always Device-tagged so
-//!   device-tier children can attach), or when an engine re-store promotes a demoted block
-//! - Emit Demotion: When the engine releases a block that KVBM still holds → Device REMOVE
-//!   + HostPinned/Disk STORE so the router can keep lower-tier overlap affinity
-//! - Emit Remove: Only when a block is removed from ALL sources (tier matches last publish)
+//! - Emit Store: Only when a block is first stored from ANY source
+//! - Emit Remove: Only when a block is removed from ALL sources
 
 use std::collections::{HashMap, HashSet};
 
@@ -143,21 +140,8 @@ impl From<RouterStorageTier> for StorageTier {
     }
 }
 
-fn is_engine_source(source: EventSource) -> bool {
-    matches!(source, EventSource::Vllm | EventSource::Trtllm)
-}
-
-fn normalize_kvbm_tier(tier: Option<StorageTier>) -> StorageTier {
-    match tier {
-        Some(StorageTier::Disk) => StorageTier::Disk,
-        // First-store / unknown KVBM placement defaults to host-pinned (G2).
-        _ => StorageTier::HostPinned,
-    }
-}
-
-/// Metadata for tracking which event sources have a block, plus enough payload
-/// to re-publish STORE events when ownership demotes Device → HostPinned/Disk
-/// (GPU eviction while KVBM still holds the block) or promotes back.
+/// Minimal metadata for tracking which event sources have a block
+/// All other metadata (tokens, parent, etc.) is stored in the ConsolidatedEvent when queued
 #[derive(Debug, Clone)]
 pub struct BlockMetadata {
     /// Event sources where this block exists (vLLM and/or KVBM)
@@ -165,46 +149,16 @@ pub struct BlockMetadata {
     /// The first external block hash seen for this token sequence (for output events)
     /// Different sources may have different external hashes, but they all represent the same token content
     pub first_block_hash: String,
-    /// Token payload retained so demotion/promotion can re-emit indexable STOREs.
-    pub token_ids: Vec<u32>,
-    /// Resolved parent external hash (first_block_hash of parent), if any.
-    pub parent_hash: Option<String>,
-    pub block_size: usize,
-    pub lora_name: Option<String>,
-    /// Tier last published on the consolidator wire.
-    pub published_tier: StorageTier,
-    /// KVBM placement while the Kvbm source still owns the block.
-    pub kvbm_tier: Option<StorageTier>,
 }
 
 impl BlockMetadata {
-    pub fn new(
-        source: EventSource,
-        block_hash: String,
-        token_ids: Vec<u32>,
-        parent_hash: Option<String>,
-        block_size: usize,
-        lora_name: Option<String>,
-        kvbm_tier: Option<StorageTier>,
-    ) -> Self {
+    pub fn new(source: EventSource, block_hash: String) -> Self {
         let mut sources = HashSet::new();
         sources.insert(source);
 
         Self {
             sources,
             first_block_hash: block_hash,
-            token_ids,
-            parent_hash,
-            block_size,
-            lora_name,
-            // First publish is always Device so device-tier children can attach
-            // in the primary indexer (see first-store path in handle_store).
-            published_tier: StorageTier::Device,
-            kvbm_tier: if source == EventSource::Kvbm {
-                Some(normalize_kvbm_tier(kvbm_tier))
-            } else {
-                None
-            },
         }
     }
 
@@ -223,21 +177,6 @@ impl BlockMetadata {
     /// Returns true if the source was present and removed
     pub fn remove_source(&mut self, source: EventSource) -> bool {
         self.sources.remove(&source)
-    }
-
-    fn has_engine_source(&self) -> bool {
-        self.sources.iter().copied().any(is_engine_source)
-    }
-
-    /// Best remaining wire tier given current source ownership.
-    fn best_remaining_tier(&self) -> Option<StorageTier> {
-        if self.has_engine_source() {
-            Some(StorageTier::Device)
-        } else if self.sources.contains(&EventSource::Kvbm) {
-            Some(self.kvbm_tier.unwrap_or(StorageTier::HostPinned))
-        } else {
-            None
-        }
     }
 }
 
@@ -388,21 +327,6 @@ impl CacheStatusTracker for DedupCacheStatusTracker {
             let is_new_source = metadata.add_source(source);
             self.hash_mapping.insert(block_hash.clone(), sequence_hash);
 
-            if source == EventSource::Kvbm {
-                metadata.kvbm_tier = Some(normalize_kvbm_tier(tier));
-            }
-
-            // Refresh retained payload when we learn more (e.g. engine store
-            // after a KVBM-only first sighting). Keep the original
-            // first_block_hash for wire identity.
-            if !token_ids.is_empty() {
-                metadata.token_ids = token_ids.clone();
-                metadata.block_size = block_size;
-                if lora_name.is_some() {
-                    metadata.lora_name = lora_name.clone();
-                }
-            }
-
             if is_new_source {
                 tracing::debug!(
                     "DEDUP: Block {} (seq_hash={}) added to source {:?} (already exists in {} source(s), {} tokens, external_hash={})\n  Token IDs: {:?}",
@@ -424,56 +348,9 @@ impl CacheStatusTracker for DedupCacheStatusTracker {
                     &token_ids
                 );
             }
-
-            // Promote: engine re-acquired a block that was demoted to a lower
-            // tier after GPU eviction. Republish as Device so the primary
-            // indexer regains ownership for full-weight routing.
-            if is_engine_source(source)
-                && metadata.published_tier != StorageTier::Device
-                && metadata.has_engine_source()
-            {
-                let promote_hash = metadata.first_block_hash.clone();
-                let promote_parent = metadata.parent_hash.clone();
-                let promote_tokens = metadata.token_ids.clone();
-                let promote_block_size = metadata.block_size;
-                let promote_lora = metadata.lora_name.clone();
-                metadata.published_tier = StorageTier::Device;
-                self.event_queue.push(ConsolidatedEvent::Store {
-                    block_hash: promote_hash,
-                    parent_hash: promote_parent,
-                    token_ids: promote_tokens,
-                    block_size: promote_block_size,
-                    lora_name: promote_lora,
-                    source: source.to_str().to_string(),
-                    tier: Some(StorageTier::Device),
-                });
-                tracing::debug!(
-                    "Block {} (seq_hash={}) promoted back to Device after engine store",
-                    block_hash,
-                    sequence_hash
-                );
-                return true;
-            }
-
             false
         } else {
-            let resolved_parent_hash = parent_hash.as_ref().and_then(|ph| {
-                self.hash_mapping.get(ph).and_then(|&parent_seq_hash| {
-                    self.blocks
-                        .get(&parent_seq_hash)
-                        .map(|parent_metadata| parent_metadata.first_block_hash.clone())
-                })
-            });
-
-            let metadata = BlockMetadata::new(
-                source,
-                block_hash.clone(),
-                token_ids.clone(),
-                resolved_parent_hash.clone(),
-                block_size,
-                lora_name.clone(),
-                tier,
-            );
+            let metadata = BlockMetadata::new(source, block_hash.clone());
 
             tracing::debug!(
                 "New block {} (seq_hash={}) stored in source {:?} (tier={:?}): {} tokens, block_size={}, parent={}, lora={:?}, dp_rank={:?}\n  Token IDs: {:?}",
@@ -495,11 +372,17 @@ impl CacheStatusTracker for DedupCacheStatusTracker {
             self.blocks.insert(sequence_hash, metadata);
             self.hash_mapping.insert(block_hash.clone(), sequence_hash);
 
-            // Always tag first stores as Device: the indexer dispatches by
+            let resolved_parent_hash = parent_hash.and_then(|ph| {
+                self.hash_mapping.get(&ph).and_then(|&parent_seq_hash| {
+                    self.blocks
+                        .get(&parent_seq_hash)
+                        .map(|parent_metadata| parent_metadata.first_block_hash.clone())
+                })
+            });
+
+            // Always tag dedup'd stores as Device: the indexer dispatches by
             // tier, and a non-device tag here would route the block to the
             // lower-tier indexer, orphaning every subsequent device-tier child.
-            // Demotion to HostPinned/Disk happens later when the engine
-            // releases and only KVBM still holds the block.
             self.event_queue.push(ConsolidatedEvent::Store {
                 block_hash: block_hash.clone(),
                 parent_hash: resolved_parent_hash,
@@ -523,6 +406,9 @@ impl CacheStatusTracker for DedupCacheStatusTracker {
     }
 
     fn handle_remove(&mut self, event: RemoveEventInput) -> bool {
+        // The source's tier is intentionally discarded: dedup mode collapses
+        // every source/tier into a unified Device-tagged stream (see the STORE
+        // path), and the REMOVE must match that tagging.
         let RemoveEventInput {
             block_hash,
             source,
@@ -552,10 +438,6 @@ impl CacheStatusTracker for DedupCacheStatusTracker {
                 return false;
             }
 
-            if source == EventSource::Kvbm {
-                metadata.kvbm_tier = None;
-            }
-
             // Don't drop hash_mapping[block_hash] on per-source removes: when
             // sources share the same external block_hash (e.g. KVBM publishing
             // TRT-LLM's hash chain), removing it now would orphan the next
@@ -564,18 +446,20 @@ impl CacheStatusTracker for DedupCacheStatusTracker {
 
             if !metadata.exists_in_any_source() {
                 let first_block_hash = metadata.first_block_hash.clone();
-                let published_tier = metadata.published_tier;
                 self.blocks.remove(&sequence_hash);
 
                 self.hash_mapping
                     .retain(|_ext_hash, seq_hash| *seq_hash != sequence_hash);
 
-                // REMOVE must match the tier of the last published STORE so it
-                // hits the same indexer (primary vs lower-tier).
+                // Mirror the dedup STORE: tag the unified REMOVE as Device so
+                // it routes to the same indexer the STORE landed in. Otherwise
+                // a non-device last-source release (e.g. KVBM holding a block
+                // longer than the engine) would deliver the REMOVE to the
+                // lower-tier indexer that never saw the corresponding STORE.
                 self.event_queue.push(ConsolidatedEvent::Remove {
                     block_hash: first_block_hash.clone(),
                     source: source.to_str().to_string(),
-                    tier: Some(published_tier),
+                    tier: Some(StorageTier::Device),
                 });
 
                 tracing::debug!(
@@ -587,57 +471,6 @@ impl CacheStatusTracker for DedupCacheStatusTracker {
                     self.hash_mapping.len()
                 );
                 true
-            } else if let Some(new_tier) = metadata.best_remaining_tier() {
-                // Demote: GPU/engine released the block but KVBM still holds it
-                // off-device. Publish Device REMOVE + lower-tier STORE so the
-                // router can keep routing on host/disk overlap instead of a
-                // stale Device entry (or dropping affinity entirely).
-                if metadata.published_tier == StorageTier::Device && new_tier != StorageTier::Device
-                {
-                    let demote_hash = metadata.first_block_hash.clone();
-                    let demote_parent = metadata.parent_hash.clone();
-                    let demote_tokens = metadata.token_ids.clone();
-                    let demote_block_size = metadata.block_size;
-                    let demote_lora = metadata.lora_name.clone();
-                    metadata.published_tier = new_tier;
-                    if metadata.kvbm_tier.is_none() {
-                        metadata.kvbm_tier = Some(new_tier);
-                    }
-
-                    self.event_queue.push(ConsolidatedEvent::Remove {
-                        block_hash: demote_hash.clone(),
-                        source: source.to_str().to_string(),
-                        tier: Some(StorageTier::Device),
-                    });
-                    self.event_queue.push(ConsolidatedEvent::Store {
-                        block_hash: demote_hash.clone(),
-                        parent_hash: demote_parent,
-                        token_ids: demote_tokens,
-                        block_size: demote_block_size,
-                        lora_name: demote_lora,
-                        source: EventSource::Kvbm.to_str().to_string(),
-                        tier: Some(new_tier),
-                    });
-
-                    tracing::debug!(
-                        "Block {} (seq_hash={}) demoted Device -> {:?} after engine release (still in KVBM)",
-                        demote_hash,
-                        sequence_hash,
-                        new_tier
-                    );
-                    true
-                } else {
-                    tracing::debug!(
-                        "Block {} (seq_hash={}) removed from source {:?}, still in {} source(s): {:?} (hash_mapping: {})",
-                        &metadata.first_block_hash[..16.min(metadata.first_block_hash.len())],
-                        sequence_hash,
-                        source,
-                        metadata.sources.len(),
-                        metadata.sources,
-                        self.hash_mapping.len()
-                    );
-                    false
-                }
             } else {
                 tracing::debug!(
                     "Block {} (seq_hash={}) removed from source {:?}, still in {} source(s): {:?} (hash_mapping: {})",
@@ -923,35 +756,20 @@ mod tests {
         assert!(!should_publish);
         assert_eq!(tracker.drain_events().len(), 0);
 
-        // Engine release while KVBM still holds the block demotes Device ->
-        // HostPinned so the router can keep affinity on the offloaded tier.
-        let demoted = tracker.handle_remove(
+        // The unified REMOVE must also be Device-tagged, even when the
+        // last-source release is on a lower tier (e.g. KVBM holding the
+        // block longer than the engine). Otherwise the REMOVE would route
+        // to the lower-tier indexer that never received the Device STORE.
+        tracker.handle_remove(
             "trtllm_hash1",
             EventSource::Trtllm,
             Some(StorageTier::Device),
         );
-        assert!(demoted, "engine release with KVBM remaining must demote");
-        let events = tracker.drain_events();
         assert_eq!(
-            events.len(),
-            2,
-            "demotion emits Device REMOVE + HostPinned STORE"
+            tracker.drain_events().len(),
+            0,
+            "trtllm release must not publish: KVBM still owns the block"
         );
-        match &events[0] {
-            ConsolidatedEvent::Remove { tier, .. } => {
-                assert_eq!(*tier, Some(StorageTier::Device));
-            }
-            other => panic!("expected Device Remove, got: {:?}", other),
-        }
-        match &events[1] {
-            ConsolidatedEvent::Store {
-                tier, token_ids, ..
-            } => {
-                assert_eq!(*tier, Some(StorageTier::HostPinned));
-                assert_eq!(token_ids, &vec![1, 2, 3]);
-            }
-            other => panic!("expected HostPinned Store, got: {:?}", other),
-        }
 
         let kvbm_remove = tracker.handle_remove(
             "kvbm_hash1",
@@ -965,110 +783,11 @@ mod tests {
             ConsolidatedEvent::Remove { tier, .. } => {
                 assert_eq!(
                     *tier,
-                    Some(StorageTier::HostPinned),
-                    "final REMOVE must match the demoted published tier"
+                    Some(StorageTier::Device),
+                    "dedup must collapse the source tier to Device on the REMOVE wire"
                 );
             }
             other => panic!("expected Remove event, got: {:?}", other),
-        }
-    }
-
-    /// GPU eviction while KVBM still holds the block must demote the wire
-    /// view to HostPinned so lower-tier router overlap stays accurate.
-    #[test]
-    fn test_engine_remove_demotes_to_host_pinned() {
-        let mut tracker = TestTracker::new();
-
-        tracker.handle_store(
-            "vllm_hash1".to_string(),
-            EventSource::Vllm,
-            vec![10, 11, 12],
-            None,
-            3,
-            None,
-            Some(StorageTier::Device),
-            None,
-        );
-        tracker.handle_store(
-            "kvbm_hash1".to_string(),
-            EventSource::Kvbm,
-            vec![10, 11, 12],
-            None,
-            3,
-            None,
-            Some(StorageTier::HostPinned),
-            None,
-        );
-        tracker.drain_events();
-
-        assert!(tracker.handle_remove("vllm_hash1", EventSource::Vllm, Some(StorageTier::Device),));
-        let events = tracker.drain_events();
-        assert_eq!(events.len(), 2);
-        assert!(matches!(
-            &events[0],
-            ConsolidatedEvent::Remove {
-                tier: Some(StorageTier::Device),
-                ..
-            }
-        ));
-        assert!(matches!(
-            &events[1],
-            ConsolidatedEvent::Store {
-                tier: Some(StorageTier::HostPinned),
-                ..
-            }
-        ));
-        assert_eq!(tracker.num_blocks(), 1);
-    }
-
-    /// After demotion, an engine re-store must promote back to Device.
-    #[test]
-    fn test_engine_restore_promotes_from_host_pinned() {
-        let mut tracker = TestTracker::new();
-
-        tracker.handle_store(
-            "vllm_hash1".to_string(),
-            EventSource::Vllm,
-            vec![7, 8, 9],
-            None,
-            3,
-            None,
-            Some(StorageTier::Device),
-            None,
-        );
-        tracker.handle_store(
-            "kvbm_hash1".to_string(),
-            EventSource::Kvbm,
-            vec![7, 8, 9],
-            None,
-            3,
-            None,
-            Some(StorageTier::HostPinned),
-            None,
-        );
-        tracker.drain_events();
-
-        assert!(tracker.handle_remove("vllm_hash1", EventSource::Vllm, Some(StorageTier::Device),));
-        tracker.drain_events();
-
-        // Engine reacquires the block (onboard / recompute).
-        assert!(tracker.handle_store(
-            "vllm_hash2".to_string(),
-            EventSource::Vllm,
-            vec![7, 8, 9],
-            None,
-            3,
-            None,
-            Some(StorageTier::Device),
-            None,
-        ));
-        let events = tracker.drain_events();
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            ConsolidatedEvent::Store { tier, .. } => {
-                assert_eq!(*tier, Some(StorageTier::Device));
-            }
-            other => panic!("expected Device Store promote, got: {:?}", other),
         }
     }
 
@@ -1138,14 +857,8 @@ mod tests {
         let trtllm_remove =
             tracker.handle_remove(&shared, EventSource::Trtllm, Some(StorageTier::Device));
         assert!(
-            trtllm_remove,
-            "first remove demotes Device -> HostPinned while KVBM still owns the block"
-        );
-        let demote_events = tracker.drain_events();
-        assert_eq!(
-            demote_events.len(),
-            2,
-            "demotion: Device REMOVE + HostPinned STORE"
+            !trtllm_remove,
+            "first remove must not publish: KVBM still owns the block"
         );
 
         let kvbm_remove =
@@ -1161,17 +874,11 @@ mod tests {
             1,
             "exactly one REMOVE published at end-of-life"
         );
-        match &events[0] {
-            ConsolidatedEvent::Remove { tier, .. } => {
-                assert_eq!(*tier, Some(StorageTier::HostPinned));
-            }
-            other => panic!("expected HostPinned Remove, got: {:?}", other),
-        }
         assert_eq!(tracker.num_blocks(), 0);
     }
 
     #[test]
-    fn test_remove_from_multi_source_demotes_then_removes() {
+    fn test_remove_from_multi_source_no_publish() {
         let mut tracker = TestTracker::new();
 
         // Store from vLLM - first STORE event published
@@ -1198,13 +905,13 @@ mod tests {
         );
         tracker.drain_events();
 
-        // Remove from vLLM - demote to HostPinned while KVBM still owns it
+        // Remove from vLLM - should not publish (still in KVBM)
         let should_publish =
             tracker.handle_remove("vllm_hash1", EventSource::Vllm, Some(StorageTier::Device));
 
-        assert!(should_publish);
+        assert!(!should_publish);
         assert_eq!(tracker.num_blocks(), 1);
-        assert_eq!(tracker.drain_events().len(), 2);
+        assert_eq!(tracker.drain_events().len(), 0);
 
         // Remove from KVBM (last source) - should publish REMOVE event
         let should_publish = tracker.handle_remove(
@@ -1215,14 +922,6 @@ mod tests {
 
         assert!(should_publish);
         assert_eq!(tracker.num_blocks(), 0);
-        let events = tracker.drain_events();
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            ConsolidatedEvent::Remove { tier, .. } => {
-                assert_eq!(*tier, Some(StorageTier::HostPinned));
-            }
-            other => panic!("expected HostPinned Remove, got: {:?}", other),
-        }
     }
 
     #[test]

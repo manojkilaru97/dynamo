@@ -61,6 +61,23 @@ For configuration details, see the [LMCache Integration Guide](../../integration
 
 For configuration details, see the [FlexKV Integration Guide](../../integrations/flexkv-integration.md).
 
+## vLLM OffloadingConnector
+
+vLLM's built-in [`OffloadingConnector`](https://docs.vllm.ai/) can offload KV blocks to CPU (and optionally secondary tiers). With Dynamo `--router-mode kv`, CPU offload stores must be **self-describing** so the router can index HostPinned ownership after GPU eviction.
+
+When KV events are enabled (`--kv-events-config` with `enable_kv_cache_events: true`), Dynamo auto-sets `self_describing_kv_events: true` in `kv_connector_extra_config` for `OffloadingConnector`. Without that, CPU store events use placeholder payloads and the router loses prefix affinity as soon as blocks leave GPU (`external_prefix_cache_hits` stays near zero).
+
+Example:
+
+```bash
+python -m dynamo.vllm \
+  --model $MODEL \
+  --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":8000000000}}' \
+  --kv-events-config '{"publisher":"zmq","enable_kv_cache_events":true,"endpoint":"tcp://*:5557"}'
+```
+
+`TieringOffloadingSpec` rejects `self_describing_kv_events`; use single-tier CPU offload when you need Dynamo to route on offloaded cache.
+
 ## See Also
 
 - **[KVBM Design](../../design-docs/kvbm-design.md)**: Architecture and design of Dynamo's built-in KV cache offloading
