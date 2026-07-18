@@ -121,6 +121,26 @@ def parse_args(argv: list[str] | None = None) -> Config:
     return dynamo_config
 
 
+def _sync_structured_outputs_reasoning_parser(engine_config: AsyncEngineArgs) -> None:
+    structured_outputs_config = getattr(
+        engine_config, "structured_outputs_config", None
+    )
+    if structured_outputs_config is None:
+        return
+
+    reasoning_parser = getattr(engine_config, "reasoning_parser", None)
+    if reasoning_parser and not getattr(
+        structured_outputs_config, "reasoning_parser", None
+    ):
+        structured_outputs_config.reasoning_parser = reasoning_parser
+
+    reasoning_parser_plugin = getattr(engine_config, "reasoning_parser_plugin", None)
+    if reasoning_parser_plugin and not getattr(
+        structured_outputs_config, "reasoning_parser_plugin", None
+    ):
+        structured_outputs_config.reasoning_parser_plugin = reasoning_parser_plugin
+
+
 def configure_rl_logprobs_mode(config: Config) -> None:
     if not config.enable_rl:
         return
