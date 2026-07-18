@@ -275,6 +275,7 @@ class VllmProcessor:
         tool_parser_class: type[ToolParser] | None,
         reasoning_parser_class: type[ReasoningParser] | None,
         routed_engine: RoutedEngine,
+        tool_parser_name: str | None = None,
         block_size: int = 16,
         enable_auto_tool_choice: bool = False,
         default_chat_template_kwargs: dict[str, Any] | None = None,
@@ -1096,6 +1097,7 @@ class EngineFactory:
             tool_parser_class,
             reasoning_parser_class,
             routed_engine,
+            tool_parser_name=tool_parser_name,
             block_size=block_size,
             enable_auto_tool_choice=enable_auto_tool_choice,
             default_chat_template_kwargs=getattr(
