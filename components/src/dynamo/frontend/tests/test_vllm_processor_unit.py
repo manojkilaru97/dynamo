@@ -570,6 +570,87 @@ class TestReasoningParserMetadata:
         assert reasoning_ended is True
         assert parser_kwargs == {"chat_template_kwargs": {"reasoning_effort": "high"}}
 
+    def test_structured_outputs_serialize_to_guided_decoding(self):
+        from dynamo.frontend.vllm_processor import _structured_outputs_to_guided_decoding
+
+        guided = _structured_outputs_to_guided_decoding(
+            StructuredOutputsParams(
+                json={
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                },
+                disable_any_whitespace=True,
+            )
+        )
+
+        assert guided == {
+            "json": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            },
+            "disable_any_whitespace": True,
+            "disable_additional_properties": False,
+        }
+
+    def test_constraints_empty_structured_outputs_are_discarded(self):
+        from dynamo.frontend.vllm_processor import _active_structured_outputs
+
+        empty = SimpleNamespace(all_constraints_none=lambda: True)
+        active = StructuredOutputsParams(json={"type": "object"})
+
+        assert _active_structured_outputs(empty) is None
+        assert _active_structured_outputs(active) is active
+
+    def test_response_format_json_schema_serializes_to_guided_decoding(self):
+        from dynamo.frontend.vllm_processor import (
+            _structured_outputs_from_response_format,
+            _structured_outputs_to_guided_decoding,
+        )
+
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        }
+        structured_outputs = _structured_outputs_from_response_format(
+            {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": schema},
+            }
+        )
+
+        guided = _structured_outputs_to_guided_decoding(structured_outputs)
+
+        assert guided == {
+            "json": schema,
+            "disable_any_whitespace": False,
+            "disable_additional_properties": False,
+        }
+
+    def test_request_extra_structured_outputs_serializes_to_guided_decoding(self):
+        from dynamo.frontend.vllm_processor import (
+            _request_structured_outputs,
+            _structured_outputs_to_guided_decoding,
+        )
+
+        schema = {
+            "type": "object",
+            "properties": {"records": {"type": "array"}},
+            "required": ["records"],
+        }
+        structured_outputs = _request_structured_outputs(
+            SimpleNamespace(
+                structured_outputs=None,
+                model_extra={"structured_outputs": {"json": schema}},
+                response_format=None,
+            ),
+            SamplingParams(max_tokens=128),
+        )
+
+        assert _structured_outputs_to_guided_decoding(structured_outputs)["json"] == schema
+
     def test_kv_router_copies_reasoning_metadata_to_extra_args(self):
         from dynamo.frontend.vllm_processor import _inject_routing_metadata
 

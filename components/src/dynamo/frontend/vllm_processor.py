@@ -199,6 +199,516 @@ def _build_reasoning_parser_metadata(
     return reasoning_parser.is_reasoning_end(prompt_token_ids), parser_kwargs
 
 
+def _structured_outputs_to_guided_decoding(
+    structured_outputs: StructuredOutputsParams | None,
+) -> dict[str, Any] | None:
+    if structured_outputs is None or structured_outputs.all_constraints_none():
+        return None
+
+    guided_decoding: dict[str, Any] = {}
+    for key in (
+        "json",
+        "regex",
+        "choice",
+        "grammar",
+        "json_object",
+        "structural_tag",
+        "disable_any_whitespace",
+        "disable_additional_properties",
+        "whitespace_pattern",
+    ):
+        value = getattr(structured_outputs, key, None)
+        if value is not None:
+            guided_decoding[key] = value
+    return guided_decoding or None
+
+
+def _get_attr_or_item(value: Any, key: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(key)
+    return getattr(value, key, None)
+
+
+def _copy_jsonable(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+    try:
+        return json.loads(json.dumps(value))
+    except TypeError:
+        return value
+
+
+def _tool_text_budget(request_text_len: int | None) -> int:
+    if request_text_len is None or request_text_len < TOOL_LONG_REQUEST_THRESHOLD:
+        return DEFAULT_TOOL_SHORT_TEXT_MAX_LENGTH
+    return max(
+        DEFAULT_TOOL_SHORT_TEXT_MAX_LENGTH,
+        min(DEFAULT_TOOL_LONG_TEXT_MAX_LENGTH, request_text_len + TOOL_LONG_REQUEST_MARGIN),
+    )
+
+
+def _request_text_len(request: Any) -> int | None:
+    messages = _get_attr_or_item(request, "messages")
+    if not isinstance(messages, list):
+        return None
+    total = 0
+    for message in messages:
+        content = _get_attr_or_item(message, "content")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, str):
+                    total += len(part)
+                else:
+                    text = _get_attr_or_item(part, "text")
+                    if isinstance(text, str):
+                        total += len(text)
+    return total
+
+
+def _bound_tool_schema(
+    schema: Any,
+    *,
+    field_name: str | None = None,
+    request_text_len: int | None = None,
+) -> Any:
+    if isinstance(schema, list):
+        return [
+            _bound_tool_schema(
+                item,
+                field_name=field_name,
+                request_text_len=request_text_len,
+            )
+            for item in schema
+        ]
+    if not isinstance(schema, dict):
+        return schema
+
+    bounded = _copy_jsonable(schema)
+    if not isinstance(bounded, dict):
+        return schema
+
+    schema_type = bounded.get("type")
+    schema_types = schema_type if isinstance(schema_type, list) else [schema_type]
+    if (
+        "string" in schema_types
+        and "maxLength" not in bounded
+        and "enum" not in bounded
+        and "const" not in bounded
+    ):
+        max_length = TOOL_FIELD_STRING_BUDGETS.get(
+            field_name or "", DEFAULT_TOOL_SCHEMA_MAX_STRING_LENGTH
+        )
+        if field_name in TOOL_LONG_TEXT_FIELD_NAMES:
+            max_length = _tool_text_budget(request_text_len)
+        bounded["maxLength"] = max_length
+    if "array" in schema_types and "maxItems" not in bounded:
+        bounded["maxItems"] = DEFAULT_TOOL_SCHEMA_MAX_ARRAY_ITEMS
+
+    for key in ("properties", "$defs", "definitions", "patternProperties"):
+        value = bounded.get(key)
+        if isinstance(value, dict):
+            bounded[key] = {
+                name: _bound_tool_schema(
+                    subschema,
+                    field_name=name if key == "properties" else None,
+                    request_text_len=request_text_len,
+                )
+                for name, subschema in value.items()
+            }
+
+    for key in ("items", "additionalProperties"):
+        value = bounded.get(key)
+        if isinstance(value, (dict, list)):
+            bounded[key] = _bound_tool_schema(
+                value,
+                field_name=field_name,
+                request_text_len=request_text_len,
+            )
+
+    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        value = bounded.get(key)
+        if isinstance(value, list):
+            bounded[key] = [
+                _bound_tool_schema(
+                    subschema,
+                    field_name=field_name,
+                    request_text_len=request_text_len,
+                )
+                for subschema in value
+            ]
+
+    return bounded
+
+
+def _tool_function(tool: Any) -> Any:
+    return _get_attr_or_item(tool, "function") or {}
+
+
+def _tool_name(tool: Any) -> str | None:
+    return _get_attr_or_item(_tool_function(tool), "name")
+
+
+def _tool_parameters(tool: Any) -> dict[str, Any]:
+    params = _get_attr_or_item(_tool_function(tool), "parameters")
+    if isinstance(params, dict):
+        return _copy_jsonable(params)
+    return {"type": "object", "properties": {}}
+
+
+def _named_tool_choice_name(tool_choice: Any) -> str | None:
+    function = _get_attr_or_item(tool_choice, "function")
+    if function is None:
+        return None
+    return _get_attr_or_item(function, "name")
+
+
+def _request_has_user_structured_output(request: Any) -> bool:
+    if _get_attr_or_item(request, "guided_json") is not None:
+        return True
+    structured_outputs = _get_attr_or_item(request, "structured_outputs")
+    if isinstance(structured_outputs, dict) and any(
+        structured_outputs.get(key) is not None
+        for key in ("json", "json_object", "regex", "choice", "grammar", "structural_tag")
+    ):
+        return True
+    if structured_outputs is not None and hasattr(
+        structured_outputs, "all_constraints_none"
+    ):
+        if not structured_outputs.all_constraints_none():
+            return True
+    response_format = _get_attr_or_item(request, "response_format")
+    if isinstance(response_format, dict):
+        return response_format.get("type") in {
+            "json_schema",
+            "json_object",
+            "structural_tag",
+        }
+    return False
+
+
+def _complete_json_text(text: str) -> str | None:
+    candidate = text.lstrip()
+    if not candidate:
+        return None
+    try:
+        _, end = json.JSONDecoder().raw_decode(candidate)
+    except json.JSONDecodeError:
+        return None
+    if candidate[end:].strip():
+        return None
+    return candidate[:end]
+
+
+def _structured_tool_choice_name(request: Any) -> str | None:
+    if _request_has_user_structured_output(request) or not _get_attr_or_item(
+        request, "tools"
+    ):
+        return None
+    tool_choice = _get_attr_or_item(request, "tool_choice")
+    if tool_choice in (None, "none", "auto", "required"):
+        return None
+    return _named_tool_choice_name(tool_choice)
+
+
+def _structured_tool_choice_required(request: Any) -> bool:
+    return (
+        bool(_get_attr_or_item(request, "tools"))
+        and not _request_has_user_structured_output(request)
+        and _get_attr_or_item(request, "tool_choice") == "required"
+    )
+
+
+def _structured_tool_calls_from_content(
+    request: Any,
+    content: str,
+) -> list[dict[str, Any]] | None:
+    _, end_marker, post_reasoning = content.rpartition("</think>")
+    arguments = _complete_json_text(post_reasoning if end_marker else content)
+    if arguments is None:
+        return None
+
+    tool_name = _structured_tool_choice_name(request)
+    if tool_name is not None:
+        return [
+            {
+                "id": make_tool_call_id(),
+                "type": "function",
+                "index": 0,
+                "function": {"name": tool_name, "arguments": arguments},
+            }
+        ]
+
+    if not _structured_tool_choice_required(request):
+        return None
+
+    try:
+        decoded = json.loads(arguments)
+    except json.JSONDecodeError:
+        return None
+    items = decoded if isinstance(decoded, list) else [decoded]
+    tool_calls: list[dict[str, Any]] = []
+    for index, item in enumerate(items):
+        name = _get_attr_or_item(item, "name")
+        parameters = _get_attr_or_item(item, "parameters")
+        if not isinstance(name, str):
+            continue
+        if not isinstance(parameters, str):
+            parameters = json.dumps(parameters or {}, ensure_ascii=False)
+        tool_calls.append(
+            {
+                "id": make_tool_call_id(),
+                "type": "function",
+                "index": index,
+                "function": {"name": name, "arguments": parameters},
+            }
+        )
+    return tool_calls or None
+
+
+def _bridge_structured_tool_content_choices(
+    request: Any,
+    choices: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if (
+        _structured_tool_choice_name(request) is None
+        and not _structured_tool_choice_required(request)
+    ):
+        return choices
+
+    bridged: list[dict[str, Any]] = []
+    for choice in choices:
+        delta = choice.get("delta") or {}
+        if delta.get("tool_calls"):
+            bridged.append(choice)
+            continue
+
+        content = delta.get("content")
+        if isinstance(content, str):
+            tool_calls = _structured_tool_calls_from_content(request, content)
+            if tool_calls:
+                new_delta = {k: v for k, v in delta.items() if k != "content"}
+                new_delta.setdefault("role", "assistant")
+                new_delta["tool_calls"] = tool_calls
+                bridged.append(
+                    {
+                        **choice,
+                        "delta": new_delta,
+                        "finish_reason": "tool_calls",
+                    }
+                )
+                continue
+
+        if choice.get("finish_reason") in {
+            "stop",
+            "length",
+            FinishReason.STOP,
+            FinishReason.LENGTH,
+        } and set(delta.keys()) <= {"role"}:
+            bridged.append({**choice, "finish_reason": None})
+            continue
+        bridged.append(choice)
+    return bridged
+
+
+def _tool_choice_guided_json_schema(request: Any) -> dict[str, Any] | None:
+    tool_choice = _get_attr_or_item(request, "tool_choice")
+    tools = _get_attr_or_item(request, "tools")
+    if tool_choice in (None, "none", "auto") or not tools:
+        return None
+
+    request_text_len = _request_text_len(request)
+    if tool_choice == "required":
+        any_of = []
+        for tool in tools:
+            name = _tool_name(tool)
+            if not name:
+                continue
+            any_of.append(
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "enum": [name]},
+                        "parameters": _tool_parameters(tool),
+                    },
+                    "required": ["name", "parameters"],
+                    "additionalProperties": False,
+                }
+            )
+        if not any_of:
+            return None
+        schema = _bound_tool_schema(
+            {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "object", "anyOf": any_of},
+            },
+            request_text_len=request_text_len,
+        )
+        schema[TOOL_CHOICE_SCHEMA_MARKER] = True
+        return schema
+
+    tool_name = _named_tool_choice_name(tool_choice)
+    if not tool_name:
+        return None
+    for tool in tools:
+        if _tool_name(tool) == tool_name:
+            schema = _bound_tool_schema(
+                _tool_parameters(tool),
+                request_text_len=request_text_len,
+            )
+            schema[TOOL_CHOICE_SCHEMA_MARKER] = True
+            return schema
+    return None
+
+
+def _forced_tool_choice_uses_qwen_xml_parser(
+    request: Any,
+    tool_parser_name: str | None,
+) -> bool:
+    tool_choice = _get_attr_or_item(request, "tool_choice")
+    tools = _get_attr_or_item(request, "tools")
+    if not tools or tool_choice in (None, "none", "auto"):
+        return False
+    return (tool_parser_name or "").strip() in QWEN_XML_STRUCTURAL_TAG_TOOL_PARSERS
+
+
+def _has_structured_outputs(structured_outputs: StructuredOutputsParams | None) -> bool:
+    return structured_outputs is not None and not structured_outputs.all_constraints_none()
+
+
+def _active_structured_outputs(
+    structured_outputs: StructuredOutputsParams | None,
+) -> StructuredOutputsParams | None:
+    """Discard request-model placeholders that carry no output constraint."""
+    return structured_outputs if _has_structured_outputs(structured_outputs) else None
+
+
+def _parse_int_env(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; expected integer", name, value)
+        return None
+
+
+def _thinking_enabled(chat_template_kwargs: dict[str, Any]) -> bool:
+    if chat_template_kwargs.get("enable_thinking") is False:
+        return False
+    if chat_template_kwargs.get("thinking") is False:
+        return False
+    return (
+        chat_template_kwargs.get("enable_thinking") is True
+        or chat_template_kwargs.get("thinking") is True
+    )
+
+
+def _tools_enabled(request_for_sampling: Any) -> bool:
+    tools = _get_attr_or_item(request_for_sampling, "tools")
+    tool_choice = _get_attr_or_item(request_for_sampling, "tool_choice")
+    return bool(tools) and tool_choice != "none"
+
+
+def _default_constrained_max_thinking_tokens(
+    *,
+    request_for_sampling: Any,
+    sampling_params: SamplingParams,
+    chat_template_kwargs: dict[str, Any],
+) -> int | None:
+    env_value = _parse_int_env("DYN_DEFAULT_CONSTRAINED_MAX_THINKING_TOKENS")
+    if env_value is None:
+        return None
+    thinking_enabled = _thinking_enabled(chat_template_kwargs)
+    tools_enabled = _tools_enabled(request_for_sampling)
+    structured_enabled = _has_structured_outputs(
+        _request_structured_outputs(request_for_sampling, sampling_params)
+    )
+    if not thinking_enabled:
+        return None
+    if not (tools_enabled or structured_enabled):
+        return None
+    return env_value
+
+
+def _structured_outputs_from_response_format(
+    response_format: Any,
+) -> StructuredOutputsParams | None:
+    response_type = _get_attr_or_item(response_format, "type")
+    if response_type == "json_object":
+        return StructuredOutputsParams(json_object=True)
+    if response_type == "json_schema":
+        json_schema = _get_attr_or_item(response_format, "json_schema")
+        schema = _get_attr_or_item(json_schema, "json_schema")
+        if schema is None:
+            schema = _get_attr_or_item(json_schema, "schema")
+        if schema is None:
+            return None
+        return StructuredOutputsParams(json=schema)
+    if response_type == "structural_tag":
+        if hasattr(response_format, "model_dump"):
+            structural_tag = response_format.model_dump(by_alias=True)
+        else:
+            structural_tag = response_format
+        return StructuredOutputsParams(structural_tag=json.dumps(structural_tag))
+    return None
+
+
+def _structured_outputs_from_request_field(
+    request_for_sampling: Any,
+) -> StructuredOutputsParams | None:
+    structured_outputs = getattr(request_for_sampling, "structured_outputs", None)
+    if structured_outputs is None:
+        model_extra = getattr(request_for_sampling, "model_extra", None)
+        if isinstance(model_extra, dict):
+            structured_outputs = model_extra.get("structured_outputs")
+
+    if structured_outputs is None:
+        return None
+    if isinstance(structured_outputs, StructuredOutputsParams):
+        return structured_outputs
+    if not isinstance(structured_outputs, dict):
+        if hasattr(structured_outputs, "all_constraints_none"):
+            return structured_outputs
+        return None
+
+    params: dict[str, Any] = {}
+    for key in (
+        "json",
+        "regex",
+        "choice",
+        "grammar",
+        "json_object",
+        "structural_tag",
+        "disable_any_whitespace",
+        "disable_additional_properties",
+        "whitespace_pattern",
+    ):
+        value = structured_outputs.get(key)
+        if value is not None:
+            params[key] = value
+    if not params:
+        return None
+    return StructuredOutputsParams(**params)
+
+
+def _request_structured_outputs(
+    request_for_sampling: Any,
+    sampling_params: SamplingParams,
+) -> StructuredOutputsParams | None:
+    if sampling_params.structured_outputs is not None:
+        return sampling_params.structured_outputs
+    structured_outputs = _structured_outputs_from_request_field(request_for_sampling)
+    if structured_outputs is not None:
+        return structured_outputs
+    return _structured_outputs_from_response_format(
+        getattr(request_for_sampling, "response_format", None)
+    )
+
+
 def _inject_routing_metadata(
     dynamo_preproc: dict[str, Any],
     target: dict[str, Any],
@@ -555,6 +1065,34 @@ class VllmProcessor:
             v = getattr(request_for_sampling, k, None)
             if v is not None:
                 setattr(sampling_params, k, v)
+        # The OpenAI request model may expose a constraints-empty placeholder
+        # even when the client omitted structured outputs. vLLM validates any
+        # non-None value, so do not pass that placeholder to process_inputs().
+        sampling_params.structured_outputs = _active_structured_outputs(
+            sampling_params.structured_outputs
+        )
+
+        reasoning_ended, reasoning_parser_kwargs = _build_reasoning_parser_metadata(
+            self.reasoning_parser_class,
+            self.tokenizer,
+            chat_template_kwargs,
+            request_for_sampling,
+            tokens,
+        )
+        skip_forced_tool_guidance_for_reasoning = (
+            reasoning_ended is False
+            and _forced_tool_choice_uses_qwen_xml_parser(
+                request_for_sampling, self.tool_parser_name
+            )
+        )
+        if not _has_structured_outputs(sampling_params.structured_outputs):
+            tool_schema = (
+                None
+                if skip_forced_tool_guidance_for_reasoning
+                else _tool_choice_guided_json_schema(request_for_sampling)
+            )
+            if tool_schema is not None:
+                sampling_params.structured_outputs = StructuredOutputsParams(json=tool_schema)
         # nvext.max_thinking_tokens is enforced on the worker, not here. The
         # frontend's InputProcessor is built without reasoning_config (it only
         # tokenizes), so setting sampling_params.thinking_token_budget would
