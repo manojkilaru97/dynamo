@@ -400,6 +400,8 @@ struct KvRouterConfigSerde {
     router_reset_states: bool,
     router_ttl_secs: f64,
     router_queue_threshold: Option<f64>,
+    router_max_pending_per_worker: Option<usize>,
+    router_max_queue_wait_ms: Option<u64>,
     #[serde(default)]
     router_policy_config: Option<String>,
     router_event_threads: u32,
@@ -435,6 +437,8 @@ impl Default for KvRouterConfigSerde {
             router_reset_states: config.router_reset_states,
             router_ttl_secs: config.router_ttl_secs,
             router_queue_threshold: config.router_queue_threshold,
+            router_max_pending_per_worker: config.router_max_pending_per_worker,
+            router_max_queue_wait_ms: config.router_max_queue_wait_ms,
             router_policy_config: config.router_policy_config,
             router_event_threads: config.router_event_threads,
             skip_initial_worker_wait: config.skip_initial_worker_wait,
@@ -529,6 +533,12 @@ pub struct KvRouterConfig {
     #[validate(range(min = 0.0))]
     pub router_queue_threshold: Option<f64>,
 
+    /// Global cap on queued requests per eligible data-parallel rank.
+    pub router_max_pending_per_worker: Option<usize>,
+
+    /// Maximum time a request may remain scheduler-queued.
+    pub router_max_queue_wait_ms: Option<u64>,
+
     /// Optional startup-only YAML policy-class configuration.
     #[serde(default)]
     pub router_policy_config: Option<String>,
@@ -609,6 +619,8 @@ impl Default for KvRouterConfig {
             router_reset_states: false,
             router_ttl_secs: 120.0,
             router_queue_threshold: Some(16.0),
+            router_max_pending_per_worker: Some(8),
+            router_max_queue_wait_ms: Some(30_000),
             router_policy_config: None,
             policy_model_name: None,
             policy_config_cache: OnceLock::new(),
@@ -658,6 +670,8 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             router_reset_states: compat.router_reset_states,
             router_ttl_secs: compat.router_ttl_secs,
             router_queue_threshold: compat.router_queue_threshold,
+            router_max_pending_per_worker: compat.router_max_pending_per_worker,
+            router_max_queue_wait_ms: compat.router_max_queue_wait_ms,
             router_policy_config: compat.router_policy_config,
             policy_model_name: None,
             policy_config_cache: OnceLock::new(),

@@ -442,6 +442,10 @@ impl SelectionCore {
             None,
             Some(overlap_refresh),
             None,
+            self.kv_router_config.router_max_pending_per_worker,
+            self.kv_router_config
+                .router_max_queue_wait_ms
+                .map(Duration::from_millis),
             self.kv_router_config.router_queue_recheck_interval(),
             self.kv_router_config.router_track_prefill_tokens,
             self.cancel_token.child_token(),

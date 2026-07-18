@@ -108,6 +108,10 @@ where
             prefill_load_estimator,
             overlap_scores_refresh,
             overloaded_worker_provider,
+            kv_router_config.router_max_pending_per_worker,
+            kv_router_config
+                .router_max_queue_wait_ms
+                .map(Duration::from_millis),
             kv_router_config.router_queue_recheck_interval(),
             kv_router_config.router_track_prefill_tokens,
             cancellation_token.child_token(),

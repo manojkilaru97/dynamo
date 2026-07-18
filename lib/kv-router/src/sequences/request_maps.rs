@@ -82,14 +82,6 @@ impl RequestIndex {
         request_ids
     }
 
-    pub(super) fn active_requests(&self) -> HashMap<WorkerWithDpRank, usize> {
-        let mut counts = HashMap::new();
-        for entry in self.request_to_worker.iter() {
-            *counts.entry(*entry.value()).or_insert(0) += 1;
-        }
-        counts
-    }
-
     pub(super) fn active_lora_counts(&self) -> HashMap<String, usize> {
         let mut counts = HashMap::new();
         for entry in self.request_to_lora.iter() {

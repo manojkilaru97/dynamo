@@ -83,6 +83,8 @@ struct SchedulerQueueActor<
     overlap_scores_refresh: Option<Arc<RF>>,
     overlap_refresh_after: Option<Duration>,
     overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+    max_pending_per_worker: Option<usize>,
+    max_queue_wait: Option<Duration>,
 }
 
 /// Queue that gates scheduling requests behind a capacity check.
@@ -128,6 +130,8 @@ impl<
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        max_pending_per_worker: Option<usize>,
+        max_queue_wait: Option<Duration>,
     ) -> Self {
         let profile = PolicyProfile::synthetic(threshold_frac, queue_policy);
         Self::new_with_policy_profile(
@@ -139,6 +143,8 @@ impl<
             prefill_load_estimator,
             overlap_scores_refresh,
             overloaded_worker_provider,
+            max_pending_per_worker,
+            max_queue_wait,
         )
     }
 
@@ -152,6 +158,8 @@ impl<
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        max_pending_per_worker: Option<usize>,
+        max_queue_wait: Option<Duration>,
     ) -> Self {
         Self::new_with_policy_profile_and_capacity(
             slots,
@@ -162,6 +170,8 @@ impl<
             prefill_load_estimator,
             overlap_scores_refresh,
             overloaded_worker_provider,
+            max_pending_per_worker,
+            max_queue_wait,
             ADMISSION_CHANNEL_CAPACITY,
         )
     }
@@ -176,6 +186,8 @@ impl<
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        max_pending_per_worker: Option<usize>,
+        max_queue_wait: Option<Duration>,
         admission_channel_capacity: usize,
     ) -> Self {
         let queueing_enabled = profile
@@ -190,6 +202,18 @@ impl<
                 prefill_busy_threshold = ?class.prefill_busy_threshold,
                 prefill_busy_threshold_frac = ?class.prefill_busy_threshold_frac,
                 "Router policy class configured"
+            );
+        }
+        if let Some(limit) = max_pending_per_worker {
+            tracing::info!(
+                limit,
+                "Router queue pending-request limit enabled per eligible DP rank"
+            );
+        }
+        if let Some(timeout) = max_queue_wait {
+            tracing::info!(
+                timeout_ms = timeout.as_millis() as u64,
+                "Router queue wait timeout enabled"
             );
         }
         let overlap_refresh_after = if overlap_scores_refresh.is_some() {
@@ -236,6 +260,8 @@ impl<
             overlap_scores_refresh,
             overlap_refresh_after,
             overloaded_worker_provider,
+            max_pending_per_worker,
+            max_queue_wait,
         };
         tokio::spawn(actor.run(admission_rx));
         Self {
@@ -280,6 +306,8 @@ impl<
             prefill_load_estimator,
             None,
             None,
+            max_pending_per_worker,
+            max_queue_wait,
         )
     }
 
@@ -304,6 +332,8 @@ impl<
             prefill_load_estimator,
             None,
             overloaded_worker_provider,
+            None,
+            None,
         )
     }
 }
@@ -496,6 +526,7 @@ impl<
             (class_index, None, should_queue)
         } else {
             let active_tokens = self.slots.active_tokens(decay_now);
+            let active_requests = self.slots.active_request_counts();
             let workers = self.workers_with_configs.borrow();
             let snapshot = Self::snapshot_for_with(&request, &workers);
             let class_index = self
@@ -503,13 +534,28 @@ impl<
                 .resolve_class_index(request.policy_class.as_deref(), snapshot.uncached_tokens);
             let class = self.profile.class(class_index);
             let should_queue = self.should_queue(class_index, class, || {
-                Self::all_workers_prefill_busy_with(&active_tokens, &workers, class, eligibility)
+                Self::all_workers_prefill_busy_with(
+                    &active_tokens,
+                    &active_requests,
+                    &workers,
+                    class,
+                    eligibility,
+                )
             });
             (class_index, Some(snapshot), should_queue)
         };
         if !should_queue {
             self.admit_one(request, decay_now);
             return;
+        }
+
+        if let Some(limit) = self.current_pending_limit(eligibility) {
+            let pending = self.pending.pending_count();
+            if pending >= limit {
+                let mut request = request;
+                request.respond(Err(KvSchedulerError::QueueFull { pending, limit }));
+                return;
+            }
         }
 
         let snapshot = snapshot.unwrap_or_else(|| self.snapshot_for(&request));
@@ -570,6 +616,7 @@ impl<
     }
 
     async fn handle_update(&mut self) {
+        self.expire_pending();
         if self.pending.pending_count() == 0 {
             return;
         }
@@ -579,6 +626,7 @@ impl<
         loop {
             let decay_now = Instant::now();
             let active_tokens = self.slots.active_tokens(decay_now);
+            let active_requests = self.slots.active_request_counts();
             let popped = {
                 let configs = self.workers_with_configs.borrow();
                 self.pending.pop_next(|_, class, queued| {
@@ -587,6 +635,7 @@ impl<
                     // that class until a bounded non-HOL strategy is introduced.
                     !Self::all_workers_prefill_busy_with(
                         &active_tokens,
+                        &active_requests,
                         &configs,
                         class,
                         queued.request.eligibility(),
@@ -807,13 +856,20 @@ impl<
         decay_now: Instant,
     ) -> bool {
         let active_tokens = self.slots.active_tokens(decay_now);
-        let active_requests = self.slots.active_requests();
+        let active_requests = self.slots.active_request_counts();
         let configs = self.workers_with_configs.borrow();
-        Self::all_workers_prefill_busy_with(&active_tokens, &configs, class, eligibility)
+        Self::all_workers_prefill_busy_with(
+            &active_tokens,
+            &active_requests,
+            &configs,
+            class,
+            eligibility,
+        )
     }
 
     fn all_workers_prefill_busy_with(
         active_tokens: &HashMap<crate::protocols::WorkerWithDpRank, usize>,
+        active_requests: &HashMap<crate::protocols::WorkerWithDpRank, usize>,
         configs: &HashMap<WorkerId, C>,
         class: &PolicyClassConfig,
         eligibility: RoutingEligibility<'_>,
@@ -827,7 +883,14 @@ impl<
                 .max_num_batched_tokens()
                 .unwrap_or(DEFAULT_MAX_BATCHED_TOKENS);
             let tokens = active_tokens.get(&worker).copied().unwrap_or(0);
-            return class.worker_is_busy(tokens, max_batched);
+            return Self::worker_is_busy(
+                worker,
+                config,
+                class,
+                tokens,
+                max_batched,
+                active_requests,
+            );
         }
 
         let mut checked_any = false;
@@ -837,10 +900,24 @@ impl<
                 .max_num_batched_tokens()
                 .unwrap_or(DEFAULT_MAX_BATCHED_TOKENS);
             let tokens = active_tokens.get(&worker).copied().unwrap_or(0);
-            !class.worker_is_busy(tokens, max_batched)
+            !Self::worker_is_busy(worker, config, class, tokens, max_batched, active_requests)
         });
 
         checked_any && !has_available
+    }
+
+    fn worker_is_busy(
+        worker: crate::protocols::WorkerWithDpRank,
+        config: &C,
+        class: &PolicyClassConfig,
+        active_tokens: usize,
+        max_batched_tokens: u64,
+        active_requests: &HashMap<crate::protocols::WorkerWithDpRank, usize>,
+    ) -> bool {
+        config
+            .max_num_seqs()
+            .is_some_and(|limit| active_requests.get(&worker).copied().unwrap_or(0) as u64 >= limit)
+            || class.worker_is_busy(active_tokens, max_batched_tokens)
     }
 
     fn add_class_counters(&self, class_index: usize, snapshot: QueueSnapshot) {
@@ -865,99 +942,33 @@ impl<
             .fetch_sub(snapshot.cached_tokens, AtomicOrdering::Relaxed);
     }
 
-    fn worker_is_saturated(
-        &self,
-        worker: WorkerWithDpRank,
-        config: &C,
-        threshold: f64,
-        active_tokens: &HashMap<WorkerWithDpRank, usize>,
-        active_requests: &HashMap<WorkerWithDpRank, usize>,
-    ) -> bool {
-        if let Some(max_num_seqs) = config.max_num_seqs() {
-            let requests = active_requests.get(&worker).copied().unwrap_or(0);
-            if (requests as u64) >= max_num_seqs {
-                return true;
-            }
-        }
-
-        let max_batched = config
-            .max_num_batched_tokens()
-            .unwrap_or(DEFAULT_MAX_BATCHED_TOKENS);
-        let tokens = active_tokens.get(&worker).copied().unwrap_or(0);
-        (tokens as f64) > threshold * (max_batched as f64)
-    }
-
-    fn current_pending_limit(
-        &self,
-        allowed: Option<&HashSet<WorkerId>>,
-        pinned_worker: Option<WorkerWithDpRank>,
-    ) -> Option<usize> {
+    fn current_pending_limit(&self, eligibility: RoutingEligibility<'_>) -> Option<usize> {
         let per_worker_limit = self.max_pending_per_worker?;
         let configs = self.workers_with_configs.borrow();
-
-        if let Some(worker) = pinned_worker {
-            return pinned_worker_config::<C>(&*configs, worker)
-                .ok()
-                .map(|_| per_worker_limit);
-        }
-
-        let eligible_ranks: usize = configs
-            .iter()
-            .filter(|(worker_id, _)| allowed.is_none_or(|ids| ids.contains(worker_id)))
-            .map(|(_, config)| config.data_parallel_size() as usize)
-            .sum();
-
+        let mut eligible_ranks = 0usize;
+        eligibility.for_each_eligible_worker_rank(&configs, |_, _| eligible_ranks += 1);
         Some(per_worker_limit.saturating_mul(eligible_ranks.max(1)))
     }
 
-    fn is_expired(&self, entry: &QueueEntry<S::Key>) -> bool {
+    fn expire_pending(&mut self) {
         let Some(limit) = self.max_queue_wait else {
-            return false;
+            return;
         };
-        entry.enqueued_at.elapsed() >= limit
-    }
-
-    fn expired_request(&self, entry: QueueEntry<S::Key>) -> (SchedulingRequest, u64, u64) {
-        let waited_ms = entry.enqueued_at.elapsed().as_millis() as u64;
-        let limit_ms = self
-            .max_queue_wait
-            .map(|limit| limit.as_millis() as u64)
-            .unwrap_or_default();
-        (entry.request, waited_ms, limit_ms)
-    }
-
-    fn refresh_pending_locked(
-        &self,
-        heap: &mut BinaryHeap<QueueEntry<S::Key>>,
-    ) -> Vec<(SchedulingRequest, u64, u64)> {
-        if self.max_queue_wait.is_none() {
-            return Vec::new();
-        }
-
-        let pending = std::mem::take(heap).into_vec();
-        let mut fresh = Vec::with_capacity(pending.len());
-        let mut expired = Vec::new();
-        for entry in pending {
-            if self.is_expired(&entry) {
-                self.pending_isl_tokens
-                    .fetch_sub(entry.request.isl_tokens, AtomicOrdering::Relaxed);
-                expired.push(self.expired_request(entry));
-            } else {
-                fresh.push(entry);
-            }
-        }
-
-        *heap = BinaryHeap::from(fresh);
-        self.pending_count
-            .store(heap.len(), AtomicOrdering::Relaxed);
-        expired
-    }
-
-    fn fail_expired(&self, expired: Vec<(SchedulingRequest, u64, u64)>) {
-        for (mut request, waited_ms, limit_ms) in expired {
+        let expired = self
+            .pending
+            .remove_where(|queued| queued.enqueue_at.elapsed() >= limit);
+        for entry in expired {
+            let snapshot = entry.snapshot();
+            self.pending_count.fetch_sub(1, AtomicOrdering::Relaxed);
+            self.pending_isl_tokens
+                .fetch_sub(snapshot.raw_isl_tokens, AtomicOrdering::Relaxed);
+            self.subtract_class_counters(entry.class_index(), snapshot);
+            let queued = entry.into_payload();
+            let waited_ms = queued.enqueue_at.elapsed().as_millis() as u64;
+            let mut request = queued.request;
             request.respond(Err(KvSchedulerError::QueueWaitTimeout {
                 waited_ms,
-                limit_ms,
+                limit_ms: limit.as_millis() as u64,
             }));
         }
     }
@@ -1309,6 +1320,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         ));
         (queue, slots, cfg_tx)
     }
@@ -1462,6 +1475,8 @@ mod tests {
             None,
             Some(refresher),
             None,
+            None,
+            None,
         ));
 
         (queue, slots)
@@ -1517,6 +1532,8 @@ mod tests {
             DefaultWorkerSelector::new(None, "test"),
             None,
             Some(refresher),
+            None,
+            None,
             None,
             admission_channel_capacity,
         ));
@@ -1644,6 +1661,8 @@ mod tests {
         let queue = SchedulerQueue::new(
             Arc::clone(&slots),
             cfg_rx,
+            None,
+            None,
             None,
             16,
             DefaultWorkerSelector::new(None, "test"),
@@ -1859,6 +1878,65 @@ mod tests {
         queue.update().await;
 
         assert_eq!(queue.pending_count(), 0, "all requests should be drained");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queue_pending_limit_rejects_excess() {
+        let (queue, _slots, _cfg_tx) =
+            make_queue_with_sender_and_limits(1, 16, 512, Some(0.0), Some(1), None, None);
+
+        let (first, first_rx) = make_request("first", 512);
+        queue.enqueue(first).await;
+        first_rx.await.unwrap().unwrap();
+        let (queued, _queued_rx) = make_request("queued", 512);
+        queue.enqueue(queued).await;
+
+        let (excess, excess_rx) = make_request("excess", 512);
+        queue.enqueue(excess).await;
+        assert!(matches!(
+            excess_rx.await.expect("response sender dropped"),
+            Err(KvSchedulerError::QueueFull {
+                pending: 1,
+                limit: 1
+            })
+        ));
+        assert_eq!(queue.pending_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_wait_timeout_expires_pending_request() {
+        let (queue, _slots, _cfg_tx) = make_queue_with_sender_and_limits(
+            1,
+            16,
+            512,
+            Some(0.0),
+            None,
+            Some(Duration::from_millis(100)),
+            None,
+        );
+
+        let (first, first_rx) = make_request("first", 512);
+        queue.enqueue(first).await;
+        first_rx.await.unwrap().unwrap();
+        let (queued, mut queued_rx) = make_request("queued", 512);
+        queue.enqueue(queued).await;
+
+        tokio::time::advance(Duration::from_millis(101)).await;
+        queue.update().await;
+        match queued_rx
+            .try_recv()
+            .expect("expired request was not failed")
+        {
+            Err(KvSchedulerError::QueueWaitTimeout {
+                waited_ms,
+                limit_ms,
+            }) => {
+                assert!(waited_ms >= 100);
+                assert_eq!(limit_ms, 100);
+            }
+            other => panic!("expected QueueWaitTimeout, got {other:?}"),
+        }
+        assert_eq!(queue.pending_count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

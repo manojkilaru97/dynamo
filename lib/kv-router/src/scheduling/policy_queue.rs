@@ -211,6 +211,30 @@ impl<T> PolicyQueue<T> {
         }
     }
 
+    /// Remove queued entries matching `remove`, returning them with their
+    /// policy metadata while rebuilding queue accounting for retained entries.
+    pub fn remove_where(&mut self, mut remove: impl FnMut(&T) -> bool) -> Vec<PolicyQueueEntry<T>> {
+        let mut removed = Vec::new();
+        self.pending_count = 0;
+        for class in &mut self.classes {
+            let pending = std::mem::take(&mut class.pending);
+            class.stats = PolicyQueueStats::default();
+            for entry in pending {
+                if remove(entry.payload()) {
+                    removed.push(entry);
+                    continue;
+                }
+                add_stats(&mut class.stats, entry.snapshot);
+                class.pending.push(entry);
+                self.pending_count += 1;
+            }
+            if class.pending.is_empty() {
+                class.deficit = 0;
+            }
+        }
+        removed
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// Applies class-local, worker-scaled limits against pre-add counters, then
     /// captures the immutable scheduling key and accounting snapshot.

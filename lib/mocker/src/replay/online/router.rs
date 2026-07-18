@@ -166,6 +166,8 @@ impl KvReplayRouter {
             prefill_load_estimator,
             None,
             None,
+            config.router_max_pending_per_worker,
+            config.router_max_queue_wait_ms.map(Duration::from_millis),
             config.router_queue_recheck_interval(),
             config.router_track_prefill_tokens,
             scheduler_cancel.clone(),

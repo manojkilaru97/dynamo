@@ -44,6 +44,8 @@ _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "router_reset_states",
     "router_ttl_secs",
     "router_queue_threshold",
+    "router_max_pending_per_worker",
+    "router_max_queue_wait_ms",
     "router_policy_config",
     "router_event_threads",
     "router_queue_policy",
@@ -127,6 +129,8 @@ class KvRouterConfigBase(ConfigBase):
     router_reset_states: bool
     router_ttl_secs: float
     router_queue_threshold: Optional[float]
+    router_max_pending_per_worker: Optional[int]
+    router_max_queue_wait_ms: Optional[int]
     router_policy_config: Optional[str] = None
     router_event_threads: int
     router_queue_policy: str
