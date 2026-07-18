@@ -63,12 +63,7 @@ class BaseOmniHandler(BaseWorkerHandler[Dict[str, Any], Dict[str, Any]]):
         self.model_max_len = config.engine_args.max_model_len
         self.shutdown_event = shutdown_event
         self.dp_range = (0, 1)
-        self._request_admission_lock = asyncio.Lock()
-        self._admitted_request_ids: set[str] = set()
-        self._pending_request_admissions = 0
-        self.max_total_requests = self._configured_max_total_requests(
-            log_ignored_per_dp=True
-        )
+        self._initialize_request_admission()
 
         logger.info(f"{self.__class__.__name__} initialized successfully")
 

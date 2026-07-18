@@ -989,10 +989,26 @@ def _make_fake_worker_handler():
     handler = object.__new__(FakeHandler)
     handler._request_admission_lock = asyncio.Lock()
     handler._admitted_request_ids = set()
+    handler._admitted_request_weights = {}
     handler._pending_request_admissions = 0
     handler.max_decode_wall_clock_secs = None
     handler.dp_range = (0, 1)
     return handler
+
+
+def test_worker_admission_shared_initializer_includes_sequence_weights(monkeypatch):
+    handler = _make_fake_worker_handler()
+    handler.engine_client = SimpleNamespace(
+        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=16))
+    )
+    monkeypatch.setenv("DYN_REQUEST_MAX_TOTAL_REQUESTS", "16")
+
+    handler._initialize_request_admission()
+
+    assert handler._admitted_request_ids == set()
+    assert handler._admitted_request_weights == {}
+    assert handler._pending_request_admissions == 0
+    assert handler.max_total_requests == 16
 
 
 @pytest.mark.asyncio
@@ -1196,6 +1212,67 @@ async def test_worker_admission_rejects_duplicate_request_id():
     assert limit == 4
     assert handler._admitted_request_ids == {"req-dup"}
     assert handler._pending_request_admissions == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_counts_n_as_engine_sequences():
+    handler = _make_fake_worker_handler()
+    handler.max_total_requests = 16
+    handler.engine_client = SimpleNamespace(
+        output_processor=SimpleNamespace(get_num_unfinished_requests=lambda: 0)
+    )
+
+    reserved, current, limit = await handler._try_reserve_request_slot(
+        "req-wide", {"sampling_options": {"n": 128}}
+    )
+
+    assert reserved is False
+    assert current == 0
+    assert limit == 16
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_holds_nested_and_top_level_n_sequence_slots():
+    handler = _make_fake_worker_handler()
+    handler.max_total_requests = 16
+    handler.engine_client = SimpleNamespace(
+        output_processor=SimpleNamespace(get_num_unfinished_requests=lambda: 0)
+    )
+
+    first = await handler._try_reserve_request_slot(
+        "req-n", {"sampling_options": {"n": 8}}
+    )
+    second = await handler._try_reserve_request_slot(
+        "req-openai", {"n": 8, "best_of": 20}
+    )
+    rejected = await handler._try_reserve_request_slot("req-over", {})
+
+    assert first == (True, 8, 16)
+    assert second == (True, 16, 16)
+    assert rejected == (False, 16, 16)
+    assert handler._admitted_request_weights == {"req-n": 8, "req-openai": 8}
+
+    await handler._release_request_slot_reservation("req-n")
+    assert handler._admitted_request_weights == {"req-openai": 8}
+
+
+@pytest.mark.asyncio
+async def test_worker_admission_cleanup_releases_on_pre_handoff_cancel():
+    handler = _make_fake_worker_handler()
+    handler.max_total_requests = 4
+    handler._admitted_request_ids = {"req-cancel-before-handoff"}
+    handler._admitted_request_weights = {"req-cancel-before-handoff": 3}
+    handler._pending_request_admissions = 1
+
+    with pytest.raises(asyncio.CancelledError):
+        async with handler._request_admission_cleanup(
+            "req-cancel-before-handoff", True
+        ):
+            raise asyncio.CancelledError()
+
+    assert handler._admitted_request_ids == set()
+    assert handler._admitted_request_weights == {}
+    assert handler._pending_request_admissions == 0
 
 
 @pytest.mark.asyncio

@@ -1667,9 +1667,16 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         self.max_decode_wall_clock_secs = self._get_positive_float_env(
             "DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS"
         )
+        self._initialize_request_admission()
+
+    def _initialize_request_admission(self) -> None:
         self._request_admission_lock = asyncio.Lock()
         # Request-id set is the source of truth (no counter drift on double-release).
         self._admitted_request_ids: set[str] = set()
+        # vLLM's Running/Waiting gauges count sequences, not API requests. A
+        # request with n > 1 therefore consumes multiple scheduler slots even
+        # though it has only one request ID.
+        self._admitted_request_weights: dict[str, int] = {}
         self._pending_request_admissions = 0  # len(_admitted_request_ids); tests/compat
         self.max_total_requests = self._configured_max_total_requests(
             log_ignored_per_dp=True
@@ -1753,6 +1760,27 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
     def _is_health_check_request(request: Any) -> bool:
         return isinstance(request, dict) and bool(request.get(HEALTH_CHECK_KEY))
 
+    @staticmethod
+    def _request_sequence_count(request: Any) -> int:
+        if not isinstance(request, dict):
+            return 1
+
+        # Token-mode workers receive an internal PreprocessedRequest, whose
+        # sampling fields are nested. Text-mode workers receive the OpenAI
+        # request shape, where n is top-level.
+        sampling_options = request.get("sampling_options")
+        source = sampling_options if isinstance(sampling_options, dict) else request
+        value = source.get("n")
+        try:
+            return max(1, int(value)) if value is not None else 1
+        except (TypeError, ValueError):
+            # Request validation reports malformed sampling parameters.
+            return 1
+
+    def _held_sequence_count(self) -> int:
+        weights = getattr(self, "_admitted_request_weights", {})
+        return sum(weights.get(request_id, 1) for request_id in self._admitted_request_ids)
+
     async def _try_reserve_request_slot(
         self, request_id: str, request: Any | None = None
     ) -> tuple[bool, int | None, int | None]:
@@ -1783,16 +1811,20 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 )
                 return False, None, limit
 
-            # held + engine zombies (engine unfinished not covered by held).
-            # Equals max(held, engine) when one set contains the other.
-            held = len(self._admitted_request_ids)
-            observed = held + max(0, current_total - held)
-            if observed >= limit:
+            held = self._held_sequence_count()
+            requested = self._request_sequence_count(request)
+            # The engine counter and reservations overlap during normal
+            # operation. Use the larger value, then reserve every sequence
+            # this request can enqueue via n, so vLLM Waiting cannot
+            # bypass a request-ID-only admission limit.
+            observed = max(held, current_total)
+            if observed + requested > limit:
                 logger.debug(
-                    "Rejecting request %s due to local total request limit: %s/%s "
-                    "(held=%s engine_unfinished=%s)",
+                    "Rejecting request %s due to local total sequence limit: "
+                    "%s+%s/%s (held_sequences=%s engine_unfinished=%s)",
                     request_id,
                     observed,
+                    requested,
                     limit,
                     held,
                     current_total,
@@ -1800,13 +1832,29 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 return False, observed, limit
 
             self._admitted_request_ids.add(request_id)
+            self._admitted_request_weights[request_id] = requested
             self._pending_request_admissions = len(self._admitted_request_ids)
-            return True, self._pending_request_admissions, limit
+            return True, observed + requested, limit
 
     async def _release_request_slot_reservation(self, request_id: str) -> None:
         async with self._request_admission_lock:
             self._admitted_request_ids.discard(request_id)
+            getattr(self, "_admitted_request_weights", {}).pop(request_id, None)
             self._pending_request_admissions = len(self._admitted_request_ids)
+
+    @asynccontextmanager
+    async def _request_admission_cleanup(self, request_id: str, reserved: bool):
+        """Own cleanup from reservation until the engine iterator takes over.
+
+        The iterator also releases on completion. Releasing here is deliberately
+        idempotent so cancellation while entering guards or creating the engine
+        generator cannot strand a reservation.
+        """
+        try:
+            yield
+        finally:
+            if reserved:
+                await self._release_request_slot_reservation(request_id)
 
     async def _iterate_engine_stream(
         self,
@@ -4027,9 +4075,12 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         # cleanup runs after _abort_monitor tears down its monitor task, so
         # any deferred-abort waiter spawned by the monitor is in a stable
         # state when close() is awaited.
-        async with _deferred_abort_guard(
-            self.engine_client, request_id, is_decode_only
-        ) as abort_guard:
+        async with (
+            self._request_admission_cleanup(request_id, reserved),
+            _deferred_abort_guard(
+                self.engine_client, request_id, is_decode_only
+            ) as abort_guard,
+        ):
             async with self._abort_monitor(
                 context, request_id, abort_guard=abort_guard
             ):
@@ -4119,7 +4170,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         trace_headers = build_trace_headers(context)
         admission_handed_to_iterator = False
 
-        async with self._abort_monitor(context, request_id):
+        async with (
+            self._request_admission_cleanup(request_id, reserved),
+            self._abort_monitor(context, request_id),
+        ):
             try:
                 gen = self.engine_client.generate(
                     prompt,
@@ -4387,7 +4441,10 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         reasoning_ended, reasoning_parser_kwargs = _request_reasoning_metadata(request)
         admission_handed_to_iterator = False
 
-        async with self._abort_monitor(context, request_id, is_prefill=True):
+        async with (
+            self._request_admission_cleanup(request_id, reserved),
+            self._abort_monitor(context, request_id, is_prefill=True),
+        ):
             try:
                 gen = self.engine_client.generate(
                     prompt,
