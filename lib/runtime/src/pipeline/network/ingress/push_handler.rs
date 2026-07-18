@@ -177,7 +177,8 @@ impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
         mut stream: ManyOut<U>,
         publisher: &StreamSender,
         payload_codec: RequestPlanePayloadCodec,
-    ) where
+    ) -> Result<(), PipelineError>
+    where
         U: Data + Serialize + MaybeError + std::fmt::Debug,
     {
         let context = stream.context();
@@ -277,6 +278,17 @@ impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
                 }
             }
         }
+        if saw_stream_failure {
+            return Err(PipelineError::Generic(
+                "response stream contained an error response".to_string(),
+            ));
+        }
+        if saw_service_overloaded {
+            return Err(PipelineError::ServiceOverloaded(
+                "response stream contained a service overloaded response".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Decode the wire envelope into its [`RequestControlMessage`] and the
@@ -662,22 +674,11 @@ where
         };
 
         self.pump_response_stream(stream, &publisher, payload_codec)
-            .await;
+            .await?;
 
         // Ensure the metrics guard is not dropped until the end of the function.
         // Drop fires "request completed" log via RAII.
         drop(_inflight_guard);
-
-        if saw_stream_failure {
-            return Err(PipelineError::Generic(
-                "response stream contained an error response".to_string(),
-            ));
-        }
-        if saw_service_overloaded {
-            return Err(PipelineError::ServiceOverloaded(
-                "response stream contained a service overloaded response".to_string(),
-            ));
-        }
 
         Ok(())
     }
