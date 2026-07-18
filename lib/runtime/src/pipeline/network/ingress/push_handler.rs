@@ -157,7 +157,8 @@ where
         mut stream: ManyOut<U>,
         publisher: &StreamSender,
         payload_codec: RequestPlanePayloadCodec,
-    ) where
+    ) -> Result<(), PipelineError>
+    where
         U: Data + std::fmt::Debug,
         Adapter: IngressResponseEncoder<U>,
     {
@@ -272,6 +273,12 @@ where
                 notifier.notify_one();
             }
         }
+        if saw_error_response {
+            return Err(PipelineError::Generic(
+                "response stream contained an error response".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Decode the wire envelope into its [`RequestControlMessage`] and the
@@ -661,7 +668,7 @@ where
         };
 
         self.pump_response_stream(stream, &publisher, payload_codec)
-            .await;
+            .await?;
 
         // Ensure the metrics guard is not dropped until the end of the function.
         // Drop fires "request completed" log via RAII.
