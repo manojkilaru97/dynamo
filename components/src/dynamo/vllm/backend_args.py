@@ -155,6 +155,15 @@ class DynamoVllmArgGroup(ArgGroup):
             choices=[m.value for m in EmbeddingTransferMode],
         )
 
+        add_argument(
+            g,
+            flag_name="--dyn-served-model-alias",
+            env_var="DYN_VLLM_SERVED_MODEL_ALIASES",
+            default=[],
+            nargs="*",
+            help="Additional model names accepted by the frontend and routed to the primary served model.",
+        )
+
         add_negatable_bool_argument(
             g,
             flag_name="--embedding-worker",
@@ -297,6 +306,7 @@ class DynamoVllmConfig(ConfigBase):
     embedding_transfer_mode: Union[
         str, EmbeddingTransferMode
     ]  # resolved to enum in validate()
+    dyn_served_model_alias: list[str] = []
     embedding_worker: bool = False
 
     # Headless mode for multi-node TP/PP
