@@ -1179,6 +1179,113 @@ impl Metrics {
             .inc()
     }
 
+    fn init_unified_request_series(&self, model: &str, endpoint: &Endpoint) {
+        for request_type in [RequestType::Unary, RequestType::Stream] {
+            let labels = &[model, endpoint.as_str(), request_type.as_str()];
+            self.request_success_total.with_label_values(labels);
+            self.request_mode_total.with_label_values(labels);
+            self.request_type_image_total.with_label_values(labels);
+            self.request_type_video_total.with_label_values(labels);
+            self.request_type_audio_total.with_label_values(labels);
+            self.request_type_tool_call_total.with_label_values(labels);
+            self.request_type_structured_output_total
+                .with_label_values(labels);
+            self.request_input_images_total.with_label_values(labels);
+            self.request_input_videos_total.with_label_values(labels);
+            self.request_input_audios_total.with_label_values(labels);
+            self.request_input_tools_total.with_label_values(labels);
+            self.request_outcome_total.with_label_values(&[
+                model,
+                endpoint.as_str(),
+                request_type.as_str(),
+                "success",
+            ]);
+            self.request_finish_reason_total.with_label_values(&[
+                model,
+                endpoint.as_str(),
+                request_type.as_str(),
+                "unknown",
+            ]);
+            self.request_tool_choice_total.with_label_values(&[
+                model,
+                endpoint.as_str(),
+                request_type.as_str(),
+                "none",
+            ]);
+            self.request_structured_output_kind_total
+                .with_label_values(&[model, endpoint.as_str(), request_type.as_str(), "none"]);
+            self.request_structured_output_backend_total
+                .with_label_values(&[model, endpoint.as_str(), request_type.as_str(), "none"]);
+        }
+    }
+
+    pub fn record_chat_request_shape(
+        &self,
+        model: &str,
+        endpoint: Endpoint,
+        streaming: bool,
+        raw_request: &Value,
+    ) {
+        let request_type = if streaming {
+            RequestType::Stream
+        } else {
+            RequestType::Unary
+        };
+        self.init_unified_request_series(model, &endpoint);
+        let base = &[model, endpoint.as_str(), request_type.as_str()];
+        self.request_mode_total.with_label_values(base).inc();
+
+        let tools_count = raw_request
+            .get("tools")
+            .and_then(Value::as_array)
+            .map_or(0_u64, |tools| tools.len() as u64);
+        if tools_count > 0 {
+            self.request_type_tool_call_total
+                .with_label_values(base)
+                .inc();
+            self.request_input_tools_total
+                .with_label_values(base)
+                .inc_by(tools_count);
+        }
+        if let Some(tool_choice) = request_tool_choice_label(raw_request) {
+            self.request_tool_choice_total
+                .with_label_values(&[model, endpoint.as_str(), request_type.as_str(), tool_choice])
+                .inc();
+        }
+
+        let media = count_multimodal_inputs(raw_request);
+        if media.images > 0 {
+            self.request_type_image_total.with_label_values(base).inc();
+            self.request_input_images_total
+                .with_label_values(base)
+                .inc_by(media.images);
+        }
+        if media.videos > 0 {
+            self.request_type_video_total.with_label_values(base).inc();
+            self.request_input_videos_total
+                .with_label_values(base)
+                .inc_by(media.videos);
+        }
+        if media.audios > 0 {
+            self.request_type_audio_total.with_label_values(base).inc();
+            self.request_input_audios_total
+                .with_label_values(base)
+                .inc_by(media.audios);
+        }
+
+        if let Some(kind) = structured_output_kind(raw_request) {
+            self.request_type_structured_output_total
+                .with_label_values(base)
+                .inc();
+            self.request_structured_output_kind_total
+                .with_label_values(&[model, endpoint.as_str(), request_type.as_str(), kind])
+                .inc();
+            self.request_structured_output_backend_total
+                .with_label_values(&[model, endpoint.as_str(), request_type.as_str(), "xgrammar"])
+                .inc();
+        }
+    }
+
     /// Get the number if inflight requests for the given model
     pub fn get_inflight_count(&self, model: &str) -> i64 {
         self.inflight_gauge.with_label_values(&[model]).get()

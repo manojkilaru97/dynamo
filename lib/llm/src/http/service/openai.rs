@@ -28,7 +28,7 @@ use dynamo_runtime::{
     pipeline::{AsyncEngineContextProvider, Context},
     protocols::annotated::AnnotationsProvider,
 };
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{
@@ -75,6 +75,9 @@ use dynamo_runtime::logging::get_distributed_tracing_context;
 use tracing::Instrument;
 
 pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
+const X_REQUEST_ID_HEADER: &str = "x-request-id";
+const AUDIT_HTTP_HEADERS_KEY: &str = "http_headers";
+const AUDIT_RAW_PAYLOAD_KEY: &str = "http_raw_payload";
 
 /// Dynamo Annotation for the request ID
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
@@ -198,6 +201,28 @@ fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
 /// Extract ErrorType from ErrorResponse for metrics
 fn extract_error_type_from_response(response: &ErrorResponse) -> ErrorType {
     classify_error_for_metrics(response.0, &response.1.message)
+}
+
+fn backend_error_status_from_error(
+    error: Option<&dynamo_runtime::error::DynamoError>,
+) -> Option<StatusCode> {
+    error.and_then(|error| {
+        if dynamo_runtime::error::match_error_chain(
+            error,
+            &[dynamo_runtime::error::ErrorType::ResourceExhausted],
+            &[],
+        ) {
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        } else {
+            None
+        }
+    })
+}
+
+fn backend_error_status_from_text(error: &str) -> Option<StatusCode> {
+    error
+        .starts_with("ResourceExhausted: ")
+        .then_some(StatusCode::SERVICE_UNAVAILABLE)
 }
 
 /// Match `InvalidArgument` at top-level OR under `Backend()`.
@@ -619,6 +644,74 @@ pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
 
     // Fallback: use validated header for backwards compat, or generate new UUID
     validated_header.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn audit_headers_from_header_map(headers: &HeaderMap) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (name, value) in headers.iter() {
+        let value = match value.to_str() {
+            Ok(value) => serde_json::Value::String(value.to_string()),
+            Err(_) => serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(value.as_bytes()),
+            ),
+        };
+        out.insert(name.as_str().to_string(), value);
+    }
+    serde_json::Value::Object(out)
+}
+
+fn raw_chat_error_payload(err_response: &ErrorResponse) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": err_response.1.message.clone(),
+            "type": err_response.1.error_type.clone(),
+            "code": err_response.1.code,
+        }
+    })
+}
+
+fn emit_raw_chat_error_audit(
+    request_id: &str,
+    raw_request: &serde_json::Value,
+    headers: &HeaderMap,
+    err_response: &ErrorResponse,
+) {
+    let model = raw_request
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let requested_streaming = raw_request
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    crate::audit::handle::emit_raw_request_response(
+        request_id,
+        model,
+        requested_streaming,
+        Some(Arc::new(raw_request.clone())),
+        Some(Arc::new(audit_headers_from_header_map(headers))),
+        Arc::new(raw_chat_error_payload(err_response)),
+    );
+}
+
+fn emit_chat_validation_error_audit(
+    request: &Context<NvCreateChatCompletionRequest>,
+    err_response: &ErrorResponse,
+) {
+    let Some(handle) = crate::audit::handle::create_handle(request.content(), request.id()) else {
+        return;
+    };
+    let headers = request
+        .get::<serde_json::Value>(AUDIT_HTTP_HEADERS_KEY)
+        .ok();
+    let raw_request = request.get::<serde_json::Value>(AUDIT_RAW_PAYLOAD_KEY).ok();
+    let typed_request = raw_request
+        .is_none()
+        .then(|| Arc::new(request.content().clone()));
+    handle.emit_request(typed_request, raw_request, headers);
+    handle.emit_raw_response(Arc::new(raw_chat_error_payload(err_response)));
 }
 
 fn context_from_headers<T: Send + Sync + 'static>(
@@ -1333,7 +1426,21 @@ async fn handler_chat_completions(
     body: Bytes,
 ) -> Result<Response, ErrorResponse> {
     ensure_json_content_type(&headers)?;
-    let mut request: NvCreateChatCompletionRequest = parse_json_request("chat completions", &body)?;
+    let raw_request: serde_json::Value = parse_json_request("chat completions", &body)?;
+    let request_id = get_or_create_request_id(&headers);
+    let mut request = NvCreateChatCompletionRequest::deserialize(&raw_request).map_err(|err| {
+        let err_response = (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorMessage {
+                message: err.to_string(),
+                error_type: map_error_code_to_error_type(StatusCode::BAD_REQUEST),
+                code: StatusCode::BAD_REQUEST.as_u16(),
+                details: None,
+            }),
+        );
+        emit_raw_chat_error_audit(&request_id, &raw_request, &headers, &err_response);
+        err_response
+    })?;
 
     // return a 503 if the service is not ready (process-level + per-model
     // serving readiness). An aggregated request to a decode-only namespace
@@ -1360,7 +1467,12 @@ async fn handler_chat_completions(
         endpoint: Endpoint::ChatCompletions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = context_from_headers(request, request_id, &headers)?;
+    let mut request = context_from_headers(request, request_id, &headers)?;
+    request.insert(
+        AUDIT_HTTP_HEADERS_KEY,
+        audit_headers_from_header_map(&headers),
+    );
+    request.insert(AUDIT_RAW_PAYLOAD_KEY, raw_request);
     let context = request.context();
 
     // create the connection handles
@@ -1590,7 +1702,7 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
                     StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
                 }
                 None if invalid_argument.is_some() => StatusCode::BAD_REQUEST,
-                None => StatusCode::INTERNAL_SERVER_ERROR,
+                None => inferred_status_code.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             };
             let message = error_payload
                 .message
@@ -1605,7 +1717,10 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
             ));
         }
 
-        return Some((error_str, StatusCode::INTERNAL_SERVER_ERROR));
+        return Some((
+            error_str,
+            inferred_status_code.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        ));
     }
 
     // Check if the data payload itself contains an error structure with code >= 400
@@ -2010,11 +2125,6 @@ async fn chat_completions(
 
     let annotations = request.annotations();
     let frontend_stream_tool_jail = forced_tool_choice_stream_jail_config(&request);
-    let frontend_stream_include_usage = request
-        .inner
-        .stream_options
-        .as_ref()
-        .is_some_and(|opts| opts.include_usage);
     let http_audit_headers = request
         .get::<serde_json::Value>(AUDIT_HTTP_HEADERS_KEY)
         .ok();
@@ -2061,11 +2171,11 @@ async fn chat_completions(
             Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>,
         > = if let Some((tool_choice, tool_definitions)) = frontend_stream_tool_jail {
             Box::pin(
-                crate::preprocessor::OpenAIPreprocessor::apply_tool_calling_jail_with_usage_defer(
+                crate::preprocessor::OpenAIPreprocessor::apply_tool_calling_jail(
                     None,
                     Some(tool_choice),
                     Some(tool_definitions),
-                    frontend_stream_include_usage,
+                    false,
                     stream,
                 ),
             )
@@ -2278,6 +2388,7 @@ fn forced_tool_choice_stream_jail_config(
         .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
             name: tool.function.name.clone(),
             parameters: tool.function.parameters.clone(),
+            strict: tool.function.strict,
         })
         .collect();
 
@@ -2408,6 +2519,25 @@ async fn handler_responses(
     headers: HeaderMap,
     Json(raw_request): Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
+    let request_id = raw_request
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|request_id| !request_id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| get_or_create_request_id(&headers));
+    let mut request = NvCreateResponse::deserialize(&raw_request).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorMessage {
+                message: err.to_string(),
+                error_type: map_error_code_to_error_type(StatusCode::BAD_REQUEST),
+                code: StatusCode::BAD_REQUEST.as_u16(),
+                details: None,
+            }),
+        )
+    })?;
+
     // return a 503 if the service or model is not ready.
     // Resolve the templated model first so empty/missing `model` fields
     // don't bypass the gate.
@@ -2436,7 +2566,12 @@ async fn handler_responses(
         endpoint: Endpoint::Responses.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = context_from_headers(request, request_id, &headers)?;
+    let mut request = context_from_headers(request, request_id, &headers)?;
+    request.insert(AUDIT_RAW_PAYLOAD_KEY, raw_request);
+    request.insert(
+        AUDIT_HTTP_HEADERS_KEY,
+        audit_headers_from_header_map(&headers),
+    );
     let context = request.context();
 
     // create the connection handles
@@ -2497,6 +2632,18 @@ async fn responses(
         .resolve_canonical_name(request.inner.model.as_deref().unwrap_or_default());
     request.inner.model = Some(model.clone());
     let streaming = request.inner.stream.unwrap_or(false);
+    let raw_audit_request = request.get::<serde_json::Value>(AUDIT_RAW_PAYLOAD_KEY).ok();
+    let raw_audit_headers = request
+        .get::<serde_json::Value>(AUDIT_HTTP_HEADERS_KEY)
+        .ok();
+    if let Some(raw_request) = raw_audit_request.as_ref() {
+        state.metrics_clone().record_chat_request_shape(
+            &model,
+            Endpoint::Responses,
+            streaming,
+            raw_request,
+        );
+    }
     let metric_model = state.manager().metric_model_for(&model).to_string();
 
     // Create http_queue_guard early - tracks time waiting to be processed

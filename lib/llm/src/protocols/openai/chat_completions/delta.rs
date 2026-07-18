@@ -30,12 +30,14 @@ impl NvCreateChatCompletionRequest {
     pub fn response_generator(&self, request_id: String) -> DeltaGenerator {
         let enable_logprobs =
             self.inner.logprobs.unwrap_or(false) || self.inner.top_logprobs.unwrap_or(0) > 0;
-        let options = DeltaGeneratorOptions::new(
+        let mut options = DeltaGeneratorOptions::new(
             self.inner.stream_options.as_ref(),
             self.return_tokens_as_token_ids,
             enable_logprobs,
             self.nvext(),
         );
+        options.structured_json_guard = self.uses_pure_json_structured_output();
+        options.expected_choices = self.inner.n.unwrap_or(1).max(1) as u32;
         DeltaGenerator::new(self.inner.model.clone(), options, request_id)
     }
 }
@@ -59,6 +61,8 @@ pub struct DeltaGenerator {
     msg_counter: u64,
     /// Configuration options for response generation.
     options: DeltaGeneratorOptions,
+    structured_json_buffers: HashMap<u32, String>,
+    structured_json_completed: HashSet<u32>,
     /// Request tracker for per-request metrics (shared with PreprocessedRequest).
     tracker: Arc<RequestTracker>,
 }

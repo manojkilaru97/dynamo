@@ -1140,12 +1140,10 @@ pub fn chat_completion_to_response(
         parallel_tool_calls: params.parallel_tool_calls.or(Some(true)),
         temperature: params.temperature.or(Some(1.0)),
         text: Some(
-            dynamo_protocols::types::responses::response_text_param_to_upstream(
-                params
-                    .text
-                    .clone()
-                    .unwrap_or_else(default_response_text_param),
-            ),
+            params
+                .text
+                .clone()
+                .unwrap_or_else(default_response_text_param),
         ),
         tool_choice: params
             .tool_choice

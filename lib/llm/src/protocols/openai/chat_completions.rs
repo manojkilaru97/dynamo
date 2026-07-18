@@ -14,7 +14,7 @@ use crate::preprocessor::media::MediaDecoder;
 use super::{
     OpenAIOutputOptionsProvider, OpenAISamplingOptionsProvider, OpenAIStopConditionsProvider,
     common_ext::{CommonExt, CommonExtProvider},
-    validate,
+    tools, validate,
 };
 use crate::protocols::common::extensions::{
     NvExt, NvExtProvider, validate_completion_token_ids_single_choice,
@@ -33,6 +33,218 @@ use dynamo_protocols::types::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk, FunctionCall,
     FunctionCallStream, FunctionType,
 };
+
+const DEFAULT_WILDCARD_PATTERN_MAX_LENGTH: u64 = 512;
+const DEFAULT_CONSTRAINED_MAX_THINKING_TOKENS_ENV: &str =
+    "DYN_DEFAULT_CONSTRAINED_MAX_THINKING_TOKENS";
+const TOOL_CHOICE_GUIDED_JSON_MARKER: &str = "x-dynamo-tool-choice-schema";
+
+fn wildcard_pattern_max_length() -> u64 {
+    std::env::var("DYN_XGRAMMAR_DEFAULT_MAX_STRING_LENGTH")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_WILDCARD_PATTERN_MAX_LENGTH)
+}
+
+fn json_string_len(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(text) => text.len(),
+        serde_json::Value::Array(values) => values.iter().map(json_string_len).sum(),
+        serde_json::Value::Object(map) => map.values().map(json_string_len).sum(),
+        _ => 0,
+    }
+}
+
+fn pattern_starts_with_unbounded_wildcard(pattern: &str) -> bool {
+    [
+        ".*",
+        ".+",
+        "[\\s\\S]*",
+        "[\\s\\S]+",
+        "[\\w\\W]*",
+        "[\\w\\W]+",
+    ]
+    .iter()
+    .any(|prefix| pattern.starts_with(prefix))
+}
+
+fn pattern_ends_with_unbounded_wildcard(pattern: &str) -> bool {
+    [
+        ".*",
+        ".+",
+        "[\\s\\S]*",
+        "[\\s\\S]+",
+        "[\\w\\W]*",
+        "[\\w\\W]+",
+    ]
+    .iter()
+    .any(|suffix| pattern.ends_with(suffix))
+}
+
+fn pattern_has_unbounded_wildcard(pattern: &str) -> bool {
+    pattern_starts_with_unbounded_wildcard(pattern)
+        || pattern_ends_with_unbounded_wildcard(pattern)
+        || pattern.contains("[\\s\\S]*")
+        || pattern.contains("[\\s\\S]+")
+        || pattern.contains("[\\w\\W]*")
+        || pattern.contains("[\\w\\W]+")
+}
+
+fn strip_prefix_wildcard(pattern: &str) -> &str {
+    [
+        ".*",
+        ".+",
+        "[\\s\\S]*",
+        "[\\s\\S]+",
+        "[\\w\\W]*",
+        "[\\w\\W]+",
+    ]
+    .iter()
+    .find_map(|prefix| pattern.strip_prefix(prefix))
+    .unwrap_or(pattern)
+}
+
+fn strip_suffix_wildcard(pattern: &str) -> &str {
+    [
+        ".*",
+        ".+",
+        "[\\s\\S]*",
+        "[\\s\\S]+",
+        "[\\w\\W]*",
+        "[\\w\\W]+",
+    ]
+    .iter()
+    .find_map(|suffix| pattern.strip_suffix(suffix))
+    .unwrap_or(pattern)
+}
+
+fn bound_wildcard_pattern(pattern: &str, max_length: u64) -> Option<String> {
+    let starts = pattern_starts_with_unbounded_wildcard(pattern);
+    let ends = pattern_ends_with_unbounded_wildcard(pattern);
+    if !starts && !ends {
+        return None;
+    }
+    let mut inner = pattern;
+    if starts {
+        inner = strip_prefix_wildcard(inner);
+    }
+    if ends {
+        inner = strip_suffix_wildcard(inner);
+    }
+    let mut bounded = String::new();
+    if starts {
+        bounded.push_str(&format!("^.{{0,{max_length}}}"));
+    }
+    bounded.push_str(inner);
+    if ends {
+        bounded.push_str(&format!(".{{0,{max_length}}}$"));
+    }
+    Some(bounded)
+}
+
+fn schema_type_includes_string(schema: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match schema.get("type") {
+        Some(serde_json::Value::String(value)) => value == "string",
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .any(|value| matches!(value, serde_json::Value::String(s) if s == "string")),
+        _ => false,
+    }
+}
+
+fn bound_wildcard_pattern_strings(schema: &mut serde_json::Value) {
+    match schema {
+        serde_json::Value::Object(object) => {
+            let pattern = object
+                .get("pattern")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if schema_type_includes_string(object)
+                && pattern
+                    .as_deref()
+                    .is_some_and(pattern_has_unbounded_wildcard)
+                && !object.contains_key("enum")
+                && !object.contains_key("const")
+            {
+                let max_length = object
+                    .get("maxLength")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|value| *value > 0)
+                    .unwrap_or_else(wildcard_pattern_max_length);
+                if let Some(pattern) = pattern
+                    .as_deref()
+                    .and_then(|pattern| bound_wildcard_pattern(pattern, max_length))
+                {
+                    object.insert("pattern".to_string(), serde_json::Value::String(pattern));
+                }
+                object
+                    .entry("maxLength".to_string())
+                    .or_insert_with(|| serde_json::Value::Number(max_length.into()));
+            }
+            for value in object.values_mut() {
+                bound_wildcard_pattern_strings(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                bound_wildcard_pattern_strings(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn guided_json_schema(mut schema: serde_json::Value) -> serde_json::Value {
+    bound_wildcard_pattern_strings(&mut schema);
+    schema
+}
+
+fn tool_choice_guided_json_schema(schema: serde_json::Value) -> serde_json::Value {
+    let mut schema = guided_json_schema(schema);
+    if let serde_json::Value::Object(object) = &mut schema {
+        object.insert(
+            TOOL_CHOICE_GUIDED_JSON_MARKER.to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    schema
+}
+
+fn default_constrained_max_thinking_tokens() -> Option<u32> {
+    let value = std::env::var(DEFAULT_CONSTRAINED_MAX_THINKING_TOKENS_ENV).ok()?;
+    let value = value.trim().parse::<i64>().ok()?;
+    (value >= 0).then(|| u32::try_from(value).ok()).flatten()
+}
+
+pub(crate) fn repair_boundary_brace_leak(content: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{')
+        || serde_json::from_str::<serde_json::Value>(trimmed.trim_end()).is_ok()
+    {
+        return None;
+    }
+    const MAX_PREFIX: usize = 8;
+    for (index, character) in trimmed.char_indices() {
+        if character != '{' || index == 0 {
+            continue;
+        }
+        if index > MAX_PREFIX {
+            break;
+        }
+        if !trimmed[..index]
+            .chars()
+            .all(|character| matches!(character, '{' | '}' | '"' | ',' | ' ' | '\t' | '\n' | '\r'))
+        {
+            break;
+        }
+        let candidate = trimmed[index..].trim_end();
+        if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
 
 /// Map a parser-native [`ToolCallResponse`] onto the protocol/wire
 /// [`ChatCompletionMessageToolCall`].
@@ -578,6 +790,45 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
     fn get_guided_json(&self) -> Option<serde_json::Value> {
         if self.uses_qwen_xml_tool_structural_tag() {
             return None;
+        }
+
+        if let Some(value) = self.common.guided_json.clone() {
+            return Some(guided_json_schema(value));
+        }
+
+        let has_explicit_structural_tag = self
+            .common
+            .structured_outputs
+            .as_ref()
+            .is_some_and(|structured| structured.structural_tag.is_some());
+
+        if !has_explicit_structural_tag
+            && let (Some(tool_choice), Some(tools)) =
+                (self.inner.tool_choice.as_ref(), self.inner.tools.as_deref())
+        {
+            match tools::get_json_schema_from_tools(
+                Some(tool_choice),
+                Some(tools),
+                self.request_text_len(),
+            ) {
+                Ok(Some(schema)) => return Some(tool_choice_guided_json_schema(schema)),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to derive guided_json from tool_choice"
+                    );
+                }
+            }
+        }
+
+        if let Some(value) = self
+            .common
+            .structured_outputs
+            .as_ref()
+            .and_then(|structured| structured.json.clone())
+        {
+            return Some(guided_json_schema(value));
         }
 
         if let Some(response_format) = self.inner.response_format.as_ref() {

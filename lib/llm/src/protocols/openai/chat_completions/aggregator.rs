@@ -344,118 +344,10 @@ impl DeltaAggregator {
                     ChatCompletionMessageContent::Text(text) => {
                         state_choice.text.push_str(text);
                     }
+                    ChatCompletionMessageContent::Parts(parts) => {
+                        state_choice.content_parts.extend(parts.iter().cloned());
+                    }
                 };
-
-                if aggregator.error.is_none()
-                    && let Some(delta) = delta.data
-                {
-                    aggregator.id = delta.inner.id;
-                    aggregator.model = delta.inner.model;
-                    aggregator.created = delta.inner.created;
-                    aggregator.service_tier = delta.inner.service_tier;
-
-                    // Aggregate usage statistics if available.
-                    if let Some(usage) = delta.inner.usage {
-                        aggregator.usage = Some(usage);
-                    }
-                    if let Some(system_fingerprint) = delta.inner.system_fingerprint {
-                        aggregator.system_fingerprint = Some(system_fingerprint);
-                    }
-
-                    merge_response_nvext(&mut aggregator.nvext, delta.nvext);
-
-                    // Aggregate choices incrementally.
-                    for choice in delta.inner.choices {
-                        let choice_role = choice.delta.role;
-                        let state_choice =
-                            aggregator
-                                .choices
-                                .entry(choice.index)
-                                .or_insert(DeltaChoice {
-                                    index: choice.index,
-                                    text: "".to_string(),
-                                    role: choice_role,
-                                    finish_reason: None,
-                                    logprobs: None,
-                                    tool_call_chunks: BTreeMap::new(),
-                                    tool_calls: None,
-                                    reasoning_content: None,
-                                    content_parts: Vec::new(),
-                                });
-
-                        if state_choice.role.is_none() {
-                            state_choice.role = choice_role;
-                        }
-
-                        // Handle content based on type
-                        if let Some(content) = &choice.delta.content {
-                            match content {
-                                ChatCompletionMessageContent::Text(text) => {
-                                    state_choice.text.push_str(text);
-                                }
-                                ChatCompletionMessageContent::Parts(parts) => {
-                                    state_choice.content_parts.extend(parts.clone());
-                                }
-                            }
-                        }
-
-                        if let Some(reasoning_content) = &choice.delta.reasoning_content {
-                            state_choice
-                                .reasoning_content
-                                .get_or_insert_with(String::new)
-                                .push_str(reasoning_content);
-                        }
-
-                        // #8640: streaming producers split a single tool call across
-                        // multiple deltas (delta 1 = id + name; delta 2..N = argument
-                        // fragments), so we merge chunks into a per-index accumulator
-                        // here instead of treating each chunk as a complete tool call.
-                        // Finalization to `tool_calls` happens after the fold.
-                        if let Some(incoming_chunks) = choice.delta.tool_calls {
-                            for chunk in incoming_chunks {
-                                let entry = state_choice
-                                    .tool_call_chunks
-                                    .entry(chunk.index)
-                                    .or_insert_with(|| {
-                                        dynamo_protocols::types::ChatCompletionMessageToolCallChunk {
-                                            index: chunk.index,
-                                            id: None,
-                                            r#type: None,
-                                            function: None,
-                                        }
-                                    });
-                                merge_tool_call_chunk(entry, chunk);
-                            }
-                        }
-
-                        // Update finish reason if provided.
-                        if let Some(finish_reason) = choice.finish_reason {
-                            state_choice.finish_reason = Some(finish_reason);
-                        }
-
-                        // Update logprobs
-                        if let Some(logprobs) = &choice.logprobs {
-                            let state_lps = state_choice.logprobs.get_or_insert(
-                                dynamo_protocols::types::ChatChoiceLogprobs {
-                                    content: None,
-                                    refusal: None,
-                                },
-                            );
-                            if let Some(content_lps) = &logprobs.content {
-                                state_lps
-                                    .content
-                                    .get_or_insert(Vec::new())
-                                    .extend(content_lps.clone());
-                            }
-                            if let Some(refusal_lps) = &logprobs.refusal {
-                                state_lps
-                                    .refusal
-                                    .get_or_insert(Vec::new())
-                                    .extend(refusal_lps.clone());
-                            }
-                        }
-                    }
-                }
             }
 
             if let Some(reasoning_content) = &choice.delta.reasoning_content {
@@ -577,7 +469,7 @@ impl DeltaAggregator {
                 } else {
                     try_tool_call_parse_aggregate_finalize(&choice.text, Some(parser), None).await
                 };
-                let (tool_calls, content) = match parse_result {
+                let mut parsed = match parse_result {
                     Ok(result) => result,
                     Err(error) => {
                         tracing::debug!(
@@ -629,8 +521,7 @@ impl DeltaAggregator {
         // leading brace; airtight, off the streaming hot path (non-stream only).
         for choice in self.choices.values_mut() {
             if !choice.text.is_empty()
-                && let Some(repaired) =
-                    dynamo_parsers::reasoning::repair_boundary_brace_leak(&choice.text)
+                && let Some(repaired) = super::repair_boundary_brace_leak(&choice.text)
             {
                 choice.text = repaired;
             }
@@ -667,10 +558,7 @@ impl DeltaAggregator {
 fn try_jsonish_tool_call_parse_aggregate_finalize(
     message: &str,
     tool_names: &[String],
-) -> anyhow::Result<(
-    Vec<dynamo_protocols::types::ChatCompletionMessageToolCall>,
-    Option<String>,
-)> {
+) -> anyhow::Result<(Vec<ToolCallResponse>, Option<String>)> {
     let mut tagged_config = JsonParserConfig::default();
     tagged_config.tool_call_start_tokens = vec!["<tools>".to_string()];
     tagged_config.tool_call_end_tokens = vec!["</tools>".to_string()];
@@ -694,25 +582,15 @@ fn try_jsonish_tool_call_parse_aggregate_finalize(
 fn filter_tool_calls_by_name(
     parsed: Vec<ToolCallResponse>,
     tool_names: &[String],
-) -> Vec<dynamo_protocols::types::ChatCompletionMessageToolCall> {
-    let mut tool_calls = Vec::new();
-    for parsed in parsed {
-        if !tool_names
-            .iter()
-            .any(|tool_name| tool_name == &parsed.function.name)
-        {
-            continue;
-        }
-        tool_calls.push(dynamo_protocols::types::ChatCompletionMessageToolCall {
-            id: parsed.id,
-            r#type: dynamo_protocols::types::FunctionType::Function,
-            function: dynamo_protocols::types::FunctionCall {
-                name: parsed.function.name,
-                arguments: parsed.function.arguments,
-            },
-        });
-    }
-    tool_calls
+) -> Vec<ToolCallResponse> {
+    parsed
+        .into_iter()
+        .filter(|parsed| {
+            tool_names
+                .iter()
+                .any(|tool_name| tool_name == &parsed.function.name)
+        })
+        .collect()
 }
 
 #[allow(deprecated)]

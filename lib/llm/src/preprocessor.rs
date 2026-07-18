@@ -70,7 +70,10 @@ use crate::protocols::{
     },
     openai::{
         DeltaGeneratorExt,
-        chat_completions::{NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse},
+        chat_completions::{
+            NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
+            first_complete_json_value, repair_boundary_brace_leak,
+        },
         completions::{NvCreateCompletionRequest, NvCreateCompletionResponse},
         embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse},
     },
@@ -185,6 +188,12 @@ struct ReasoningChoiceState {
     emitted_tool_calls: bool,
 }
 
+#[derive(Default)]
+struct StructuredJsonChoiceState {
+    buffer: String,
+    completed: bool,
+}
+
 const THINK_END_TOKEN: &str = "</think>";
 
 fn split_content_after_reasoning_boundary(text: String) -> (Option<String>, String) {
@@ -228,7 +237,7 @@ fn first_complete_repaired_boundary_json(input: &str) -> Option<String> {
         }
     }
 
-    dynamo_parsers::reasoning::repair_boundary_brace_leak(input)
+    repair_boundary_brace_leak(input)
 }
 
 fn is_partial_object_key_prefix(prefix: &str) -> bool {
@@ -2214,18 +2223,12 @@ impl OpenAIPreprocessor {
         Ok((builder.build()?, annotations))
     }
 
-    pub fn postprocessor_parsing_stream<S>(
+    fn reasoning_stream_modes(
         &self,
-        stream: S,
         request: &NvCreateChatCompletionRequest,
         prompt_injected_reasoning: bool,
         uses_tool_call_structural_tag: bool,
-    ) -> anyhow::Result<
-        impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
-    >
-    where
-        S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
-    {
+    ) -> (bool, bool, bool, Option<&'static str>) {
         // Guided output may be bare JSON or `reasoning</think>JSON`. Supported
         // parsers inspect the stream shape before deciding whether to parse it.
         let is_guided_tool_choice = matches!(
@@ -2281,6 +2284,8 @@ impl OpenAIPreprocessor {
         (
             should_parse_reasoning,
             should_strip_disabled_reasoning_start,
+            bypass_reasoning_for_bare_guided_json,
+            guided_reasoning_start_token,
         )
     }
 
@@ -2289,14 +2294,23 @@ impl OpenAIPreprocessor {
         stream: S,
         request: &NvCreateChatCompletionRequest,
         prompt_injected_reasoning: bool,
+        uses_tool_call_structural_tag: bool,
     ) -> anyhow::Result<
         impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     >
     where
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     {
-        let (should_parse_reasoning, should_strip_disabled_reasoning_start) =
-            self.reasoning_stream_modes(request);
+        let (
+            should_parse_reasoning,
+            should_strip_disabled_reasoning_start,
+            bypass_reasoning_for_bare_guided_json,
+            guided_reasoning_start_token,
+        ) = self.reasoning_stream_modes(
+            request,
+            prompt_injected_reasoning,
+            uses_tool_call_structural_tag,
+        );
         let structured_json_guard_after_reasoning =
             should_parse_reasoning && request.uses_pure_json_structured_output();
 
@@ -2741,7 +2755,7 @@ impl OpenAIPreprocessor {
             detokenize_count: tracker.as_ref().map(|t| t.detokenize_count()),
         };
         if trace_tokens_enabled {
-            crate::agents::trace::record_llm_metric_tokens(
+            crate::request_trace::record_llm_metric_tokens(
                 tracker.as_deref(),
                 Some(usage.prompt_tokens as usize),
                 usage.completion_tokens as usize,
@@ -3233,7 +3247,12 @@ impl OpenAIPreprocessor {
             reasoning_parser,
             chat_template_args,
             prompt_injected_reasoning,
-            request.uses_pure_json_structured_output(),
+            common_request
+                .sampling_options
+                .guided_decoding
+                .as_ref()
+                .is_some_and(|guided| guided.json.is_some())
+                && request.tools().is_none(),
         ) {
             updates.insert(
                 "reasoning_ended".to_string(),
@@ -3733,7 +3752,7 @@ impl
         );
 
         // create a response generator
-        let response_generator = request.response_generator(context.id().to_string());
+        let mut response_generator = request.response_generator(context.id().to_string());
         let tracker = Some(response_generator.tracker());
         let preprocess_options = PreprocessRequestOptions {
             preserve_omitted_max_tokens: context
@@ -3768,8 +3787,14 @@ impl
         // Attach the timing tracker to the request so downstream components can record metrics
         common_request.tracker = tracker;
 
-        let structured_json_guard_after_reasoning =
-            request.uses_pure_json_structured_output() && self.reasoning_stream_modes(&request).0;
+        let structured_json_guard_after_reasoning = request.uses_pure_json_structured_output()
+            && self
+                .reasoning_stream_modes(
+                    &request,
+                    prompt_injected_reasoning,
+                    uses_tool_call_structural_tag,
+                )
+                .0;
         if structured_json_guard_after_reasoning {
             response_generator.set_structured_json_guard(false);
         }

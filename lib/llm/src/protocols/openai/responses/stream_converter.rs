@@ -20,9 +20,9 @@ use dynamo_protocols::types::responses::{
     ResponseContentPartAddedEvent, ResponseContentPartDoneEvent, ResponseCreatedEvent,
     ResponseFailedEvent, ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallArgumentsDoneEvent, ResponseInProgressEvent, ResponseOutputItemAddedEvent,
-    ResponseOutputItemDoneEvent, ResponseReasoningTextDeltaEvent, ResponseReasoningTextDoneEvent,
-    ResponseStreamEvent, ResponseTextDeltaEvent, ResponseTextDoneEvent, ResponseUsage, ServiceTier,
-    Status, ToolChoiceOptions, ToolChoiceParam, Truncation,
+    ResponseOutputItemDoneEvent, ResponseReasoningTextDeltaEvent, ResponseStreamEvent,
+    ResponseTextDeltaEvent, ResponseTextDoneEvent, ResponseUsage, ServiceTier, Status,
+    ToolChoiceOptions, ToolChoiceParam, Truncation,
 };
 use serde::{
     Serialize,
@@ -142,12 +142,10 @@ impl ResponseStreamConverter {
             parallel_tool_calls: self.params.parallel_tool_calls.or(Some(true)),
             temperature: self.params.temperature.or(Some(1.0)),
             text: Some(
-                dynamo_protocols::types::responses::response_text_param_to_upstream(
-                    self.params
-                        .text
-                        .clone()
-                        .unwrap_or_else(super::default_response_text_param),
-                ),
+                self.params
+                    .text
+                    .clone()
+                    .unwrap_or_else(super::default_response_text_param),
             ),
             tool_choice: self
                 .params

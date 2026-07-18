@@ -67,6 +67,12 @@ pub mod logging {
         /// OTLP exporter endpoint URL for logs. Falls back to OTEL_EXPORTER_OTLP_ENDPOINT or the protocol default when unset.
         pub const OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT";
 
+        /// OTLP exporter timeout for logs, in milliseconds.
+        pub const OTEL_EXPORTER_OTLP_LOGS_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT";
+
+        /// Generic OTLP exporter timeout fallback, in milliseconds.
+        pub const OTEL_EXPORTER_OTLP_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TIMEOUT";
+
         /// Trace sampling ratio used when set. Example: "0.01" samples roughly 1% of traces.
         pub const OTEL_TRACES_SAMPLE_RATIO: &str = "OTEL_TRACES_SAMPLE_RATIO";
 

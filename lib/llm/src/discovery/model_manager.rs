@@ -104,6 +104,9 @@ pub struct ModelManager {
     /// Per-endpoint runtime config watchers. Keyed by EndpointId (includes namespace).
     runtime_configs: DashMap<EndpointId, RuntimeConfigWatch>,
 
+    /// Alias to primary model name mapping.
+    alias_to_primary: DashMap<String, String>,
+
     // LoRA allocation state. The state objects are always created so discovery can
     // populate them, but `lora_filter()` only hands out the filter when LoRA serving is
     // enabled (DYN_LORA_ENABLED) — so non-LoRA deployments keep the unmodified routing
@@ -139,6 +142,7 @@ impl ModelManager {
             cards: DashMap::new(),
             prefill_router_activators: DashMap::new(),
             runtime_configs: DashMap::new(),
+            alias_to_primary: DashMap::new(),
             lora_routing_table,
             lora_state_tracker,
             lora_load_estimator: Arc::new(LoadEstimator::new()),

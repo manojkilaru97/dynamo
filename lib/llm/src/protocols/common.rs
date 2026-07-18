@@ -441,10 +441,6 @@ pub struct GuidedDecodingOptions {
     /// If specified, whitespace pattern to use for guided decoding. Can be a string or null.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub whitespace_pattern: Option<String>,
-
-    /// If specified, xgrammar structural tag constraint for guided decoding.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub structural_tag: Option<serde_json::Value>,
 }
 
 impl GuidedDecodingOptions {
@@ -464,7 +460,6 @@ impl GuidedDecodingOptions {
             regex,
             choice,
             grammar,
-            structural_tag: None,
             backend,
             whitespace_pattern,
             structural_tag,
@@ -509,7 +504,7 @@ impl GuidedDecodingOptions {
             regex,
             choice,
             grammar,
-            None,
+            structural_tag,
             backend,
             whitespace_pattern,
         )
@@ -555,13 +550,12 @@ impl GuidedDecodingOptions {
             && regex.is_none()
             && is_empty_choice
             && grammar.is_none()
-            && structural_tag.is_none()
             && whitespace_pattern.is_none()
             && structural_tag.is_none()
         {
             return Ok(None);
         }
-        let instance = Self::validated(
+        let mut instance = Self::validated(
             json,
             regex,
             choice,
@@ -570,6 +564,8 @@ impl GuidedDecodingOptions {
             whitespace_pattern,
             structural_tag,
         )?;
+        instance.json_object = json_object;
+        instance.validate()?;
         Ok(Some(instance))
     }
 
@@ -582,7 +578,6 @@ impl GuidedDecodingOptions {
             self.regex.is_some(),
             self.choice.as_ref().is_some_and(|v| !v.is_empty()),
             self.grammar.is_some(),
-            self.structural_tag.is_some(),
             self.whitespace_pattern.is_some(),
             self.structural_tag.is_some(),
         ]
@@ -592,7 +587,7 @@ impl GuidedDecodingOptions {
 
         if count > 1 {
             return Err(anyhow::anyhow!(
-                "Only one of json, regex, choice, grammar, or structural_tag can be set, but multiple are specified: {:?}",
+                "Only one of json, json_object, regex, choice, grammar, structural_tag, or whitespace_pattern can be set, but multiple are specified: {:?}",
                 self
             ));
         }
