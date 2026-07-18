@@ -288,10 +288,156 @@ where
 struct ReasoningState {
     stream: Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>,
     reasoning_parser: Option<Box<dyn ReasoningParser>>,
+    choices: HashMap<u32, ReasoningChoiceState>,
     bypass_bare_guided_json: bool,
     // TODO: Track this per choice.index for n > 1. The current bypass
     // decision and parser state are shared across all streamed choices.
     guided_json_bypass_decision: Option<bool>,
+}
+
+#[derive(Default)]
+struct ReasoningChoiceState {
+    reasoning_content: String,
+    emitted_content: bool,
+    emitted_tool_calls: bool,
+}
+
+const THINK_END_TOKEN: &str = "</think>";
+
+fn split_content_after_reasoning_boundary(text: String) -> (Option<String>, String) {
+    if let Some(end_idx) = text.rfind(THINK_END_TOKEN) {
+        let before = text[..end_idx].to_string();
+        let after = text[end_idx + THINK_END_TOKEN.len()..]
+            .trim_start_matches(['\n', '\r'])
+            .to_string();
+        (Some(before), after)
+    } else {
+        (None, text)
+    }
+}
+
+fn first_complete_repaired_boundary_json(input: &str) -> Option<String> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+
+    const MAX_STRUCTURAL_PREFIX: usize = 8;
+    const MAX_PARTIAL_KEY_PREFIX: usize = 32;
+    for (i, c) in trimmed.char_indices() {
+        if c != '{' || i == 0 {
+            continue;
+        }
+        if i > MAX_PARTIAL_KEY_PREFIX {
+            break;
+        }
+        let prefix = &trimmed[..i];
+        let structural_prefix = prefix
+            .chars()
+            .all(|c| matches!(c, '{' | '}' | '"' | ',' | ' ' | '\t' | '\n' | '\r'));
+        if (structural_prefix && i > MAX_STRUCTURAL_PREFIX)
+            || (!structural_prefix && !is_partial_object_key_prefix(prefix))
+        {
+            break;
+        }
+        if let Some(json) = first_complete_json_value(&trimmed[i..]) {
+            return Some(json);
+        }
+    }
+
+    dynamo_parsers::reasoning::repair_boundary_brace_leak(input)
+}
+
+fn is_partial_object_key_prefix(prefix: &str) -> bool {
+    const MAX_PARTIAL_KEY_PREFIX: usize = 32;
+    if prefix.len() > MAX_PARTIAL_KEY_PREFIX {
+        return false;
+    }
+
+    let Some(rest) = prefix.strip_prefix('{') else {
+        return false;
+    };
+    let rest = rest.trim_start().strip_prefix('"').unwrap_or(rest);
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' '))
+}
+
+fn parse_first_json_object_key(input: &str) -> Option<String> {
+    let after_open = input.trim_start().strip_prefix('{')?.trim_start();
+    let (key, literal_len) = parse_json_string_literal(after_open)?;
+    if after_open[literal_len..].trim_start().starts_with(':') {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+fn parse_json_string_literal(input: &str) -> Option<(String, usize)> {
+    if !input.starts_with('"') {
+        return None;
+    }
+
+    let mut escaped = false;
+    for (idx, ch) in input.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '"' => {
+                let end = idx + ch.len_utf8();
+                let key = serde_json::from_str::<String>(&input[..end]).ok()?;
+                return Some((key, end));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn complete_json_object(candidate: String) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&candidate)
+        .ok()
+        .filter(|value| value.is_object())
+        .map(|_| candidate)
+}
+
+fn repair_escaped_object_key_boundary_leak(input: &str) -> Option<String> {
+    let key = parse_first_json_object_key(input)?;
+    let unescaped_key = key.replace("\\\"", "\"");
+
+    for key in [key.as_str(), unescaped_key.as_str()] {
+        let base = if key.starts_with('{') {
+            key.to_string()
+        } else if key.starts_with('"') {
+            format!("{{{key}")
+        } else {
+            format!("{{\"{key}")
+        };
+
+        if let Some(repaired) =
+            complete_json_object(base.clone()).or_else(|| complete_json_object(format!("{base}}}")))
+        {
+            return Some(repaired);
+        }
+    }
+
+    None
+}
+
+fn first_complete_structured_json_content(input: &str) -> Option<String> {
+    first_complete_repaired_boundary_json(input)
+        .or_else(|| repair_escaped_object_key_boundary_leak(input))
+        .or_else(|| first_complete_json_value(input))
+}
+
+fn finalize_structured_json_content(buffered: String) -> String {
+    first_complete_structured_json_content(&buffered).unwrap_or(buffered)
 }
 
 /// Per-image routing payload accumulated by `gather_multi_modal_data` and
@@ -3446,6 +3592,7 @@ impl OpenAIPreprocessor {
         let state = ReasoningState {
             stream: Box::pin(stream),
             reasoning_parser: Some(reasoning_parser),
+            choices: HashMap::new(),
             bypass_bare_guided_json,
             guided_json_bypass_decision: None,
         };
@@ -3486,7 +3633,8 @@ impl OpenAIPreprocessor {
                     // Keep bare JSON and leading whitespace available to the tool jail.
                     response
                 } else if let Some(ref mut parser) = state.reasoning_parser {
-                    response.map_data(|mut data| {
+                    let mut response = response;
+                    if let Some(mut data) = response.data.take() {
                         // Process all choices, not just the first one
                         for choice in data.inner.choices.iter_mut() {
                             // Reasoning parsing only applies to text content
@@ -3497,10 +3645,47 @@ impl OpenAIPreprocessor {
                                     parser.parse_reasoning_streaming_incremental(text, &[]);
 
                                 // Update this specific choice with parsed content
-                                choice.delta.content = parser_result
-                                    .get_some_normal_text()
-                                    .map(ChatCompletionMessageContent::Text);
-                                choice.delta.reasoning_content = parser_result.get_some_reasoning();
+                                let mut delta_reasoning = parser_result.reasoning_text;
+                                if !delta_reasoning.is_empty() {
+                                    choice_state.reasoning_content.push_str(&delta_reasoning);
+                                }
+
+                                let mut normal_text = parser_result.normal_text;
+                                if !normal_text.is_empty()
+                                    && !choice_state.reasoning_content.is_empty()
+                                {
+                                    let (boundary_reasoning, after_boundary) =
+                                        split_content_after_reasoning_boundary(std::mem::take(
+                                            &mut normal_text,
+                                        ));
+                                    if let Some(boundary_reasoning) = boundary_reasoning {
+                                        if !boundary_reasoning.is_empty() {
+                                            choice_state
+                                                .reasoning_content
+                                                .push_str(&boundary_reasoning);
+                                            delta_reasoning.push_str(&boundary_reasoning);
+                                        }
+                                        normal_text = after_boundary;
+                                    }
+                                }
+
+                                choice.delta.reasoning_content = if delta_reasoning.is_empty() {
+                                    None
+                                } else {
+                                    Some(delta_reasoning)
+                                };
+                                normal_text = if choice_state.emitted_content {
+                                    normal_text
+                                } else {
+                                    normal_text.trim_start_matches(['\n', '\r']).to_string()
+                                };
+                                if normal_text.is_empty() {
+                                    choice.delta.content = None;
+                                } else {
+                                    choice_state.emitted_content = true;
+                                    choice.delta.content =
+                                        Some(ChatCompletionMessageContent::Text(normal_text));
+                                }
                             }
                             // For multimodal content, pass through unchanged
                         }
