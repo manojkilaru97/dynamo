@@ -1785,16 +1785,22 @@ async fn tool_choice_mistral_required_recognizes_split_reasoning_start() {
 #[tokio::test]
 async fn tool_choice_force_reasoning_named_keeps_reasoning_before_guided_params() {
     for &(reasoning_parser, close_marker) in REASONING_BEFORE_GUIDED_JSON_PARSERS {
-        let preprocessor = build_preprocessor(Some(reasoning_parser), Some("nemotron_nano"));
+        let tool_parser = if reasoning_parser == "nemotron_v3" {
+            "qwen3_coder"
+        } else {
+            "nemotron_nano"
+        };
+        let preprocessor = build_preprocessor(Some(reasoning_parser), Some(tool_parser));
         let mut request = streaming_tool_request(ChatCompletionToolChoiceOption::Named(
             "get_weather".to_string().into(),
         ));
         enable_opt_in_reasoning(&mut request, reasoning_parser);
+        let close_and_json_start = format!(r#"{close_marker}{{"#);
         let input_stream = stream::iter(
             vec![
                 mock_content_chunk("Let me check."),
-                mock_content_chunk(close_marker),
-                mock_content_chunk(r#"{"location":"San Francisco"}"#),
+                mock_content_chunk(&close_and_json_start),
+                mock_content_chunk(r#""location":"San Francisco"}"#),
                 mock_final_chunk(),
             ]
             .into_iter()
