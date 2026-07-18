@@ -24,6 +24,10 @@ pub struct DeltaGeneratorOptions {
     pub enable_logprobs: bool,
     /// When true, logprob token fields use "token_id:<id>" format instead of decoded text.
     pub return_tokens_as_token_ids: bool,
+    /// Buffer pure structured JSON streams until the first complete JSON value.
+    pub structured_json_guard: bool,
+    /// Number of streamed choices expected for this request.
+    pub expected_choices: u32,
     /// Determines which nvext response fields may be emitted for this request.
     pub response_fields: NvExtResponseFieldSelection,
 }
@@ -42,6 +46,8 @@ impl DeltaGeneratorOptions {
             enable_logprobs,
             response_fields,
             return_tokens_as_token_ids: return_tokens_as_token_ids.unwrap_or(false),
+            structured_json_guard: false,
+            expected_choices: 1,
         }
     }
 }
