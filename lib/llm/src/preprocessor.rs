@@ -171,10 +171,32 @@ where
 struct ReasoningState {
     stream: Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>,
     reasoning_parser: Option<Box<dyn ReasoningParser>>,
+    choices: HashMap<u32, ReasoningChoiceState>,
     bypass_bare_guided_json: bool,
     // TODO: Track this per choice.index for n > 1. The current bypass
     // decision and parser state are shared across all streamed choices.
     guided_json_bypass_decision: Option<bool>,
+}
+
+#[derive(Default)]
+struct ReasoningChoiceState {
+    reasoning_content: String,
+    emitted_content: bool,
+    emitted_tool_calls: bool,
+}
+
+const THINK_END_TOKEN: &str = "</think>";
+
+fn split_content_after_reasoning_boundary(text: String) -> (Option<String>, String) {
+    if let Some(end_idx) = text.rfind(THINK_END_TOKEN) {
+        let before = text[..end_idx].to_string();
+        let after = text[end_idx + THINK_END_TOKEN.len()..]
+            .trim_start_matches(['\n', '\r'])
+            .to_string();
+        (Some(before), after)
+    } else {
+        (None, text)
+    }
 }
 
 fn first_complete_repaired_boundary_json(input: &str) -> Option<String> {
@@ -3306,6 +3328,7 @@ impl OpenAIPreprocessor {
         let state = ReasoningState {
             stream: Box::pin(stream),
             reasoning_parser: Some(reasoning_parser),
+            choices: HashMap::new(),
             bypass_bare_guided_json,
             guided_json_bypass_decision: None,
         };
@@ -3346,7 +3369,8 @@ impl OpenAIPreprocessor {
                     // Keep bare JSON and leading whitespace available to the tool jail.
                     response
                 } else if let Some(ref mut parser) = state.reasoning_parser {
-                    response.map_data(|mut data| {
+                    let mut response = response;
+                    if let Some(mut data) = response.data.take() {
                         // Process all choices, not just the first one
                         for choice in data.inner.choices.iter_mut() {
                             let choice_state = state.choices.entry(choice.index).or_default();
@@ -3372,10 +3396,47 @@ impl OpenAIPreprocessor {
                                     parser.parse_reasoning_streaming_incremental(text, &[]);
 
                                 // Update this specific choice with parsed content
-                                choice.delta.content = parser_result
-                                    .get_some_normal_text()
-                                    .map(ChatCompletionMessageContent::Text);
-                                choice.delta.reasoning_content = parser_result.get_some_reasoning();
+                                let mut delta_reasoning = parser_result.reasoning_text;
+                                if !delta_reasoning.is_empty() {
+                                    choice_state.reasoning_content.push_str(&delta_reasoning);
+                                }
+
+                                let mut normal_text = parser_result.normal_text;
+                                if !normal_text.is_empty()
+                                    && !choice_state.reasoning_content.is_empty()
+                                {
+                                    let (boundary_reasoning, after_boundary) =
+                                        split_content_after_reasoning_boundary(std::mem::take(
+                                            &mut normal_text,
+                                        ));
+                                    if let Some(boundary_reasoning) = boundary_reasoning {
+                                        if !boundary_reasoning.is_empty() {
+                                            choice_state
+                                                .reasoning_content
+                                                .push_str(&boundary_reasoning);
+                                            delta_reasoning.push_str(&boundary_reasoning);
+                                        }
+                                        normal_text = after_boundary;
+                                    }
+                                }
+
+                                choice.delta.reasoning_content = if delta_reasoning.is_empty() {
+                                    None
+                                } else {
+                                    Some(delta_reasoning)
+                                };
+                                normal_text = if choice_state.emitted_content {
+                                    normal_text
+                                } else {
+                                    normal_text.trim_start_matches(['\n', '\r']).to_string()
+                                };
+                                if normal_text.is_empty() {
+                                    choice.delta.content = None;
+                                } else {
+                                    choice_state.emitted_content = true;
+                                    choice.delta.content =
+                                        Some(ChatCompletionMessageContent::Text(normal_text));
+                                }
                             }
                             // For multimodal content, pass through unchanged
 
