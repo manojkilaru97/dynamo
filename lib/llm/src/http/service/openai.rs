@@ -587,6 +587,15 @@ pub(super) fn context_from_headers<T: Send + Sync + 'static>(
     let metadata = extract_metadata_from_http(headers)
         .map_err(|err| ErrorMessage::request_headers_too_large(&err.to_string()))?;
     let mut request = Context::with_id_and_metadata(request, request_id, metadata);
+    if std::env::var_os("DYN_NANO35_AUDIT_FILE").is_some()
+        && let Some(audit_id) = headers
+            .get("x-nano35-audit-id")
+            .and_then(|value| value.to_str().ok())
+    {
+        request
+            .metadata_mut()
+            .insert("nano35-audit-id".to_string(), audit_id.to_string());
+    }
     attach_x_request_id(&mut request, headers);
     if let Some(agent_context) = agent_context_from_headers(headers) {
         request.insert(AGENT_CONTEXT_CONTEXT_KEY, agent_context);

@@ -38,6 +38,7 @@ from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine
 
+from .nano35_audit import record_nano35_render_audit
 from .prepost import StreamingPostProcessor, preprocess_chat_request
 from .thinking import runtime_default_thinking_mode
 from .utils import (
@@ -512,6 +513,15 @@ class VllmProcessor:
         engine_prompt = pre.engine_prompt
         tokens = pre.prompt_token_ids
         guided_decoding = pre.guided_decoding
+        record_nano35_render_audit(
+            request=request,
+            context=context,
+            response_id=request_id,
+            engine_prompt=engine_prompt,
+            prompt_token_ids=tokens,
+            tokenizer=self.tokenizer,
+            chat_template_kwargs=chat_template_kwargs,
+        )
 
         if request_for_sampling.max_completion_tokens is not None:
             max_tokens = request_for_sampling.max_completion_tokens
