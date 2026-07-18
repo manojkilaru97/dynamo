@@ -447,6 +447,15 @@ class TestReasoningParserMetadata:
             "disable_additional_properties": False,
         }
 
+    def test_constraints_empty_structured_outputs_are_discarded(self):
+        from dynamo.frontend.vllm_processor import _active_structured_outputs
+
+        empty = SimpleNamespace(all_constraints_none=lambda: True)
+        active = StructuredOutputsParams(json={"type": "object"})
+
+        assert _active_structured_outputs(empty) is None
+        assert _active_structured_outputs(active) is active
+
     def test_response_format_json_schema_serializes_to_guided_decoding(self):
         from dynamo.frontend.vllm_processor import (
             _structured_outputs_from_response_format,

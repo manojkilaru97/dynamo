@@ -523,6 +523,13 @@ def _has_structured_outputs(structured_outputs: StructuredOutputsParams | None) 
     return structured_outputs is not None and not structured_outputs.all_constraints_none()
 
 
+def _active_structured_outputs(
+    structured_outputs: StructuredOutputsParams | None,
+) -> StructuredOutputsParams | None:
+    """Discard request-model placeholders that carry no output constraint."""
+    return structured_outputs if _has_structured_outputs(structured_outputs) else None
+
+
 def _parse_int_env(name: str) -> int | None:
     value = os.environ.get(name)
     if value is None or value == "":
@@ -942,6 +949,13 @@ class VllmProcessor:
             v = getattr(request_for_sampling, k, None)
             if v is not None:
                 setattr(sampling_params, k, v)
+
+        # The OpenAI request model may expose a constraints-empty placeholder
+        # even when the client omitted structured outputs. vLLM validates any
+        # non-None value, so do not pass that placeholder to process_inputs().
+        sampling_params.structured_outputs = _active_structured_outputs(
+            sampling_params.structured_outputs
+        )
 
         reasoning_ended, reasoning_parser_kwargs = _build_reasoning_parser_metadata(
             self.reasoning_parser_class,
