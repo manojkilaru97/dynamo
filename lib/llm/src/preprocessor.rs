@@ -184,6 +184,7 @@ struct ReasoningState {
 #[derive(Default)]
 struct ReasoningChoiceState {
     reasoning_content: String,
+    reasoning_ended: bool,
     emitted_content: bool,
     emitted_tool_calls: bool,
 }
@@ -1051,7 +1052,9 @@ impl OpenAIPreprocessor {
             common_request.router = Some(router_params.clone());
         }
 
-        let mut preprocessed = builder.build()?;
+        // Keep the request enriched above. Rebuilding from `builder` here drops
+        // reasoning-engine metadata (and router parameters) before dispatch.
+        let mut preprocessed = common_request;
         if let Some(reasoning_ended) = Self::prompt_injected_reasoning_ended_arg(
             self.runtime_config.reasoning_parser.as_deref(),
             formatted_prompt.as_deref(),
@@ -2311,8 +2314,14 @@ impl OpenAIPreprocessor {
             prompt_injected_reasoning,
             uses_tool_call_structural_tag,
         );
-        let structured_json_guard_after_reasoning =
-            should_parse_reasoning && request.uses_pure_json_structured_output();
+        let forced_tool_json_after_reasoning = !uses_tool_call_structural_tag
+            && matches!(
+                request.inner.tool_choice.as_ref(),
+                Some(ChatCompletionToolChoiceOption::Required)
+                    | Some(ChatCompletionToolChoiceOption::Named(_))
+            );
+        let structured_json_guard_after_reasoning = should_parse_reasoning
+            && (request.uses_pure_json_structured_output() || forced_tool_json_after_reasoning);
 
         // Reasoning Content Parsing Transformation Step
         // Current Solution:
@@ -3411,16 +3420,41 @@ impl OpenAIPreprocessor {
                             if let Some(ChatCompletionMessageContent::Text(text)) =
                                 choice.delta.content.as_ref()
                             {
-                                let parser_result =
-                                    parser.parse_reasoning_streaming_incremental(text, &[]);
+                                let (mut delta_reasoning, mut normal_text) =
+                                    if choice_state.reasoning_ended {
+                                        (String::new(), text.clone())
+                                    } else {
+                                        let parser_result = parser
+                                            .parse_reasoning_streaming_incremental(text, &[]);
+                                        (
+                                            parser_result.reasoning_text,
+                                            parser_result.normal_text,
+                                        )
+                                    };
+
+                                // The parser API receives no token IDs on this layer. For
+                                // parsers whose boundary is token-driven, recognize the
+                                // configured textual boundary here and keep the choice in
+                                // normal-content mode for every following chunk.
+                                if !choice_state.reasoning_ended
+                                    && let Some(end_idx) = text.rfind(THINK_END_TOKEN)
+                                {
+                                    delta_reasoning = text[..end_idx].to_string();
+                                    normal_text = text[end_idx + THINK_END_TOKEN.len()..]
+                                        .trim_start_matches(['\n', '\r'])
+                                        .to_string();
+                                    choice_state.reasoning_ended = true;
+                                } else if !normal_text.is_empty()
+                                    && !choice_state.reasoning_content.is_empty()
+                                {
+                                    choice_state.reasoning_ended = true;
+                                }
 
                                 // Update this specific choice with parsed content
-                                let mut delta_reasoning = parser_result.reasoning_text;
                                 if !delta_reasoning.is_empty() {
                                     choice_state.reasoning_content.push_str(&delta_reasoning);
                                 }
 
-                                let mut normal_text = parser_result.normal_text;
                                 if !normal_text.is_empty()
                                     && !choice_state.reasoning_content.is_empty()
                                 {
@@ -3428,6 +3462,7 @@ impl OpenAIPreprocessor {
                                         split_content_after_reasoning_boundary(std::mem::take(
                                             &mut normal_text,
                                         ));
+                                    normal_text = after_boundary;
                                     if let Some(boundary_reasoning) = boundary_reasoning {
                                         if !boundary_reasoning.is_empty() {
                                             choice_state
@@ -3435,7 +3470,6 @@ impl OpenAIPreprocessor {
                                                 .push_str(&boundary_reasoning);
                                             delta_reasoning.push_str(&boundary_reasoning);
                                         }
-                                        normal_text = after_boundary;
                                     }
                                 }
 

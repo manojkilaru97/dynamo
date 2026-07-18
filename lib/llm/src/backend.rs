@@ -109,18 +109,19 @@ impl DecoderParams {
 }
 
 fn select_output_text(
-    skip_special_tokens: bool,
+    _skip_special_tokens: bool,
     engine_text: Option<String>,
     decoded_text: Option<String>,
 ) -> Option<String> {
     let engine_text = engine_text.filter(|text| !text.is_empty());
     let decoded_text = decoded_text.filter(|text| !text.is_empty());
 
-    if skip_special_tokens {
-        engine_text.or(decoded_text)
-    } else {
-        decoded_text.or(engine_text)
-    }
+    // When an engine supplies non-empty text it has already applied its own
+    // streaming decoder and parser-visible marker policy. Keep processing the
+    // token IDs for stop handling and accounting, but do not replace that text
+    // with Dynamo's independently decoded delta: the two decoder states can
+    // diverge at a reasoning boundary and drop the following structured output.
+    engine_text.or(decoded_text)
 }
 
 impl Backend {
@@ -792,7 +793,7 @@ mod tests {
                 Some("<tool_call>".to_string()),
                 Some("x".to_string())
             ),
-            Some("x".to_string())
+            Some("<tool_call>".to_string())
         );
         assert_eq!(
             select_output_text(true, Some("<tool_call>".to_string()), Some("x".to_string())),

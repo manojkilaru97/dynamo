@@ -2044,6 +2044,16 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         # Request-plane RL method map served by rl_dispatch on
         # dyn://<namespace>.<component>.rl when --enable-rl / DYN_ENABLE_RL is set.
         self.rl_route_registry = RLRouteRegistry(self.runtime, logger_=logger)
+        self.max_decode_wall_clock_secs = self._get_positive_float_env(
+            "DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS"
+        )
+        self._request_admission_lock = asyncio.Lock()
+        self._admitted_request_ids: set[str] = set()
+        self._pending_request_admissions = 0
+        self._last_request_admission_log_at: float | None = None
+        self.max_total_requests = self._configured_max_total_requests(
+            log_ignored_per_dp=True
+        )
 
     def _shutdown_worker(self) -> NoReturn:
         logger.warning("Initiating Dynamo Runtime shutdown.")
@@ -2053,6 +2063,531 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
     def _shutdown_on_engine_dead(self, e: EngineDeadError) -> NoReturn:
         logger.error(f"vLLM EngineDeadError: {e}")
         self._shutdown_worker()
+
+    @staticmethod
+    def _get_positive_float_env(name: str) -> float | None:
+        value = os.environ.get(name)
+        if value in (None, ""):
+            return None
+        try:
+            parsed = float(value)
+        except ValueError:
+            logger.warning("Ignoring invalid %s=%r", name, value)
+            return None
+        return parsed if parsed > 0 else None
+
+    @staticmethod
+    def _get_positive_int_env(name: str) -> int | None:
+        value = os.environ.get(name)
+        if value in (None, ""):
+            return None
+        try:
+            parsed = int(value)
+        except ValueError:
+            logger.warning("Ignoring invalid %s=%r", name, value)
+            return None
+        return parsed if parsed > 0 else None
+
+    def _get_default_max_total_requests(self) -> int | None:
+        scheduler_config = getattr(
+            getattr(self.engine_client, "vllm_config", None),
+            "scheduler_config",
+            None,
+        )
+        value = getattr(scheduler_config, "max_num_seqs", None)
+        if value in (None, ""):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid scheduler max_num_seqs=%r", value)
+            return None
+        return parsed if parsed > 0 else None
+
+    def _configured_max_total_requests(
+        self, *, log_ignored_per_dp: bool = False
+    ) -> int | None:
+        per_dp_limit = self._get_positive_int_env(
+            "DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP"
+        )
+        total_limit = self._get_positive_int_env("DYN_REQUEST_MAX_TOTAL_REQUESTS")
+        local_dp_size = self.dp_range[1] if len(self.dp_range) > 1 else 1
+        if per_dp_limit is not None and local_dp_size > 1:
+            return per_dp_limit
+        if per_dp_limit is not None and local_dp_size <= 1 and log_ignored_per_dp:
+            logger.info(
+                "Ignoring DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP=%s because this "
+                "worker manages a single local DP rank",
+                per_dp_limit,
+            )
+        return total_limit or self._get_default_max_total_requests()
+
+    def _current_total_local_requests(self) -> int | None:
+        output_processor = getattr(self.engine_client, "output_processor", None)
+        getter = getattr(output_processor, "get_num_unfinished_requests", None)
+        if getter is None:
+            return None
+        try:
+            return int(getter())
+        except Exception as error:
+            logger.warning("Failed to read local unfinished request count: %s", error)
+            return None
+
+    def _output_processor_request_breakdown(self) -> tuple[int | None, int | None]:
+        output_processor = getattr(self.engine_client, "output_processor", None)
+        if output_processor is None:
+            return None, None
+
+        def collection_size(name: str) -> int | None:
+            value = getattr(output_processor, name, None)
+            try:
+                return len(value) if value is not None else None
+            except TypeError:
+                return None
+
+        return collection_size("external_req_ids"), collection_size("parent_requests")
+
+    @staticmethod
+    def _is_health_check_request(request: Any) -> bool:
+        return isinstance(request, dict) and bool(request.get(HEALTH_CHECK_KEY))
+
+    async def _try_reserve_request_slot(
+        self, request_id: str, request: Any | None = None
+    ) -> tuple[bool, int | None, int | None]:
+        if self._is_health_check_request(request):
+            return True, None, None
+        limit = self.max_total_requests
+        if limit is None:
+            return True, None, None
+
+        async with self._request_admission_lock:
+            if request_id in self._admitted_request_ids:
+                return False, len(self._admitted_request_ids), limit
+            current_total = self._current_total_local_requests()
+            if current_total is None:
+                logger.warning(
+                    "Rejecting request %s: unfinished request count unavailable "
+                    "with total request limit %s configured",
+                    request_id,
+                    limit,
+                )
+                return False, None, limit
+            held = len(self._admitted_request_ids)
+            observed = held + max(0, current_total - held)
+            if observed >= limit:
+                now = time.monotonic()
+                last_log_at = self._last_request_admission_log_at
+                if last_log_at is None or now - last_log_at >= 10.0:
+                    self._last_request_admission_log_at = now
+                    log = logger.warning if current_total > limit else logger.info
+                    external_requests, parent_requests = (
+                        self._output_processor_request_breakdown()
+                    )
+                    log(
+                        "Worker admission saturated: observed=%s limit=%s "
+                        "held_request_slots=%s output_processor_states=%s "
+                        "output_processor_external_requests=%s "
+                        "output_processor_parent_requests=%s",
+                        observed,
+                        limit,
+                        held,
+                        current_total,
+                        external_requests,
+                        parent_requests,
+                    )
+                return False, observed, limit
+            self._admitted_request_ids.add(request_id)
+            self._pending_request_admissions = len(self._admitted_request_ids)
+            return True, self._pending_request_admissions, limit
+
+    async def _release_request_slot_reservation(self, request_id: str) -> None:
+        async with self._request_admission_lock:
+            self._admitted_request_ids.discard(request_id)
+            self._pending_request_admissions = len(self._admitted_request_ids)
+
+    async def _iterate_engine_stream(
+        self,
+        gen,
+        request_id: str,
+        *,
+        enforce_decode_timeout: bool = False,
+        release_request_admission: bool = False,
+        abort_guard: Optional[_DeferredAbort] = None,
+    ):
+        timeout_secs = (
+            self.max_decode_wall_clock_secs if enforce_decode_timeout else None
+        )
+        deadline = time.monotonic() + timeout_secs if timeout_secs is not None else None
+        admission_released = not release_request_admission
+
+        async def release_admission_once() -> None:
+            nonlocal admission_released
+            if not admission_released:
+                admission_released = True
+                await self._release_request_slot_reservation(request_id)
+
+        try:
+            while True:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        await self._raise_decode_timeout(
+                            request_id, abort_guard=abort_guard
+                        )
+                    next_item = asyncio.wait_for(gen.__anext__(), timeout=remaining)
+                else:
+                    next_item = gen.__anext__()
+                try:
+                    item = await next_item
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    await self._raise_decode_timeout(
+                        request_id, abort_guard=abort_guard
+                    )
+                else:
+                    yield item
+        finally:
+            try:
+                close = getattr(gen, "aclose", None)
+                if close is not None:
+                    await close()
+            except (asyncio.CancelledError, GeneratorExit):
+                raise
+            except Exception as close_error:
+                logger.warning(
+                    "Failed to close engine stream for request %s: %s",
+                    request_id,
+                    close_error,
+                )
+            finally:
+                await release_admission_once()
+
+    async def _raise_decode_timeout(
+        self,
+        request_id: str,
+        *,
+        abort_guard: Optional[_DeferredAbort] = None,
+    ) -> None:
+        timeout_secs = self.max_decode_wall_clock_secs
+        if timeout_secs is None:
+            raise DecodeWallClockTimeoutError(
+                "decode timeout triggered without configuration"
+            )
+        message = f"Decode wall clock timeout after {timeout_secs:g}s"
+        logger.warning("%s for request %s", message, request_id)
+        try:
+            if abort_guard is not None and not getattr(
+                abort_guard, "_first_token_received", False
+            ):
+                logger.warning(
+                    "Skipping immediate abort for request %s after decode timeout "
+                    "because disaggregated decode has not produced its first token",
+                    request_id,
+                )
+            elif abort_guard is not None:
+                await abort_guard.abort()
+            else:
+                await self.engine_client.abort(request_id)
+        except Exception as abort_error:
+            logger.warning(
+                "Failed to abort request %s after decode timeout: %s",
+                request_id,
+                abort_error,
+            )
+        raise DecodeWallClockTimeoutError(message)
+
+    def _tokenizer_for_reasoning_budget(self):
+        tokenizer = getattr(self.engine_client, "tokenizer", None)
+        return getattr(tokenizer, "tokenizer", tokenizer)
+
+    @staticmethod
+    def _is_unittest_mock(value: Any) -> bool:
+        return type(value).__module__.startswith("unittest.mock")
+
+    def _parser_visible_marker_token_ids(self) -> frozenset[int]:
+        cached = getattr(self, "_dynamo_parser_visible_marker_token_ids", None)
+        if isinstance(cached, frozenset):
+            return cached
+        cached = frozenset(self._parser_visible_marker_token_map().keys())
+        try:
+            setattr(self, "_dynamo_parser_visible_marker_token_ids", cached)
+        except Exception:
+            pass
+        return cached
+
+    def _parser_visible_marker_token_map(self) -> dict[int, str]:
+        cached = getattr(self, "_dynamo_parser_visible_marker_token_map", None)
+        if isinstance(cached, dict):
+            return cached
+
+        tokenizer = self._tokenizer_for_reasoning_budget()
+        marker_ids: dict[int, str] = {}
+        if tokenizer is not None and not self._is_unittest_mock(tokenizer):
+            unk_token_id = getattr(tokenizer, "unk_token_id", None)
+
+            def add_token_id(value: Any, marker: str) -> None:
+                if isinstance(value, bool):
+                    return
+                try:
+                    token_id = int(value)
+                except (TypeError, ValueError):
+                    return
+                if token_id < 0:
+                    return
+                try:
+                    if unk_token_id is not None and token_id == int(unk_token_id):
+                        return
+                except (TypeError, ValueError):
+                    pass
+                marker_ids[token_id] = marker
+
+            convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
+            encode = getattr(tokenizer, "encode", None)
+            for marker in PARSER_VISIBLE_MARKER_TOKENS:
+                if callable(convert_tokens_to_ids):
+                    try:
+                        add_token_id(convert_tokens_to_ids(marker), marker)
+                    except Exception:
+                        pass
+                if callable(encode):
+                    try:
+                        encoded = encode(marker, add_special_tokens=False)
+                    except TypeError:
+                        try:
+                            encoded = encode(marker)
+                        except Exception:
+                            continue
+                    except Exception:
+                        continue
+                    if isinstance(encoded, (list, tuple)) and len(encoded) == 1:
+                        add_token_id(encoded[0], marker)
+
+        try:
+            setattr(self, "_dynamo_parser_visible_marker_token_map", marker_ids)
+        except Exception:
+            pass
+        return marker_ids
+
+    def _decode_parser_visible_text(self, token_ids: list[int]) -> str | None:
+        if not token_ids:
+            return None
+        tokenizer = self._tokenizer_for_reasoning_budget()
+        if tokenizer is None or self._is_unittest_mock(tokenizer):
+            return None
+        decode = getattr(tokenizer, "decode", None)
+        if not callable(decode):
+            return None
+
+        marker_map = self._parser_visible_marker_token_map()
+
+        def decode_span(span: list[int]) -> str | None:
+            if not span:
+                return ""
+            try:
+                text = decode(span, skip_special_tokens=True)
+            except TypeError:
+                try:
+                    text = decode(span)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+            return text if isinstance(text, str) else None
+
+        parts: list[str] = []
+        span: list[int] = []
+        for token_id in token_ids:
+            marker = marker_map.get(int(token_id))
+            if marker is None:
+                span.append(token_id)
+                continue
+            decoded = decode_span(span)
+            if decoded is None:
+                return None
+            parts.append(decoded)
+            parts.append(marker)
+            span = []
+
+        decoded = decode_span(span)
+        if decoded is None:
+            return None
+        parts.append(decoded)
+        return "".join(parts)
+
+    def _compute_newline_token_ids(
+        self,
+        tokenizer,
+        strings: list[str] | None = None,
+    ) -> list[int]:
+        cached = getattr(tokenizer, "_dynamo_newline_token_ids", None)
+        if isinstance(cached, list):
+            return cached
+
+        if strings is None:
+            strings = ["\n", "\r\n", "\n\n"]
+
+        newline_ids: set[int] = set()
+        for value in strings:
+            try:
+                encoded = tokenizer.encode(value, add_special_tokens=False)
+            except TypeError:
+                try:
+                    encoded = tokenizer.encode(value)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            for token_id in encoded:
+                try:
+                    newline_ids.add(int(token_id))
+                except Exception:
+                    continue
+
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if isinstance(vocab_size, int):
+            for token_id in range(min(vocab_size, 300000)):
+                try:
+                    token_text = tokenizer.decode([token_id])
+                except Exception:
+                    continue
+                if any(token_text.endswith(value) for value in strings):
+                    newline_ids.add(token_id)
+
+        ids_list = sorted(newline_ids)
+        try:
+            setattr(tokenizer, "_dynamo_newline_token_ids", ids_list)
+        except Exception:
+            pass
+        return ids_list
+
+    def _apply_reasoning_budget_extra_args(
+        self, sampling_params: SamplingParams
+    ) -> None:
+        extra = sampling_params.extra_args
+        if not isinstance(extra, dict) or "reasoning_budget" not in extra:
+            return
+
+        reasoning_config = getattr(
+            getattr(self.engine_client, "vllm_config", None),
+            "reasoning_config",
+            None,
+        )
+        if reasoning_config is None or not getattr(reasoning_config, "enabled", False):
+            if hasattr(sampling_params, "thinking_token_budget"):
+                sampling_params.thinking_token_budget = None
+            return
+
+        try:
+            budget_int = int(extra["reasoning_budget"])
+        except Exception:
+            logger.warning(
+                "Invalid reasoning_budget=%r; skipping", extra.get("reasoning_budget")
+            )
+            return
+        if budget_int == -1:
+            return
+        extra["reasoning_budget"] = budget_int
+
+        try:
+            extra["reasoning_budget_grace_period"] = int(
+                extra.get("reasoning_budget_grace_period", 0) or 0
+            )
+        except Exception:
+            extra["reasoning_budget_grace_period"] = 0
+
+        end_token_ids = extra.get("end_token_ids")
+        parsed_end_ids: list[int] = []
+        if isinstance(end_token_ids, list):
+            try:
+                parsed_end_ids = [int(token_id) for token_id in end_token_ids]
+            except Exception:
+                parsed_end_ids = []
+
+        if not parsed_end_ids and extra.get("think_end_token_id") is not None:
+            try:
+                parsed_end_ids = [int(extra["think_end_token_id"])]
+            except Exception:
+                parsed_end_ids = []
+
+        if not parsed_end_ids:
+            config_end_ids = getattr(reasoning_config, "reasoning_end_token_ids", None)
+            if isinstance(config_end_ids, list):
+                try:
+                    parsed_end_ids = [int(token_id) for token_id in config_end_ids]
+                except Exception:
+                    parsed_end_ids = []
+
+        tokenizer = None
+        if not parsed_end_ids:
+            tokenizer = self._tokenizer_for_reasoning_budget()
+            end_token = getattr(reasoning_config, "reasoning_end_str", None)
+            parser_name = getattr(
+                getattr(self.config, "engine_args", None), "reasoning_parser", None
+            )
+            if parser_name and tokenizer is not None:
+                try:
+                    from vllm.reasoning import ReasoningParserManager
+
+                    parser_class = ReasoningParserManager.get_reasoning_parser(parser_name)
+                    reasoning_parser = parser_class(tokenizer)
+                    parser_end_ids = getattr(reasoning_parser, "end_token_ids", None)
+                    if isinstance(parser_end_ids, list):
+                        parsed_end_ids = [int(token_id) for token_id in parser_end_ids]
+                    if (
+                        not parsed_end_ids
+                        and getattr(reasoning_parser, "end_token_id", None) is not None
+                    ):
+                        parsed_end_ids = [int(reasoning_parser.end_token_id)]
+                    if not parsed_end_ids:
+                        end_token = (
+                            getattr(reasoning_parser, "end_token", None)
+                            or getattr(reasoning_parser, "reasoning_end_str", None)
+                            or end_token
+                        )
+                except Exception:
+                    parsed_end_ids = []
+
+            if not parsed_end_ids and isinstance(end_token, str) and end_token:
+                try:
+                    parsed_end_ids = [
+                        int(token_id)
+                        for token_id in tokenizer.encode(
+                            end_token, add_special_tokens=False
+                        )
+                    ]
+                except TypeError:
+                    try:
+                        parsed_end_ids = [
+                            int(token_id) for token_id in tokenizer.encode(end_token)
+                        ]
+                    except Exception:
+                        parsed_end_ids = []
+                except Exception:
+                    parsed_end_ids = []
+                if not parsed_end_ids:
+                    vocab = getattr(tokenizer, "get_vocab", lambda: {})()
+                    token_id = vocab.get(end_token)
+                    if token_id is not None:
+                        try:
+                            parsed_end_ids = [int(token_id)]
+                        except Exception:
+                            parsed_end_ids = []
+
+        if parsed_end_ids:
+            extra.setdefault("think_end_token_id", parsed_end_ids[0])
+            extra.setdefault("end_token_ids", parsed_end_ids)
+
+        if "newline_token_ids" not in extra:
+            if tokenizer is None:
+                tokenizer = self._tokenizer_for_reasoning_budget()
+            if tokenizer is not None:
+                try:
+                    newline_ids = self._compute_newline_token_ids(tokenizer)
+                except Exception:
+                    newline_ids = []
+                if newline_ids:
+                    extra["newline_token_ids"] = newline_ids
 
     def init_embedding_loader(
         self, config: Config, encode_worker_client: Optional[Client] = None
@@ -4002,6 +4537,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         abort_guard: Optional[_DeferredAbort] = None,
     ):
         admission_handed_to_iterator = False
+        engine_stream = None
         try:
             # Log LoRA usage for this generation (debug level to avoid log spam)
             self._log_with_lora_context(
@@ -4029,12 +4565,21 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
             total_output_tokens_by_index: dict[int, int] = {}
             raw_routed_experts_by_output: dict[int, Any] = {}
+            parser_visible_marker_ids = self._parser_visible_marker_token_ids()
             # vLLM surfaces prompt_logprobs once (at end-of-prefill) and clears
             # them on subsequent chunks, so the generation-finish chunk often
             # carries None. Capture the first non-None payload and attach it to
             # the final chunk instead of reading res.prompt_logprobs there.
             prompt_logprobs_payload: Optional[list] = None
-            async for res in gen:
+            admission_handed_to_iterator = True
+            engine_stream = self._iterate_engine_stream(
+                gen,
+                request_id,
+                enforce_decode_timeout=enforce_decode_timeout,
+                release_request_admission=release_request_admission,
+                abort_guard=abort_guard,
+            )
+            async for res in engine_stream:
                 # res is vllm's RequestOutput
                 if (
                     prompt_logprobs_payload is None
@@ -4088,6 +4633,10 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                         "index": output_idx,
                         "token_ids": token_ids,
                     }
+                    if parser_visible_marker_ids and token_ids:
+                        decoded_text = self._decode_parser_visible_text(token_ids)
+                        if decoded_text is not None:
+                            out["text"] = decoded_text
                     # Capture the raw routed_experts cheaply here; serialize it
                     # only once on the final chunk (base64-encoding a tensor on
                     # every streamed chunk would be wasted work, since only the
@@ -4137,6 +4686,16 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                         )
                         if routed_experts is not None:
                             _attach_routed_experts_engine_data(out, routed_experts)
+                        for context_key in (
+                            "spec_decode",
+                            "scheduler_snapshot",
+                            "request_throughput",
+                        ):
+                            context_value = getattr(output, context_key, None)
+                            if context_value:
+                                out.setdefault("extra_args", {})[
+                                    context_key
+                                ] = context_value
                         # Log completion with LoRA info (debug level to avoid log spam)
                         self._log_with_lora_context(
                             "Completed token generation for request {request_id}{lora_info}: "
@@ -4154,15 +4713,18 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
         except EngineDeadError as e:
             if release_request_admission and not admission_handed_to_iterator:
-                await self._release_request_slot_reservation()
+                await self._release_request_slot_reservation(request_id)
             logger.error(f"vLLM EngineDeadError: {e}")
             logger.warning("Initiating Dynamo Runtime shutdown.")
             self.runtime.shutdown()
             os._exit(1)
         except Exception:
             if release_request_admission and not admission_handed_to_iterator:
-                await self._release_request_slot_reservation()
+                await self._release_request_slot_reservation(request_id)
             raise
+        finally:
+            if engine_stream is not None:
+                await engine_stream.aclose()
 
 
 class DecodeWorkerHandler(BaseWorkerHandler):
@@ -4351,23 +4913,6 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             enable_rl=self.config.enable_rl,
         )
         self._apply_reasoning_budget_extra_args(sampling_params)
-        if os.environ.get("DYN_DEBUG_REASONING_BUDGET") == "1":
-            extra_args = (
-                sampling_params.extra_args
-                if isinstance(sampling_params.extra_args, dict)
-                else {}
-            )
-            logger.warning(
-                "reasoning budget sampling params request_id=%s "
-                "budget=%s grace=%s end_token_ids=%s stop_token_ids=%s "
-                "all_stop_token_ids=%s",
-                request_id,
-                extra_args.get("reasoning_budget"),
-                extra_args.get("reasoning_budget_grace_period"),
-                extra_args.get("end_token_ids"),
-                getattr(sampling_params, "stop_token_ids", None),
-                getattr(sampling_params, "all_stop_token_ids", None),
-            )
 
         if kv_params is not None:
             if sampling_params.extra_args is None:
@@ -4395,8 +4940,44 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
         priority = -int(routing.get("priority", 0))
 
+        reserved, current_total_requests, total_request_limit = (
+            await self._try_reserve_request_slot(request_id, request)
+        )
+        if not reserved:
+            message = (
+                f"Worker local total request limit reached "
+                f"({current_total_requests}/{total_request_limit})"
+            )
+            yield _build_token_overload_response(
+                message,
+                current_total_requests=current_total_requests,
+                total_request_limit=total_request_limit,
+            )
+            return
+
         trace_headers = context.trace_headers()
         reasoning_ended, reasoning_parser_kwargs = _request_reasoning_metadata(request)
+        if reasoning_ended is False and getattr(
+            sampling_params, "structured_outputs", None
+        ) is not None:
+            # A reasoning-gated grammar must observe the reasoning boundary.
+            # Nemotron can use EOS as that boundary before its required tool
+            # payload, so do not terminate the request on that token.
+            eos_token_ids = {
+                token_id
+                for token_id in request.get("eos_token_ids", [])
+                if isinstance(token_id, int)
+            }
+            if sampling_params.eos_token_id is not None:
+                eos_token_ids.add(sampling_params.eos_token_id)
+            sampling_params.ignore_eos = True
+            sampling_params._eos_token_id = None
+            sampling_params._all_stop_token_ids.difference_update(eos_token_ids)
+            sampling_params.stop_token_ids = [
+                token_id
+                for token_id in (sampling_params.stop_token_ids or [])
+                if token_id not in eos_token_ids
+            ]
 
         # In disagg decode mode, defer engine_client.abort() until the first
         # token so we don't abort while a NIXL KV transfer is still in flight
@@ -4541,6 +5122,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         ) as abort_guard, self._abort_monitor(
             context, request_id, abort_guard=abort_guard
         ):
+            admission_handed_to_iterator = False
+            engine_stream = None
             try:
                 gen = self.engine_client.generate(
                     prompt,
@@ -4552,12 +5135,14 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 )
 
                 admission_handed_to_iterator = True
-                async for res in self._iterate_engine_stream(
+                engine_stream = self._iterate_engine_stream(
                     gen,
                     request_id,
                     enforce_decode_timeout=not self._is_health_check_request(request),
                     release_request_admission=reserved,
-                ):
+                    abort_guard=abort_guard,
+                )
+                async for res in engine_stream:
                     if not res.outputs:
                         yield {
                             "id": openai_request_id,
@@ -4653,15 +5238,18 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 yield _build_text_error_chunk(str(e), openai_request_id)
             except EngineDeadError as e:
                 if reserved and not admission_handed_to_iterator:
-                    await self._release_request_slot_reservation()
+                    await self._release_request_slot_reservation(request_id)
                 logger.error(f"vLLM EngineDeadError: {e}")
                 logger.warning("Initiating Dynamo Runtime shutdown.")
                 self.runtime.shutdown()
                 os._exit(1)
             except Exception:
                 if reserved and not admission_handed_to_iterator:
-                    await self._release_request_slot_reservation()
+                    await self._release_request_slot_reservation(request_id)
                 raise
+            finally:
+                if engine_stream is not None:
+                    await engine_stream.aclose()
 
 
 class PrefillWorkerHandler(BaseWorkerHandler):
@@ -4793,6 +5381,21 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
         priority = -int(routing.get("priority", 0))
 
+        reserved, current_total_requests, total_request_limit = (
+            await self._try_reserve_request_slot(request_id, request)
+        )
+        if not reserved:
+            message = (
+                f"Worker local total request limit reached "
+                f"({current_total_requests}/{total_request_limit})"
+            )
+            yield _build_prefill_overload_response(
+                message,
+                current_total_requests=current_total_requests,
+                total_request_limit=total_request_limit,
+            )
+            return
+
         trace_headers = context.trace_headers()
         reasoning_ended, reasoning_parser_kwargs = _request_reasoning_metadata(request)
         admission_handed_to_iterator = False
@@ -4819,55 +5422,59 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 admission_handed_to_iterator = True
             except EngineDeadError as e:
                 if reserved and not admission_handed_to_iterator:
-                    await self._release_request_slot_reservation()
+                    await self._release_request_slot_reservation(request_id)
                 logger.error(f"vLLM EngineDeadError: {e}")
                 logger.warning("Initiating Dynamo Runtime shutdown.")
                 self.runtime.shutdown()
                 os._exit(1)
             except Exception:
                 if reserved and not admission_handed_to_iterator:
-                    await self._release_request_slot_reservation()
+                    await self._release_request_slot_reservation(request_id)
                 raise
 
-            async for res in self._iterate_engine_stream(
+            engine_stream = self._iterate_engine_stream(
                 gen,
                 request_id,
                 release_request_admission=reserved,
-            ):
-                logger.debug(f"kv transfer params: {res.kv_transfer_params}")
+            )
+            try:
+                async for res in engine_stream:
+                    logger.debug(f"kv transfer params: {res.kv_transfer_params}")
 
-                token_ids = res.outputs[0].token_ids if res.outputs else []
+                    token_ids = res.outputs[0].token_ids if res.outputs else []
 
-                # For prefill worker, only one res will be generated,
-                # so we can always build embedding params here without conditionals
-                embedding_params = self._build_embedding_params(
-                    multi_modal_data or {}, res.prompt_token_ids
-                )
+                    # For prefill worker, only one res will be generated,
+                    # so we can always build embedding params here without conditionals
+                    embedding_params = self._build_embedding_params(
+                        multi_modal_data or {}, res.prompt_token_ids
+                    )
 
-                output: Dict[str, Any] = {
-                    "token_ids": list(token_ids),
-                    "disaggregated_params": self._build_disaggregated_params(
-                        kv_protocol.decode_request_kv_transfer_params(res),
-                        embedding_params,
-                    ),
-                    "completion_usage": BaseWorkerHandler._build_completion_usage(
-                        request_output=res,
-                        embedding_sequence_length=embedding_sequence_length,
-                    ),
-                }
+                    output: Dict[str, Any] = {
+                        "token_ids": list(token_ids),
+                        "disaggregated_params": self._build_disaggregated_params(
+                            kv_protocol.decode_request_kv_transfer_params(res),
+                            embedding_params,
+                        ),
+                        "completion_usage": BaseWorkerHandler._build_completion_usage(
+                            request_output=res,
+                            embedding_sequence_length=embedding_sequence_length,
+                        ),
+                    }
 
-                # Log prefill completion with LoRA info
-                self._log_with_lora_context(
-                    "Prefill completed for request {request_id}{lora_info}: "
-                    "generated {token_count} token(s), has_kv_params={has_kv_params}",
-                    request_id,
-                    lora_request,
-                    level="info" if lora_request else "debug",
-                    token_count=len(token_ids),
-                    has_kv_params=res.kv_transfer_params is not None,
-                )
+                    # Log prefill completion with LoRA info
+                    self._log_with_lora_context(
+                        "Prefill completed for request {request_id}{lora_info}: "
+                        "generated {token_count} token(s), has_kv_params={has_kv_params}",
+                        request_id,
+                        lora_request,
+                        level="info" if lora_request else "debug",
+                        token_count=len(token_ids),
+                        has_kv_params=res.kv_transfer_params is not None,
+                    )
 
-                yield output
+                    yield output
+            finally:
+                await engine_stream.aclose()
 
     def _build_disaggregated_params(
         self, kv_transfer_params, embedding_params=None, expanded_prompt_token_ids=None

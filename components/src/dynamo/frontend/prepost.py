@@ -95,9 +95,9 @@ def _resolve_chat_template_kwargs(
 ) -> dict[str, Any]:
     resolver = getattr(request, "get_resolved_chat_template_kwargs", None)
     if callable(resolver):
-        return dict(resolver())
-
-    kwargs = dict(request.chat_template_kwargs or {})
+        kwargs = dict(resolver())
+    else:
+        kwargs = dict(request.chat_template_kwargs or {})
     if "thinking" in kwargs and "enable_thinking" not in kwargs:
         kwargs["enable_thinking"] = kwargs["thinking"]
     if any(
@@ -639,15 +639,6 @@ class StreamingPostProcessor:
             and self._tool_marker_ids.intersection(raw_delta_token_ids)
         )
         saw_start_text = bool(tool_call_start and tool_call_start in delta_text)
-        if saw_marker_id:
-            self._debug_handoff(
-                "raw_tool_marker_seen",
-                raw_tail=raw_delta_token_ids[-32:],
-                marker_ids=sorted(self._tool_marker_ids),
-                capture_started=self._raw_tool_capture_started,
-                delta_len=len(delta_text),
-                delta_tail=delta_text[-240:],
-            )
         if (
             not self._raw_tool_capture_started
             and not saw_marker_id
@@ -661,12 +652,6 @@ class StreamingPostProcessor:
 
         if self._raw_tool_capture_started:
             self._raw_tool_text_buffer += raw_delta_text
-            self._debug_handoff(
-                "raw_tool_capture_append",
-                raw_text_tail=raw_delta_text[-240:],
-                buffer_len=len(self._raw_tool_text_buffer),
-                buffer_tail=self._raw_tool_text_buffer[-240:],
-            )
             return
 
         if tool_call_start and tool_call_start in raw_delta_text:
@@ -674,17 +659,6 @@ class StreamingPostProcessor:
             self._raw_tool_text_buffer += raw_delta_text[
                 raw_delta_text.index(tool_call_start) :
             ]
-            self._debug_handoff(
-                "raw_tool_capture_start",
-                raw_text_tail=raw_delta_text[-240:],
-                buffer_len=len(self._raw_tool_text_buffer),
-                buffer_tail=self._raw_tool_text_buffer[-240:],
-            )
-
-    def _debug_handoff(self, message: str, **kwargs: Any) -> None:
-        if os.environ.get("DYN_DEBUG_REASONING_BUDGET") != "1":
-            return
-        logger.warning("tool handoff debug: %s %s", message, kwargs)
 
     def needs_raw_parser_delta(self, raw_delta_token_ids: Sequence[int]) -> bool:
         return (
@@ -724,16 +698,6 @@ class StreamingPostProcessor:
             return self._compose_delta_message(saved_reasoning, None)
 
         extracted = self.tool_parser.extract_tool_calls(text, self.request_for_sampling)
-        self._debug_handoff(
-            "extract_tool_calls",
-            text_len=len(text),
-            text_head=text[:120],
-            text_tail=text[-240:],
-            tools_called=extracted.tools_called,
-            tool_calls=len(extracted.tool_calls),
-            content_len=len(extracted.content or ""),
-            tool_choice=str(self.request_for_sampling.tool_choice),
-        )
         if extracted.tools_called:
             for i, tool_call in enumerate(extracted.tool_calls):
                 self._add_tool_call_from_extracted(i, tool_call)
@@ -889,16 +853,6 @@ class StreamingPostProcessor:
             ):
                 buffered_text = candidate
                 break
-
-        self._debug_handoff(
-            "buffered_tool_fallback",
-            finish_reason=str(output.finish_reason),
-            raw_buffer_len=len(self._raw_tool_text_buffer),
-            post_raw_len=len(self._post_reasoning_raw_text_buffer),
-            post_text_len=len(self._post_reasoning_text_buffer),
-            selected_len=len(buffered_text),
-            raw_buffer_tail=self._raw_tool_text_buffer[-240:],
-        )
 
         if not buffered_text:
             if not output.finish_reason:
@@ -1088,12 +1042,16 @@ class StreamingPostProcessor:
             delta = {}
         return self._build_choice(output, delta)
 
-    def process_output(self, output: Any) -> dict[str, Any] | None:
+    def process_output(
+        self,
+        output: Any,
+        raw_delta_token_ids: Sequence[int] | None = None,
+    ) -> dict[str, Any] | None:
         if self._should_buffer_for_non_streaming_tool_parse():
             return self._process_non_streaming_tool_output(output)
 
-        delta_token_ids = list(output.token_ids or [])
-        raw_delta_token_ids = list(raw_delta_token_ids or delta_token_ids)
+        delta_token_ids = list(raw_delta_token_ids or output.token_ids or [])
+        raw_delta_token_ids = delta_token_ids
         # vLLM output_processor already applies stop-token/stop-string trimming
         # to text. Re-detokenizing from token_ids can reintroduce stop markers.
         delta_text = output.text or ""
@@ -1243,20 +1201,6 @@ class StreamingPostProcessor:
                         self._post_reasoning_text_buffer += post_content
                     if raw_post_content and self._should_parse_tools():
                         self._post_reasoning_raw_text_buffer += raw_post_content
-                    self._debug_handoff(
-                        "reasoning_end_plain_content",
-                        post_len=len(post_content),
-                        post_head=post_content[:120],
-                        post_tail=post_content[-240:],
-                        raw_post_len=len(raw_post_content),
-                        raw_post_head=raw_post_content[:120],
-                        raw_post_tail=raw_post_content[-240:],
-                        tool_start=tool_call_start,
-                        finish_reason=str(output.finish_reason),
-                        delta_len=len(delta_text),
-                        delta_tail=delta_text[-240:],
-                        delta_token_tail=delta_token_ids[-32:],
-                    )
                     # Plain content (or no content) after reasoning end.
                     delta_message = self._compose_delta_message(
                         reasoning=saved_reasoning,

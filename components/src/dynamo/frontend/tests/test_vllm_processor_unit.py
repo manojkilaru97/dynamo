@@ -7,6 +7,7 @@ Tests for the tool-stripping behaviour of _prepare_request when
 tool_choice='none' and the exclude_tools_when_tool_choice_none flag.
 """
 
+import asyncio
 import importlib.util
 import json
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 from _routed_engine_fakes import FakeRoutedEngine as _FakeRoutedEngine
 from transformers import AutoTokenizer
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 
 from dynamo.frontend.prepost import StreamingPostProcessor, _prepare_request
 from dynamo.frontend.vllm_processor import _with_parser_visible_engine_text
@@ -76,6 +78,18 @@ TOOL_REQUEST = {
 }
 
 
+def test_parser_visible_engine_text_overrides_trimmed_delta():
+    output = SimpleNamespace(
+        index=0,
+        text="",
+        token_ids=[13],
+        finish_reason=None,
+        logprobs=None,
+    )
+    visible = _with_parser_visible_engine_text(output, "</think>")
+    assert visible.text == "</think>"
+
+
 @pytest.fixture(scope="module")
 def tokenizer():
     return AutoTokenizer.from_pretrained(MODEL)
@@ -136,7 +150,7 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
                 "structured_outputs": {"json": {"type": "object"}},
             },
             tokenizer=tokenizer,
-            tool_parser_class=Qwen3CoderToolParser,
+            tool_parser_class=_resolve_qwen3_tool_parser_class(),
             enable_auto_tool_choice=True,
         )
 
@@ -531,7 +545,10 @@ class _FakeOutputProcessor:
 
 
 class _FakePostProcessor:
-    def process_output(self, output):
+    def needs_raw_parser_delta(self, raw_delta_token_ids):
+        return False
+
+    def process_output(self, output, raw_delta_token_ids=None):
         return {
             "index": output.index,
             "delta": {"content": "x"},
@@ -592,6 +609,7 @@ async def _run_generate(processor, preproc, *, mm_routing_info=None, context=Non
             preproc["token_ids"],
             vllm_preproc,
             post_processors,
+            request_for_sampling=SimpleNamespace(tool_choice=None),
             mm_routing_info=mm_routing_info,
             context=context,
         )
@@ -599,6 +617,50 @@ async def _run_generate(processor, preproc, *, mm_routing_info=None, context=Non
 
 
 class TestRoutedEnginePath:
+    def test_terminal_chunk_without_vllm_output_flushes_postprocessor(
+        self, vllm_processor_module
+    ):
+        routed_engine = _FakeRoutedEngine(
+            [{"token_ids": [], "index": 0, "finish_reason": "stop"}]
+        )
+        processor = _make_processor(vllm_processor_module, routed_engine)
+        processor.output_processor.process_outputs = lambda outputs: SimpleNamespace(
+            reqs_to_abort=[], request_outputs=[]
+        )
+
+        class TerminalPostProcessor(_FakePostProcessor):
+            def process_output(self, output, raw_delta_token_ids=None):
+                assert output.finish_reason == "stop"
+                return {
+                    "index": output.index,
+                    "delta": {"role": "assistant", "tool_calls": [{"index": 0}]},
+                    "finish_reason": "tool_calls",
+                }
+
+        async def run():
+            vllm_preproc = SimpleNamespace(
+                sampling_params=SimpleNamespace(n=1),
+                request_id="vllm-request",
+                external_req_id=None,
+            )
+            return [
+                item
+                async for item in processor._generate_and_stream(
+                    "request-id",
+                    {"model": MODEL},
+                    _base_preproc(),
+                    [1, 2, 3],
+                    vllm_preproc,
+                    {0: TerminalPostProcessor()},
+                    request_for_sampling=SimpleNamespace(tool_choice=None),
+                )
+            ]
+
+        chunks = asyncio.run(run())
+        assert chunks[0]["data"]["choices"][0]["delta"]["tool_calls"] == [
+            {"index": 0}
+        ]
+
     @pytest.mark.asyncio
     async def test_routed_engine_gets_extra_args_metadata(self, vllm_processor_module):
         routed_engine = _FakeRoutedEngine()

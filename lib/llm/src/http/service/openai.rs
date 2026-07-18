@@ -2124,7 +2124,6 @@ async fn chat_completions(
         .create_response_collector(&metric_model);
 
     let annotations = request.annotations();
-    let frontend_stream_tool_jail = forced_tool_choice_stream_jail_config(&request);
     let http_audit_headers = request
         .get::<serde_json::Value>(AUDIT_HTTP_HEADERS_KEY)
         .ok();
@@ -2169,19 +2168,7 @@ async fn chat_completions(
     if streaming {
         let stream: Pin<
             Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>,
-        > = if let Some((tool_choice, tool_definitions)) = frontend_stream_tool_jail {
-            Box::pin(
-                crate::preprocessor::OpenAIPreprocessor::apply_tool_calling_jail(
-                    None,
-                    Some(tool_choice),
-                    Some(tool_definitions),
-                    false,
-                    stream,
-                ),
-            )
-        } else {
-            Box::pin(stream)
-        };
+        > = Box::pin(stream);
         let stream = if let Some(audit) = http_audit_handle {
             let (stream, agg_fut) = crate::audit::stream::scan_aggregate_with_future_and_options(
                 stream,
@@ -2358,41 +2345,6 @@ fn bare_json_auto_tool_parse_names(request: &NvCreateChatCompletionRequest) -> O
         .filter(|name| !name.is_empty())
         .collect();
     (!names.is_empty()).then_some(names)
-}
-
-fn forced_tool_choice_stream_jail_config(
-    request: &NvCreateChatCompletionRequest,
-) -> Option<(
-    dynamo_protocols::types::ChatCompletionToolChoiceOption,
-    Vec<dynamo_parsers::tool_calling::ToolDefinition>,
-)> {
-    use dynamo_protocols::types::ChatCompletionToolChoiceOption;
-
-    let tool_choice = match request.inner.tool_choice.as_ref()? {
-        ChatCompletionToolChoiceOption::Named(_) | ChatCompletionToolChoiceOption::Required => {
-            request.inner.tool_choice.clone()?
-        }
-        ChatCompletionToolChoiceOption::None | ChatCompletionToolChoiceOption::Auto => {
-            return None;
-        }
-    };
-
-    let tools = request
-        .inner
-        .tools
-        .as_ref()
-        .filter(|tools| !tools.is_empty())?;
-
-    let tool_definitions = tools
-        .iter()
-        .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
-            name: tool.function.name.clone(),
-            parameters: tool.function.parameters.clone(),
-            strict: tool.function.strict,
-        })
-        .collect();
-
-    Some((tool_choice, tool_definitions))
 }
 
 /// Checks for unsupported fields in the request.
