@@ -40,7 +40,13 @@ use dynamo_runtime::metrics::frontend_perf::{
     StageGuard, TEMPLATE_SECONDS, TOKENIZE_SECONDS,
 };
 use std::borrow::Cow;
-use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
+use std::{
+    any::Any,
+    collections::HashMap,
+    io::Write,
+    pin::Pin,
+    sync::{Arc, Mutex, OnceLock},
+};
 use tracing;
 
 #[cfg(feature = "mm-routing")]
@@ -115,6 +121,93 @@ fn encode_floats_to_base64(floats: &[f32]) -> String {
 
 pub const ANNOTATION_FORMATTED_PROMPT: &str = "formatted_prompt";
 pub const ANNOTATION_TOKEN_IDS: &str = "token_ids";
+
+static NANO35_AUDIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const NANO35_EFFICIENT_MARKER: &str = "{reasoning effort: efficient}";
+const NANO35_THINKING_SUFFIX: &str = "<|im_start|>assistant\n<think>\n";
+const NANO35_DISABLED_SUFFIX: &str = "<|im_start|>assistant\n<think></think>";
+
+fn nano35_sha256(value: impl AsRef<[u8]>) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(value.as_ref()))
+}
+
+fn valid_nano35_audit_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+}
+
+fn record_nano35_render_audit<R: OAIChatLikeRequest>(
+    request: &R,
+    formatted_prompt: Option<&str>,
+) -> Result<()> {
+    let Some(output) = std::env::var_os("DYN_NANO35_AUDIT_FILE") else {
+        return Ok(());
+    };
+    let Some(args) = request.chat_template_args() else {
+        return Ok(());
+    };
+    let Some(audit_id) = args
+        .get("__dynamo_nano35_audit_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| valid_nano35_audit_id(value))
+    else {
+        return Ok(());
+    };
+    let prompt = formatted_prompt.context("Nano 3.5 audit requires a rendered text prompt")?;
+    let response_id = args
+        .get("__dynamo_nano35_response_id")
+        .and_then(serde_json::Value::as_str)
+        .context("Nano 3.5 audit response ID is missing")?;
+    let template_path = std::env::var("DYN_NANO35_AUDIT_TEMPLATE")
+        .context("DYN_NANO35_AUDIT_TEMPLATE is required when audit is enabled")?;
+    let template_path = std::fs::canonicalize(template_path)?;
+    let template_bytes = std::fs::read(&template_path)?;
+    let marker_count = prompt.matches(NANO35_EFFICIENT_MARKER).count();
+    let (generation_prefix, suffix) = if prompt.ends_with(NANO35_THINKING_SUFFIX) {
+        ("thinking", NANO35_THINKING_SUFFIX)
+    } else if prompt.ends_with(NANO35_DISABLED_SUFFIX) {
+        ("disabled", NANO35_DISABLED_SUFFIX)
+    } else {
+        (
+            "unknown",
+            &prompt[prompt.floor_char_boundary(prompt.len().saturating_sub(96))..],
+        )
+    };
+    let record = serde_json::json!({
+        "audit_id": audit_id,
+        "response_id": response_id,
+        "wire_reasoning_effort": args.get("__dynamo_nano35_wire_reasoning_effort").cloned().unwrap_or(serde_json::Value::Null),
+        "enable_thinking": args.get("enable_thinking").cloned().unwrap_or(serde_json::Value::Null),
+        "medium_effort": args.get("medium_effort").cloned().unwrap_or(serde_json::Value::Null),
+        "efficient_marker_count": marker_count,
+        "template_path": template_path.to_string_lossy(),
+        "template_sha256": nano35_sha256(template_bytes),
+        "rendered_prompt_sha256": nano35_sha256(prompt),
+        "redacted_final_user_suffix": if marker_count > 0 { format!("<redacted>{NANO35_EFFICIENT_MARKER}") } else { "<redacted>".to_string() },
+        "generation_prefix": generation_prefix,
+        "generation_suffix_sha256": nano35_sha256(suffix),
+    });
+    let destination = std::path::PathBuf::from(output);
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _guard = NANO35_AUDIT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(destination)?;
+    serde_json::to_writer(&mut file, &record)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    Ok(())
+}
 
 /// Drain a standalone router's forwarded `routing_data` onto this request's tracker so the
 /// frontend's timing/worker/token surfaces populate, then drop the field to keep it off the
@@ -996,6 +1089,7 @@ impl OpenAIPreprocessor {
                 .with_context(|| "Failed to apply prompt template")?
         };
         TEMPLATE_SECONDS.observe(template_start.elapsed().as_secs_f64());
+        record_nano35_render_audit(request, formatted_prompt.as_deref())?;
 
         // Generic reasoning parsers start from `<think>`; MiniMax M3 starts
         // from `<mm:think>`. If the chat template injected that opener at the

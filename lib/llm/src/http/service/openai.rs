@@ -741,14 +741,25 @@ fn context_from_headers<T: Send + Sync + 'static>(
     Ok(request)
 }
 
-fn attach_nano35_audit_id(request: &mut NvCreateChatCompletionRequest, audit_id: Option<&str>) {
+fn attach_nano35_audit_context(
+    request: &mut NvCreateChatCompletionRequest,
+    audit_id: Option<&str>,
+    response_id: &str,
+) {
     let Some(audit_id) = audit_id else {
         return;
     };
-    request
-        .chat_template_args
-        .get_or_insert_default()
-        .insert("__dynamo_nano35_audit_id".to_string(), audit_id.into());
+    let args = request.chat_template_args.get_or_insert_default();
+    args.insert("__dynamo_nano35_audit_id".to_string(), audit_id.into());
+    args.insert(
+        "__dynamo_nano35_response_id".to_string(),
+        response_id.into(),
+    );
+    if let Some(effort) = request.inner.reasoning_effort.as_ref()
+        && let Ok(effort) = serde_json::to_value(effort)
+    {
+        args.insert("__dynamo_nano35_wire_reasoning_effort".to_string(), effort);
+    }
 }
 
 fn copy_context_metadata<T: Send + Sync + 'static, U: Send + Sync + 'static>(
@@ -1479,7 +1490,8 @@ async fn handler_chat_completions(
     };
     let mut request = context_from_headers(request, request_id, &headers)?;
     let nano35_audit_id = request.metadata().get("nano35-audit-id").cloned();
-    attach_nano35_audit_id(&mut request, nano35_audit_id.as_deref());
+    let response_id = request.id().to_string();
+    attach_nano35_audit_context(&mut request, nano35_audit_id.as_deref(), &response_id);
     request.insert(
         AUDIT_HTTP_HEADERS_KEY,
         audit_headers_from_header_map(&headers),
@@ -2680,7 +2692,7 @@ async fn responses(
     // that the stream converter needs for faithful response reconstruction.
     let responses_ctx = unified_request.responses_context().cloned();
     let mut chat_request = unified_request.into_inner();
-    attach_nano35_audit_id(&mut chat_request, nano35_audit_id.as_deref());
+    attach_nano35_audit_context(&mut chat_request, nano35_audit_id.as_deref(), &request_id);
     if let Err(err_response) = normalize_chat_reasoning_template_args(&mut chat_request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
