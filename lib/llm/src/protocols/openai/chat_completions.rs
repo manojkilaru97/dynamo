@@ -497,6 +497,252 @@ pub(super) fn stream_choice_chunk_from_template(
     }
 }
 
+impl NvCreateChatCompletionRequest {
+    pub(crate) fn request_text_len(&self) -> Option<usize> {
+        serde_json::to_value(&self.inner.messages)
+            .ok()
+            .map(|value| json_string_len(&value))
+            .filter(|length| *length > 0)
+    }
+
+    pub(crate) fn uses_pure_json_structured_output(&self) -> bool {
+        if self
+            .inner
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+        {
+            return false;
+        }
+
+        if self.common.guided_json.is_some() {
+            return true;
+        }
+
+        if self
+            .common
+            .structured_outputs
+            .as_ref()
+            .is_some_and(|structured| {
+                structured.json.is_some() || structured.json_object.unwrap_or(false)
+            })
+        {
+            return true;
+        }
+
+        matches!(
+            self.inner.response_format.as_ref(),
+            Some(
+                dynamo_protocols::types::ResponseFormat::JsonObject
+                    | dynamo_protocols::types::ResponseFormat::JsonSchema { .. }
+            )
+        )
+    }
+
+    fn uses_qwen_xml_tool_structural_tag(&self) -> bool {
+        let has_named_tool_choice = matches!(
+            self.inner.tool_choice.as_ref(),
+            Some(dynamo_protocols::types::ChatCompletionToolChoiceOption::Named(_))
+        );
+        let has_required_tool_choice = matches!(
+            self.inner.tool_choice.as_ref(),
+            Some(dynamo_protocols::types::ChatCompletionToolChoiceOption::Required)
+        );
+        let tools = self.inner.tools.as_deref().unwrap_or(&[]);
+
+        if has_named_tool_choice
+            && tools::named_tool_choice_has_freeform_text_field(
+                self.inner.tool_choice.as_ref(),
+                Some(tools),
+            )
+        {
+            return false;
+        }
+        if !(has_named_tool_choice || has_required_tool_choice) || tools.is_empty() {
+            return false;
+        }
+        if has_required_tool_choice && tools.len() != 1 {
+            return false;
+        }
+
+        let parser = std::env::var("DYN_DYNAMO_TOOL_CALL_PARSER")
+            .or_else(|_| std::env::var("DYN_TOOL_CALL_PARSER"))
+            .unwrap_or_default();
+        matches!(parser.trim(), "qwen3_coder" | "qwen3_xml" | "nemotron_nano")
+    }
+
+    pub fn normalize_reasoning_controls(&mut self) {
+        self.normalize_template_thinking_aliases();
+
+        let explicit_template_thinking = self.has_explicit_template_thinking();
+        if !explicit_template_thinking {
+            if let Some(effort) = self.reasoning_effort_string() {
+                self.apply_reasoning_effort_template_args(&effort);
+            }
+        }
+
+        let Some(reasoning) = self.unsupported_fields.remove("reasoning") else {
+            return;
+        };
+        let Some(reasoning) = reasoning.as_object() else {
+            return;
+        };
+
+        if !self.unsupported_fields.contains_key("reasoning_budget")
+            && let Some(max_tokens) = reasoning.get("max_tokens")
+        {
+            self.unsupported_fields
+                .insert("reasoning_budget".to_string(), max_tokens.clone());
+        }
+
+        if reasoning
+            .get("enabled")
+            .is_some_and(|enabled| enabled == &serde_json::Value::Bool(false))
+        {
+            if !explicit_template_thinking {
+                self.set_chat_template_arg_if_absent("enable_thinking", serde_json::json!(false));
+            }
+            return;
+        }
+
+        if explicit_template_thinking || self.inner.reasoning_effort.is_some() {
+            return;
+        }
+
+        if let Some(effort) = reasoning.get("effort").and_then(|value| value.as_str()) {
+            if let Ok(parsed) = serde_json::from_value::<dynamo_protocols::types::ReasoningEffort>(
+                serde_json::Value::String(effort.to_string()),
+            ) {
+                self.inner.reasoning_effort = Some(parsed);
+            }
+            self.apply_reasoning_effort_template_args(effort);
+        } else if reasoning
+            .get("enabled")
+            .is_some_and(|enabled| enabled == &serde_json::Value::Bool(true))
+        {
+            self.set_chat_template_arg_if_absent("enable_thinking", serde_json::json!(true));
+        }
+    }
+
+    fn has_explicit_template_thinking(&self) -> bool {
+        self.chat_template_args.as_ref().is_some_and(|args| {
+            args.contains_key("enable_thinking")
+                || args.contains_key("thinking")
+                || args.contains_key("low_effort")
+                || args.contains_key("medium_effort")
+        })
+    }
+
+    fn normalize_template_thinking_aliases(&mut self) {
+        let Some(thinking) = self
+            .chat_template_args
+            .as_ref()
+            .and_then(|args| args.get("thinking"))
+            .and_then(serde_json::Value::as_bool)
+        else {
+            return;
+        };
+
+        self.set_chat_template_arg_if_absent("enable_thinking", serde_json::json!(thinking));
+    }
+
+    fn reasoning_effort_string(&self) -> Option<String> {
+        let value = serde_json::to_value(self.inner.reasoning_effort.as_ref()?).ok()?;
+        value.as_str().map(|effort| effort.to_ascii_lowercase())
+    }
+
+    fn set_chat_template_arg_if_absent(&mut self, key: &str, value: serde_json::Value) {
+        self.chat_template_args
+            .get_or_insert_with(Default::default)
+            .entry(key.to_string())
+            .or_insert(value);
+    }
+
+    fn apply_reasoning_effort_template_args(&mut self, effort: &str) {
+        match effort {
+            "none" => {
+                self.set_chat_template_arg_if_absent("enable_thinking", serde_json::json!(false));
+            }
+            "minimal" | "low" | "medium" => {
+                self.set_chat_template_arg_if_absent("enable_thinking", serde_json::json!(true));
+                self.set_chat_template_arg_if_absent("low_effort", serde_json::json!(true));
+                self.set_chat_template_arg_if_absent("medium_effort", serde_json::json!(true));
+            }
+            "high" | "xhigh" | "max" => {
+                self.set_chat_template_arg_if_absent("enable_thinking", serde_json::json!(true));
+            }
+            _ => {}
+        }
+    }
+
+    fn template_thinking_enabled(&self) -> bool {
+        self.chat_template_args.as_ref().is_some_and(|args| {
+            let enable_thinking = args
+                .get("enable_thinking")
+                .and_then(serde_json::Value::as_bool);
+            let thinking = args.get("thinking").and_then(serde_json::Value::as_bool);
+            if enable_thinking == Some(false) || thinking == Some(false) {
+                return false;
+            }
+
+            enable_thinking == Some(true)
+                || thinking == Some(true)
+                || args.get("low_effort").and_then(serde_json::Value::as_bool) == Some(true)
+                || args
+                    .get("medium_effort")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        })
+    }
+
+    fn uses_constrained_decoding(&self) -> bool {
+        let tools_enabled = self
+            .inner
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+            && !matches!(
+                self.inner.tool_choice.as_ref(),
+                Some(dynamo_protocols::types::ChatCompletionToolChoiceOption::None)
+            );
+        if tools_enabled {
+            return true;
+        }
+
+        if self.common.guided_json.is_some()
+            || self.common.guided_regex.is_some()
+            || self.common.guided_grammar.is_some()
+            || self.common.guided_choice.is_some()
+        {
+            return true;
+        }
+
+        if self
+            .common
+            .structured_outputs
+            .as_ref()
+            .is_some_and(|structured| {
+                structured.json.is_some()
+                    || structured.json_object.unwrap_or(false)
+                    || structured.regex.is_some()
+                    || structured.grammar.is_some()
+                    || structured.choice.is_some()
+                    || structured.structural_tag.is_some()
+            })
+        {
+            return true;
+        }
+
+        matches!(
+            self.inner.response_format.as_ref(),
+            Some(
+                dynamo_protocols::types::ResponseFormat::JsonObject
+                    | dynamo_protocols::types::ResponseFormat::JsonSchema { .. }
+            )
+        )
+    }
+}
+
 /// Implements `NvExtProvider` for `NvCreateChatCompletionRequest`,
 /// providing access to NVIDIA-specific extensions.
 impl NvExtProvider for NvCreateChatCompletionRequest {
