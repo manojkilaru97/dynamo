@@ -26,13 +26,15 @@ def _sha256(value: bytes | str) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _audit_id(context: Any | None) -> str | None:
-    if context is None:
-        return None
-    metadata = getattr(context, "metadata", None)
-    if metadata is None:
-        return None
-    value = metadata.get("nano35-audit-id")
+def _audit_id(context: Any | None, request: dict[str, Any]) -> str | None:
+    metadata = getattr(context, "metadata", None) if context is not None else None
+    value = metadata.get("nano35-audit-id") if metadata is not None else None
+    if value is None:
+        template_args = request.get("chat_template_args")
+        if not isinstance(template_args, dict):
+            template_args = request.get("chat_template_kwargs")
+        if isinstance(template_args, dict):
+            value = template_args.get("__dynamo_nano35_audit_id")
     return value if isinstance(value, str) and _AUDIT_ID_RE.fullmatch(value) else None
 
 
@@ -58,7 +60,7 @@ def record_nano35_render_audit(
     """Write one redacted JSONL record only for an explicitly tagged request."""
 
     output = os.getenv("DYN_NANO35_AUDIT_FILE")
-    if not output or not (audit_id := _audit_id(context)):
+    if not output or not (audit_id := _audit_id(context, request)):
         return
 
     template_path_value = os.getenv("DYN_NANO35_AUDIT_TEMPLATE")

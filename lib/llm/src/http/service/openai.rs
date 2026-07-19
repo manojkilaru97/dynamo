@@ -606,6 +606,16 @@ pub(super) fn context_from_headers<T: Send + Sync + 'static>(
     Ok(request)
 }
 
+fn attach_nano35_audit_id(request: &mut NvCreateChatCompletionRequest, audit_id: Option<&str>) {
+    let Some(audit_id) = audit_id else {
+        return;
+    };
+    request
+        .chat_template_args
+        .get_or_insert_default()
+        .insert("__dynamo_nano35_audit_id".to_string(), audit_id.into());
+}
+
 fn copy_context_metadata<T: Send + Sync + 'static, U: Send + Sync + 'static>(
     source: &Context<T>,
     target: &mut Context<U>,
@@ -1830,6 +1840,8 @@ async fn handler_chat_completions(
             captured,
         );
     }
+    let nano35_audit_id = request.metadata().get("nano35-audit-id").cloned();
+    attach_nano35_audit_id(&mut request, nano35_audit_id.as_deref());
     let context = request.context();
 
     // create the connection handles
@@ -2920,6 +2932,7 @@ async fn responses(
         safety_identifier: request.inner.safety_identifier.clone(),
     };
     let request_id = request.id().to_string();
+    let nano35_audit_id = request.metadata().get("nano35-audit-id").cloned();
     let (orig_request, context) = request.into_parts();
 
     let unified_request: UnifiedRequest = orig_request.try_into().map_err(|e: anyhow::Error| {
@@ -2938,6 +2951,7 @@ async fn responses(
     // that the stream converter needs for faithful response reconstruction.
     let responses_ctx = unified_request.responses_context().cloned();
     let mut chat_request = unified_request.into_inner();
+    attach_nano35_audit_id(&mut chat_request, nano35_audit_id.as_deref());
     if let Err(err_response) = normalize_chat_reasoning_template_args(&mut chat_request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
