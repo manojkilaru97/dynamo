@@ -45,7 +45,7 @@ use crate::protocols::common::extensions::{NvExt, NvExtProvider};
 /// that walked `serde_json::Value` to inject synthetic defaults for missing
 /// `id` / `status` / `annotations`; that was replaced by typed ownership for
 /// correctness and to avoid the double-deserialize cost.
-#[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone)]
+#[derive(ToSchema, Serialize, Validate, Debug, Clone)]
 pub struct NvCreateResponse {
     /// Flattened CreateResponse fields (model, input, temperature, etc.).
     ///
@@ -63,6 +63,47 @@ pub struct NvCreateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object)]
     pub nvext: Option<NvExt>,
+
+    /// Preserves Responses reasoning efforts that the pinned upstream
+    /// `Reasoning` type cannot represent yet (currently `max`).
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) reasoning_effort_override: Option<ChatReasoningEffort>,
+}
+
+impl<'de> Deserialize<'de> for NvCreateResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let reasoning_effort_override = value
+            .pointer("/reasoning/effort")
+            .and_then(serde_json::Value::as_str)
+            .filter(|effort| *effort == "max")
+            .map(|_| ChatReasoningEffort::Max);
+        if reasoning_effort_override.is_some()
+            && let Some(effort) = value.pointer_mut("/reasoning/effort")
+        {
+            *effort = serde_json::json!("xhigh");
+        }
+
+        let nvext = value
+            .as_object_mut()
+            .and_then(|object| object.remove("nvext"))
+            .filter(|value| !value.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(D::Error::custom)?;
+        let inner = serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(Self {
+            inner,
+            nvext,
+            reasoning_effort_override,
+        })
+    }
 }
 
 #[derive(ToSchema, Deserialize, Validate, Debug, Clone)]
@@ -801,12 +842,13 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
         // Map reasoning.effort to reasoning_effort. The upstream responses
         // `effort` is the same `async_openai` enum the Chat field is built on,
         // so the local `From` impl converts it directly and exhaustively.
-        let reasoning_effort = resp
-            .inner
-            .reasoning
-            .as_ref()
-            .and_then(|r| r.effort.clone())
-            .map(ChatReasoningEffort::from);
+        let reasoning_effort = resp.reasoning_effort_override.clone().or_else(|| {
+            resp.inner
+                .reasoning
+                .as_ref()
+                .and_then(|r| r.effort.clone())
+                .map(ChatReasoningEffort::from)
+        });
 
         // Map text.format to response_format
         let response_format = resp.inner.text.as_ref().and_then(convert_text_format);
@@ -1232,6 +1274,7 @@ mod tests {
                 annotations: Some(vec!["debug".into(), "trace".into()]),
                 ..Default::default()
             }),
+            reasoning_effort_override: None,
         }
     }
 
@@ -1318,6 +1361,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1362,6 +1406,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1441,6 +1486,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1482,6 +1528,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1525,6 +1572,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1573,6 +1621,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1612,6 +1661,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1646,6 +1696,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1688,6 +1739,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1749,6 +1801,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1821,6 +1874,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1878,6 +1932,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1933,6 +1988,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1980,6 +2036,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -2045,6 +2102,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -2124,6 +2182,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -2197,6 +2256,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
         let messages = &chat_req.inner.messages;
@@ -2266,6 +2326,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
         let messages = &chat_req.inner.messages;
@@ -2332,6 +2393,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
         let messages = &chat_req.inner.messages;
@@ -2389,6 +2451,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
         let messages = &chat_req.inner.messages;
@@ -2428,6 +2491,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -2618,6 +2682,25 @@ thinking
         assert_eq!(
             chat.inner.reasoning_effort,
             Some(ChatReasoningEffort::Medium)
+        );
+    }
+
+    #[test]
+    fn test_reasoning_effort_max_deserializes_and_maps_to_chat_completion() {
+        let req: NvCreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "think as hard as possible",
+            "reasoning": {"effort": "max"}
+        }))
+        .unwrap();
+
+        let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        assert_eq!(chat.inner.reasoning_effort, Some(ChatReasoningEffort::Max));
+        assert_eq!(
+            chat.chat_template_args
+                .as_ref()
+                .and_then(|args| args.get("enable_thinking")),
+            Some(&serde_json::json!(true))
         );
     }
 

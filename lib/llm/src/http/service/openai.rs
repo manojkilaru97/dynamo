@@ -3979,6 +3979,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            reasoning_effort_override: None,
         }
     }
 
