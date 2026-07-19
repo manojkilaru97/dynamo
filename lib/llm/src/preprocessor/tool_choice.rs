@@ -76,7 +76,8 @@ impl OpenAIPreprocessor {
             return Ok(true);
         }
 
-        match get_json_schema_from_tools(Some(tool_choice), Some(tools), None) {
+        match get_json_schema_from_tools(Some(tool_choice), Some(tools), request.request_text_len())
+        {
             Ok(Some(schema)) => {
                 let gd = common_request
                     .sampling_options

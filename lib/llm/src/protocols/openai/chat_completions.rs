@@ -452,7 +452,7 @@ pub struct NvCreateChatCompletionStreamResponse {
 }
 
 impl NvCreateChatCompletionRequest {
-    fn request_text_len(&self) -> Option<usize> {
+    pub(crate) fn request_text_len(&self) -> Option<usize> {
         serde_json::to_value(&self.inner.messages)
             .ok()
             .map(|value| json_string_len(&value))
