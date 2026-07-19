@@ -1056,6 +1056,47 @@ def test_build_sampling_params_maps_max_thinking_tokens():
     assert sp.thinking_token_budget == 1024
 
 
+def test_build_sampling_params_maps_json_object_guidance():
+    from dynamo.vllm.handlers import build_sampling_params
+
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {
+            "guided_decoding": {
+                "json_object": True,
+                "disable_any_whitespace": True,
+                "disable_additional_properties": True,
+            }
+        },
+        "stop_conditions": {},
+        "output_options": {},
+    }
+
+    structured = build_sampling_params(request, {}).structured_outputs
+    assert structured is not None
+    assert structured.json_object is True
+    assert structured.disable_any_whitespace is True
+    assert structured.disable_additional_properties is True
+
+
+def test_build_sampling_params_ignores_constraint_empty_guidance():
+    from dynamo.vllm.handlers import build_sampling_params
+
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {
+            "guided_decoding": {
+                "disable_any_whitespace": False,
+                "disable_additional_properties": False,
+            }
+        },
+        "stop_conditions": {},
+        "output_options": {},
+    }
+
+    assert build_sampling_params(request, {}).structured_outputs is None
+
+
 def test_build_sampling_params_caps_omitted_max_tokens_to_generation_default():
     from dynamo.vllm.handlers import build_sampling_params
 
