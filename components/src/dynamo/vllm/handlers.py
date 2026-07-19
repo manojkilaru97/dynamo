@@ -717,19 +717,35 @@ def build_sampling_params(
             sampling_options.update(passthrough_sampling_options)
     guided_decoding = sampling_options.get("guided_decoding")
     if guided_decoding is not None and isinstance(guided_decoding, dict):
-        json_schema = guided_decoding.get("json")
-        if json_schema is not None:
-            reject_nonprogressing_guided_json_ref_cycles(json_schema)
-        sampling_params.structured_outputs = StructuredOutputsParams(
-            json=json_schema,
-            regex=guided_decoding.get("regex"),
-            choice=guided_decoding.get("choice"),
-            grammar=guided_decoding.get("grammar"),
-            whitespace_pattern=guided_decoding.get("whitespace_pattern"),
-            structural_tag=serialize_structural_tag(
-                guided_decoding.get("structural_tag")
-            ),
+        constraint_keys = (
+            "json",
+            "regex",
+            "choice",
+            "grammar",
+            "json_object",
+            "structural_tag",
         )
+        if any(guided_decoding.get(key) is not None for key in constraint_keys):
+            json_schema = guided_decoding.get("json")
+            if json_schema is not None:
+                reject_nonprogressing_guided_json_ref_cycles(json_schema)
+            sampling_params.structured_outputs = StructuredOutputsParams(
+                json=guided_decoding.get("json"),
+                regex=guided_decoding.get("regex"),
+                choice=guided_decoding.get("choice"),
+                grammar=guided_decoding.get("grammar"),
+                json_object=guided_decoding.get("json_object"),
+                disable_any_whitespace=guided_decoding.get(
+                    "disable_any_whitespace", False
+                ),
+                disable_additional_properties=guided_decoding.get(
+                    "disable_additional_properties", False
+                ),
+                whitespace_pattern=guided_decoding.get("whitespace_pattern"),
+                structural_tag=serialize_structural_tag(
+                    guided_decoding.get("structural_tag")
+                ),
+            )
 
     # Apply remaining sampling_options
     for key, value in sampling_options.items():
