@@ -1079,6 +1079,36 @@ def test_build_sampling_params_maps_json_object_guidance():
     assert structured.disable_additional_properties is True
 
 
+def test_build_sampling_params_bounds_guided_json_strings_and_arrays():
+    from dynamo.vllm.handlers import build_sampling_params
+
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {
+            "guided_decoding": {
+                "json": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                }
+            }
+        },
+        "stop_conditions": {},
+        "output_options": {},
+    }
+
+    structured = build_sampling_params(request, {}).structured_outputs
+    assert structured is not None
+    assert structured.json["properties"]["summary"]["maxLength"] == 4096
+    assert structured.json["properties"]["tags"]["maxItems"] == 32
+    assert structured.json["properties"]["tags"]["items"]["maxLength"] == 4096
+
+
 def test_build_sampling_params_ignores_constraint_empty_guidance():
     from dynamo.vllm.handlers import build_sampling_params
 

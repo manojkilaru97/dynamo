@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import copy
 import inspect
 import json
 import logging
@@ -972,8 +973,13 @@ def build_sampling_params(
             "structural_tag",
         )
         if any(guided_decoding.get(key) is not None for key in constraint_keys):
+            guided_json = guided_decoding.get("json")
             sampling_params.structured_outputs = StructuredOutputsParams(
-                json=guided_decoding.get("json"),
+                json=(
+                    bound_json_schema_for_constrained_decoding(guided_json)
+                    if guided_json is not None
+                    else None
+                ),
                 regex=guided_decoding.get("regex"),
                 choice=guided_decoding.get("choice"),
                 grammar=guided_decoding.get("grammar"),
@@ -1588,12 +1594,10 @@ def _structured_outputs_from_fields(fields: Any) -> StructuredOutputsParams | No
     if fields.get("json") is not None:
         schema = fields["json"]
         _validate_structured_json_schema(schema)
-        if isinstance(schema, dict) and schema.get(TOOL_CHOICE_SCHEMA_MARKER) is True:
-            params["json"] = bound_json_schema_for_constrained_decoding(schema)
-        else:
-            # User structured-output schemas should stay equivalent to vLLM's
-            # OpenAI path. Tool-choice schemas are explicitly marked above.
-            params["json"] = schema
+        # The Rust frontend normalizes response_format into guided_decoding.
+        # Apply the same finite-schema safety bounds used by the direct OpenAI
+        # path so unconstrained strings cannot decode until max_tokens.
+        params["json"] = bound_json_schema_for_constrained_decoding(schema)
     for key in ("regex", "choice", "grammar", "json_object"):
         if fields.get(key) is not None:
             if key == "regex":
