@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import copy
 import importlib
 import inspect
 import logging
@@ -726,11 +727,15 @@ def build_sampling_params(
             "structural_tag",
         )
         if any(guided_decoding.get(key) is not None for key in constraint_keys):
-            json_schema = guided_decoding.get("json")
-            if json_schema is not None:
-                reject_nonprogressing_guided_json_ref_cycles(json_schema)
+            guided_json = guided_decoding.get("json")
+            if guided_json is not None:
+                reject_nonprogressing_guided_json_ref_cycles(guided_json)
             sampling_params.structured_outputs = StructuredOutputsParams(
-                json=guided_decoding.get("json"),
+                json=(
+                    bound_json_schema_for_constrained_decoding(guided_json)
+                    if guided_json is not None
+                    else None
+                ),
                 regex=guided_decoding.get("regex"),
                 choice=guided_decoding.get("choice"),
                 grammar=guided_decoding.get("grammar"),
@@ -841,6 +846,685 @@ def build_sampling_params(
     sampling_params.output_kind = _DELTA_REQUEST_OUTPUT_KIND
 
     return sampling_params
+
+
+def _value_from_mapping_or_object(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def bound_json_schema_for_constrained_decoding(
+    schema: Any,
+    field_name: str | None = None,
+    field_string_budgets: dict[str, int] | None = None,
+    request_text_len: int | None = None,
+) -> Any:
+    if isinstance(schema, list):
+        return [
+            bound_json_schema_for_constrained_decoding(
+                item, field_name, field_string_budgets, request_text_len
+            )
+            for item in schema
+        ]
+    if not isinstance(schema, dict):
+        return schema
+
+    bounded = copy.deepcopy(schema)
+    bounded.pop(TOOL_CHOICE_SCHEMA_MARKER, None)
+    for key in ("format", "pattern"):
+        if bounded.get(key) == "":
+            bounded.pop(key)
+    pattern = bounded.get("pattern")
+    if isinstance(pattern, str) and ".*" in pattern:
+        bounded.pop("pattern")
+
+    schema_type = bounded.get("type")
+    schema_types = schema_type if isinstance(schema_type, list) else [schema_type]
+    if (
+        "string" in schema_types
+        and "maxLength" not in bounded
+        and "enum" not in bounded
+        and "const" not in bounded
+    ):
+        max_length = DEFAULT_SCHEMA_MAX_STRING_LENGTH
+        if field_string_budgets is not None and field_name is not None:
+            max_length = field_string_budgets.get(field_name, max_length)
+        if field_name in TOOL_LONG_TEXT_FIELD_NAMES:
+            max_length = _tool_long_text_budget(request_text_len)
+        bounded["maxLength"] = max_length
+    if "array" in schema_types and "maxItems" not in bounded:
+        bounded["maxItems"] = DEFAULT_SCHEMA_MAX_ARRAY_ITEMS
+
+    for key in ("properties", "$defs", "definitions", "patternProperties"):
+        value = bounded.get(key)
+        if isinstance(value, dict):
+            bounded[key] = {
+                name: bound_json_schema_for_constrained_decoding(
+                    subschema,
+                    name if key == "properties" else None,
+                    field_string_budgets,
+                    request_text_len,
+                )
+                for name, subschema in value.items()
+            }
+
+    for key in ("items", "additionalProperties"):
+        value = bounded.get(key)
+        if isinstance(value, (dict, list)):
+            bounded[key] = bound_json_schema_for_constrained_decoding(
+                value, field_name, field_string_budgets, request_text_len
+            )
+
+    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        value = bounded.get(key)
+        if isinstance(value, list):
+            bounded[key] = [
+                bound_json_schema_for_constrained_decoding(
+                    subschema, field_name, field_string_budgets, request_text_len
+                )
+                for subschema in value
+            ]
+
+    return bounded
+
+
+def _tool_long_text_budget(request_text_len: int | None) -> int:
+    if request_text_len is None or request_text_len < TOOL_LONG_REQUEST_THRESHOLD:
+        return DEFAULT_TOOL_SHORT_TEXT_MAX_LENGTH
+    return max(
+        DEFAULT_TOOL_SHORT_TEXT_MAX_LENGTH,
+        min(DEFAULT_TOOL_LONG_TEXT_MAX_LENGTH, request_text_len + TOOL_LONG_REQUEST_MARGIN),
+    )
+
+
+def _request_text_len(request: Dict[str, Any]) -> int | None:
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return None
+    total = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, str):
+                    total += len(part)
+                elif isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        total += len(text)
+    return total
+
+
+def _schema_has_freeform_long_text_field(schema: Any) -> bool:
+    if not isinstance(schema, dict):
+        return False
+
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        for name, subschema in properties.items():
+            if (
+                name in TOOL_LONG_TEXT_FIELD_NAMES
+                and _schema_type_includes(subschema, "string")
+                and isinstance(subschema, dict)
+                and "enum" not in subschema
+                and "const" not in subschema
+            ):
+                return True
+            if _schema_has_freeform_long_text_field(subschema):
+                return True
+
+    for key in ("items", "additionalProperties", "anyOf", "oneOf", "allOf"):
+        value = schema.get(key)
+        if isinstance(value, list):
+            if any(_schema_has_freeform_long_text_field(item) for item in value):
+                return True
+        elif isinstance(value, dict) and _schema_has_freeform_long_text_field(value):
+            return True
+
+    return False
+
+
+def _schema_type_includes(schema: Any, expected: str) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        return expected in schema_type
+    return schema_type == expected
+
+
+def _tool_function(tool: Any) -> Any:
+    return _value_from_mapping_or_object(tool, "function", {})
+
+
+def _tool_name(tool: Any) -> str | None:
+    return _value_from_mapping_or_object(_tool_function(tool), "name")
+
+
+def _tool_parameters(tool: Any) -> dict[str, Any]:
+    params = _value_from_mapping_or_object(_tool_function(tool), "parameters")
+    if isinstance(params, dict):
+        return copy.deepcopy(params)
+    return {"type": "object", "properties": {}}
+
+
+def _named_tool_choice_name(tool_choice: Any) -> str | None:
+    function = _value_from_mapping_or_object(tool_choice, "function")
+    if function is None:
+        return None
+    return _value_from_mapping_or_object(function, "name")
+
+
+def _complete_json_text(text: str) -> str | None:
+    candidate = text.strip()
+    if not candidate:
+        return None
+    try:
+        _, end = json.JSONDecoder().raw_decode(candidate)
+    except json.JSONDecodeError:
+        return None
+    if candidate[end:].strip():
+        return None
+    return candidate[:end]
+
+
+def _forced_tool_calls_from_post_reasoning_json(
+    request: Dict[str, Any],
+    content: str,
+) -> list[dict[str, Any]] | None:
+    tools = request.get("tools")
+    tool_choice = request.get("tool_choice")
+    if not tools or tool_choice in (None, "none", "auto"):
+        return None
+    if any(
+        request.get(key) is not None
+        for key in (
+            "guided_json",
+            "guided_regex",
+            "guided_choice",
+            "guided_grammar",
+            "structured_outputs",
+            "response_format",
+        )
+    ):
+        return None
+
+    _, end_marker, post_reasoning = content.rpartition("</think>")
+    arguments = _complete_json_text(post_reasoning if end_marker else content)
+    if arguments is None:
+        return None
+
+    named_tool = _named_tool_choice_name(tool_choice)
+    if named_tool is not None:
+        return [
+            {
+                "index": 0,
+                "id": make_tool_call_id(),
+                "type": "function",
+                "function": {
+                    "name": named_tool,
+                    "arguments": arguments,
+                },
+            }
+        ]
+
+    if tool_choice != "required":
+        return None
+    try:
+        decoded = json.loads(arguments)
+    except json.JSONDecodeError:
+        return None
+
+    items = decoded if isinstance(decoded, list) else [decoded]
+    tool_calls: list[dict[str, Any]] = []
+    for index, item in enumerate(items):
+        name = _value_from_mapping_or_object(item, "name")
+        parameters = _value_from_mapping_or_object(item, "parameters", {})
+        if not isinstance(name, str):
+            continue
+        if not isinstance(parameters, str):
+            parameters = json.dumps(parameters, ensure_ascii=False)
+        tool_calls.append(
+            {
+                "index": index,
+                "id": make_tool_call_id(),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": parameters,
+                },
+            }
+        )
+    return tool_calls or None
+
+
+def _schema_for_required_tool_choice(
+    tools: list[Any],
+    request_text_len: int | None = None,
+) -> dict[str, Any]:
+    if not tools:
+        raise ValueError("tool_choice='required' needs at least one tool")
+
+    defs: dict[str, Any] = {}
+    any_of: list[dict[str, Any]] = []
+    for tool in tools:
+        name = _tool_name(tool)
+        if not name:
+            continue
+
+        params = _tool_parameters(tool)
+        tool_defs = params.pop("$defs", None)
+        if isinstance(tool_defs, dict):
+            for def_name, def_schema in tool_defs.items():
+                if def_name in defs and defs[def_name] != def_schema:
+                    raise ValueError(
+                        f"Tool definition '{def_name}' has multiple schemas"
+                    )
+                defs[def_name] = def_schema
+
+        any_of.append(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "enum": [name]},
+                    "parameters": params,
+                },
+                "required": ["name", "parameters"],
+                "additionalProperties": False,
+            }
+        )
+
+    if not any_of:
+        raise ValueError("tool_choice='required' needs at least one named tool")
+
+    schema: dict[str, Any] = {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+            "anyOf": any_of,
+        },
+    }
+    if defs:
+        schema["$defs"] = defs
+    return bound_json_schema_for_constrained_decoding(
+        schema,
+        field_string_budgets=TOOL_FIELD_STRING_BUDGETS,
+        request_text_len=request_text_len,
+    )
+
+
+def _schema_for_tool_choice(request: Dict[str, Any]) -> dict[str, Any] | None:
+    tools = request.get("tools")
+    tool_choice = request.get("tool_choice")
+    if tool_choice in (None, "none", "auto") or not tools:
+        return None
+
+    if tool_choice == "required":
+        return _schema_for_required_tool_choice(tools, _request_text_len(request))
+
+    if isinstance(tool_choice, dict) or _named_tool_choice_name(tool_choice):
+        tool_name = _named_tool_choice_name(tool_choice)
+        if not tool_name:
+            return None
+        for tool in tools:
+            if _tool_name(tool) == tool_name:
+                return bound_json_schema_for_constrained_decoding(
+                    _tool_parameters(tool),
+                    field_string_budgets=TOOL_FIELD_STRING_BUDGETS,
+                    request_text_len=_request_text_len(request),
+                )
+        raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`")
+
+    return None
+
+
+def _tool_call_parser_name(parser_name: str | None = None) -> str:
+    return (parser_name or "").strip() or (
+        os.environ.get("DYN_DYNAMO_TOOL_CALL_PARSER")
+        or os.environ.get("DYN_TOOL_CALL_PARSER")
+        or ""
+    ).strip()
+
+
+def _qwen_xml_tool_tag(
+    tool: Any,
+    request_text_len: int | None = None,
+) -> dict[str, Any]:
+    name = _tool_name(tool)
+    if not name:
+        raise ValueError("Tool choice needs a named tool")
+    return {
+        "type": "tag",
+        "begin": f"<tool_call>\n<function={name}>\n",
+        "content": {
+            "type": "json_schema",
+            "json_schema": bound_json_schema_for_constrained_decoding(
+                _tool_parameters(tool),
+                field_string_budgets=TOOL_FIELD_STRING_BUDGETS,
+                request_text_len=request_text_len,
+            ),
+            "style": "qwen_xml",
+        },
+        "end": "\n</function>\n</tool_call>",
+    }
+
+
+def _qwen_xml_structural_tag_for_tool_choice(
+    request: Dict[str, Any],
+    tool_call_parser_name: str | None = None,
+) -> StructuredOutputsParams | None:
+    if (
+        _tool_call_parser_name(tool_call_parser_name)
+        not in QWEN_XML_STRUCTURAL_TAG_TOOL_PARSERS
+    ):
+        return None
+
+    tools = request.get("tools")
+    tool_choice = request.get("tool_choice")
+    if not tools or tool_choice in (None, "none", "auto"):
+        return None
+    request_text_len = _request_text_len(request)
+
+    if tool_choice == "required":
+        tags = [
+            _qwen_xml_tool_tag(tool, request_text_len)
+            for tool in tools
+            if _tool_name(tool)
+        ]
+        if not tags:
+            raise ValueError("tool_choice='required' needs at least one named tool")
+        if len(tags) != 1:
+            return None
+        structural_tag = {
+            "type": "structural_tag",
+            "format": {
+                "type": "triggered_tags",
+                "tags": tags[:DEFAULT_TOOL_CALL_MAX_ARRAY_ITEMS],
+                "triggers": FORCED_TOOL_STRUCTURAL_TAG_TRIGGERS,
+                "stop_after_first": False,
+            },
+        }
+        return StructuredOutputsParams(structural_tag=json.dumps(structural_tag))
+
+    tool_name = _named_tool_choice_name(tool_choice)
+    if not tool_name:
+        return None
+    for tool in tools:
+        if _tool_name(tool) == tool_name:
+            if _schema_has_freeform_long_text_field(_tool_parameters(tool)):
+                return None
+            structural_tag = {
+                "type": "structural_tag",
+                "format": {
+                    "type": "triggered_tags",
+                    "tags": [_qwen_xml_tool_tag(tool, request_text_len)],
+                    "triggers": FORCED_TOOL_STRUCTURAL_TAG_TRIGGERS,
+                    "stop_after_first": True,
+                },
+            }
+            return StructuredOutputsParams(structural_tag=json.dumps(structural_tag))
+    raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`")
+
+
+def _validate_structured_regex(pattern: Any) -> None:
+    if not isinstance(pattern, str):
+        return
+    if any(token in pattern for token in UNSUPPORTED_STRUCTURED_REGEX_TOKENS):
+        raise ValueError(
+            "Unsupported structured output regex: lookaround assertions are not "
+            "supported by the configured guided-decoding backend"
+        )
+
+
+def _validate_structured_json_schema(schema: Any) -> None:
+    if isinstance(schema, dict):
+        if schema.get(TOOL_CHOICE_SCHEMA_MARKER) is True:
+            return
+
+        pattern = schema.get("pattern")
+        if pattern is not None:
+            _validate_structured_regex(pattern)
+
+        pattern_properties = schema.get("patternProperties")
+        if isinstance(pattern_properties, dict):
+            for property_pattern in pattern_properties:
+                _validate_structured_regex(property_pattern)
+
+        for value in schema.values():
+            _validate_structured_json_schema(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            _validate_structured_json_schema(item)
+
+
+def _validate_structured_grammar(grammar: Any) -> None:
+    if not isinstance(grammar, str):
+        return
+
+    in_char_class = False
+    escaped = False
+    for char in grammar:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if in_char_class:
+            if char in "\r\n":
+                raise ValueError(
+                    "Unsupported structured output grammar: raw newlines inside "
+                    "character classes are not supported"
+                )
+            if char == "]":
+                in_char_class = False
+            continue
+        if char == "[":
+            in_char_class = True
+
+
+def _structured_outputs_from_fields(fields: Any) -> StructuredOutputsParams | None:
+    if isinstance(fields, StructuredOutputsParams):
+        return fields
+    if not isinstance(fields, dict):
+        return None
+
+    params: dict[str, Any] = {}
+    if fields.get("json") is not None:
+        schema = fields["json"]
+        _validate_structured_json_schema(schema)
+        # The Rust frontend normalizes response_format into guided_decoding.
+        # Apply the same finite-schema safety bounds used by the direct OpenAI
+        # path so unconstrained strings cannot decode until max_tokens.
+        params["json"] = bound_json_schema_for_constrained_decoding(schema)
+    for key in ("regex", "choice", "grammar", "json_object"):
+        if fields.get(key) is not None:
+            if key == "regex":
+                _validate_structured_regex(fields[key])
+            elif key == "grammar":
+                _validate_structured_grammar(fields[key])
+            params[key] = fields[key]
+    if fields.get("structural_tag") is not None:
+        params["structural_tag"] = _normalize_structural_tag(fields["structural_tag"])
+    if not params:
+        return None
+    for key in (
+        "disable_any_whitespace",
+        "disable_additional_properties",
+        "whitespace_pattern",
+    ):
+        if fields.get(key) is not None:
+            params[key] = fields[key]
+    return StructuredOutputsParams(**params)
+
+
+def _is_required_single_tool_repeat_structural_tag(
+    value: Any,
+    request: Dict[str, Any],
+) -> bool:
+    if request.get("tool_choice") != "required":
+        return False
+
+    tool_names = [_tool_name(tool) for tool in request.get("tools") or []]
+    tool_names = [name for name in tool_names if name]
+    if len(tool_names) != 1:
+        return False
+
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return False
+    if not isinstance(value, dict):
+        return False
+
+    tag_format = value.get("format")
+    if not isinstance(tag_format, dict) or tag_format.get("type") != "repeat":
+        return False
+    if tag_format.get("min") != 1 or tag_format.get("max") != 1:
+        return False
+
+    content = tag_format.get("content")
+    if not isinstance(content, dict) or content.get("type") != "or":
+        return False
+    elements = content.get("elements")
+    if not isinstance(elements, list) or len(elements) != 1:
+        return False
+    expected_begin = f"<tool_call>\n<function={tool_names[0]}>\n"
+    return isinstance(elements[0], dict) and elements[0].get("begin") == expected_begin
+
+
+def _request_has_pure_json_structured_output(request: dict[str, Any]) -> bool:
+    if request.get("tools"):
+        return False
+
+    guided_decoding = request.get("guided_decoding")
+    if isinstance(guided_decoding, dict) and (
+        guided_decoding.get("json") is not None
+        or guided_decoding.get("json_object") is not None
+    ):
+        return True
+
+    sampling_options = request.get("sampling_options")
+    if isinstance(sampling_options, dict):
+        guided_decoding = sampling_options.get("guided_decoding")
+        if isinstance(guided_decoding, dict) and (
+            guided_decoding.get("json") is not None
+            or guided_decoding.get("json_object") is not None
+        ):
+            return True
+
+    if request.get("guided_json") is not None:
+        return True
+
+    structured_outputs = request.get("structured_outputs")
+    if isinstance(structured_outputs, dict) and (
+        structured_outputs.get("json") is not None
+        or structured_outputs.get("json_object") is not None
+    ):
+        return True
+
+    response_format = request.get("response_format")
+    if isinstance(response_format, dict):
+        return response_format.get("type") in {"json_schema", "json_object"}
+    return False
+
+
+class _StructuredJsonStreamGuard:
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._emitted = False
+
+    @property
+    def emitted(self) -> bool:
+        return self._emitted
+
+    def filter_delta(self, delta_text: str) -> str:
+        if self._emitted:
+            return ""
+        self._buffer += delta_text
+        candidate = self._buffer.lstrip()
+        if not candidate:
+            return ""
+        try:
+            _, end = json.JSONDecoder().raw_decode(candidate)
+        except json.JSONDecodeError:
+            return ""
+        self._emitted = True
+        return candidate[:end]
+
+
+def _structured_outputs_from_openai_request(
+    request: Dict[str, Any],
+    tool_call_parser_name: str | None = None,
+) -> StructuredOutputsParams | None:
+    guided_decoding = request.get("guided_decoding")
+    tool_structural_tag = _qwen_xml_structural_tag_for_tool_choice(
+        request, tool_call_parser_name
+    )
+    guided_outputs = _structured_outputs_from_fields(guided_decoding)
+    if (
+        guided_outputs is not None
+        and isinstance(guided_decoding, dict)
+        and guided_decoding.get("structural_tag") is not None
+    ):
+        if tool_structural_tag is not None and _is_required_single_tool_repeat_structural_tag(
+            guided_decoding.get("structural_tag"),
+            request,
+        ):
+            return tool_structural_tag
+        return guided_outputs
+
+    if tool_structural_tag is not None:
+        return tool_structural_tag
+
+    if guided_outputs is not None:
+        return guided_outputs
+
+    if request.get("guided_json") is not None:
+        _validate_structured_json_schema(request["guided_json"])
+        return StructuredOutputsParams(
+            json=bound_json_schema_for_constrained_decoding(request["guided_json"])
+        )
+    if request.get("guided_regex") is not None:
+        _validate_structured_regex(request["guided_regex"])
+        return StructuredOutputsParams(regex=request["guided_regex"])
+    if request.get("guided_choice") is not None:
+        return StructuredOutputsParams(choice=request["guided_choice"])
+    if request.get("guided_grammar") is not None:
+        _validate_structured_grammar(request["guided_grammar"])
+        return StructuredOutputsParams(grammar=request["guided_grammar"])
+
+    tool_schema = _schema_for_tool_choice(request)
+    if tool_schema is not None:
+        return StructuredOutputsParams(json=tool_schema)
+
+    structured_outputs = _structured_outputs_from_fields(
+        request.get("structured_outputs")
+    )
+    if structured_outputs is not None:
+        return structured_outputs
+
+    response_format = request.get("response_format")
+    if isinstance(response_format, dict):
+        response_type = response_format.get("type")
+        if response_type == "json_object":
+            return StructuredOutputsParams(json_object=True)
+        if response_type == "json_schema":
+            json_schema = response_format.get("json_schema") or {}
+            schema = json_schema.get("schema")
+            if schema is not None:
+                _validate_structured_json_schema(schema)
+                return StructuredOutputsParams(
+                    json=bound_json_schema_for_constrained_decoding(schema)
+                )
+
+    return None
 
 
 def build_sampling_params_openai(
