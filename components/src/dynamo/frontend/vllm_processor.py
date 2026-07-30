@@ -1368,6 +1368,12 @@ class VllmProcessor:
                         request_for_sampling,
                         choices,
                     )
+                    for choice in choices:
+                        post = post_processors.get(choice.get("index", 0))
+                        if post is not None:
+                            post._strip_tool_markup_from_delta(
+                                choice.get("delta") or {}
+                            )
                     dynamo_out = {
                         "id": request_id,
                         "choices": choices,

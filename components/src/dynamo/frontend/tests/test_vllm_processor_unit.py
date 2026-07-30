@@ -14,7 +14,13 @@ import pytest
 from transformers import AutoTokenizer
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
-from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
+
+try:
+    from vllm.tool_parsers.qwen3_engine_tool_parser import (
+        Qwen3EngineToolParser as Qwen3CoderToolParser,
+    )
+except ImportError:
+    from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
 
 from dynamo.frontend.prepost import StreamingPostProcessor, _prepare_request
 from dynamo.frontend.vllm_processor import _with_parser_visible_engine_text
@@ -634,6 +640,42 @@ class _FallbackToolParser:
         )
 
 
+class _EngineAdapterToolParser(_FallbackToolParser):
+    tool_call_start_token = None
+    tool_call_end_token = None
+    tool_call_start_token_id = None
+    tool_call_end_token_id = None
+
+    def __init__(self):
+        self._parser_engine = SimpleNamespace(
+            _tool_call_token_id=14,
+            _tool_call_end_token_id=15,
+        )
+
+    def extract_tool_calls(self, text, request):
+        called = "<tool_call>" in text and "</tool_call>" in text
+        return SimpleNamespace(
+            tools_called=called,
+            content=None if called else text,
+            tool_calls=[
+                SimpleNamespace(
+                    id=None,
+                    function=SimpleNamespace(
+                        name="Read",
+                        arguments='{"path":"package.json"}',
+                    ),
+                )
+            ]
+            if called
+            else [],
+        )
+
+
+class _OpaqueToolParser(_EngineAdapterToolParser):
+    def __init__(self):
+        self._parser_engine = SimpleNamespace()
+
+
 class _RawToolTokenizer:
     all_special_tokens = ("<|im_end|>",)
 
@@ -652,6 +694,13 @@ class _RawToolTokenizer:
         if skip_special_tokens:
             text = text.replace("<|im_end|>", "")
         return text
+
+    def encode(self, text, add_special_tokens=False):
+        token_ids = {
+            "<tool_call>": [14],
+            "</tool_call>": [15],
+        }
+        return token_ids.get(text, [20, 21])
 
     def convert_ids_to_tokens(self, token_ids):
         return [self._token_text.get(token_id, "") for token_id in token_ids]
@@ -722,6 +771,155 @@ class TestStreamingPostProcessorStructuredJson:
 
 
 class TestStreamingPostProcessorToolFallback:
+    def test_tool_enabled_request_filters_markup_without_frontend_parser(self):
+        post = StreamingPostProcessor(
+            tokenizer=_RawToolTokenizer(),
+            request_for_sampling=SimpleNamespace(
+                tool_choice="auto",
+                tools=[{"type": "function"}],
+                structured_outputs=None,
+                response_format=None,
+            ),
+            sampling_params=SamplingParams(max_tokens=128),
+            prompt_token_ids=[],
+            tool_parser=None,
+            reasoning_parser_class=_FallbackReasoningParser,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        delta = {
+            "reasoning_content": (
+                "Need the file.<tool_call><function=Read>"
+            )
+        }
+
+        post._strip_tool_markup_from_delta(delta)
+
+        assert delta["reasoning_content"] == "Need the file."
+
+    def test_qwen3_marker_fallback_without_parser_metadata(self):
+        post = StreamingPostProcessor(
+            tokenizer=_RawToolTokenizer(),
+            request_for_sampling=SimpleNamespace(tool_choice="auto"),
+            sampling_params=SamplingParams(max_tokens=128),
+            prompt_token_ids=[],
+            tool_parser=_OpaqueToolParser(),
+            reasoning_parser_class=_FallbackReasoningParser,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+
+        assert post._tool_call_start_token() == "<tool_call>"
+        assert post._tool_call_end_token() == "</tool_call>"
+
+    def test_tool_markup_is_defensively_removed_from_reasoning(self):
+        post = StreamingPostProcessor(
+            tokenizer=_RawToolTokenizer(),
+            request_for_sampling=SimpleNamespace(tool_choice="auto"),
+            sampling_params=SamplingParams(max_tokens=128),
+            prompt_token_ids=[],
+            tool_parser=_EngineAdapterToolParser(),
+            reasoning_parser_class=_FallbackReasoningParser,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        first = DeltaMessage(
+            reasoning="Need the file.<tool_call><function=Read>"
+        )
+        continuation = DeltaMessage(reasoning="<parameter=path>package.json")
+
+        post._strip_tool_markup_from_reasoning(first)
+        post._strip_tool_markup_from_reasoning(continuation)
+
+        assert first.reasoning == "Need the file."
+        assert continuation.reasoning is None
+
+    def test_tool_markup_is_removed_at_choice_boundary(self):
+        post = StreamingPostProcessor(
+            tokenizer=_RawToolTokenizer(),
+            request_for_sampling=SimpleNamespace(tool_choice="auto"),
+            sampling_params=SamplingParams(max_tokens=128),
+            prompt_token_ids=[],
+            tool_parser=_EngineAdapterToolParser(),
+            reasoning_parser_class=_FallbackReasoningParser,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        output = SimpleNamespace(
+            index=0,
+            finish_reason=None,
+            logprobs=None,
+        )
+
+        first = post._build_choice(
+            output,
+            {
+                "reasoning_content": (
+                    "Need the file.<tool_call><function=Read>"
+                ),
+                "reasoning": "duplicate reasoning",
+                "content": "duplicate content",
+            },
+        )
+        continuation = post._build_choice(
+            output,
+            {"reasoning_content": "<parameter=path>package.json"},
+        )
+
+        assert first["delta"]["reasoning_content"] == "Need the file."
+        assert "reasoning" not in first["delta"]
+        assert "content" not in first["delta"]
+        assert "reasoning_content" not in continuation["delta"]
+
+    def test_tool_call_without_reasoning_end_does_not_leak_markup(self):
+        post = StreamingPostProcessor(
+            tokenizer=_RawToolTokenizer(),
+            request_for_sampling=SimpleNamespace(tool_choice="auto"),
+            sampling_params=SamplingParams(max_tokens=128),
+            prompt_token_ids=[],
+            tool_parser=_EngineAdapterToolParser(),
+            reasoning_parser_class=_FallbackReasoningParser,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+
+        chunks = [
+            SimpleNamespace(
+                index=0,
+                token_ids=[1],
+                text="Need the file.",
+                finish_reason=None,
+                logprobs=None,
+            ),
+            SimpleNamespace(
+                index=0,
+                token_ids=[14, 20],
+                text="<tool_call>\n<function=Read>\n",
+                finish_reason=None,
+                logprobs=None,
+            ),
+            SimpleNamespace(
+                index=0,
+                token_ids=[21, 15],
+                text=(
+                    "<parameter=path>package.json</parameter>\n"
+                    "</function>\n</tool_call>"
+                ),
+                finish_reason="stop",
+                logprobs=None,
+            ),
+        ]
+
+        choices = [choice for chunk in chunks if (choice := post.process_output(chunk))]
+        serialized = json.dumps(choices)
+        reasoning = "".join(
+            choice["delta"].get("reasoning_content", "") for choice in choices
+        )
+        tool_choice = next(
+            choice for choice in choices if "tool_calls" in choice["delta"]
+        )
+
+        assert reasoning == "Need the file."
+        assert "<tool_call>" not in serialized
+        assert "<parameter=" not in serialized
+        assert tool_choice["finish_reason"] == "tool_calls"
+        assert tool_choice["delta"]["tool_calls"][0]["function"]["name"] == "Read"
+
     def test_complete_buffered_tool_call_emits_before_finish_chunk(self):
         post = StreamingPostProcessor(
             tokenizer=SimpleNamespace(all_special_tokens=()),
