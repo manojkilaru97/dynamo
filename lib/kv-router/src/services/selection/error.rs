@@ -65,7 +65,9 @@ fn scheduler_error_status(error: &KvSchedulerError) -> StatusCode {
         | KvSchedulerError::SubscriberShutdown
         | KvSchedulerError::InitFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
         KvSchedulerError::AllEligibleWorkersOverloaded
-        | KvSchedulerError::PinnedWorkerOverloaded { .. } => StatusCode::TOO_MANY_REQUESTS,
+        | KvSchedulerError::PinnedWorkerOverloaded { .. }
+        | KvSchedulerError::QueueFull { .. } => StatusCode::TOO_MANY_REQUESTS,
+        KvSchedulerError::QueueWaitTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         KvSchedulerError::QueueRejected(_) => StatusCode::SERVICE_UNAVAILABLE,
         KvSchedulerError::PinnedWorkerNotAllowed { .. } => StatusCode::BAD_REQUEST,
         KvSchedulerError::BookingFailed(_) => StatusCode::CONFLICT,
@@ -100,5 +102,28 @@ impl IntoResponse for SelectionError {
             Json(serde_json::json!({"error": self.to_string()})),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_capacity_errors_have_stable_http_statuses() {
+        assert_eq!(
+            scheduler_error_status(&KvSchedulerError::QueueFull {
+                pending: 8,
+                limit: 8,
+            }),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            scheduler_error_status(&KvSchedulerError::QueueWaitTimeout {
+                waited_ms: 1_001,
+                limit_ms: 1_000,
+            }),
+            StatusCode::GATEWAY_TIMEOUT
+        );
     }
 }
