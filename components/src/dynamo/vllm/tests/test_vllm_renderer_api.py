@@ -443,11 +443,25 @@ class TestVllmRendererApi:
         omni_cached_token_output_fields = (
             cached_token_output_fields + omni_output_extra_fields
         )
+        ec_output_fields = (
+            base_output_fields[:9]
+            + ("ec_transfer_params",)
+            + base_output_fields[9:]
+        )
+        ec_cached_token_output_fields = (
+            cached_token_output_fields[:9]
+            + ("ec_transfer_params",)
+            + cached_token_output_fields[9:]
+        )
         valid_output_fields = (
             base_output_fields,
             cached_token_output_fields,
             omni_output_fields,
             omni_cached_token_output_fields,
+            ec_output_fields,
+            ec_cached_token_output_fields,
+            ec_output_fields + omni_output_extra_fields,
+            ec_cached_token_output_fields + omni_output_extra_fields,
         )
         actual_output_fields = EngineCoreOutput.__struct_fields__
         assert actual_output_fields in valid_output_fields, (

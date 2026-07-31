@@ -615,6 +615,9 @@ class StreamingPostProcessor:
         )
         if marker:
             return marker
+        bot_token = getattr(self.tool_parser, "bot_token", None)
+        if isinstance(bot_token, str) and bot_token:
+            return bot_token
         if self._has_single_token_tool_marker("<tool_call>"):
             return "<tool_call>"
         return None
@@ -717,7 +720,11 @@ class StreamingPostProcessor:
     def _tool_marker_token_ids(self) -> set[int]:
         marker_ids: set[int] = set()
         if self.tool_parser:
-            for attr in ("tool_call_start_token_id", "tool_call_end_token_id"):
+            for attr in (
+                "tool_call_start_token_id",
+                "tool_call_end_token_id",
+                "bot_token_id",
+            ):
                 token_id = getattr(self.tool_parser, attr, None)
                 if isinstance(token_id, int):
                     marker_ids.add(token_id)
@@ -755,7 +762,10 @@ class StreamingPostProcessor:
         ):
             return
 
-        raw_delta_text = get_raw_delta_text() or delta_text
+        # Prefer vLLM's incrementally decoded text whenever it is available.
+        # Re-decoding token IDs is only a fallback for parser markers that
+        # vLLM intentionally omits from the visible delta.
+        raw_delta_text = delta_text or get_raw_delta_text()
         if not raw_delta_text:
             return
 
@@ -810,8 +820,19 @@ class StreamingPostProcessor:
         if extracted.tools_called:
             for i, tool_call in enumerate(extracted.tool_calls):
                 self._add_tool_call_from_extracted(i, tool_call)
+            content = extracted.content or None
+            if content:
+                marker_offsets = [
+                    text.find(marker)
+                    for marker in ("<tool_call>", "<function=", "[TOOL_CALLS]")
+                    if marker in text
+                ]
+                if marker_offsets:
+                    original_prefix = text[: min(marker_offsets)]
+                    if original_prefix.strip() == content.strip():
+                        content = original_prefix
             return self._compose_delta_message(
-                saved_reasoning, extracted.content or None
+                saved_reasoning, content
             )
 
         structured_calls, structured_reasoning = (
@@ -944,7 +965,7 @@ class StreamingPostProcessor:
 
         tool_call_start = self._tool_call_start_token()
         tool_call_end = self._tool_call_end_token()
-        if not tool_call_start or not tool_call_end:
+        if not tool_call_start:
             return None
 
         buffered_text = ""
@@ -954,14 +975,15 @@ class StreamingPostProcessor:
             self._post_reasoning_text_buffer,
             *(extra_candidates or ()),
         )
-        for candidate in candidates:
-            if (
-                candidate
-                and tool_call_start in candidate
-                and tool_call_end in candidate
-            ):
-                buffered_text = candidate
-                break
+        if tool_call_end:
+            for candidate in candidates:
+                if (
+                    candidate
+                    and tool_call_start in candidate
+                    and tool_call_end in candidate
+                ):
+                    buffered_text = candidate
+                    break
 
         if not buffered_text:
             if not output.finish_reason:
@@ -989,6 +1011,19 @@ class StreamingPostProcessor:
             existing = self.in_progress_tool_calls.get(tool_delta.index)
             merged = self._merge_tool_call(existing, tool_delta)
             self.in_progress_tool_calls[tool_delta.index] = merged
+
+    def _in_progress_tool_calls_are_complete(self) -> bool:
+        if not self.in_progress_tool_calls:
+            return False
+        for tool_call in self.in_progress_tool_calls.values():
+            arguments = tool_call.function.arguments if tool_call.function else None
+            if not arguments:
+                return False
+            try:
+                json.loads(arguments)
+            except (TypeError, json.JSONDecodeError):
+                return False
+        return True
 
     def _dump_in_progress_tool_calls(self) -> list[dict[str, Any]]:
         return [
@@ -1271,7 +1306,7 @@ class StreamingPostProcessor:
                 )
             )
             if tool_in_reasoning:
-                saved_reasoning = None
+                saved_reasoning = reasoning_text or None
                 if tool_call_start in reasoning_text:
                     saved_reasoning = (
                         reasoning_text.partition(tool_call_start)[0] or None
@@ -1441,6 +1476,19 @@ class StreamingPostProcessor:
             )
             if fallback_message is not None or self.in_progress_tool_calls:
                 delta_message = fallback_message
+
+        # A streaming parser may leave a truncated argument fragment when a
+        # terminal chunk contains malformed or repeated closing markers. At
+        # finish, repair it with vLLM's batch parser over the complete text.
+        if (
+            output.finish_reason
+            and self.in_progress_tool_calls
+            and not self._in_progress_tool_calls_are_complete()
+        ):
+            self.in_progress_tool_calls.clear()
+            batch_message = self._extract_tool_calls_from_text(current_text)
+            if self.in_progress_tool_calls:
+                delta_message = batch_message
 
         self._strip_tool_markup_from_reasoning(delta_message)
         delta_message, structured_tool_choice = self._maybe_emit_structured_tool_call(
