@@ -79,8 +79,17 @@ TOOL_CHOICE_SCHEMA_MARKER = "x-dynamo-tool-choice-schema"
 QWEN_XML_STRUCTURAL_TAG_TOOL_PARSERS = {"qwen3_coder", "qwen3_xml"}
 
 
-def _with_parser_visible_engine_text(output: Any, engine_text: str | None) -> Any:
-    if not engine_text or getattr(output, "text", None):
+def _with_parser_visible_engine_text(
+    output: Any,
+    engine_text: str | None,
+    *,
+    parser_needs_raw_delta: bool,
+) -> Any:
+    if (
+        not parser_needs_raw_delta
+        or not engine_text
+        or getattr(output, "text", None)
+    ):
         return output
     return SimpleNamespace(
         index=output.index,
@@ -1289,16 +1298,20 @@ class VllmProcessor:
                 postprocess_error = False
                 if not vllm_out.request_outputs:
                     post = post_processors.get(output_idx)
+                    parser_needs_raw_delta = bool(
+                        post is not None
+                        and post.needs_raw_parser_delta(raw_token_ids)
+                    )
                     if post is not None and (
-                        engine_text
-                        or raw_finish_reason
-                        or post.needs_raw_parser_delta(raw_token_ids)
+                        raw_finish_reason or parser_needs_raw_delta
                     ):
                         choice = post.process_output(
                             SimpleNamespace(
                                 index=output_idx,
                                 token_ids=raw_token_ids,
-                                text=engine_text,
+                                # vLLM deliberately buffers incomplete UTF-8. Only
+                                # bypass that buffer for parser-significant markers.
+                                text=engine_text if parser_needs_raw_delta else "",
                                 finish_reason=raw_finish_reason,
                                 logprobs=None,
                             ),
@@ -1308,7 +1321,6 @@ class VllmProcessor:
                             choices.append(choice)
                 else:
                     for output in vllm_out.request_outputs[0].outputs:
-                        output = _with_parser_visible_engine_text(output, engine_text)
                         post = post_processors.get(output.index)
                         if post is None:
                             yield {
@@ -1322,6 +1334,13 @@ class VllmProcessor:
                             }
                             postprocess_error = True
                             break
+                        output = _with_parser_visible_engine_text(
+                            output,
+                            engine_text,
+                            parser_needs_raw_delta=post.needs_raw_parser_delta(
+                                raw_token_ids
+                            ),
+                        )
                         choice = post.process_output(
                             output, raw_delta_token_ids=raw_token_ids
                         )
