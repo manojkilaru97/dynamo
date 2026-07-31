@@ -1,0 +1,34 @@
+FROM nvcr.io/qc69jvmznzxy/llm_nim/nano@sha256:9a72053788a5c22aa893af486fe3f77f82ffd43c1dd00c3a4a3462662231861c
+
+COPY --from=wheelhouse ai_dynamo_runtime-1.3.0-cp310-abi3-linux_x86_64.whl /tmp/dynamo-wheels/
+COPY --from=sourcewheel ai_dynamo-1.3.0-py3-none-any.whl /tmp/dynamo-wheels/
+
+RUN python3 -m pip uninstall -y ai-dynamo ai-dynamo-runtime \
+ && rm -rf \
+      /usr/local/lib/python3.12/dist-packages/dynamo \
+      /usr/local/lib/python3.12/dist-packages/ai_dynamo-*.dist-info \
+ && python3 -m pip install --no-deps /tmp/dynamo-wheels/*.whl \
+ && rm -rf /tmp/dynamo-wheels
+
+RUN python3 -m compileall -q /usr/local/lib/python3.12/dist-packages/dynamo \
+ && python3 - <<'PY'
+import hashlib
+import importlib.metadata as metadata
+from pathlib import Path
+
+assert metadata.version("ai-dynamo") == "1.3.0"
+assert metadata.version("ai-dynamo-runtime") == "1.3.0"
+handlers = Path("/usr/local/lib/python3.12/dist-packages/dynamo/vllm/handlers.py")
+assert hashlib.sha256(handlers.read_bytes()).hexdigest() == "938e2e517271afddaf1db9c67e629f17797b2ba3d16330c5ef307c47bc6f0d18"
+PY
+
+LABEL org.opencontainers.image.revision="c35b4dc0f4d8011686314342dd252238a4ea168e" \
+      com.nvidia.dynamo.source.revision="c35b4dc0f4d8011686314342dd252238a4ea168e" \
+      ai.nvidia.nano.dynamo.base-digest="sha256:9a72053788a5c22aa893af486fe3f77f82ffd43c1dd00c3a4a3462662231861c" \
+      ai.nvidia.nano.dynamo.dynamo-commit="c35b4dc0f4d8011686314342dd252238a4ea168e" \
+      ai.nvidia.nano.dynamo.rebase-commit="c87b7401110c201b110f211bb646a467ba550b5e" \
+      ai.nvidia.nano.dynamo.python-wheel-sha256="d04975f4971cc011abbd5e026d6888f329af998db09c2c34e2281333d4cf64b9" \
+      ai.nvidia.nano.dynamo.runtime-wheel-sha256="cf37595842b745ed964ac6525bf1a0d879c81bed52bbb0678b11066e3b0e0fe9" \
+      ai.nvidia.nano.dynamo.version="1.3.0" \
+      ai.nvidia.nano.dynamo.vllm-version="0.26.0+cu129" \
+      ai.nvidia.nano.dynamo.vllm-commit="909163fe0edd1dc01834633c7a2b5b2825a2a2c7"
