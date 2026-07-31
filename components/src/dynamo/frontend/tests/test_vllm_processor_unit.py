@@ -929,6 +929,58 @@ def test_tool_markup_is_removed_without_frontend_parser():
     assert delta == {"reasoning_content": "Need the file."}
 
 
+def test_orphaned_qwen_tool_closing_markup_is_removed():
+    post = StreamingPostProcessor(
+        tokenizer=_ToolMarkerTokenizer(),
+        request_for_sampling=SimpleNamespace(
+            tool_choice="auto",
+            tools=[{"type": "function"}],
+            structured_outputs=None,
+            response_format=None,
+        ),
+        sampling_params=SamplingParams(max_tokens=128),
+        prompt_token_ids=[],
+        tool_parser=None,
+        reasoning_parser_class=None,
+        chat_template_kwargs={"enable_thinking": True},
+    )
+    first_delta = {"reasoning_content": "Let me update the fix:\n</"}
+    leaked_tail = {
+        "reasoning_content": (
+            "parameter>\n<parameter=command>python3 -c 'print(42)'\n"
+            "</parameter>\n</function>\n</tool_call>"
+        )
+    }
+
+    post._strip_tool_markup_from_delta(first_delta)
+    post._strip_tool_markup_from_delta(leaked_tail)
+
+    assert first_delta == {"reasoning_content": "Let me update the fix:\n"}
+    assert leaked_tail == {}
+
+
+def test_non_tool_closing_markup_is_preserved():
+    post = StreamingPostProcessor(
+        tokenizer=_ToolMarkerTokenizer(),
+        request_for_sampling=SimpleNamespace(
+            tool_choice="auto",
+            tools=[{"type": "function"}],
+            structured_outputs=None,
+            response_format=None,
+        ),
+        sampling_params=SamplingParams(max_tokens=128),
+        prompt_token_ids=[],
+        tool_parser=None,
+        reasoning_parser_class=None,
+        chat_template_kwargs={"enable_thinking": True},
+    )
+    delta = {"reasoning_content": "The HTML closes with </div>."}
+
+    post._strip_tool_markup_from_delta(delta)
+
+    assert delta == {"reasoning_content": "The HTML closes with </div>."}
+
+
 def test_tool_markers_fall_back_to_parser_engine_ids():
     parser = SimpleNamespace(
         tool_call_start_token=None,

@@ -656,9 +656,27 @@ class StreamingPostProcessor:
             delta_message.reasoning = None
             return
         tool_call_start = self._tool_call_start_token()
-        if tool_call_start and tool_call_start in delta_message.reasoning:
+        marker_offsets = [
+            delta_message.reasoning.find(marker)
+            for marker in (
+                tool_call_start,
+                "<function=",
+                "<parameter=",
+            )
+            if marker and marker in delta_message.reasoning
+        ]
+        closing_offset = delta_message.reasoning.find("</")
+        if closing_offset >= 0:
+            closing_tail = delta_message.reasoning[closing_offset + 2 :]
+            if not closing_tail or any(
+                closing_tail.startswith(name) or name.startswith(closing_tail)
+                for name in ("parameter", "function", "tool_call")
+            ):
+                marker_offsets.append(closing_offset)
+        if marker_offsets:
+            marker_offset = min(marker_offsets)
             delta_message.reasoning = (
-                delta_message.reasoning.partition(tool_call_start)[0] or None
+                delta_message.reasoning[:marker_offset] or None
             )
             self._reasoning_tool_markup_started = True
 
