@@ -215,17 +215,27 @@ _MALFORMED_COMPOSITE_TERMINAL_SUFFIXES = (
     f"{_MALFORMED_COMPOSITE_TOOL_TAIL_TEXT}<|im_end|>",
     _MALFORMED_COMPOSITE_TOOL_TAIL_TEXT,
 )
+_MALFORMED_COMPOSITE_PROTOCOL_RESTART = "\n</parameter>\n<parameter="
 _MALFORMED_COMPOSITE_TERMINAL_PREFIXES = frozenset(
-    suffix[:length]
-    for suffix in _MALFORMED_COMPOSITE_TERMINAL_SUFFIXES
-    for length in range(1, len(suffix) + 1)
+    [
+        suffix[:length]
+        for suffix in _MALFORMED_COMPOSITE_TERMINAL_SUFFIXES
+        for length in range(1, len(suffix) + 1)
+    ]
+    + [
+        _MALFORMED_COMPOSITE_PROTOCOL_RESTART[:length]
+        for length in range(1, len(_MALFORMED_COMPOSITE_PROTOCOL_RESTART))
+    ]
 )
 
 
 def _malformed_composite_terminal_prefix_length(text: str) -> int:
     max_length = min(
         len(text),
-        max(map(len, _MALFORMED_COMPOSITE_TERMINAL_SUFFIXES)),
+        max(
+            max(map(len, _MALFORMED_COMPOSITE_TERMINAL_SUFFIXES)),
+            len(_MALFORMED_COMPOSITE_PROTOCOL_RESTART),
+        ),
     )
     return next(
         (
@@ -249,6 +259,7 @@ def _strip_malformed_composite_tool_tail(
             "held": "",
             "held_key": None,
             "tool_emitted": False,
+            "suppress_reasoning": False,
         },
     )
     delta = choice.get("delta")
@@ -281,6 +292,25 @@ def _strip_malformed_composite_tool_tail(
         None,
     )
     reasoning = delta.get(reasoning_key) if reasoning_key else None
+
+    if state["suppress_reasoning"]:
+        delta.pop("reasoning_content", None)
+        delta.pop("reasoning", None)
+        return
+
+    if reasoning_key:
+        candidate = state["held"] + reasoning
+        restart_start = candidate.find(_MALFORMED_COMPOSITE_PROTOCOL_RESTART)
+        if restart_start >= 0:
+            visible = candidate[:restart_start]
+            if visible:
+                delta[reasoning_key] = visible
+            else:
+                delta.pop(reasoning_key, None)
+            state["held"] = ""
+            state["held_key"] = None
+            state["suppress_reasoning"] = True
+            return
 
     if state["tool_emitted"]:
         flush_held()

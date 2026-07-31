@@ -213,6 +213,86 @@ def test_final_openai_boundary_strips_orphaned_protocol_suffixes(marker):
     assert choice["delta"]["reasoning_content"] == "Malformed tool attempt."
 
 
+def test_final_openai_boundary_strips_observed_incomplete_parameter_call():
+    visible = "Let me test this more carefully:"
+    malformed = (
+        "\n</parameter>\n<parameter=description>\n"
+        "Debug why _store_type_annotation_node does not work"
+    )
+    output = visible + malformed
+
+    for split_at in range(len(output) + 1):
+        states: dict[int, dict] = {}
+        choices = [
+            {
+                "index": 0,
+                "delta": {"reasoning_content": output[:split_at]},
+            },
+            {
+                "index": 0,
+                "delta": {"reasoning_content": output[split_at:]},
+            },
+            {"index": 0, "delta": {}, "finish_reason": "stop"},
+        ]
+
+        for choice in choices:
+            _strip_malformed_composite_tool_tail(choice, states)
+
+        assert _reasoning_from_choices(choices) == visible
+
+
+def test_composite_boundary_suppresses_only_reasoning_after_protocol_restart():
+    states: dict[int, dict] = {}
+    malformed = {
+        "index": 0,
+        "delta": {
+            "reasoning_content": (
+                "Reasoning.\n</parameter>\n<parameter=description>"
+            ),
+            "tool_calls": [{"index": 0, "function": {"name": "bash"}}],
+        },
+    }
+    continuation = {
+        "index": 0,
+        "delta": {
+            "reasoning_content": "hidden",
+            "content": "visible content",
+        },
+        "finish_reason": "tool_calls",
+    }
+
+    _strip_malformed_composite_tool_tail(malformed, states)
+    _strip_malformed_composite_tool_tail(continuation, states)
+
+    assert malformed["delta"] == {
+        "reasoning_content": "Reasoning.",
+        "tool_calls": [{"index": 0, "function": {"name": "bash"}}],
+    }
+    assert continuation["delta"] == {"content": "visible content"}
+
+
+def test_composite_boundary_preserves_protocol_restart_near_mismatch():
+    output = "Reasoning.\n</parameter>\n<parameterX> is literal."
+    split_at = output.index("X")
+    choices = [
+        {
+            "index": 0,
+            "delta": {"reasoning_content": output[:split_at]},
+        },
+        {
+            "index": 0,
+            "delta": {"reasoning_content": output[split_at:]},
+            "finish_reason": "stop",
+        },
+    ]
+    states: dict[int, dict] = {}
+
+    for choice in choices:
+        _strip_malformed_composite_tool_tail(choice, states)
+
+    assert _reasoning_from_choices(choices) == output
+
+
 _ORPHAN_COMPOSITE_TOOL_TAIL = "\n</parameter>\n</function>\n</tool_call>"
 
 
