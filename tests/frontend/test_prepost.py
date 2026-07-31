@@ -1557,7 +1557,7 @@ def test_qwen3_coder_non_streaming_uses_batch_tool_parse(
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["name"] == "get_weather"
     assert json.loads(tool_calls[0]["function"]["arguments"]) == {"location": "NYC"}
-    assert non_streaming_results[0]["finish_reason"] == "length"
+    assert non_streaming_results[0]["finish_reason"] == "tool_calls"
 
 
 @pytest.mark.vllm

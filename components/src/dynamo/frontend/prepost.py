@@ -873,9 +873,18 @@ class StreamingPostProcessor:
         if extracted.tools_called:
             for i, tool_call in enumerate(extracted.tool_calls):
                 self._add_tool_call_from_extracted(i, tool_call)
-            return self._compose_delta_message(
-                saved_reasoning, extracted.content or None
-            )
+            content = extracted.content or None
+            if content:
+                marker_offsets = [
+                    text.find(marker)
+                    for marker in (*self._tool_start_markers(), "<function=")
+                    if marker in text
+                ]
+                if marker_offsets:
+                    original_prefix = text[: min(marker_offsets)]
+                    if original_prefix.strip() == content.strip():
+                        content = original_prefix
+            return self._compose_delta_message(saved_reasoning, content)
 
         return self._compose_delta_message(saved_reasoning, extracted.content or None)
 
@@ -904,6 +913,19 @@ class StreamingPostProcessor:
             existing = self.in_progress_tool_calls.get(tool_delta.index)
             merged = self._merge_tool_call(existing, tool_delta)
             self.in_progress_tool_calls[tool_delta.index] = merged
+
+    def _in_progress_tool_calls_are_complete(self) -> bool:
+        if not self.in_progress_tool_calls:
+            return False
+        for tool_call in self.in_progress_tool_calls.values():
+            arguments = tool_call.function.arguments if tool_call.function else None
+            if not arguments:
+                return False
+            try:
+                json.loads(arguments)
+            except (TypeError, json.JSONDecodeError):
+                return False
+        return True
 
     def _dump_in_progress_tool_calls(self) -> list[dict[str, Any]]:
         return [
@@ -1135,6 +1157,18 @@ class StreamingPostProcessor:
                         current_token_ids=current_token_ids,
                         delta_token_ids=delta_token_ids,
                     )
+
+        # Repair an incomplete terminal streaming fragment with the parser's
+        # batch path over the complete visible output.
+        if (
+            output.finish_reason
+            and self.in_progress_tool_calls
+            and not self._in_progress_tool_calls_are_complete()
+        ):
+            self.in_progress_tool_calls.clear()
+            batch_message = self._extract_tool_calls_from_text(current_text)
+            if self.in_progress_tool_calls:
+                delta_message = batch_message
 
         choice = None
         if delta_message is None:
