@@ -652,6 +652,7 @@ class StreamingPostProcessor:
         # this correctly, so we accumulate text here and fall back to the
         # non-streaming extract_tool_calls() once the buffer is complete.
         self._tool_text_buffer: str | None = None
+        self._reasoning_tool_markup_started = False
 
     def _should_buffer_for_non_streaming_tool_parse(self) -> bool:
         return (
@@ -714,11 +715,45 @@ class StreamingPostProcessor:
                 markers.append(marker)
         return tuple(markers)
 
+    def _decode_token_ids_for_parser(self, token_ids: Sequence[int]) -> str:
+        if not token_ids:
+            return ""
+        try:
+            return self.tokenizer.decode(
+                list(token_ids),
+                skip_special_tokens=False,
+            )
+        except TypeError:
+            return self.tokenizer.decode(list(token_ids))
+        except Exception:
+            return ""
+
+    def _parser_engine_marker(self, attr: str) -> str | None:
+        parser_engine = getattr(self.tool_parser, "_parser_engine", None)
+        token_id = getattr(parser_engine, attr, None)
+        if not isinstance(token_id, int):
+            return None
+        return self._decode_token_ids_for_parser([token_id]) or None
+
+    def _single_token_marker(self, marker: str) -> str | None:
+        try:
+            token_ids = self.tokenizer.encode(marker, add_special_tokens=False)
+        except Exception:
+            return None
+        if (
+            len(token_ids) == 1
+            and self._decode_token_ids_for_parser(token_ids) == marker
+        ):
+            return marker
+        return None
+
     def _tool_start_markers(self) -> tuple[str, ...]:
         markers = [
             getattr(self.tool_parser, "tool_call_start_token", None),
             # MistralToolParser names its [TOOL_CALLS] marker bot_token.
             getattr(self.tool_parser, "bot_token", None),
+            self._parser_engine_marker("_tool_call_token_id"),
+            self._single_token_marker("<tool_call>"),
             *self._tool_parser_terminal_markers(("TOOL_START", "FUNC_PREFIX")),
         ]
         return tuple(
@@ -730,6 +765,8 @@ class StreamingPostProcessor:
     def _tool_end_markers(self) -> tuple[str, ...]:
         markers = [
             getattr(self.tool_parser, "tool_call_end_token", None),
+            self._parser_engine_marker("_tool_call_end_token_id"),
+            self._single_token_marker("</tool_call>"),
             *self._tool_parser_terminal_markers(("TOOL_END", "FUNC_END")),
         ]
         return tuple(
@@ -737,6 +774,47 @@ class StreamingPostProcessor:
                 marker for marker in markers if isinstance(marker, str) and marker
             )
         )
+
+    def _tool_markup_filter_enabled(self) -> bool:
+        return (
+            self.request_for_sampling.tool_choice != "none"
+            and (
+                self.tool_parser is not None
+                or bool(getattr(self.request_for_sampling, "tools", None))
+            )
+        )
+
+    def _strip_tool_markup_from_reasoning(
+        self, delta_message: DeltaMessage | None
+    ) -> None:
+        if (
+            delta_message is None
+            or not delta_message.reasoning
+            or not self._tool_markup_filter_enabled()
+        ):
+            return
+        if self._reasoning_tool_markup_started:
+            delta_message.reasoning = None
+            return
+        for marker in self._tool_start_markers():
+            if marker in delta_message.reasoning:
+                delta_message.reasoning = (
+                    delta_message.reasoning.partition(marker)[0] or None
+                )
+                self._reasoning_tool_markup_started = True
+                return
+
+    def _strip_tool_markup_from_delta(self, delta: dict[str, Any]) -> None:
+        for key in ("reasoning_content", "reasoning", "content"):
+            value = delta.get(key)
+            if not value:
+                continue
+            message = DeltaMessage(reasoning=value)
+            self._strip_tool_markup_from_reasoning(message)
+            if message.reasoning:
+                delta[key] = message.reasoning
+            else:
+                delta.pop(key, None)
 
     @staticmethod
     def _compose_delta_message(
@@ -838,6 +916,7 @@ class StreamingPostProcessor:
         return choice
 
     def _build_choice(self, output: Any, delta: dict[str, Any]) -> dict[str, Any]:
+        self._strip_tool_markup_from_delta(delta)
         if delta.get("tool_calls"):
             self._tool_call_choices_emitted.add(output.index)
         return {
