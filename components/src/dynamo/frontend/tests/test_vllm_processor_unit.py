@@ -7,12 +7,18 @@ Tests for the tool-stripping behaviour of _prepare_request when
 tool_choice='none' and the exclude_tools_when_tool_choice_none flag.
 """
 
+import asyncio
 import json
+from enum import IntEnum
 from types import SimpleNamespace
 
 import pytest
 from transformers import AutoTokenizer
-from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.entrypoints.openai.engine.protocol import (
+    DeltaFunctionCall,
+    DeltaMessage,
+    DeltaToolCall,
+)
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 
 try:
@@ -23,7 +29,13 @@ except ImportError:
     from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
 
 from dynamo.frontend.prepost import StreamingPostProcessor, _prepare_request
-from dynamo.frontend.vllm_processor import _with_parser_visible_engine_text
+from dynamo.frontend.vllm_processor import (
+    VllmProcessor,
+    _strip_malformed_composite_tool_tail,
+    _strip_raw_tool_protocol_from_choice,
+    _tools_enabled,
+    _with_parser_visible_engine_text,
+)
 
 # Needs vllm packages (gpu_1 container).  No need for parallel marker.
 pytestmark = [
@@ -52,6 +64,406 @@ TOOL_REQUEST = {
         }
     ],
 }
+
+
+def test_async_tokenizer_fallback_is_cached_and_preserves_kwargs(monkeypatch):
+    from dynamo.frontend import prepost
+
+    calls = []
+
+    class _Tokenizer:
+        def __call__(self, text, **kwargs):
+            calls.append((text, kwargs))
+            return SimpleNamespace(input_ids=[7, 8, 9])
+
+    tokenizer = _Tokenizer()
+    monkeypatch.setattr(prepost, "_AsyncMicrobatchTokenizer", None)
+    prepost._ASYNC_TOKENIZER_POOL.pop(id(tokenizer), None)
+
+    async def exercise():
+        first = prepost._get_async_tokenizer(tokenizer)
+        second = prepost._get_async_tokenizer(tokenizer)
+        encoded = await first("hello", add_special_tokens=False)
+        return first, second, encoded
+
+    first, second, encoded = asyncio.run(exercise())
+    prepost._ASYNC_TOKENIZER_POOL.pop(id(tokenizer), None)
+
+    assert first is second
+    assert encoded.input_ids == [7, 8, 9]
+    assert calls == [("hello", {"add_special_tokens": False})]
+
+
+def test_async_tokenizer_prefers_microbatch_implementation(monkeypatch):
+    from dynamo.frontend import prepost
+
+    class _Tokenizer:
+        pass
+
+    class _MicrobatchTokenizer:
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+    tokenizer = _Tokenizer()
+    monkeypatch.setattr(
+        prepost,
+        "_AsyncMicrobatchTokenizer",
+        _MicrobatchTokenizer,
+    )
+    prepost._ASYNC_TOKENIZER_POOL.pop(id(tokenizer), None)
+
+    wrapped = prepost._get_async_tokenizer(tokenizer)
+    prepost._ASYNC_TOKENIZER_POOL.pop(id(tokenizer), None)
+
+    assert isinstance(wrapped, _MicrobatchTokenizer)
+    assert wrapped.tokenizer is tokenizer
+
+
+def test_raw_tool_request_remains_detectable_after_sampling_normalization():
+    assert _tools_enabled(TOOL_REQUEST)
+    assert not _tools_enabled({**TOOL_REQUEST, "tool_choice": "none"})
+
+
+def test_final_openai_boundary_strips_protocol_and_continuations():
+    states: dict[int, dict] = {}
+    first = {
+        "index": 0,
+        "delta": {
+            "reasoning_content": (
+                "Need the file.<tool_call><function=Read>"
+            )
+        },
+    }
+    continuation = {
+        "index": 0,
+        "delta": {
+            "reasoning_content": "<parameter=path>package.json</parameter>"
+        },
+    }
+
+    _strip_raw_tool_protocol_from_choice(first, states)
+    _strip_raw_tool_protocol_from_choice(continuation, states)
+
+    assert first["delta"]["reasoning_content"] == "Need the file."
+    assert "reasoning_content" not in continuation["delta"]
+
+
+@pytest.mark.parametrize("split_at", range(1, len("<tool_call>")))
+def test_final_openai_boundary_strips_split_protocol(split_at):
+    states: dict[int, dict] = {}
+    marker = "<tool_call>"
+    first = {
+        "index": 0,
+        "delta": {"reasoning_content": "Need the file." + marker[:split_at]},
+    }
+    second = {
+        "index": 0,
+        "delta": {"reasoning_content": marker[split_at:] + "<function=Read>"},
+    }
+
+    _strip_raw_tool_protocol_from_choice(first, states)
+    _strip_raw_tool_protocol_from_choice(second, states)
+
+    assert first["delta"]["reasoning_content"] == "Need the file."
+    assert "reasoning_content" not in second["delta"]
+
+
+def test_final_openai_boundary_tracks_split_protocol_across_fields():
+    states: dict[int, dict] = {}
+    first = {
+        "index": 0,
+        "delta": {"reasoning_content": "Need the file.<tool_"},
+    }
+    second = {
+        "index": 0,
+        "delta": {"content": "call><function=Read>"},
+    }
+
+    _strip_raw_tool_protocol_from_choice(first, states)
+    _strip_raw_tool_protocol_from_choice(second, states)
+
+    assert first["delta"]["reasoning_content"] == "Need the file."
+    assert "content" not in second["delta"]
+
+
+def test_final_openai_boundary_flushes_partial_marker_at_finish():
+    choice = {
+        "index": 0,
+        "delta": {"reasoning_content": "This ends with <tool_"},
+        "finish_reason": "stop",
+    }
+
+    _strip_raw_tool_protocol_from_choice(choice, {})
+
+    assert choice["delta"]["reasoning_content"] == "This ends with <tool_"
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ("</parameter>", "</function>", "</tool_call>", "<|im_end|>"),
+)
+def test_final_openai_boundary_strips_orphaned_protocol_suffixes(marker):
+    choice = {
+        "index": 0,
+        "delta": {"reasoning_content": f"Malformed tool attempt.{marker}"},
+    }
+
+    _strip_raw_tool_protocol_from_choice(choice, {})
+
+    assert choice["delta"]["reasoning_content"] == "Malformed tool attempt."
+
+
+def test_composite_boundary_strips_exact_orphaned_tool_tail():
+    states: dict[int, dict] = {}
+    choices = [
+        {"index": 0, "delta": {"reasoning_content": "\n</parameter>"}},
+        {"index": 0, "delta": {"reasoning_content": "\n</function>"}},
+        {"index": 0, "delta": {"reasoning_content": "\n</tool_call>"}},
+        {"index": 0, "delta": {"reasoning_content": "<|im_end|>"}},
+    ]
+
+    for choice in choices:
+        _strip_malformed_composite_tool_tail(choice, states)
+
+    assert all(not choice["delta"] for choice in choices)
+
+
+def test_composite_boundary_flushes_marker_mentions_on_mismatch():
+    states: dict[int, dict] = {}
+    held = {"index": 0, "delta": {"reasoning_content": "\n</parameter>"}}
+    mismatch = {
+        "index": 0,
+        "delta": {"reasoning_content": " is a literal string."},
+    }
+
+    _strip_malformed_composite_tool_tail(held, states)
+    _strip_malformed_composite_tool_tail(mismatch, states)
+
+    assert not held["delta"]
+    assert mismatch["delta"]["reasoning_content"] == (
+        "\n</parameter> is a literal string."
+    )
+
+
+def test_composite_boundary_flushes_complete_tail_before_visible_text():
+    states: dict[int, dict] = {}
+    choices = [
+        {"index": 0, "delta": {"reasoning_content": "\n</parameter>"}},
+        {"index": 0, "delta": {"reasoning_content": "\n</function>"}},
+        {"index": 0, "delta": {"reasoning_content": "\n</tool_call>"}},
+        {"index": 0, "delta": {"reasoning_content": " is literal text."}},
+    ]
+
+    for choice in choices:
+        _strip_malformed_composite_tool_tail(choice, states)
+
+    assert choices[-1]["delta"]["reasoning_content"] == (
+        "\n</parameter>\n</function>\n</tool_call> is literal text."
+    )
+
+
+def test_composite_boundary_flushes_held_reasoning_before_content():
+    states: dict[int, dict] = {}
+    held = {"index": 0, "delta": {"reasoning_content": "\n</parameter>"}}
+    content = {"index": 0, "delta": {"content": "visible content"}}
+
+    _strip_malformed_composite_tool_tail(held, states)
+    _strip_malformed_composite_tool_tail(content, states)
+
+    assert content["delta"] == {
+        "reasoning_content": "\n</parameter>",
+        "content": "visible content",
+    }
+
+
+def test_composite_boundary_flushes_partial_tail_at_finish():
+    choice = {
+        "index": 0,
+        "delta": {"reasoning_content": "\n</parameter>"},
+        "finish_reason": "stop",
+    }
+
+    _strip_malformed_composite_tool_tail(choice, {})
+
+    assert choice["delta"]["reasoning_content"] == "\n</parameter>"
+
+
+def test_composite_boundary_strips_complete_tail_at_finish():
+    states: dict[int, dict] = {}
+    choices = [
+        {"index": 0, "delta": {"reasoning_content": "\n</parameter>"}},
+        {"index": 0, "delta": {"reasoning_content": "\n</function>"}},
+        {
+            "index": 0,
+            "delta": {"reasoning_content": "\n</tool_call>"},
+            "finish_reason": "stop",
+        },
+    ]
+
+    for choice in choices:
+        _strip_malformed_composite_tool_tail(choice, states)
+
+    assert all(not choice["delta"] for choice in choices)
+
+
+def test_composite_boundary_preserves_visible_content():
+    choice = {
+        "index": 0,
+        "delta": {"content": "The literal string <tool_call> is in the file."},
+    }
+
+    _strip_malformed_composite_tool_tail(choice, {})
+
+    assert choice["delta"]["content"] == (
+        "The literal string <tool_call> is in the file."
+    )
+
+
+def test_vllm_composite_parser_owns_reasoning_tool_transition():
+    class _CompositeParser:
+        def __init__(self):
+            self.calls = []
+
+        def parse_delta(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["delta_text"] == "reason":
+                return DeltaMessage(reasoning="Need the file.")
+            if kwargs["delta_text"] == "tool":
+                return DeltaMessage(
+                    tool_calls=[
+                        DeltaToolCall(
+                            index=0,
+                            id="call-1",
+                            type="function",
+                            function=DeltaFunctionCall(
+                                name="Read",
+                                arguments='{"path":"package.json"}',
+                            ),
+                        )
+                    ]
+                )
+            return None
+
+    parser = _CompositeParser()
+    post = StreamingPostProcessor(
+        tokenizer=_RawToolTokenizer(),
+        request_for_sampling=SimpleNamespace(
+            tool_choice="auto",
+            tools=TOOL_REQUEST["tools"],
+        ),
+        sampling_params=SamplingParams(max_tokens=128),
+        prompt_token_ids=[101, 102],
+        tool_parser=_FallbackToolParser(),
+        reasoning_parser_class=_FallbackReasoningParser,
+        chat_template_kwargs={"enable_thinking": True},
+        composite_parser=parser,
+    )
+    chunks = [
+        SimpleNamespace(
+            index=0,
+            token_ids=[1],
+            text="reason",
+            finish_reason=None,
+            logprobs=None,
+        ),
+        SimpleNamespace(
+            index=0,
+            token_ids=[14],
+            text="tool",
+            finish_reason=None,
+            logprobs=None,
+        ),
+        SimpleNamespace(
+            index=0,
+            token_ids=[11],
+            text="",
+            finish_reason="stop",
+            logprobs=None,
+        ),
+    ]
+
+    choices = [choice for chunk in chunks if (choice := post.process_output(chunk))]
+
+    assert post.uses_vllm_composite_parser
+    assert choices[0]["delta"]["reasoning_content"] == "Need the file."
+    assert "reasoning" not in choices[0]["delta"]
+    assert choices[1]["delta"]["tool_calls"][0]["function"]["name"] == "Read"
+    assert choices[-1]["finish_reason"] == "tool_calls"
+    assert [call["finished"] for call in parser.calls] == [False, False, True]
+    assert all(call["prompt_token_ids"] == [101, 102] for call in parser.calls)
+
+
+def test_composite_parser_adjusts_request_before_sampling():
+    class _CompositeParser:
+        reasoning_parser_cls = object
+
+        def __init__(self, tokenizer, tools, **kwargs):
+            self.tokenizer = tokenizer
+            self.tools = tools
+            self.kwargs = kwargs
+
+        def adjust_request(self, request):
+            request.skip_special_tokens = False
+            return request
+
+    processor = object.__new__(VllmProcessor)
+    processor.composite_parser_class = _CompositeParser
+    processor.tokenizer = object()
+    processor.model_config = object()
+    request = SimpleNamespace(
+        tool_choice="none",
+        tools=None,
+        structured_outputs=None,
+        model_extra=None,
+        response_format=None,
+        skip_special_tokens=True,
+    )
+
+    adjusted = processor._adjust_request_for_composite_parser(
+        request,
+        {"enable_thinking": True},
+    )
+
+    assert adjusted.skip_special_tokens is False
+
+
+def test_composite_parser_preserves_generated_structural_tag():
+    class _CompositeParser:
+        reasoning_parser_cls = object
+
+        def __init__(self, tokenizer, tools, **kwargs):
+            pass
+
+        def adjust_request(self, request):
+            request.structured_outputs = {"structural_tag": "generated"}
+            return request
+
+    processor = object.__new__(VllmProcessor)
+    processor.composite_parser_class = _CompositeParser
+    processor.tokenizer = object()
+    processor.model_config = object()
+    request = SimpleNamespace(
+        tool_choice="auto",
+        tools=TOOL_REQUEST["tools"],
+        structured_outputs=None,
+        model_extra=None,
+        response_format=None,
+    )
+    enabled = processor._composite_parser_enabled_for_request(request)
+
+    adjusted = processor._adjust_request_for_composite_parser(
+        request,
+        {},
+        enabled=enabled,
+    )
+    streaming_parser = processor._new_composite_parser(
+        adjusted,
+        {},
+        enabled=enabled,
+    )
+
+    assert adjusted.structured_outputs == {"structural_tag": "generated"}
+    assert streaming_parser is not None
 
 
 @pytest.fixture(scope="module")
@@ -676,6 +1088,10 @@ class _OpaqueToolParser(_EngineAdapterToolParser):
         self._parser_engine = SimpleNamespace()
 
 
+class _ZeroValuedFinishReason(IntEnum):
+    STOP = 0
+
+
 class _RawToolTokenizer:
     all_special_tokens = ("<|im_end|>",)
 
@@ -710,7 +1126,7 @@ class _RawToolTokenizer:
 
 
 class TestStreamingPostProcessorStructuredJson:
-    def test_pure_structured_json_emits_first_complete_value_once(self):
+    def test_pure_structured_json_emits_complete_value_at_finish(self):
         post = StreamingPostProcessor(
             tokenizer=SimpleNamespace(all_special_tokens=()),
             request_for_sampling=SimpleNamespace(
@@ -743,14 +1159,7 @@ class TestStreamingPostProcessorStructuredJson:
             SimpleNamespace(
                 index=0,
                 token_ids=[2],
-                text='} {"a":2}',
-                finish_reason=None,
-                logprobs=None,
-            ),
-            SimpleNamespace(
-                index=0,
-                token_ids=[3],
-                text=' {"a":3}',
+                text="}",
                 finish_reason=None,
                 logprobs=None,
             ),
@@ -765,9 +1174,47 @@ class TestStreamingPostProcessorStructuredJson:
 
         choices = [choice for chunk in chunks if (choice := post.process_output(chunk))]
 
-        assert len(choices) == 2
+        assert len(choices) == 1
         assert choices[0]["delta"]["content"] == '{"a":1}'
         assert choices[-1]["finish_reason"] == "stop"
+
+    def test_pure_structured_json_does_not_complete_number_prefix_early(self):
+        post = StreamingPostProcessor(
+            tokenizer=SimpleNamespace(all_special_tokens=()),
+            request_for_sampling=SimpleNamespace(
+                tool_choice="auto",
+                tools=[],
+                structured_outputs={"json": {"type": "number"}},
+                response_format=None,
+            ),
+            sampling_params=SamplingParams(max_tokens=128),
+            prompt_token_ids=[],
+            tool_parser=_FallbackToolParser(),
+            reasoning_parser_class=None,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        first = post.process_output(
+            SimpleNamespace(
+                index=0,
+                token_ids=[1],
+                text="1",
+                finish_reason=None,
+                logprobs=None,
+            )
+        )
+        final = post.process_output(
+            SimpleNamespace(
+                index=0,
+                token_ids=[2],
+                text="23",
+                finish_reason="stop",
+                logprobs=None,
+            )
+        )
+
+        assert first is None
+        assert final["delta"]["content"] == "123"
 
 
 class TestStreamingPostProcessorToolFallback:
@@ -795,6 +1242,31 @@ class TestStreamingPostProcessorToolFallback:
         post._strip_tool_markup_from_delta(delta)
 
         assert delta["reasoning_content"] == "Need the file."
+
+    def test_forced_final_guard_filters_after_tool_metadata_is_erased(self):
+        post = StreamingPostProcessor(
+            tokenizer=_RawToolTokenizer(),
+            request_for_sampling=SimpleNamespace(tool_choice="auto"),
+            sampling_params=SamplingParams(max_tokens=128),
+            prompt_token_ids=[],
+            tool_parser=None,
+            reasoning_parser_class=_FallbackReasoningParser,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        first = {
+            "reasoning_content": (
+                "Need the file.<tool_call><function=Read>"
+            )
+        }
+        continuation = {
+            "reasoning_content": "<parameter=path>package.json</parameter>"
+        }
+
+        post._strip_tool_markup_from_delta(first, force=True)
+        post._strip_tool_markup_from_delta(continuation, force=True)
+
+        assert first["reasoning_content"] == "Need the file."
+        assert "reasoning_content" not in continuation
 
     def test_qwen3_marker_fallback_without_parser_metadata(self):
         post = StreamingPostProcessor(
@@ -920,7 +1392,46 @@ class TestStreamingPostProcessorToolFallback:
         assert tool_choice["finish_reason"] == "tool_calls"
         assert tool_choice["delta"]["tool_calls"][0]["function"]["name"] == "Read"
 
-    def test_complete_buffered_tool_call_emits_before_finish_chunk(self):
+    def test_zero_valued_stop_still_recovers_terminal_tool_call(self):
+        post = StreamingPostProcessor(
+            tokenizer=_RawToolTokenizer(),
+            request_for_sampling=SimpleNamespace(tool_choice="auto"),
+            sampling_params=SamplingParams(max_tokens=128),
+            prompt_token_ids=[],
+            tool_parser=_EngineAdapterToolParser(),
+            reasoning_parser_class=_FallbackReasoningParser,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        chunks = [
+            SimpleNamespace(
+                index=0,
+                token_ids=[1],
+                text="Need the file.",
+                finish_reason=None,
+                logprobs=None,
+            ),
+            SimpleNamespace(
+                index=0,
+                token_ids=[14, 20, 21, 15],
+                text=(
+                    "<tool_call>\n<function=Read>\n"
+                    "<parameter=path>package.json</parameter>\n"
+                    "</function>\n</tool_call>"
+                ),
+                finish_reason=_ZeroValuedFinishReason.STOP,
+                logprobs=None,
+            ),
+        ]
+
+        choices = [choice for chunk in chunks if (choice := post.process_output(chunk))]
+        tool_choice = next(
+            choice for choice in choices if "tool_calls" in choice["delta"]
+        )
+
+        assert tool_choice["finish_reason"] == "tool_calls"
+        assert tool_choice["delta"]["tool_calls"][0]["function"]["name"] == "Read"
+
+    def test_complete_buffered_tool_call_emits_on_finish_chunk(self):
         post = StreamingPostProcessor(
             tokenizer=SimpleNamespace(all_special_tokens=()),
             request_for_sampling=SimpleNamespace(tool_choice="auto"),
@@ -975,7 +1486,7 @@ class TestStreamingPostProcessorToolFallback:
 
         choices = [choice for chunk in chunks if (choice := post.process_output(chunk))]
 
-        assert len(choices) == 3
+        assert len(choices) == 2
         assert choices[1]["delta"]["tool_calls"][0]["function"]["name"] == "Read"
         assert "ignored continuation" not in json.dumps(choices)
         assert choices[-1]["finish_reason"] == "tool_calls"

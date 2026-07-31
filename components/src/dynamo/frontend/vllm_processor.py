@@ -6,6 +6,7 @@
 #
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from typing import Any
 from msgspec.structs import replace as msgspec_replace
 from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.config import CacheConfig, LoadConfig, ModelConfig, VllmConfig
+from vllm.parser import Parser, ParserManager
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
 from vllm.sampling_params import (
     RequestOutputKind,
@@ -51,7 +53,11 @@ from dynamo.llm import (
 )
 from dynamo.runtime import Client, DistributedRuntime
 
-from .prepost import StreamingPostProcessor, preprocess_chat_request
+from .prepost import (
+    StreamingPostProcessor,
+    _has_user_structured_output_constraint,
+    preprocess_chat_request,
+)
 from .utils import (
     extract_mm_urls,
     handle_engine_error,
@@ -60,6 +66,10 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+_VLLM_COMPOSITE_PARSER_SUPPORTS_FINISHED = (
+    "finished" in inspect.signature(Parser.parse_delta).parameters
+)
 
 
 _FINISH_REASON_MAP: dict[str, FinishReason] = {
@@ -111,6 +121,201 @@ def _with_parser_visible_engine_text(output: Any, engine_text: str | None) -> An
         finish_reason=output.finish_reason,
         logprobs=output.logprobs,
     )
+
+
+_RAW_TOOL_PROTOCOL_MARKERS = (
+    "<tool_call>",
+    "</tool_call>",
+    "<function=",
+    "</function>",
+    "<parameter=",
+    "</parameter>",
+    "<|im_end|>",
+)
+
+
+def _strip_raw_tool_protocol_from_choice(
+    choice: dict[str, Any],
+    states: dict[int, dict[str, Any]],
+) -> None:
+    """Keep split Qwen tool protocol out of assistant-visible stream fields."""
+    choice_index = choice.get("index", 0)
+    state = states.setdefault(
+        choice_index,
+        {"suppressed": False, "held": "", "held_key": None},
+    )
+    delta = choice.get("delta")
+    if not isinstance(delta, dict):
+        return
+
+    for key in ("reasoning_content", "reasoning", "content"):
+        value = delta.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        if state["suppressed"]:
+            delta.pop(key, None)
+            continue
+
+        candidate = state["held"] + value
+        state["held"] = ""
+        state["held_key"] = None
+        marker_starts = [
+            start
+            for marker in _RAW_TOOL_PROTOCOL_MARKERS
+            if (start := candidate.find(marker)) >= 0
+        ]
+        if marker_starts:
+            marker_start = min(marker_starts)
+            prefix = candidate[:marker_start]
+            if prefix:
+                delta[key] = prefix
+            else:
+                delta.pop(key, None)
+            state["suppressed"] = True
+            continue
+
+        held_length = max(
+            (
+                length
+                for marker in _RAW_TOOL_PROTOCOL_MARKERS
+                for length in range(1, len(marker))
+                if candidate.endswith(marker[:length])
+            ),
+            default=0,
+        )
+        emit_end = len(candidate) - held_length
+        if emit_end:
+            delta[key] = candidate[:emit_end]
+        else:
+            delta.pop(key, None)
+        if held_length:
+            state["held"] = candidate[emit_end:]
+            state["held_key"] = key
+
+    if (
+        choice.get("finish_reason") is not None
+        and state["held"]
+        and not state["suppressed"]
+    ):
+        key = state["held_key"] or "reasoning_content"
+        delta[key] = (delta.get(key) or "") + state["held"]
+        state["held"] = ""
+        state["held_key"] = None
+
+
+_MALFORMED_COMPOSITE_TOOL_TAIL = (
+    "</parameter>",
+    "</function>",
+    "</tool_call>",
+)
+
+
+def _strip_malformed_composite_tool_tail(
+    choice: dict[str, Any],
+    states: dict[int, dict[str, Any]],
+) -> None:
+    """Suppress vLLM's protocol-only orphan closing-tag fallback."""
+    choice_index = choice.get("index", 0)
+    state = states.setdefault(
+        choice_index,
+        {
+            "stage": 0,
+            "held": [],
+            "held_key": None,
+            "confirmed": False,
+            "tool_emitted": False,
+        },
+    )
+    delta = choice.get("delta")
+    if not isinstance(delta, dict):
+        return
+
+    if delta.get("tool_calls"):
+        state["tool_emitted"] = True
+
+    reasoning_key = next(
+        (
+            key
+            for key in ("reasoning_content", "reasoning")
+            if isinstance(delta.get(key), str) and delta[key]
+        ),
+        None,
+    )
+    reasoning = delta.get(reasoning_key) if reasoning_key else None
+
+    if state["tool_emitted"]:
+        if state["held"]:
+            held = "".join(state["held"])
+            held_key = state["held_key"] or reasoning_key or "reasoning_content"
+            if held_key == reasoning_key:
+                delta[reasoning_key] = held + reasoning
+            else:
+                delta[held_key] = held + (delta.get(held_key) or "")
+            state["held"] = []
+            state["held_key"] = None
+            state["stage"] = 0
+        return
+
+    if state["confirmed"]:
+        if reasoning_key and reasoning.strip() == "<|im_end|>":
+            delta.pop(reasoning_key, None)
+        return
+
+    if reasoning_key and state["stage"] == len(_MALFORMED_COMPOSITE_TOOL_TAIL):
+        if reasoning.strip() == "<|im_end|>":
+            delta.pop(reasoning_key, None)
+            state["held"] = []
+            state["held_key"] = None
+            state["confirmed"] = True
+            return
+
+    if reasoning_key and state["stage"] < len(_MALFORMED_COMPOSITE_TOOL_TAIL):
+        expected = _MALFORMED_COMPOSITE_TOOL_TAIL[state["stage"]]
+        if reasoning.strip() == expected:
+            state["held"].append(reasoning)
+            state["held_key"] = state["held_key"] or reasoning_key
+            state["stage"] += 1
+            delta.pop(reasoning_key, None)
+            if state["stage"] == len(_MALFORMED_COMPOSITE_TOOL_TAIL):
+                if choice.get("finish_reason") is not None:
+                    state["held"] = []
+                    state["held_key"] = None
+                    state["confirmed"] = True
+            elif choice.get("finish_reason") is not None:
+                delta[reasoning_key] = "".join(state["held"])
+                state["held"] = []
+                state["held_key"] = None
+                state["stage"] = 0
+            return
+
+    visible_text = reasoning
+    visible_key = reasoning_key
+    if visible_key is None and isinstance(delta.get("content"), str):
+        visible_text = delta["content"]
+        visible_key = "content"
+
+    if state["held"] and visible_key:
+        held_key = state["held_key"] or "reasoning_content"
+        held = "".join(state["held"])
+        if held_key == visible_key:
+            delta[visible_key] = held + (visible_text or "")
+        else:
+            delta[held_key] = held + (delta.get(held_key) or "")
+        state["held"] = []
+        state["held_key"] = None
+        state["stage"] = 0
+
+    if choice.get("finish_reason") is not None and state["held"]:
+        if state["stage"] == len(_MALFORMED_COMPOSITE_TOOL_TAIL):
+            state["confirmed"] = True
+        else:
+            held_key = state["held_key"] or "reasoning_content"
+            delta[held_key] = "".join(state["held"]) + (
+                delta.get(held_key) or ""
+            )
+        state["held"] = []
+        state["held_key"] = None
+        state["stage"] = 0
 
 
 def _build_reasoning_parser_metadata(
@@ -676,6 +881,8 @@ class VllmProcessor:
         tool_parser_name: str | None = None,
         block_size: int = 16,
         enable_auto_tool_choice: bool = False,
+        composite_parser_class: type[Parser] | None = None,
+        model_config: ModelConfig | None = None,
     ):
         self.tokenizer = tokenizer
         self.input_processor = input_processor
@@ -685,6 +892,8 @@ class VllmProcessor:
         self.tool_parser_class = tool_parser_class
         self.tool_parser_name = tool_parser_name
         self.reasoning_parser_class = reasoning_parser_class
+        self.composite_parser_class = composite_parser_class
+        self.model_config = model_config
         self.exclude_tools_when_tool_choice_none = True
         self.block_size = block_size
         self.enable_auto_tool_choice = enable_auto_tool_choice
@@ -702,6 +911,62 @@ class VllmProcessor:
         transfer_mode = os.environ.get("DYNAMO_MM_TRANSFER", "shm").lower()
         self.use_shm_transfer = transfer_mode == "shm"
         logger.info("[mm-routing] Transfer mode: %s", transfer_mode)
+
+    def _composite_parser_enabled_for_request(
+        self,
+        request_for_sampling: Any,
+    ) -> bool:
+        tool_choice = getattr(request_for_sampling, "tool_choice", None)
+        return (
+            self.composite_parser_class is not None
+            and not _has_user_structured_output_constraint(request_for_sampling)
+            and tool_choice in (None, "none", "auto")
+        )
+
+    def _new_composite_parser(
+        self,
+        request_for_sampling: Any,
+        chat_template_kwargs: dict[str, Any],
+        *,
+        enabled: bool | None = None,
+    ) -> Parser | None:
+        if enabled is None:
+            enabled = self._composite_parser_enabled_for_request(
+                request_for_sampling
+            )
+        if not enabled:
+            return None
+        assert self.composite_parser_class is not None
+        return self.composite_parser_class(
+            self.tokenizer,
+            getattr(request_for_sampling, "tools", None),
+            chat_template_kwargs=chat_template_kwargs,
+            model_config=self.model_config,
+        )
+
+    def _adjust_request_for_composite_parser(
+        self,
+        request_for_sampling: Any,
+        chat_template_kwargs: dict[str, Any],
+        *,
+        enabled: bool | None = None,
+    ) -> Any:
+        parser = self._new_composite_parser(
+            request_for_sampling,
+            chat_template_kwargs,
+            enabled=enabled,
+        )
+        if parser is None:
+            return request_for_sampling
+
+        tool_choice = getattr(request_for_sampling, "tool_choice", "none")
+        if (
+            getattr(self.composite_parser_class, "reasoning_parser_cls", None)
+            is not None
+            or tool_choice != "none"
+        ):
+            return parser.adjust_request(request_for_sampling)
+        return request_for_sampling
 
     def _get_eos_token_ids(self) -> list[int]:
         """Return EOS token ids using tokenizer metadata.
@@ -893,6 +1158,18 @@ class VllmProcessor:
         engine_prompt = pre.engine_prompt
         tokens = pre.prompt_token_ids
 
+        composite_parser_enabled = self._composite_parser_enabled_for_request(
+            request_for_sampling
+        )
+        # Match vLLM's OnlineRenderer ordering: parser request adjustments
+        # (notably skip_special_tokens=False for reasoning models) must happen
+        # before request fields are copied into SamplingParams.
+        request_for_sampling = self._adjust_request_for_composite_parser(
+            request_for_sampling,
+            chat_template_kwargs,
+            enabled=composite_parser_enabled,
+        )
+
         if request_for_sampling.max_completion_tokens is not None:
             max_tokens = request_for_sampling.max_completion_tokens
         elif request_for_sampling.max_tokens is not None:
@@ -1049,11 +1326,17 @@ class VllmProcessor:
             dynamo_preproc["reasoning_ended"] = reasoning_ended
         if reasoning_parser_kwargs is not None:
             dynamo_preproc["reasoning_parser_kwargs"] = reasoning_parser_kwargs
-        if request_for_sampling.reasoning_budget is not None:
-            dynamo_preproc["reasoning_budget"] = request_for_sampling.reasoning_budget
-        if request_for_sampling.reasoning_budget_grace_period is not None:
+        reasoning_budget = getattr(request_for_sampling, "reasoning_budget", None)
+        if reasoning_budget is not None:
+            dynamo_preproc["reasoning_budget"] = reasoning_budget
+        reasoning_budget_grace_period = getattr(
+            request_for_sampling,
+            "reasoning_budget_grace_period",
+            None,
+        )
+        if reasoning_budget_grace_period is not None:
             dynamo_preproc["reasoning_budget_grace_period"] = (
-                request_for_sampling.reasoning_budget_grace_period
+                reasoning_budget_grace_period
             )
 
         # Extract MM routing metadata and prepare transfer.
@@ -1088,6 +1371,11 @@ class VllmProcessor:
                 ] = request_for_sampling.mm_processor_kwargs
 
             def new_post_processor() -> StreamingPostProcessor:
+                composite_parser = self._new_composite_parser(
+                    request_for_sampling,
+                    chat_template_kwargs,
+                    enabled=composite_parser_enabled,
+                )
                 return StreamingPostProcessor(
                     tokenizer=self.tokenizer,
                     request_for_sampling=request_for_sampling,
@@ -1096,6 +1384,7 @@ class VllmProcessor:
                     tool_parser=tool_parser,
                     reasoning_parser_class=self.reasoning_parser_class,
                     chat_template_kwargs=chat_template_kwargs,
+                    composite_parser=composite_parser,
                 )
 
             # StreamingPostProcessor keeps delta/tool/reasoning parser state, so
@@ -1230,6 +1519,8 @@ class VllmProcessor:
             rng_stream = _nvtx.start_range(
                 "mm_frontend:stream_response", color="purple"
             )
+            raw_tool_markup_choices: dict[int, dict[str, Any]] = {}
+            malformed_composite_tail_choices: dict[int, dict[str, Any]] = {}
             async for dynamo_response in dynamo_stream:
                 if self.is_kv_router:
                     engine_response = dynamo_response
@@ -1304,8 +1595,13 @@ class VllmProcessor:
                 choices = []
                 if not vllm_out.request_outputs:
                     post = post_processors.get(output_idx)
-                    if post is not None and (
-                        engine_text or post.needs_raw_parser_delta(raw_token_ids)
+                    if (
+                        post is not None
+                        and not post.uses_vllm_composite_parser
+                        and (
+                            engine_text
+                            or post.needs_raw_parser_delta(raw_token_ids)
+                        )
                     ):
                         choice = post.process_output(
                             SimpleNamespace(
@@ -1353,8 +1649,13 @@ class VllmProcessor:
                                 processed_token_ids[-32:],
                                 (output.text or "")[-240:],
                             )
-                        parser_output = _with_parser_visible_engine_text(
-                            output, engine_text
+                        parser_output = (
+                            output
+                            if post.uses_vllm_composite_parser
+                            else _with_parser_visible_engine_text(
+                                output,
+                                engine_text,
+                            )
                         )
                         choice = post.process_output(
                             parser_output,
@@ -1370,10 +1671,24 @@ class VllmProcessor:
                     )
                     for choice in choices:
                         post = post_processors.get(choice.get("index", 0))
-                        if post is not None:
-                            post._strip_tool_markup_from_delta(
-                                choice.get("delta") or {}
-                            )
+                        if (
+                            post is not None
+                            and post._tool_markup_filter_enabled()
+                        ):
+                            if post.uses_vllm_composite_parser:
+                                _strip_malformed_composite_tool_tail(
+                                    choice,
+                                    malformed_composite_tail_choices,
+                                )
+                            else:
+                                post._strip_tool_markup_from_delta(
+                                    choice.get("delta") or {},
+                                    force=True,
+                                )
+                                _strip_raw_tool_protocol_from_choice(
+                                    choice,
+                                    raw_tool_markup_choices,
+                                )
                     dynamo_out = {
                         "id": request_id,
                         "choices": choices,
@@ -1533,6 +1848,16 @@ class EngineFactory:
             )
         else:
             reasoning_parser_class = None
+        composite_parser_class = (
+            ParserManager.get_parser(
+                tool_parser_name=tool_parser_name,
+                reasoning_parser_name=reasoning_parser_name,
+                enable_auto_tools=enable_auto_tool_choice,
+                model_name=model_config.model,
+            )
+            if _VLLM_COMPOSITE_PARSER_SUPPORTS_FINISHED
+            else None
+        )
 
         namespace_name, component_name, endpoint_name = instance_id.triple()
         generate_endpoint = self.runtime.endpoint(
@@ -1562,6 +1887,8 @@ class EngineFactory:
             tool_parser_name=tool_parser_name,
             block_size=block_size,
             enable_auto_tool_choice=enable_auto_tool_choice,
+            composite_parser_class=composite_parser_class,
+            model_config=model_config,
         )
         gen.exclude_tools_when_tool_choice_none = (
             self.config.exclude_tools_when_tool_choice_none

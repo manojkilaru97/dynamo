@@ -22,7 +22,14 @@ from vllm.renderers import ChatParams
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
-from vllm.utils.async_utils import AsyncMicrobatchTokenizer
+from vllm.utils.async_utils import make_async
+
+try:
+    from vllm.utils.async_utils import (
+        AsyncMicrobatchTokenizer as _AsyncMicrobatchTokenizer,
+    )
+except ImportError:
+    _AsyncMicrobatchTokenizer = None
 
 logger = logging.getLogger(__name__)
 
@@ -45,15 +52,18 @@ class PreprocessResult:
     prompt_token_ids: list[int]
 
 
-_ASYNC_TOKENIZER_POOL: dict[int, AsyncMicrobatchTokenizer] = {}
+_ASYNC_TOKENIZER_POOL: dict[int, Any] = {}
 SKIP_REQUEST_VALIDATION = os.getenv("DYN_VLLM_SKIP_REQUEST_VALIDATION", "1") == "1"
 
 
-def _get_async_tokenizer(tokenizer: TokenizerLike) -> AsyncMicrobatchTokenizer:
+def _get_async_tokenizer(tokenizer: TokenizerLike) -> Any:
     key = id(tokenizer)
     async_tokenizer = _ASYNC_TOKENIZER_POOL.get(key)
     if async_tokenizer is None:
-        async_tokenizer = AsyncMicrobatchTokenizer(tokenizer)
+        if _AsyncMicrobatchTokenizer is not None:
+            async_tokenizer = _AsyncMicrobatchTokenizer(tokenizer)
+        else:
+            async_tokenizer = make_async(tokenizer)
         _ASYNC_TOKENIZER_POOL[key] = async_tokenizer
     return async_tokenizer
 
@@ -321,10 +331,12 @@ class StreamingPostProcessor:
         tool_parser: ToolParser | None,
         reasoning_parser_class: type[ReasoningParser] | None,
         chat_template_kwargs: dict[str, Any],
+        composite_parser: Any | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.request_for_sampling = request_for_sampling
         self.sampling_params = sampling_params
+        self.prompt_token_ids = list(prompt_token_ids)
         self.tool_parser = tool_parser
         # See https://github.com/ai-dynamo/dynamo/issues/8636 —
         # when the chat template runs with enable_thinking=False,
@@ -354,6 +366,17 @@ class StreamingPostProcessor:
         ):
             self._structured_tool_call_name = None
             self._structured_required_tool_choice = False
+        self._composite_parser = (
+            composite_parser
+            if (
+                composite_parser is not None
+                and not self._structured_json_guard
+                and self._structured_tool_call_name is None
+                and not self._structured_required_tool_choice
+            )
+            else None
+        )
+        self._composite_role_emitted = False
         self._fast_plain_text = (
             (
                 self.tool_parser is None
@@ -632,12 +655,15 @@ class StreamingPostProcessor:
         )
 
     def _strip_tool_markup_from_reasoning(
-        self, delta_message: DeltaMessage | None
+        self,
+        delta_message: DeltaMessage | None,
+        *,
+        force: bool = False,
     ) -> None:
         if (
             delta_message is None
             or not delta_message.reasoning
-            or not self._tool_markup_filter_enabled()
+            or (not force and not self._tool_markup_filter_enabled())
         ):
             return
         if self._reasoning_tool_markup_started:
@@ -659,13 +685,18 @@ class StreamingPostProcessor:
             )
         )
 
-    def _strip_tool_markup_from_delta(self, delta: dict[str, Any]) -> None:
+    def _strip_tool_markup_from_delta(
+        self,
+        delta: dict[str, Any],
+        *,
+        force: bool = False,
+    ) -> None:
         for key in ("reasoning_content", "reasoning", "content"):
             value = delta.get(key)
             if not value:
                 continue
             message = DeltaMessage(reasoning=value)
-            self._strip_tool_markup_from_reasoning(message)
+            self._strip_tool_markup_from_reasoning(message, force=force)
             if message.reasoning:
                 delta[key] = message.reasoning
             else:
@@ -978,7 +1009,7 @@ class StreamingPostProcessor:
         )
 
         if not buffered_text:
-            if not output.finish_reason:
+            if output.finish_reason is None:
                 return None
             for candidate in candidates:
                 if not candidate:
@@ -1019,10 +1050,11 @@ class StreamingPostProcessor:
         # choice. Per-choice tracking is required for `n > 1` requests —
         # choice 0 emitting tool_calls must not remap choice 1's stop.
         # Spec: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+        finish_reason_name = getattr(finish_reason, "name", "").lower()
         if (
             finish_reason in {"stop", "length"}
-            and output_index in self._tool_call_choices_emitted
-        ):
+            or finish_reason_name in {"stop", "length"}
+        ) and output_index in self._tool_call_choices_emitted:
             return "tool_calls"
         return finish_reason
 
@@ -1063,7 +1095,7 @@ class StreamingPostProcessor:
             return delta_message, None
 
         content = delta_message.content or ""
-        finished = bool(output.finish_reason)
+        finished = output.finish_reason is not None
         if not content and not finished:
             return delta_message, None
 
@@ -1110,7 +1142,8 @@ class StreamingPostProcessor:
         )
 
     def _build_choice(self, output: Any, delta: dict[str, Any]) -> dict[str, Any]:
-        self._strip_tool_markup_from_delta(delta)
+        if self._composite_parser is None:
+            self._strip_tool_markup_from_delta(delta)
         if delta.get("tool_calls"):
             self._tool_call_choices_emitted.add(output.index)
         finish_reason = output.finish_reason
@@ -1125,12 +1158,49 @@ class StreamingPostProcessor:
             "logprobs": output.logprobs,
         }
 
+    @property
+    def uses_vllm_composite_parser(self) -> bool:
+        return self._composite_parser is not None
+
+    def _process_vllm_composite_output(self, output: Any) -> dict[str, Any] | None:
+        delta_message = self._composite_parser.parse_delta(
+            delta_text=output.text or "",
+            delta_token_ids=list(output.token_ids or []),
+            request=self.request_for_sampling,
+            prompt_token_ids=self.prompt_token_ids,
+            finished=output.finish_reason is not None,
+        )
+        if delta_message is None:
+            if output.finish_reason is None:
+                return None
+            return self._build_choice(output, {})
+
+        delta: dict[str, Any] = {}
+        if delta_message.role is not None:
+            delta["role"] = delta_message.role
+        if delta_message.content is not None:
+            delta["content"] = delta_message.content
+        if delta_message.reasoning is not None:
+            delta["reasoning_content"] = delta_message.reasoning
+        if delta_message.tool_calls:
+            delta["tool_calls"] = [
+                tool_call.model_dump(exclude_none=True)
+                for tool_call in delta_message.tool_calls
+            ]
+        if not self._composite_role_emitted:
+            delta.setdefault("role", "assistant")
+            self._composite_role_emitted = True
+        return self._build_choice(output, delta)
+
     def process_output(
         self,
         output: Any,
         *,
         raw_delta_token_ids: Sequence[int] | None = None,
     ) -> dict[str, Any] | None:
+        if self._composite_parser is not None:
+            return self._process_vllm_composite_output(output)
+
         delta_token_ids = list(output.token_ids or [])
         raw_delta_token_ids = list(raw_delta_token_ids or delta_token_ids)
         # vLLM output_processor already applies stop-token/stop-string trimming
@@ -1153,14 +1223,14 @@ class StreamingPostProcessor:
             content = delta_text
             if self._structured_json_guard:
                 content = self._structured_json_delta(
-                    delta_text, finished=bool(output.finish_reason)
+                    delta_text, finished=output.finish_reason is not None
                 )
             if content:
                 delta = {
                     "role": "assistant",
                     "content": content,
                 }
-            elif output.finish_reason:
+            elif output.finish_reason is not None:
                 delta = {}
             else:
                 return None
@@ -1178,7 +1248,7 @@ class StreamingPostProcessor:
         if output.index in self._tool_call_choices_emitted:
             self.previous_text = current_text
             self.previous_token_ids = current_token_ids
-            if output.finish_reason:
+            if output.finish_reason is not None:
                 return self._build_choice(output, {})
             return None
 
@@ -1197,7 +1267,7 @@ class StreamingPostProcessor:
                 tool_call_end
                 and tool_call_end in self._tool_text_buffer
                 and not self._buffer_tool_calls_until_finish()
-            ) or output.finish_reason
+            ) or output.finish_reason is not None
             if buffer_complete:
                 buffered_text = self._tool_text_buffer
                 self._tool_text_buffer = None
@@ -1251,7 +1321,7 @@ class StreamingPostProcessor:
                 self.previous_token_ids = []
                 current_text = ""
                 current_token_ids = []
-                if output.finish_reason:
+                if output.finish_reason is not None:
                     buffered_text = (
                         raw_tool_text
                         or reasoning_text[reasoning_text.index(tool_call_start) :]
@@ -1310,7 +1380,7 @@ class StreamingPostProcessor:
                     # extraction (streaming parser can't handle the combined
                     # reasoning-end + tool-start in a single chunk).
                     self._tool_text_buffer = tool_post_content
-                    if output.finish_reason:
+                    if output.finish_reason is not None:
                         # If finish_reason is already set, this is the final
                         # chunk; parse buffered text now instead of waiting for
                         # a later call that will never happen.
@@ -1377,7 +1447,7 @@ class StreamingPostProcessor:
                     self._tool_text_buffer = delta_text[
                         delta_text.index(tool_call_start) :
                     ]
-                    if output.finish_reason:
+                    if output.finish_reason is not None:
                         buffered_text = self._tool_text_buffer
                         self._tool_text_buffer = None
                         delta_message = self._extract_tool_calls_from_text(
@@ -1439,11 +1509,11 @@ class StreamingPostProcessor:
         if delta_message is None:
             if self.in_progress_tool_calls:
                 choice = self._emit_tool_calls_choice(output)
-            elif output.finish_reason:
+            elif output.finish_reason is not None:
                 choice = self._build_choice(output, {})
         elif delta_message.tool_calls:
             self._merge_streaming_tool_calls(delta_message.tool_calls)
-            if output.finish_reason and self.in_progress_tool_calls:
+            if output.finish_reason is not None and self.in_progress_tool_calls:
                 # Tool calls and finish_reason arrived in the same chunk.
                 # Emit now — there will be no subsequent process_output call
                 # to drain the buffer.
@@ -1464,7 +1534,7 @@ class StreamingPostProcessor:
                 choice = self._build_choice(output, delta)
         elif self.in_progress_tool_calls:
             choice = self._emit_tool_calls_choice(output)
-        elif output.finish_reason:
+        elif output.finish_reason is not None:
             choice = self._build_choice(output, {})
 
         self.previous_text = current_text
