@@ -973,7 +973,7 @@ class VllmProcessor:
             nvext_max_thinking_tokens = _default_constrained_max_thinking_tokens(
                 request_for_sampling=request_for_sampling,
                 sampling_params=sampling_params,
-                chat_template_kwargs=effective_chat_template_kwargs,
+                chat_template_kwargs=chat_template_kwargs,
             )
         logprobs = request_for_sampling.logprobs
         top_logprobs = request_for_sampling.top_logprobs
