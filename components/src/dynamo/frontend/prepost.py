@@ -796,13 +796,29 @@ class StreamingPostProcessor:
         if self._reasoning_tool_markup_started:
             delta_message.reasoning = None
             return
-        for marker in self._tool_start_markers():
-            if marker in delta_message.reasoning:
-                delta_message.reasoning = (
-                    delta_message.reasoning.partition(marker)[0] or None
-                )
-                self._reasoning_tool_markup_started = True
-                return
+        marker_offsets = [
+            delta_message.reasoning.find(marker)
+            for marker in (
+                *self._tool_start_markers(),
+                "<function=",
+                "<parameter=",
+            )
+            if marker and marker in delta_message.reasoning
+        ]
+        closing_offset = delta_message.reasoning.find("</")
+        if closing_offset >= 0:
+            closing_tail = delta_message.reasoning[closing_offset + 2 :]
+            if not closing_tail or any(
+                closing_tail.startswith(name) or name.startswith(closing_tail)
+                for name in ("parameter", "function", "tool_call")
+            ):
+                marker_offsets.append(closing_offset)
+        if marker_offsets:
+            marker_offset = min(marker_offsets)
+            delta_message.reasoning = (
+                delta_message.reasoning[:marker_offset] or None
+            )
+            self._reasoning_tool_markup_started = True
 
     def _strip_tool_markup_from_delta(self, delta: dict[str, Any]) -> None:
         for key in ("reasoning_content", "reasoning", "content"):
