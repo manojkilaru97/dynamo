@@ -208,6 +208,33 @@ _MALFORMED_COMPOSITE_TOOL_TAIL = (
     "</function>",
     "</tool_call>",
 )
+_MALFORMED_COMPOSITE_TOOL_TAIL_TEXT = "".join(
+    f"\n{marker}" for marker in _MALFORMED_COMPOSITE_TOOL_TAIL
+)
+_MALFORMED_COMPOSITE_TERMINAL_SUFFIXES = (
+    f"{_MALFORMED_COMPOSITE_TOOL_TAIL_TEXT}<|im_end|>",
+    _MALFORMED_COMPOSITE_TOOL_TAIL_TEXT,
+)
+_MALFORMED_COMPOSITE_TERMINAL_PREFIXES = frozenset(
+    suffix[:length]
+    for suffix in _MALFORMED_COMPOSITE_TERMINAL_SUFFIXES
+    for length in range(1, len(suffix) + 1)
+)
+
+
+def _malformed_composite_terminal_prefix_length(text: str) -> int:
+    max_length = min(
+        len(text),
+        max(map(len, _MALFORMED_COMPOSITE_TERMINAL_SUFFIXES)),
+    )
+    return next(
+        (
+            length
+            for length in range(max_length, 0, -1)
+            if text[-length:] in _MALFORMED_COMPOSITE_TERMINAL_PREFIXES
+        ),
+        0,
+    )
 
 
 def _strip_malformed_composite_tool_tail(
@@ -219,10 +246,8 @@ def _strip_malformed_composite_tool_tail(
     state = states.setdefault(
         choice_index,
         {
-            "stage": 0,
-            "held": [],
+            "held": "",
             "held_key": None,
-            "confirmed": False,
             "tool_emitted": False,
         },
     )
@@ -232,6 +257,20 @@ def _strip_malformed_composite_tool_tail(
 
     if delta.get("tool_calls"):
         state["tool_emitted"] = True
+
+    def flush_held(*, append: bool = False) -> None:
+        if not state["held"]:
+            return
+        held_key = state["held_key"] or "reasoning_content"
+        visible = delta.get(held_key)
+        if not isinstance(visible, str):
+            visible = ""
+        if append:
+            delta[held_key] = visible + state["held"]
+        else:
+            delta[held_key] = state["held"] + visible
+        state["held"] = ""
+        state["held_key"] = None
 
     reasoning_key = next(
         (
@@ -244,78 +283,32 @@ def _strip_malformed_composite_tool_tail(
     reasoning = delta.get(reasoning_key) if reasoning_key else None
 
     if state["tool_emitted"]:
-        if state["held"]:
-            held = "".join(state["held"])
-            held_key = state["held_key"] or reasoning_key or "reasoning_content"
-            if held_key == reasoning_key:
-                delta[reasoning_key] = held + reasoning
-            else:
-                delta[held_key] = held + (delta.get(held_key) or "")
-            state["held"] = []
-            state["held_key"] = None
-            state["stage"] = 0
+        flush_held()
         return
 
-    if state["confirmed"]:
-        if reasoning_key and reasoning.strip() == "<|im_end|>":
-            delta.pop(reasoning_key, None)
-        return
+    if state["held"] and reasoning_key and reasoning_key != state["held_key"]:
+        flush_held()
 
-    if reasoning_key and state["stage"] == len(_MALFORMED_COMPOSITE_TOOL_TAIL):
-        if reasoning.strip() == "<|im_end|>":
-            delta.pop(reasoning_key, None)
-            state["held"] = []
-            state["held_key"] = None
-            state["confirmed"] = True
-            return
-
-    if reasoning_key and state["stage"] < len(_MALFORMED_COMPOSITE_TOOL_TAIL):
-        expected = _MALFORMED_COMPOSITE_TOOL_TAIL[state["stage"]]
-        if reasoning.strip() == expected:
-            state["held"].append(reasoning)
-            state["held_key"] = state["held_key"] or reasoning_key
-            state["stage"] += 1
-            delta.pop(reasoning_key, None)
-            if state["stage"] == len(_MALFORMED_COMPOSITE_TOOL_TAIL):
-                if choice.get("finish_reason") is not None:
-                    state["held"] = []
-                    state["held_key"] = None
-                    state["confirmed"] = True
-            elif choice.get("finish_reason") is not None:
-                delta[reasoning_key] = "".join(state["held"])
-                state["held"] = []
-                state["held_key"] = None
-                state["stage"] = 0
-            return
-
-    visible_text = reasoning
-    visible_key = reasoning_key
-    if visible_key is None and isinstance(delta.get("content"), str):
-        visible_text = delta["content"]
-        visible_key = "content"
-
-    if state["held"] and visible_key:
-        held_key = state["held_key"] or "reasoning_content"
-        held = "".join(state["held"])
-        if held_key == visible_key:
-            delta[visible_key] = held + (visible_text or "")
+    if reasoning_key:
+        candidate = state["held"] + reasoning
+        held_length = _malformed_composite_terminal_prefix_length(candidate)
+        visible_end = len(candidate) - held_length
+        if visible_end:
+            delta[reasoning_key] = candidate[:visible_end]
         else:
-            delta[held_key] = held + (delta.get(held_key) or "")
-        state["held"] = []
-        state["held_key"] = None
-        state["stage"] = 0
+            delta.pop(reasoning_key, None)
+        state["held"] = candidate[visible_end:]
+        state["held_key"] = reasoning_key if held_length else None
+
+    if isinstance(delta.get("content"), str) and delta["content"]:
+        flush_held(append=reasoning_key == state["held_key"])
 
     if choice.get("finish_reason") is not None and state["held"]:
-        if state["stage"] == len(_MALFORMED_COMPOSITE_TOOL_TAIL):
-            state["confirmed"] = True
+        if state["held"] in _MALFORMED_COMPOSITE_TERMINAL_SUFFIXES:
+            state["held"] = ""
+            state["held_key"] = None
         else:
-            held_key = state["held_key"] or "reasoning_content"
-            delta[held_key] = "".join(state["held"]) + (
-                delta.get(held_key) or ""
-            )
-        state["held"] = []
-        state["held_key"] = None
-        state["stage"] = 0
+            flush_held(append=True)
 
 
 def _build_reasoning_parser_metadata(

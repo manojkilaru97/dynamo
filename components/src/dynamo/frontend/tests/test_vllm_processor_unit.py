@@ -213,65 +213,120 @@ def test_final_openai_boundary_strips_orphaned_protocol_suffixes(marker):
     assert choice["delta"]["reasoning_content"] == "Malformed tool attempt."
 
 
-def test_composite_boundary_strips_exact_orphaned_tool_tail():
-    states: dict[int, dict] = {}
+_ORPHAN_COMPOSITE_TOOL_TAIL = "\n</parameter>\n</function>\n</tool_call>"
+
+
+def _reasoning_from_choices(choices):
+    return "".join(choice["delta"].get("reasoning_content", "") for choice in choices)
+
+
+@pytest.mark.parametrize("terminal", ("", "<|im_end|>"))
+def test_composite_boundary_strips_every_binary_partition_at_empty_finish(
+    terminal,
+):
+    visible = "Let me test with the axis directly:"
+    output = f"{visible}{_ORPHAN_COMPOSITE_TOOL_TAIL}{terminal}"
+
+    for split_at in range(len(output) + 1):
+        states: dict[int, dict] = {}
+        choices = [
+            {
+                "index": 0,
+                "delta": {"reasoning_content": output[:split_at]},
+            },
+            {
+                "index": 0,
+                "delta": {"reasoning_content": output[split_at:]},
+            },
+            {"index": 0, "delta": {}, "finish_reason": "stop"},
+        ]
+
+        for choice in choices:
+            _strip_malformed_composite_tool_tail(choice, states)
+
+        assert _reasoning_from_choices(choices) == visible
+
+
+@pytest.mark.parametrize("terminal", ("", "<|im_end|>"))
+def test_composite_boundary_strips_character_partition_at_empty_finish(
+    terminal,
+):
+    visible = "Reasoning."
+    output = f"{visible}{_ORPHAN_COMPOSITE_TOOL_TAIL}{terminal}"
     choices = [
-        {"index": 0, "delta": {"reasoning_content": "\n</parameter>"}},
-        {"index": 0, "delta": {"reasoning_content": "\n</function>"}},
-        {"index": 0, "delta": {"reasoning_content": "\n</tool_call>"}},
-        {"index": 0, "delta": {"reasoning_content": "<|im_end|>"}},
+        {"index": 0, "delta": {"reasoning_content": character}} for character in output
     ]
+    choices.append({"index": 0, "delta": {}, "finish_reason": "stop"})
+    states: dict[int, dict] = {}
 
     for choice in choices:
         _strip_malformed_composite_tool_tail(choice, states)
 
-    assert all(not choice["delta"] for choice in choices)
+    assert _reasoning_from_choices(choices) == visible
 
 
-def test_composite_boundary_flushes_marker_mentions_on_mismatch():
-    states: dict[int, dict] = {}
-    held = {"index": 0, "delta": {"reasoning_content": "\n</parameter>"}}
-    mismatch = {
-        "index": 0,
-        "delta": {"reasoning_content": " is a literal string."},
-    }
-
-    _strip_malformed_composite_tool_tail(held, states)
-    _strip_malformed_composite_tool_tail(mismatch, states)
-
-    assert not held["delta"]
-    assert mismatch["delta"]["reasoning_content"] == (
-        "\n</parameter> is a literal string."
-    )
-
-
-def test_composite_boundary_flushes_complete_tail_before_visible_text():
-    states: dict[int, dict] = {}
+def test_composite_boundary_flushes_longest_partial_prefix_on_mismatch():
+    output = "Reasoning.\n</parameterX> is a literal string."
     choices = [
-        {"index": 0, "delta": {"reasoning_content": "\n</parameter>"}},
-        {"index": 0, "delta": {"reasoning_content": "\n</function>"}},
-        {"index": 0, "delta": {"reasoning_content": "\n</tool_call>"}},
-        {"index": 0, "delta": {"reasoning_content": " is literal text."}},
+        {
+            "index": 0,
+            "delta": {"reasoning_content": "Reasoning.\n</param"},
+        },
+        {
+            "index": 0,
+            "delta": {"reasoning_content": "eterX> is a literal string."},
+            "finish_reason": "stop",
+        },
     ]
+    states: dict[int, dict] = {}
 
     for choice in choices:
         _strip_malformed_composite_tool_tail(choice, states)
 
-    assert choices[-1]["delta"]["reasoning_content"] == (
-        "\n</parameter>\n</function>\n</tool_call> is literal text."
-    )
+    assert _reasoning_from_choices(choices) == output
+
+
+@pytest.mark.parametrize("terminal", ("", "<|im_end|>"))
+def test_composite_boundary_flushes_complete_tail_before_visible_text(
+    terminal,
+):
+    output = f"Reasoning.{_ORPHAN_COMPOSITE_TOOL_TAIL}{terminal} is literal text."
+    choices = [
+        {
+            "index": 0,
+            "delta": {
+                "reasoning_content": (
+                    f"Reasoning.{_ORPHAN_COMPOSITE_TOOL_TAIL}{terminal}"
+                )
+            },
+        },
+        {
+            "index": 0,
+            "delta": {"reasoning_content": " is literal text."},
+            "finish_reason": "stop",
+        },
+    ]
+    states: dict[int, dict] = {}
+
+    for choice in choices:
+        _strip_malformed_composite_tool_tail(choice, states)
+
+    assert _reasoning_from_choices(choices) == output
 
 
 def test_composite_boundary_flushes_held_reasoning_before_content():
     states: dict[int, dict] = {}
-    held = {"index": 0, "delta": {"reasoning_content": "\n</parameter>"}}
+    held = {
+        "index": 0,
+        "delta": {"reasoning_content": _ORPHAN_COMPOSITE_TOOL_TAIL},
+    }
     content = {"index": 0, "delta": {"content": "visible content"}}
 
     _strip_malformed_composite_tool_tail(held, states)
     _strip_malformed_composite_tool_tail(content, states)
 
     assert content["delta"] == {
-        "reasoning_content": "\n</parameter>",
+        "reasoning_content": _ORPHAN_COMPOSITE_TOOL_TAIL,
         "content": "visible content",
     }
 
@@ -286,6 +341,18 @@ def test_composite_boundary_flushes_partial_tail_at_finish():
     _strip_malformed_composite_tool_tail(choice, {})
 
     assert choice["delta"]["reasoning_content"] == "\n</parameter>"
+
+
+def test_composite_boundary_flushes_partial_tail_at_empty_finish():
+    states: dict[int, dict] = {}
+    held = {"index": 0, "delta": {"reasoning_content": "\n</param"}}
+    finish = {"index": 0, "delta": {}, "finish_reason": "stop"}
+
+    _strip_malformed_composite_tool_tail(held, states)
+    _strip_malformed_composite_tool_tail(finish, states)
+
+    assert not held["delta"]
+    assert finish["delta"]["reasoning_content"] == "\n</param"
 
 
 def test_composite_boundary_strips_complete_tail_at_finish():
@@ -304,6 +371,61 @@ def test_composite_boundary_strips_complete_tail_at_finish():
         _strip_malformed_composite_tool_tail(choice, states)
 
     assert all(not choice["delta"] for choice in choices)
+
+
+@pytest.mark.parametrize("terminal", ("", "<|im_end|>"))
+def test_composite_boundary_strips_coalesced_tail_on_same_terminal_chunk(
+    terminal,
+):
+    reasoning = "Let me test with the axis directly:"
+    choice = {
+        "index": 0,
+        "delta": {
+            "reasoning_content": (
+                f"{reasoning}\n</parameter>\n</function>\n</tool_call>{terminal}"
+            )
+        },
+        "finish_reason": "stop",
+    }
+
+    _strip_malformed_composite_tool_tail(choice, {})
+
+    assert choice["delta"]["reasoning_content"] == reasoning
+
+
+def test_composite_boundary_buffers_nonterminal_tail_until_continuation():
+    reasoning = f"Literal example:{_ORPHAN_COMPOSITE_TOOL_TAIL}<|im_end|>"
+    held = {
+        "index": 0,
+        "delta": {"reasoning_content": reasoning},
+    }
+    continuation = {
+        "index": 0,
+        "delta": {"reasoning_content": " is visible."},
+        "finish_reason": "stop",
+    }
+    states: dict[int, dict] = {}
+
+    _strip_malformed_composite_tool_tail(held, states)
+    _strip_malformed_composite_tool_tail(continuation, states)
+
+    assert _reasoning_from_choices([held, continuation]) == f"{reasoning} is visible."
+
+
+def test_composite_boundary_preserves_mismatched_coalesced_terminal_tail():
+    reasoning = (
+        "Malformed example:\n"
+        "</parameter>\n</function>\n</tool_calls><|im_end|>"
+    )
+    choice = {
+        "index": 0,
+        "delta": {"reasoning_content": reasoning},
+        "finish_reason": "stop",
+    }
+
+    _strip_malformed_composite_tool_tail(choice, {})
+
+    assert choice["delta"]["reasoning_content"] == reasoning
 
 
 def test_composite_boundary_preserves_visible_content():
