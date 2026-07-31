@@ -60,6 +60,39 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "content_filter": FinishReason.STOP,
 }
 
+DEFAULT_TOOL_SCHEMA_MAX_STRING_LENGTH = 4096
+DEFAULT_TOOL_SCHEMA_MAX_ARRAY_ITEMS = 32
+DEFAULT_TOOL_SHORT_TEXT_MAX_LENGTH = 256
+DEFAULT_TOOL_LONG_TEXT_MAX_LENGTH = 8192
+TOOL_LONG_REQUEST_THRESHOLD = 2048
+TOOL_LONG_REQUEST_MARGIN = 512
+TOOL_FIELD_STRING_BUDGETS = {
+    "expression": 256,
+}
+TOOL_LONG_TEXT_FIELD_NAMES = {"body", "content", "message"}
+TOOL_CHOICE_SCHEMA_MARKER = "x-dynamo-tool-choice-schema"
+QWEN_XML_STRUCTURAL_TAG_TOOL_PARSERS = {"qwen3_coder", "qwen3_xml"}
+
+
+def _with_parser_visible_engine_text(
+    output: Any,
+    engine_text: str | None,
+    *,
+    parser_needs_raw_delta: bool,
+) -> Any:
+    if (
+        not parser_needs_raw_delta
+        or not engine_text
+        or getattr(output, "text", None)
+    ):
+        return output
+    return SimpleNamespace(
+        index=output.index,
+        token_ids=output.token_ids,
+        text=engine_text,
+        finish_reason=output.finish_reason,
+        logprobs=output.logprobs,
+    )
 
 def map_finish_reason(raw_reason: str | None) -> FinishReason | None:
     if raw_reason is None:
@@ -1417,7 +1450,30 @@ class VllmProcessor:
 
                 choices = []
                 postprocess_error = False
-                if vllm_out.request_outputs:
+                if not vllm_out.request_outputs:
+                    post = post_processors.get(output_idx)
+                    parser_needs_raw_delta = bool(
+                        post is not None
+                        and post.needs_raw_parser_delta(raw_token_ids)
+                    )
+                    if post is not None and (
+                        raw_finish_reason or parser_needs_raw_delta
+                    ):
+                        choice = post.process_output(
+                            SimpleNamespace(
+                                index=output_idx,
+                                token_ids=raw_token_ids,
+                                # vLLM deliberately buffers incomplete UTF-8. Only
+                                # bypass that buffer for parser-significant markers.
+                                text=engine_text if parser_needs_raw_delta else "",
+                                finish_reason=raw_finish_reason,
+                                logprobs=None,
+                            ),
+                            raw_delta_token_ids=raw_token_ids,
+                        )
+                        if choice:
+                            choices.append(choice)
+                else:
                     for output in vllm_out.request_outputs[0].outputs:
                         post = post_processors.get(output.index)
                         if post is None:
@@ -1432,7 +1488,16 @@ class VllmProcessor:
                             }
                             postprocess_error = True
                             break
-                        choice = post.process_output(output)
+                        output = _with_parser_visible_engine_text(
+                            output,
+                            engine_text,
+                            parser_needs_raw_delta=post.needs_raw_parser_delta(
+                                raw_token_ids
+                            ),
+                        )
+                        choice = post.process_output(
+                            output, raw_delta_token_ids=raw_token_ids
+                        )
                         if choice:
                             choices.append(choice)
 

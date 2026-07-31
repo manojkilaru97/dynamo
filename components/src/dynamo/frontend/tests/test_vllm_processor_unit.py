@@ -94,6 +94,34 @@ TOOL_REQUEST = {
 }
 
 
+def test_parser_visible_engine_text_overrides_trimmed_delta():
+    output = SimpleNamespace(
+        index=0,
+        text="",
+        token_ids=[13],
+        finish_reason=None,
+        logprobs=None,
+    )
+    visible = _with_parser_visible_engine_text(
+        output, "</think>", parser_needs_raw_delta=True
+    )
+    assert visible.text == "</think>"
+
+
+def test_parser_visible_engine_text_preserves_utf8_buffering():
+    output = SimpleNamespace(
+        index=0,
+        text="",
+        token_ids=[1226],
+        finish_reason=None,
+        logprobs=None,
+    )
+    visible = _with_parser_visible_engine_text(
+        output, "�", parser_needs_raw_delta=False
+    )
+    assert visible is output
+    assert visible.text == ""
+
 @pytest.fixture(scope="module")
 def tokenizer():
     return AutoTokenizer.from_pretrained(MODEL)

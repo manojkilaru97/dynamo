@@ -775,6 +775,15 @@ class StreamingPostProcessor:
             )
         )
 
+    def needs_raw_parser_delta(self, raw_delta_token_ids: Sequence[int]) -> bool:
+        if not raw_delta_token_ids or not self._should_parse_tools():
+            return False
+        decoded = self._decode_token_ids_for_parser(raw_delta_token_ids)
+        return any(
+            marker in decoded
+            for marker in (*self._tool_start_markers(), *self._tool_end_markers())
+        )
+
     def _tool_markup_filter_enabled(self) -> bool:
         return (
             self.request_for_sampling.tool_choice != "none"
@@ -986,7 +995,11 @@ class StreamingPostProcessor:
             delta = {}
         return self._build_choice(output, delta)
 
-    def process_output(self, output: Any) -> dict[str, Any] | None:
+    def process_output(
+        self,
+        output: Any,
+        raw_delta_token_ids: Sequence[int] | None = None,
+    ) -> dict[str, Any] | None:
         if self._should_buffer_for_non_streaming_tool_parse():
             return self._process_non_streaming_tool_output(output)
 
