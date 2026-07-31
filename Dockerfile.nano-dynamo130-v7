@@ -20,14 +20,16 @@ assert metadata.version("ai-dynamo") == "1.3.0"
 assert metadata.version("ai-dynamo-runtime") == "1.3.0"
 handlers = Path("/usr/local/lib/python3.12/dist-packages/dynamo/vllm/handlers.py")
 assert hashlib.sha256(handlers.read_bytes()).hexdigest() == "938e2e517271afddaf1db9c67e629f17797b2ba3d16330c5ef307c47bc6f0d18"
+processor = Path("/usr/local/lib/python3.12/dist-packages/dynamo/frontend/vllm_processor.py")
+assert hashlib.sha256(processor.read_bytes()).hexdigest() == "588720ce6e4201cf960d50ed59204133bd5de067eb227e62ca3ce4648d4913ad"
 PY
 
-LABEL org.opencontainers.image.revision="25ccc987ca296664f534fdb487087826cae65bbf" \
-      com.nvidia.dynamo.source.revision="25ccc987ca296664f534fdb487087826cae65bbf" \
+LABEL org.opencontainers.image.revision="b9536bc4a869b079d5191e89c992bc6d378d8d0d" \
+      com.nvidia.dynamo.source.revision="b9536bc4a869b079d5191e89c992bc6d378d8d0d" \
       ai.nvidia.nano.dynamo.base-digest="sha256:9a72053788a5c22aa893af486fe3f77f82ffd43c1dd00c3a4a3462662231861c" \
-      ai.nvidia.nano.dynamo.dynamo-commit="25ccc987ca296664f534fdb487087826cae65bbf" \
+      ai.nvidia.nano.dynamo.dynamo-commit="b9536bc4a869b079d5191e89c992bc6d378d8d0d" \
       ai.nvidia.nano.dynamo.rebase-commit="c87b7401110c201b110f211bb646a467ba550b5e" \
-      ai.nvidia.nano.dynamo.python-wheel-sha256="85eb119f00269ef1c12700ea1e3df330d668795c09787e95a0b2756bb5ecd56c" \
+      ai.nvidia.nano.dynamo.python-wheel-sha256="cb12ed3d4970a4315d75c1258be36d942c430a75374b553d8e0441d29bbdf4df" \
       ai.nvidia.nano.dynamo.runtime-wheel-sha256="cf37595842b745ed964ac6525bf1a0d879c81bed52bbb0678b11066e3b0e0fe9" \
       ai.nvidia.nano.dynamo.version="1.3.0" \
       ai.nvidia.nano.dynamo.vllm-version="0.26.0+cu129" \
