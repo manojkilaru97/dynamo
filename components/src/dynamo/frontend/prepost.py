@@ -529,6 +529,7 @@ class StreamingPostProcessor:
         return (
             not self.stream_response
             and self.tool_parser is not None
+            and bool(getattr(self.request_for_sampling, "tools", None))
             and self.request_for_sampling.tool_choice != "none"
         )
 
@@ -569,6 +570,7 @@ class StreamingPostProcessor:
     def _should_parse_tools(self) -> bool:
         return (
             self.tool_parser is not None
+            and bool(getattr(self.request_for_sampling, "tools", None))
             and self.request_for_sampling.tool_choice != "none"
             and self._structured_tool_call_name is None
             and not self._structured_required_tool_choice
@@ -1164,6 +1166,13 @@ class StreamingPostProcessor:
                 current_text,
                 request=self.request_for_sampling,
             )
+            end_token = getattr(self.reasoning_parser, "end_token", None)
+            if (
+                saved_reasoning
+                and content == current_text
+                and (not end_token or end_token not in current_text)
+            ):
+                content = None
             if not self.request_for_sampling.include_reasoning:
                 saved_reasoning = None
 
