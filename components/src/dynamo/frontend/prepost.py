@@ -653,6 +653,7 @@ class StreamingPostProcessor:
         # non-streaming extract_tool_calls() once the buffer is complete.
         self._tool_text_buffer: str | None = None
         self._reasoning_tool_markup_started = False
+        self._emitted_reasoning_text = ""
 
     def _should_buffer_for_non_streaming_tool_parse(self) -> bool:
         return (
@@ -983,6 +984,16 @@ class StreamingPostProcessor:
         return choice
 
     def _build_choice(self, output: Any, delta: dict[str, Any]) -> dict[str, Any]:
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+        if reasoning:
+            self._emitted_reasoning_text += reasoning
+        if (
+            output.finish_reason
+            and not self.reasoning_is_done
+            and delta.get("content")
+            and delta["content"] == self._emitted_reasoning_text
+        ):
+            delta.pop("content")
         self._strip_tool_markup_from_delta(delta)
         if delta.get("tool_calls"):
             self._tool_call_choices_emitted.add(output.index)

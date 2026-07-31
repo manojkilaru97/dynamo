@@ -1648,6 +1648,53 @@ def test_non_streaming_unclosed_reasoning_is_not_duplicated_as_content(
 
 
 @pytest.mark.vllm
+def test_terminal_content_does_not_replay_previously_emitted_reasoning(
+    tokenizer,
+    qwen3_coder_request_for_sampling,
+    sampling_params,
+):
+    request = qwen3_coder_request_for_sampling.model_copy(
+        update={"tools": None, "tool_choice": None}
+    )
+    proc = StreamingPostProcessor(
+        tokenizer=tokenizer,
+        request_for_sampling=request,
+        sampling_params=sampling_params,
+        prompt_token_ids=PROMPT_TOKEN_IDS,
+        tool_parser=_make_qwen3_tool_parser(tokenizer, []),
+        reasoning_parser_class=_resolve_qwen3_reasoning_parser_class(),
+        chat_template_kwargs={"reasoning_effort": None},
+        stream_response=False,
+    )
+    unfinished = "unfinished reasoning"
+    first = proc._build_choice(
+        CompletionOutput(
+            index=0,
+            text=unfinished,
+            token_ids=[1001],
+            cumulative_logprob=None,
+            logprobs=None,
+        ),
+        {"role": "assistant", "reasoning_content": unfinished},
+    )
+    terminal = proc._build_choice(
+        CompletionOutput(
+            index=0,
+            text=unfinished,
+            token_ids=[1001],
+            cumulative_logprob=None,
+            logprobs=None,
+            finish_reason="length",
+        ),
+        {"role": "assistant", "content": unfinished},
+    )
+
+    assert first["delta"]["reasoning_content"] == unfinished
+    assert terminal["delta"].get("content") is None
+    assert terminal["finish_reason"] == "length"
+
+
+@pytest.mark.vllm
 def test_qwen3_coder_non_streaming_batches_reasoning_before_tool_parse(
     tokenizer, qwen3_coder_request_for_sampling, sampling_params
 ):
