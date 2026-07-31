@@ -1185,12 +1185,21 @@ class VllmProcessor:
             dynamo_preproc["reasoning_ended"] = reasoning_ended
         if reasoning_parser_kwargs is not None:
             dynamo_preproc["reasoning_parser_kwargs"] = reasoning_parser_kwargs
-
         # Attach user cache identities before building routing metadata. Opaque
         # UUIDs deliberately suppress multimodal exact routing and frontend
         # tensor transfer; the worker owns processor-cache fill and lookup.
         if mm_uuids:
             dynamo_preproc["multi_modal_uuids"] = mm_uuids
+        reasoning_budget = _get_attr_or_item(request_for_sampling, "reasoning_budget")
+        if reasoning_budget is not None:
+            dynamo_preproc["reasoning_budget"] = reasoning_budget
+        reasoning_budget_grace_period = _get_attr_or_item(
+            request_for_sampling, "reasoning_budget_grace_period"
+        )
+        if reasoning_budget_grace_period is not None:
+            dynamo_preproc["reasoning_budget_grace_period"] = (
+                reasoning_budget_grace_period
+            )
 
         # Extract MM routing metadata and prepare transfer.
         cleanup_items: list = []
