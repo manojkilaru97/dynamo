@@ -15,7 +15,7 @@ use dynamo_llm::protocols::{
 };
 use dynamo_protocols::types::{
     ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionStreamResponseDelta,
-    CreateChatCompletionStreamResponse, Role,
+    CreateChatCompletionStreamResponse, FinishReason, Role,
 };
 use futures::StreamExt;
 
@@ -256,4 +256,30 @@ async fn test_nvext_none_when_absent() {
             .unwrap();
 
     assert_eq!(result.nvext, None);
+}
+
+/// Reasoning-only streams must keep final content null. Mirroring reasoning into
+/// content changes the OpenAI response shape and duplicates truncated reasoning.
+#[tokio::test]
+async fn test_reasoning_only_stream_aggregates_with_null_content() {
+    let mut delta = make_stream_delta(Some(""), None);
+    let choice = &mut delta.data.as_mut().unwrap().inner.choices[0];
+    choice.delta.content = None;
+    choice.delta.reasoning_content = Some("Still reasoning at the token limit.".to_string());
+    choice.finish_reason = Some(FinishReason::Length);
+
+    let result = NvCreateChatCompletionResponse::from_annotated_stream(
+        futures::stream::iter(vec![delta]),
+        ParsingOptions::default(),
+    )
+    .await
+    .unwrap();
+    let choice = &result.inner.choices[0];
+
+    assert!(choice.message.content.is_none());
+    assert_eq!(
+        choice.message.reasoning_content.as_deref(),
+        Some("Still reasoning at the token limit.")
+    );
+    assert_eq!(choice.finish_reason, Some(FinishReason::Length));
 }

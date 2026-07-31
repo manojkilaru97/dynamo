@@ -94,13 +94,6 @@ impl DeltaChoice {
             .is_some_and(|reasoning| !reasoning.is_empty())
     }
 
-    fn has_tool_calls_or_chunks(&self) -> bool {
-        self.tool_calls
-            .as_ref()
-            .is_some_and(|tool_calls| !tool_calls.is_empty())
-            || !self.tool_call_chunks.is_empty()
-    }
-
     fn normalize_content_after_reasoning(&mut self) {
         if !self.has_reasoning_content() || self.text.is_empty() {
             return;
@@ -123,18 +116,6 @@ impl DeltaChoice {
                 .text
                 .trim_start_matches(|ch| ch == '\n' || ch == '\r')
                 .to_string();
-        }
-    }
-
-    fn mirror_reasoning_as_content_if_needed(&mut self) {
-        if !self.text.is_empty() || self.has_tool_calls_or_chunks() {
-            return;
-        }
-        let Some(reasoning) = self.reasoning_content.as_ref() else {
-            return;
-        };
-        if !reasoning.is_empty() {
-            self.text = reasoning.clone();
         }
     }
 }
@@ -439,7 +420,6 @@ impl DeltaAggregator {
 
         for choice in self.choices.values_mut() {
             choice.normalize_content_after_reasoning();
-            choice.mirror_reasoning_as_content_if_needed();
         }
 
         if let Some(parser) = parsing_options.tool_call_parser.as_deref() {
