@@ -1335,6 +1335,13 @@ class VllmProcessor:
                         request_for_sampling,
                         choices,
                     )
+                    for choice in choices:
+                        post = post_processors.get(choice.get("index", 0))
+                        strip_tool_markup = getattr(
+                            post, "_strip_tool_markup_from_delta", None
+                        )
+                        if strip_tool_markup is not None:
+                            strip_tool_markup(choice.get("delta") or {})
                     dynamo_out = {
                         "id": request_id,
                         "choices": choices,

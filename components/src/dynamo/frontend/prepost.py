@@ -405,6 +405,7 @@ class StreamingPostProcessor:
         # hiding a valid tool call inside replayed reasoning text.
         self._raw_tool_text_buffer = ""
         self._raw_tool_capture_started = False
+        self._reasoning_tool_markup_started = False
         self._tool_marker_ids = self._tool_marker_token_ids()
 
     def _is_pure_structured_json_request(self) -> bool:
@@ -593,9 +594,94 @@ class StreamingPostProcessor:
     def _buffer_tool_calls_until_finish(self) -> bool:
         if self.tool_parser is None:
             return False
-        tool_call_start = getattr(self.tool_parser, "tool_call_start_token", None)
-        tool_call_end = getattr(self.tool_parser, "tool_call_end_token", None)
+        tool_call_start = self._tool_call_start_token()
+        tool_call_end = self._tool_call_end_token()
         return tool_call_start == "<tool_call>" and tool_call_end == "</tool_call>"
+
+    def _tool_call_marker(self, attr: str, engine_id_attr: str) -> str | None:
+        marker = getattr(self.tool_parser, attr, None)
+        if marker:
+            return marker
+        engine = getattr(self.tool_parser, "_parser_engine", None)
+        token_id = getattr(engine, engine_id_attr, None)
+        if not isinstance(token_id, int):
+            return None
+        return self._decode_token_ids_for_parser([token_id]) or None
+
+    def _tool_call_start_token(self) -> str | None:
+        marker = self._tool_call_marker(
+            "tool_call_start_token",
+            "_tool_call_token_id",
+        )
+        if marker:
+            return marker
+        if self._has_single_token_tool_marker("<tool_call>"):
+            return "<tool_call>"
+        return None
+
+    def _tool_call_end_token(self) -> str | None:
+        marker = self._tool_call_marker(
+            "tool_call_end_token",
+            "_tool_call_end_token_id",
+        )
+        if marker:
+            return marker
+        if self._has_single_token_tool_marker("</tool_call>"):
+            return "</tool_call>"
+        return None
+
+    def _has_single_token_tool_marker(self, marker: str) -> bool:
+        try:
+            token_ids = self.tokenizer.encode(
+                marker,
+                add_special_tokens=False,
+            )
+        except Exception:
+            return False
+        return (
+            len(token_ids) == 1
+            and self._decode_token_ids_for_parser(token_ids) == marker
+        )
+
+    def _strip_tool_markup_from_reasoning(
+        self, delta_message: DeltaMessage | None
+    ) -> None:
+        if (
+            delta_message is None
+            or not delta_message.reasoning
+            or not self._tool_markup_filter_enabled()
+        ):
+            return
+        if self._reasoning_tool_markup_started:
+            delta_message.reasoning = None
+            return
+        tool_call_start = self._tool_call_start_token()
+        if tool_call_start and tool_call_start in delta_message.reasoning:
+            delta_message.reasoning = (
+                delta_message.reasoning.partition(tool_call_start)[0] or None
+            )
+            self._reasoning_tool_markup_started = True
+
+    def _tool_markup_filter_enabled(self) -> bool:
+        return (
+            self.request_for_sampling.tool_choice != "none"
+            and (
+                self.tool_parser is not None
+                or bool(getattr(self.request_for_sampling, "tools", None))
+            )
+        )
+
+    def _strip_tool_markup_from_delta(self, delta: dict[str, Any]) -> None:
+        for key in ("reasoning_content", "reasoning", "content"):
+            value = delta.get(key)
+            if not value:
+                continue
+            message = DeltaMessage(reasoning=value)
+            self._strip_tool_markup_from_reasoning(message)
+            if message.reasoning:
+                delta[key] = message.reasoning
+            else:
+                delta.pop(key, None)
 
     def _raw_post_reasoning_text(
         self, current_token_ids: Sequence[int], raw_delta_text: str
@@ -617,6 +703,11 @@ class StreamingPostProcessor:
                 token_id = getattr(self.tool_parser, attr, None)
                 if isinstance(token_id, int):
                     marker_ids.add(token_id)
+            engine = getattr(self.tool_parser, "_parser_engine", None)
+            for attr in ("_tool_call_token_id", "_tool_call_end_token_id"):
+                token_id = getattr(engine, attr, None)
+                if isinstance(token_id, int):
+                    marker_ids.add(token_id)
         if self.reasoning_parser:
             token_id = getattr(self.reasoning_parser, "end_token_id", None)
             if isinstance(token_id, int):
@@ -633,7 +724,7 @@ class StreamingPostProcessor:
         if not self._should_parse_tools():
             return
 
-        tool_call_start = getattr(self.tool_parser, "tool_call_start_token", None)
+        tool_call_start = self._tool_call_start_token()
         saw_marker_id = bool(
             self._tool_marker_ids
             and self._tool_marker_ids.intersection(raw_delta_token_ids)
@@ -833,8 +924,8 @@ class StreamingPostProcessor:
         ):
             return None
 
-        tool_call_start = getattr(self.tool_parser, "tool_call_start_token", None)
-        tool_call_end = getattr(self.tool_parser, "tool_call_end_token", None)
+        tool_call_start = self._tool_call_start_token()
+        tool_call_end = self._tool_call_end_token()
         if not tool_call_start or not tool_call_end:
             return None
 
@@ -917,6 +1008,7 @@ class StreamingPostProcessor:
         }
         if reasoning:
             delta["reasoning_content"] = reasoning
+        self._strip_tool_markup_from_delta(delta)
         choice = {
             "index": output.index,
             "delta": delta,
@@ -986,6 +1078,7 @@ class StreamingPostProcessor:
         )
 
     def _build_choice(self, output: Any, delta: dict[str, Any]) -> dict[str, Any]:
+        self._strip_tool_markup_from_delta(delta)
         if delta.get("tool_calls"):
             self._tool_call_choices_emitted.add(output.index)
         finish_reason = output.finish_reason
@@ -1111,7 +1204,7 @@ class StreamingPostProcessor:
         # ------------------------------------------------------------------
         if self._tool_text_buffer is not None:
             self._tool_text_buffer += delta_text
-            tool_call_end = getattr(self.tool_parser, "tool_call_end_token", None)
+            tool_call_end = self._tool_call_end_token()
             buffer_complete = (
                 tool_call_end
                 and tool_call_end in self._tool_text_buffer
@@ -1137,12 +1230,62 @@ class StreamingPostProcessor:
                 delta_token_ids,
             )
 
+            # Some models transition directly from reasoning to a tool call
+            # without emitting the reasoning end marker. A split reasoning
+            # parser otherwise exposes the raw tool XML as reasoning_content
+            # even though the tool parser also emits a valid tool call.
+            tool_call_start = self._tool_call_start_token()
+            reasoning_text = (
+                delta_message.reasoning
+                if delta_message and delta_message.reasoning
+                else ""
+            )
+            raw_tool_text = (
+                self._raw_tool_text_buffer
+                if self._raw_tool_capture_started
+                else ""
+            )
+            tool_in_reasoning = bool(
+                tool_call_start
+                and (
+                    tool_call_start in reasoning_text
+                    or tool_call_start in raw_tool_text
+                )
+            )
+            if tool_in_reasoning:
+                saved_reasoning = None
+                if tool_call_start in reasoning_text:
+                    saved_reasoning = (
+                        reasoning_text.partition(tool_call_start)[0] or None
+                    )
+                self.reasoning_is_done = True
+                self.previous_text = ""
+                self.previous_token_ids = []
+                current_text = ""
+                current_token_ids = []
+                if output.finish_reason:
+                    buffered_text = (
+                        raw_tool_text
+                        or reasoning_text[reasoning_text.index(tool_call_start) :]
+                    )
+                    self._raw_tool_text_buffer = ""
+                    self._raw_tool_capture_started = False
+                    delta_message = self._extract_tool_calls_from_text(
+                        buffered_text,
+                        saved_reasoning=saved_reasoning,
+                    )
+                else:
+                    delta_message = self._compose_delta_message(
+                        saved_reasoning,
+                        None,
+                    )
+
             # When reasoning ends in this chunk, reset accumulated state.
             # If there is post-reasoning content (e.g. <tool_call> markup),
             # buffer it for non-streaming extraction rather than feeding it
             # to the streaming tool parser which cannot handle the combined
             # reasoning-end + tool-start in a single chunk.
-            if self.reasoning_parser.is_reasoning_end_streaming(
+            elif self.reasoning_parser.is_reasoning_end_streaming(
                 current_token_ids, delta_token_ids
             ):
                 self.reasoning_is_done = True
@@ -1162,9 +1305,7 @@ class StreamingPostProcessor:
                 current_text = ""
                 current_token_ids = []
 
-                tool_call_start = getattr(
-                    self.tool_parser, "tool_call_start_token", None
-                )
+                tool_call_start = self._tool_call_start_token()
                 tool_post_content = (
                     raw_post_content
                     if raw_post_content
@@ -1224,9 +1365,7 @@ class StreamingPostProcessor:
                 )
         else:
             if self._should_parse_tools():
-                tool_call_start = getattr(
-                    self.tool_parser, "tool_call_start_token", None
-                )
+                tool_call_start = self._tool_call_start_token()
                 if (
                     self._buffer_tool_calls_until_finish()
                     and self._tool_text_buffer is None
@@ -1285,6 +1424,7 @@ class StreamingPostProcessor:
             if fallback_message is not None or self.in_progress_tool_calls:
                 delta_message = fallback_message
 
+        self._strip_tool_markup_from_reasoning(delta_message)
         delta_message, structured_tool_choice = self._maybe_emit_structured_tool_call(
             output, delta_message
         )

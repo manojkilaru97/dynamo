@@ -897,3 +897,56 @@ def test_runtime_config_context_length(vllm_processor_module, runtime_config, ex
     mdc = SimpleNamespace(runtime_config=lambda: runtime_config)
 
     assert vllm_processor_module._runtime_config_context_length(mdc) == expected
+
+
+class _ToolMarkerTokenizer:
+    def encode(self, text, add_special_tokens=False):
+        return {"<tool_call>": [14], "</tool_call>": [15]}.get(text, [])
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        return {14: "<tool_call>", 15: "</tool_call>"}.get(token_ids[0], "")
+
+
+def test_tool_markup_is_removed_without_frontend_parser():
+    post = StreamingPostProcessor(
+        tokenizer=_ToolMarkerTokenizer(),
+        request_for_sampling=SimpleNamespace(
+            tool_choice="auto",
+            tools=[{"type": "function"}],
+            structured_outputs=None,
+            response_format=None,
+        ),
+        sampling_params=SamplingParams(max_tokens=128),
+        prompt_token_ids=[],
+        tool_parser=None,
+        reasoning_parser_class=None,
+        chat_template_kwargs={"enable_thinking": True},
+    )
+    delta = {"reasoning_content": "Need the file.<tool_call><function=Read>"}
+
+    post._strip_tool_markup_from_delta(delta)
+
+    assert delta == {"reasoning_content": "Need the file."}
+
+
+def test_tool_markers_fall_back_to_parser_engine_ids():
+    parser = SimpleNamespace(
+        tool_call_start_token=None,
+        tool_call_end_token=None,
+        _parser_engine=SimpleNamespace(
+            _tool_call_token_id=14,
+            _tool_call_end_token_id=15,
+        ),
+    )
+    post = StreamingPostProcessor(
+        tokenizer=_ToolMarkerTokenizer(),
+        request_for_sampling=SimpleNamespace(tool_choice="auto", tools=[]),
+        sampling_params=SamplingParams(max_tokens=128),
+        prompt_token_ids=[],
+        tool_parser=parser,
+        reasoning_parser_class=None,
+        chat_template_kwargs={"enable_thinking": True},
+    )
+
+    assert post._tool_call_start_token() == "<tool_call>"
+    assert post._tool_call_end_token() == "</tool_call>"
