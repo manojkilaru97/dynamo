@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dynamo_tokens::SequenceHash;
 use parking_lot::RwLock;
