@@ -1630,10 +1630,11 @@ def test_non_streaming_unclosed_reasoning_is_not_duplicated_as_content(
         chat_template_kwargs={"reasoning_effort": None},
         stream_response=False,
     )
+    output_text = "<think>unfinished reasoning" if with_tools else "unfinished reasoning"
     output = CompletionOutput(
         index=0,
-        text="<think>unfinished reasoning",
-        token_ids=[151667, 1001],
+        text=output_text,
+        token_ids=[151667, 1001] if with_tools else [1001],
         cumulative_logprob=None,
         logprobs=None,
         finish_reason="length",
