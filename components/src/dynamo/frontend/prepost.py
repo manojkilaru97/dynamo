@@ -831,6 +831,24 @@ class StreamingPostProcessor:
             )
             self._reasoning_tool_markup_started = True
 
+    def _suppress_unclosed_reasoning_content(
+        self,
+        delta_message: DeltaMessage | None,
+        current_text: str,
+    ) -> None:
+        if (
+            self.reasoning_parser is None
+            or delta_message is None
+            or not delta_message.reasoning
+            or not delta_message.content
+        ):
+            return
+        end_token = getattr(self.reasoning_parser, "end_token", None)
+        if (
+            (not end_token or end_token not in current_text)
+            and delta_message.content == delta_message.reasoning
+        ):
+            delta_message.content = None
     def _strip_tool_markup_from_delta(self, delta: dict[str, Any]) -> None:
         for key in ("reasoning_content", "reasoning", "content"):
             value = delta.get(key)
@@ -1179,6 +1197,8 @@ class StreamingPostProcessor:
             if self.in_progress_tool_calls:
                 delta_message = batch_message
 
+        self._suppress_unclosed_reasoning_content(delta_message, current_text)
+        self._strip_tool_markup_from_reasoning(delta_message)
         choice = None
         if delta_message is None:
             if self.in_progress_tool_calls:
