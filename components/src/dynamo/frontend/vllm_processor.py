@@ -18,7 +18,7 @@ from typing import Any
 
 from msgspec.structs import replace as msgspec_replace
 from vllm.entrypoints.chat_utils import make_tool_call_id
-from vllm.config import CacheConfig, LoadConfig, ModelConfig, VllmConfig
+from vllm.config import CacheConfig, DeviceConfig, LoadConfig, ModelConfig, VllmConfig
 from vllm.parser import Parser, ParserManager
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
 from vllm.sampling_params import (
@@ -1817,6 +1817,7 @@ class EngineFactory:
             model_config=model_config,
             load_config=LoadConfig(load_format=load_format),
             cache_config=CacheConfig(),
+            device_config=DeviceConfig(device="cpu"),
             # scheduler_config=SchedulerConfig(),
         )
 
