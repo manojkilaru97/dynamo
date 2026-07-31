@@ -1607,6 +1607,46 @@ def test_qwen3_coder_non_streaming_preserves_content_before_tool_call(
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize("with_tools", [False, True])
+def test_non_streaming_unclosed_reasoning_is_not_duplicated_as_content(
+    tokenizer,
+    qwen3_coder_request_for_sampling,
+    sampling_params,
+    with_tools,
+):
+    request = qwen3_coder_request_for_sampling.model_copy(
+        update={
+            "tools": qwen3_coder_request_for_sampling.tools if with_tools else None,
+            "tool_choice": "auto" if with_tools else None,
+        }
+    )
+    proc = StreamingPostProcessor(
+        tokenizer=tokenizer,
+        request_for_sampling=request,
+        sampling_params=sampling_params,
+        prompt_token_ids=PROMPT_TOKEN_IDS,
+        tool_parser=_make_qwen3_tool_parser(tokenizer, request.tools or []),
+        reasoning_parser_class=_resolve_qwen3_reasoning_parser_class(),
+        chat_template_kwargs={"reasoning_effort": None},
+        stream_response=False,
+    )
+    output = CompletionOutput(
+        index=0,
+        text="<think>unfinished reasoning",
+        token_ids=[151667, 1001],
+        cumulative_logprob=None,
+        logprobs=None,
+        finish_reason="length",
+    )
+
+    results = _collect_results(proc, [output])
+    assert len(results) == 1
+    assert results[0]["delta"].get("reasoning_content") == "unfinished reasoning"
+    assert results[0]["delta"].get("content") is None
+    assert results[0]["finish_reason"] == "length"
+
+
+@pytest.mark.vllm
 def test_qwen3_coder_non_streaming_batches_reasoning_before_tool_parse(
     tokenizer, qwen3_coder_request_for_sampling, sampling_params
 ):
