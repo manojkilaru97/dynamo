@@ -7,6 +7,7 @@
 # mypy: ignore-errors
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,16 +21,20 @@ HAS_QWEN3_TOOL_PARSER = check_module_available(
     "vllm.tool_parsers.qwen3_engine_tool_parser"
 ) or check_module_available("vllm.tool_parsers.qwen3coder_tool_parser")
 if HAS_VLLM:
+    from dynamo.frontend.prepost import StreamingPostProcessor
     from vllm.entrypoints.openai.chat_completion.protocol import (
         ChatCompletionRequest,
         ChatCompletionToolsParam,
     )
-    from vllm.entrypoints.openai.engine.protocol import FunctionDefinition
+    from vllm.entrypoints.openai.engine.protocol import (
+        DeltaFunctionCall,
+        DeltaMessage,
+        DeltaToolCall,
+        FunctionDefinition,
+    )
     from vllm.outputs import CompletionOutput
     from vllm.sampling_params import SamplingParams
     from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
-
-    from dynamo.frontend.prepost import StreamingPostProcessor
 else:
     # Fake some types so that `pre-commit` passes
     class CompletionOutput:
@@ -1604,6 +1609,70 @@ def test_qwen3_coder_non_streaming_preserves_content_before_tool_call(
     assert tool_calls[0]["function"]["name"] == "get_weather"
     assert json.loads(tool_calls[0]["function"]["arguments"]) == {"location": "NYC"}
     assert results[0]["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.vllm
+def test_terminal_tool_delta_is_repaired_after_merge(
+    tokenizer, qwen3_coder_request_for_sampling, sampling_params
+):
+    """A partial tool call first seen on the final delta must be batch-repaired."""
+    tool_parser = _make_qwen3_tool_parser(
+        tokenizer, qwen3_coder_request_for_sampling.tools
+    )
+    tool_parser.extract_tool_calls_streaming = lambda *args, **kwargs: DeltaMessage(
+        tool_calls=[
+            DeltaToolCall(
+                index=0,
+                type="function",
+                id="chatcmpl-tool-partial",
+                function=DeltaFunctionCall(name="get_weather", arguments=None),
+            )
+        ]
+    )
+    tool_parser.extract_tool_calls = lambda *args, **kwargs: SimpleNamespace(
+        tools_called=True,
+        tool_calls=[
+            SimpleNamespace(
+                id="chatcmpl-tool-repaired",
+                function=SimpleNamespace(
+                    name="get_weather", arguments='{"location":"NYC"}'
+                ),
+            )
+        ],
+        content=None,
+    )
+    proc = StreamingPostProcessor(
+        tokenizer=tokenizer,
+        request_for_sampling=qwen3_coder_request_for_sampling,
+        sampling_params=sampling_params,
+        prompt_token_ids=PROMPT_TOKEN_IDS,
+        tool_parser=tool_parser,
+        reasoning_parser_class=None,
+        chat_template_kwargs={"reasoning_effort": None},
+        stream_response=True,
+    )
+
+    results = _collect_results(
+        proc,
+        [
+            CompletionOutput(
+                index=0,
+                text="parser-visible complete tool text",
+                token_ids=[1001],
+                cumulative_logprob=None,
+                logprobs=None,
+                finish_reason="stop",
+            )
+        ],
+    )
+
+    tool_calls = _collect_tool_calls(results)
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "location": "NYC"
+    }
+    assert results[-1]["finish_reason"] == "tool_calls"
 
 
 @pytest.mark.vllm

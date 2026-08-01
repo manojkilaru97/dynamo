@@ -948,6 +948,36 @@ class StreamingPostProcessor:
                 return False
         return True
 
+    def _repair_terminal_tool_calls(
+        self, output: Any, current_text: str
+    ) -> DeltaMessage | None:
+        if (
+            not output.finish_reason
+            or not self.in_progress_tool_calls
+            or self._in_progress_tool_calls_are_complete()
+        ):
+            return None
+
+        original_tool_calls = self.in_progress_tool_calls
+        candidates = (
+            getattr(self, "_raw_tool_text_buffer", ""),
+            getattr(self, "_post_reasoning_raw_text_buffer", ""),
+            getattr(self, "_post_reasoning_text_buffer", ""),
+            current_text,
+        )
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            self.in_progress_tool_calls = {}
+            batch_message = self._extract_tool_calls_from_text(candidate)
+            if self._in_progress_tool_calls_are_complete():
+                return batch_message
+
+        self.in_progress_tool_calls = original_tool_calls
+        return None
+
     def _dump_in_progress_tool_calls(self) -> list[dict[str, Any]]:
         return [
             tool_call.model_dump(exclude_none=True)
@@ -1196,17 +1226,12 @@ class StreamingPostProcessor:
                         delta_token_ids=delta_token_ids,
                     )
 
-        # Repair an incomplete terminal streaming fragment with the parser's
-        # batch path over the complete visible output.
-        if (
-            output.finish_reason
-            and self.in_progress_tool_calls
-            and not self._in_progress_tool_calls_are_complete()
-        ):
-            self.in_progress_tool_calls.clear()
-            batch_message = self._extract_tool_calls_from_text(current_text)
-            if self.in_progress_tool_calls:
-                delta_message = batch_message
+        # A streaming parser may leave a truncated argument fragment when a
+        # terminal chunk contains malformed or repeated closing markers. At
+        # finish, repair it with vLLM's batch parser over the complete text.
+        batch_message = self._repair_terminal_tool_calls(output, current_text)
+        if batch_message is not None:
+            delta_message = batch_message
 
         self._suppress_unclosed_reasoning_content(delta_message, current_text)
         self._strip_tool_markup_from_reasoning(delta_message)
@@ -1218,6 +1243,9 @@ class StreamingPostProcessor:
                 choice = self._build_choice(output, {})
         elif delta_message.tool_calls:
             self._merge_streaming_tool_calls(delta_message.tool_calls)
+            batch_message = self._repair_terminal_tool_calls(output, current_text)
+            if batch_message is not None:
+                delta_message = batch_message
             if output.finish_reason and self.in_progress_tool_calls:
                 # Tool calls and finish_reason arrived in the same chunk.
                 # Emit now — there will be no subsequent process_output call
