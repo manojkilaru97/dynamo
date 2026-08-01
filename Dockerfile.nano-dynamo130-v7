@@ -19,7 +19,7 @@ from pathlib import Path
 assert metadata.version("ai-dynamo") == "1.3.0"
 assert metadata.version("ai-dynamo-runtime") == "1.3.0"
 core = Path("/usr/local/lib/python3.12/dist-packages/dynamo/_core.abi3.so")
-assert hashlib.sha256(core.read_bytes()).hexdigest() == "f01e8f917518c3b417760e12601f2f8ae9c7fe6a21d2128bfe369cad25ff287a"
+assert hashlib.sha256(core.read_bytes()).hexdigest() == "ac3c59e3acc12d771dd055d99a56e9166ac2f27eb7b6e5e4e759f9e6db328540"
 handlers = Path("/usr/local/lib/python3.12/dist-packages/dynamo/vllm/handlers.py")
 assert hashlib.sha256(handlers.read_bytes()).hexdigest() == "938e2e517271afddaf1db9c67e629f17797b2ba3d16330c5ef307c47bc6f0d18"
 processor = Path("/usr/local/lib/python3.12/dist-packages/dynamo/frontend/vllm_processor.py")
@@ -28,13 +28,13 @@ prepost = Path("/usr/local/lib/python3.12/dist-packages/dynamo/frontend/prepost.
 assert hashlib.sha256(prepost.read_bytes()).hexdigest() == "54b2fb507d43e0fffc098b7202e3096bffa72b59371d6a1853e2a9d9e289ab12"
 PY
 
-LABEL org.opencontainers.image.revision="c240b80587da3ea5e5e136376fa536aff7c80f74" \
-      com.nvidia.dynamo.source.revision="c240b80587da3ea5e5e136376fa536aff7c80f74" \
+LABEL org.opencontainers.image.revision="d654ee9d0bd4d725e746076abefc97eb999e3df8" \
+      com.nvidia.dynamo.source.revision="d654ee9d0bd4d725e746076abefc97eb999e3df8" \
       ai.nvidia.nano.dynamo.base-digest="sha256:9a72053788a5c22aa893af486fe3f77f82ffd43c1dd00c3a4a3462662231861c" \
-      ai.nvidia.nano.dynamo.dynamo-commit="c240b80587da3ea5e5e136376fa536aff7c80f74" \
+      ai.nvidia.nano.dynamo.dynamo-commit="d654ee9d0bd4d725e746076abefc97eb999e3df8" \
       ai.nvidia.nano.dynamo.rebase-commit="c87b7401110c201b110f211bb646a467ba550b5e" \
       ai.nvidia.nano.dynamo.python-wheel-sha256="0d0b64057a9ee9466462fa119a50eea0da01ec3c821a70351ca388a0cc12d1d7" \
-      ai.nvidia.nano.dynamo.runtime-wheel-sha256="7139ab5670bde07ea594ffbf62ca01d0ad1ba1149d83ab5f2634c8ceb68ebe4f" \
+      ai.nvidia.nano.dynamo.runtime-wheel-sha256="efdf42f40da04ba4dd58453a04ff20bdde9cbff8f24f3101bd97b968300d4f13" \
       ai.nvidia.nano.dynamo.version="1.3.0" \
       ai.nvidia.nano.dynamo.vllm-version="0.26.0+cu129" \
       ai.nvidia.nano.dynamo.vllm-commit="909163fe0edd1dc01834633c7a2b5b2825a2a2c7"
