@@ -1,0 +1,14 @@
+FROM nvcr.io/qc69jvmznzxy/llm_nim/nano@sha256:5fbf6cee30f8b69ab40029eb4d6b7dbee93d04aeef07bc07bde2eb3c795c0c2d
+
+COPY components/src/dynamo/frontend/prepost.py /usr/local/lib/python3.12/dist-packages/dynamo/frontend/prepost.py
+
+RUN python3 -m py_compile /usr/local/lib/python3.12/dist-packages/dynamo/frontend/prepost.py \
+ && echo "1af75f9507fec47d5ddd487e30f3270a592ff2a6c849786775f914f53bd4a6ac  /usr/local/lib/python3.12/dist-packages/dynamo/frontend/prepost.py" \
+    | sha256sum --check --strict
+
+LABEL org.opencontainers.image.revision="bdf1b59a77bbb94d386e58b62819a7914e0e2892" \
+      com.nvidia.dynamo.source.revision="bdf1b59a77bbb94d386e58b62819a7914e0e2892" \
+      ai.nvidia.nano.dynamo.base-digest="sha256:5fbf6cee30f8b69ab40029eb4d6b7dbee93d04aeef07bc07bde2eb3c795c0c2d" \
+      ai.nvidia.nano.dynamo.dynamo-commit="bdf1b59a77bbb94d386e58b62819a7914e0e2892" \
+      ai.nvidia.nano.dynamo.version="1.3.0" \
+      ai.nvidia.nano.dynamo.vllm-version="0.26.0+cu129"
