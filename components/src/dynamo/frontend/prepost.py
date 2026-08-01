@@ -654,6 +654,9 @@ class StreamingPostProcessor:
         self._tool_text_buffer: str | None = None
         self._reasoning_tool_markup_started = False
         self._emitted_reasoning_text = ""
+        self._raw_tool_text_buffer = ""
+        self._raw_tool_capture_started = False
+        self._tool_marker_ids = self._tool_marker_token_ids()
 
     def _should_buffer_for_non_streaming_tool_parse(self) -> bool:
         return (
@@ -778,15 +781,6 @@ class StreamingPostProcessor:
             )
         )
 
-    def needs_raw_parser_delta(self, raw_delta_token_ids: Sequence[int]) -> bool:
-        if not raw_delta_token_ids or not self._should_parse_tools():
-            return False
-        decoded = self._decode_token_ids_for_parser(raw_delta_token_ids)
-        return any(
-            marker in decoded
-            for marker in (*self._tool_start_markers(), *self._tool_end_markers())
-        )
-
     def _tool_markup_filter_enabled(self) -> bool:
         return (
             self.request_for_sampling.tool_choice != "none"
@@ -861,6 +855,98 @@ class StreamingPostProcessor:
                 delta[key] = message.reasoning
             else:
                 delta.pop(key, None)
+
+    def _raw_post_reasoning_text(
+        self, current_token_ids: Sequence[int], raw_delta_text: str
+    ) -> str:
+        if not self.reasoning_parser:
+            return raw_delta_text
+        end_token = getattr(self.reasoning_parser, "end_token", None)
+        if not end_token:
+            return raw_delta_text
+        raw_current_text = self._decode_token_ids_for_parser(current_token_ids)
+        if end_token in raw_current_text:
+            return raw_current_text.rpartition(end_token)[2]
+        return raw_delta_text
+
+    def _tool_marker_token_ids(self) -> set[int]:
+        marker_ids: set[int] = set()
+        if self.tool_parser:
+            for attr in (
+                "tool_call_start_token_id",
+                "tool_call_end_token_id",
+                "bot_token_id",
+            ):
+                token_id = getattr(self.tool_parser, attr, None)
+                if isinstance(token_id, int):
+                    marker_ids.add(token_id)
+            engine = getattr(self.tool_parser, "_parser_engine", None)
+            for attr in ("_tool_call_token_id", "_tool_call_end_token_id"):
+                token_id = getattr(engine, attr, None)
+                if isinstance(token_id, int):
+                    marker_ids.add(token_id)
+        if self.reasoning_parser:
+            token_id = getattr(self.reasoning_parser, "end_token_id", None)
+            if isinstance(token_id, int):
+                marker_ids.add(token_id)
+        return marker_ids
+
+    def _maybe_capture_raw_tool_text(
+        self,
+        *,
+        delta_text: str,
+        raw_delta_token_ids: list[int],
+        get_raw_delta_text: Any,
+    ) -> None:
+        if not self._should_parse_tools():
+            return
+
+        tool_call_starts = self._tool_start_markers()
+        saw_marker_id = bool(
+            self._tool_marker_ids
+            and self._tool_marker_ids.intersection(raw_delta_token_ids)
+        )
+        saw_start_text = any(marker in delta_text for marker in tool_call_starts)
+        if (
+            not self._raw_tool_capture_started
+            and not saw_marker_id
+            and not saw_start_text
+        ):
+            return
+
+        # Prefer vLLM's incrementally decoded text unless the raw token IDs
+        # prove that this chunk contains a parser marker. vLLM may omit that
+        # marker from a non-empty visible delta, so using ``delta_text`` merely
+        # because it is non-empty can prevent raw tool capture from starting.
+        raw_delta_text = (
+            get_raw_delta_text()
+            if saw_marker_id
+            else delta_text or get_raw_delta_text()
+        )
+        if not raw_delta_text:
+            return
+
+        if self._raw_tool_capture_started:
+            self._raw_tool_text_buffer += raw_delta_text
+            return
+
+        start_offsets = [
+            raw_delta_text.index(marker)
+            for marker in tool_call_starts
+            if marker in raw_delta_text
+        ]
+        if start_offsets:
+            self._raw_tool_capture_started = True
+            self._raw_tool_text_buffer += raw_delta_text[min(start_offsets) :]
+
+    def needs_raw_parser_delta(self, raw_delta_token_ids: Sequence[int]) -> bool:
+        return self._should_parse_tools() and (
+            bool(self._raw_tool_capture_started or self._tool_text_buffer is not None)
+            or bool(
+                self._tool_marker_ids
+                and self._tool_marker_ids.intersection(raw_delta_token_ids)
+            )
+        )
 
     @staticmethod
     def _compose_delta_message(
@@ -1037,8 +1123,22 @@ class StreamingPostProcessor:
         }
 
     def _process_non_streaming_tool_output(self, output: Any) -> dict[str, Any] | None:
-        delta_token_ids = list(output.token_ids or [])
+        delta_token_ids = list(raw_delta_token_ids or output.token_ids or [])
+        raw_delta_token_ids = delta_token_ids
         delta_text = output.text or ""
+        raw_delta_text: str | None = None
+
+        def get_raw_delta_text() -> str:
+            nonlocal raw_delta_text
+            if raw_delta_text is None:
+                raw_delta_text = self._decode_token_ids_for_parser(raw_delta_token_ids)
+            return raw_delta_text
+
+        self._maybe_capture_raw_tool_text(
+            delta_text=delta_text,
+            raw_delta_token_ids=delta_token_ids,
+            get_raw_delta_text=get_raw_delta_text,
+        )
         current_text = self.previous_text + delta_text
         current_token_ids = self.previous_token_ids + delta_token_ids
 
