@@ -1705,6 +1705,91 @@ def test_raw_tool_capture_prefers_marker_bearing_token_delta(
 
 
 @pytest.mark.vllm
+def test_incomplete_tool_call_is_not_emitted_before_arguments(
+    tokenizer, qwen3_coder_request_for_sampling, sampling_params
+):
+    """An empty intermediate parser delta must not lock an incomplete call."""
+    tool_parser = _make_qwen3_tool_parser(
+        tokenizer, qwen3_coder_request_for_sampling.tools
+    )
+    parser_deltas = iter(
+        [
+            DeltaMessage(
+                tool_calls=[
+                    DeltaToolCall(
+                        index=0,
+                        type="function",
+                        id="chatcmpl-tool-buffered",
+                        function=DeltaFunctionCall(name="bash", arguments=None),
+                    )
+                ]
+            ),
+            DeltaMessage(),
+            DeltaMessage(
+                tool_calls=[
+                    DeltaToolCall(
+                        index=0,
+                        function=DeltaFunctionCall(
+                            name=None, arguments='{"command":"pwd"}'
+                        ),
+                    )
+                ]
+            ),
+        ]
+    )
+    tool_parser.extract_tool_calls_streaming = lambda *args, **kwargs: next(
+        parser_deltas
+    )
+    proc = StreamingPostProcessor(
+        tokenizer=tokenizer,
+        request_for_sampling=qwen3_coder_request_for_sampling,
+        sampling_params=sampling_params,
+        prompt_token_ids=PROMPT_TOKEN_IDS,
+        tool_parser=tool_parser,
+        reasoning_parser_class=None,
+        chat_template_kwargs={"reasoning_effort": None},
+        stream_response=True,
+    )
+    outputs = [
+        CompletionOutput(
+            index=0,
+            text="<function=bash>",
+            token_ids=[1001],
+            cumulative_logprob=None,
+            logprobs=None,
+        ),
+        CompletionOutput(
+            index=0,
+            text="",
+            token_ids=[1002],
+            cumulative_logprob=None,
+            logprobs=None,
+        ),
+        CompletionOutput(
+            index=0,
+            text="<parameter=command>pwd</parameter></function>",
+            token_ids=[1003],
+            cumulative_logprob=None,
+            logprobs=None,
+            finish_reason="stop",
+        ),
+    ]
+
+    assert proc.process_output(outputs[0]) is None
+    assert proc.process_output(outputs[1]) is None
+    result = proc.process_output(outputs[2])
+
+    assert result is not None
+    tool_calls = _collect_tool_calls([result])
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "bash"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "command": "pwd"
+    }
+    assert result["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize("with_tools", [False, True])
 def test_non_streaming_unclosed_reasoning_is_not_duplicated_as_content(
     tokenizer,

@@ -1337,7 +1337,9 @@ class StreamingPostProcessor:
         self._strip_tool_markup_from_reasoning(delta_message)
         choice = None
         if delta_message is None:
-            if self.in_progress_tool_calls:
+            if self.in_progress_tool_calls and (
+                output.finish_reason or self._in_progress_tool_calls_are_complete()
+            ):
                 choice = self._emit_tool_calls_choice(output)
             elif output.finish_reason:
                 choice = self._build_choice(output, {})
@@ -1360,12 +1362,18 @@ class StreamingPostProcessor:
                 delta["content"] = content
             if delta_message.reasoning:
                 delta["reasoning_content"] = delta_message.reasoning
-            if self.in_progress_tool_calls:
+            if (
+                self.in_progress_tool_calls
+                and self._in_progress_tool_calls_are_complete()
+            ):
                 delta["tool_calls"] = self._dump_in_progress_tool_calls()
                 self.in_progress_tool_calls.clear()
+                self._tool_call_choices_emitted.add(output.index)
             if len(delta) > 1:
                 choice = self._build_choice(output, delta)
-        elif self.in_progress_tool_calls:
+        elif self.in_progress_tool_calls and (
+            output.finish_reason or self._in_progress_tool_calls_are_complete()
+        ):
             choice = self._emit_tool_calls_choice(output)
         elif output.finish_reason:
             choice = self._build_choice(output, {})
