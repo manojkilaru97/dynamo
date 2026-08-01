@@ -21,19 +21,19 @@ assert metadata.version("ai-dynamo-runtime") == "1.3.0"
 core = Path("/usr/local/lib/python3.12/dist-packages/dynamo/_core.abi3.so")
 assert hashlib.sha256(core.read_bytes()).hexdigest() == "ac3c59e3acc12d771dd055d99a56e9166ac2f27eb7b6e5e4e759f9e6db328540"
 handlers = Path("/usr/local/lib/python3.12/dist-packages/dynamo/vllm/handlers.py")
-assert hashlib.sha256(handlers.read_bytes()).hexdigest() == "938e2e517271afddaf1db9c67e629f17797b2ba3d16330c5ef307c47bc6f0d18"
+assert hashlib.sha256(handlers.read_bytes()).hexdigest() == "9cc50bc7e4e8886961c0d4a00e143f61dcb974fc45a1d3617c9425914c89b3d9"
 processor = Path("/usr/local/lib/python3.12/dist-packages/dynamo/frontend/vllm_processor.py")
 assert hashlib.sha256(processor.read_bytes()).hexdigest() == "09ea3c597a2b49de6b2a23af05efa976b95bb7b9e080233cd5992faa940820c2"
 prepost = Path("/usr/local/lib/python3.12/dist-packages/dynamo/frontend/prepost.py")
 assert hashlib.sha256(prepost.read_bytes()).hexdigest() == "54b2fb507d43e0fffc098b7202e3096bffa72b59371d6a1853e2a9d9e289ab12"
 PY
 
-LABEL org.opencontainers.image.revision="9df0dc1ebe7084577a38307ad6f42fd42e3003f8" \
-      com.nvidia.dynamo.source.revision="9df0dc1ebe7084577a38307ad6f42fd42e3003f8" \
+LABEL org.opencontainers.image.revision="69f59d09a65906fcf9449fc4c4dcd725a9462eb3" \
+      com.nvidia.dynamo.source.revision="69f59d09a65906fcf9449fc4c4dcd725a9462eb3" \
       ai.nvidia.nano.dynamo.base-digest="sha256:9a72053788a5c22aa893af486fe3f77f82ffd43c1dd00c3a4a3462662231861c" \
-      ai.nvidia.nano.dynamo.dynamo-commit="9df0dc1ebe7084577a38307ad6f42fd42e3003f8" \
+      ai.nvidia.nano.dynamo.dynamo-commit="69f59d09a65906fcf9449fc4c4dcd725a9462eb3" \
       ai.nvidia.nano.dynamo.rebase-commit="c87b7401110c201b110f211bb646a467ba550b5e" \
-      ai.nvidia.nano.dynamo.python-wheel-sha256="2f92ed9c07789a176fac4a26d8167b07168b7b5518c24620c619791d99c969ec" \
+      ai.nvidia.nano.dynamo.python-wheel-sha256="78ca4265592021645710add83339b4863b1d9de5946a706e6a3980311ce9dc40" \
       ai.nvidia.nano.dynamo.runtime-wheel-sha256="efdf42f40da04ba4dd58453a04ff20bdde9cbff8f24f3101bd97b968300d4f13" \
       ai.nvidia.nano.dynamo.version="1.3.0" \
       ai.nvidia.nano.dynamo.vllm-version="0.26.0+cu129" \
