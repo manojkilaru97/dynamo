@@ -94,7 +94,19 @@ def _with_parser_visible_engine_text(
         logprobs=output.logprobs,
     )
 
-def map_finish_reason(raw_reason: str | None) -> FinishReason | None:
+def _normalize_router_finish_reason(raw_reason: Any) -> str | None:
+    if raw_reason is None:
+        return None
+    if isinstance(raw_reason, dict):
+        raw_reason = raw_reason.get("type")
+    if not isinstance(raw_reason, str):
+        logger.warning("Malformed finish_reason from router: %r", raw_reason)
+        return "error"
+    return raw_reason
+
+
+def map_finish_reason(raw_reason: Any) -> FinishReason | None:
+    raw_reason = _normalize_router_finish_reason(raw_reason)
     if raw_reason is None:
         return None
     if raw_reason.startswith("error"):
@@ -1420,7 +1432,9 @@ class VllmProcessor:
                     }
                     break
 
-                raw_finish_reason = engine_response.get("finish_reason")
+                raw_finish_reason = _normalize_router_finish_reason(
+                    engine_response.get("finish_reason")
+                )
                 finish_reason = map_finish_reason(raw_finish_reason)
                 stop_reason = engine_response.get("stop_reason")
 
