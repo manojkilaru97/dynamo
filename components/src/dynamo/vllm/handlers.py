@@ -2108,22 +2108,6 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             return None
         return parsed if parsed > 0 else None
 
-    def _get_default_max_total_requests(self) -> int | None:
-        scheduler_config = getattr(
-            getattr(self.engine_client, "vllm_config", None),
-            "scheduler_config",
-            None,
-        )
-        value = getattr(scheduler_config, "max_num_seqs", None)
-        if value in (None, ""):
-            return None
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            logger.warning("Ignoring invalid scheduler max_num_seqs=%r", value)
-            return None
-        return parsed if parsed > 0 else None
-
     def _configured_max_total_requests(
         self, *, log_ignored_per_dp: bool = False
     ) -> int | None:
@@ -2140,7 +2124,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 "worker manages a single local DP rank",
                 per_dp_limit,
             )
-        return total_limit or self._get_default_max_total_requests()
+        return total_limit
 
     def _current_total_local_requests(self) -> int | None:
         output_processor = getattr(self.engine_client, "output_processor", None)

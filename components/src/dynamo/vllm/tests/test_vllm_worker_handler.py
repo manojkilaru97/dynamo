@@ -93,6 +93,7 @@ def _make_handler(
     # BaseWorkerHandler.__init__ is bypassed above; the decode generate path
     # registers per-request deferred-abort guards here.
     handler._deferred_aborts = {}
+    handler.max_total_requests = None
     return handler
 
 
@@ -136,6 +137,28 @@ def _make_engine_response(request_id: str = "req-1", finished: bool = True):
     resp.metrics = None
     resp.kv_transfer_params = {"do_remote_decode": False}
     return resp
+
+
+def test_worker_total_request_limit_is_opt_in(monkeypatch):
+    handler = _make_handler()
+    handler.dp_range = (0, 1)
+    handler.engine_client = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=32)
+        )
+    )
+    monkeypatch.delenv("DYN_REQUEST_MAX_TOTAL_REQUESTS", raising=False)
+    monkeypatch.delenv("DYN_REQUEST_MAX_TOTAL_REQUESTS_PER_DP", raising=False)
+
+    assert handler._configured_max_total_requests() is None
+
+
+def test_worker_total_request_limit_honors_explicit_override(monkeypatch):
+    handler = _make_handler()
+    handler.dp_range = (0, 1)
+    monkeypatch.setenv("DYN_REQUEST_MAX_TOTAL_REQUESTS", "64")
+
+    assert handler._configured_max_total_requests() == 64
 
 
 @pytest.mark.asyncio
