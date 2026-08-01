@@ -1043,13 +1043,30 @@ class StreamingPostProcessor:
         if not self.in_progress_tool_calls:
             return False
         for tool_call in self.in_progress_tool_calls.values():
-            arguments = tool_call.function.arguments if tool_call.function else None
+            if tool_call.function is None or not tool_call.function.name:
+                return False
+            arguments = tool_call.function.arguments
             if not arguments:
                 return False
             try:
-                json.loads(arguments)
+                decoded = json.loads(arguments)
             except (TypeError, json.JSONDecodeError):
                 return False
+            for tool in getattr(self.request_for_sampling, "tools", None) or ():
+                function = _value_from_mapping_or_object(tool, "function")
+                if (
+                    _value_from_mapping_or_object(function, "name")
+                    != tool_call.function.name
+                ):
+                    continue
+                parameters = _value_from_mapping_or_object(function, "parameters", {})
+                required = _value_from_mapping_or_object(parameters, "required", ()) or ()
+                if required and (
+                    not isinstance(decoded, dict)
+                    or not all(key in decoded for key in required)
+                ):
+                    return False
+                break
         return True
 
     def _repair_terminal_tool_calls(
@@ -1570,9 +1587,7 @@ class StreamingPostProcessor:
 
         choice = None
         if delta_message is None:
-            if self.in_progress_tool_calls and (
-                output.finish_reason or self._in_progress_tool_calls_are_complete()
-            ):
+            if self.in_progress_tool_calls and output.finish_reason:
                 choice = self._emit_tool_calls_choice(output)
             elif output.finish_reason:
                 choice = self._build_choice(output, {})
@@ -1597,16 +1612,14 @@ class StreamingPostProcessor:
                 delta["reasoning_content"] = delta_message.reasoning
             if (
                 self.in_progress_tool_calls
-                and self._in_progress_tool_calls_are_complete()
+                and output.finish_reason
             ):
                 delta["tool_calls"] = self._dump_in_progress_tool_calls()
                 self.in_progress_tool_calls.clear()
                 self._tool_call_choices_emitted.add(output.index)
             if len(delta) > 1:
                 choice = self._build_choice(output, delta)
-        elif self.in_progress_tool_calls and (
-            output.finish_reason or self._in_progress_tool_calls_are_complete()
-        ):
+        elif self.in_progress_tool_calls and output.finish_reason:
             choice = self._emit_tool_calls_choice(output)
         elif output.finish_reason:
             choice = self._build_choice(output, {})

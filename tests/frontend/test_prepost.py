@@ -1720,20 +1720,15 @@ def test_incomplete_tool_call_is_not_emitted_before_arguments(
                         index=0,
                         type="function",
                         id="chatcmpl-tool-buffered",
-                        function=DeltaFunctionCall(name="bash", arguments=None),
+                        function=DeltaFunctionCall(
+                            name="get_weather", arguments="{}"
+                        ),
                     )
                 ]
             ),
             DeltaMessage(),
             DeltaMessage(
-                tool_calls=[
-                    DeltaToolCall(
-                        index=0,
-                        function=DeltaFunctionCall(
-                            name=None, arguments='{"command":"pwd"}'
-                        ),
-                    )
-                ]
+                tool_calls=[]
             ),
         ]
     )
@@ -1753,7 +1748,7 @@ def test_incomplete_tool_call_is_not_emitted_before_arguments(
     outputs = [
         CompletionOutput(
             index=0,
-            text="<function=bash>",
+            text="<function=get_weather>",
             token_ids=[1001],
             cumulative_logprob=None,
             logprobs=None,
@@ -1767,7 +1762,7 @@ def test_incomplete_tool_call_is_not_emitted_before_arguments(
         ),
         CompletionOutput(
             index=0,
-            text="<parameter=command>pwd</parameter></function>",
+            text="<parameter=location>NYC</parameter></function>",
             token_ids=[1003],
             cumulative_logprob=None,
             logprobs=None,
@@ -1782,9 +1777,9 @@ def test_incomplete_tool_call_is_not_emitted_before_arguments(
     assert result is not None
     tool_calls = _collect_tool_calls([result])
     assert len(tool_calls) == 1
-    assert tool_calls[0]["function"]["name"] == "bash"
+    assert tool_calls[0]["function"]["name"] == "get_weather"
     assert json.loads(tool_calls[0]["function"]["arguments"]) == {
-        "command": "pwd"
+        "location": "NYC"
     }
     assert result["finish_reason"] == "tool_calls"
 
