@@ -642,12 +642,31 @@ async def _run_generate(processor, preproc, *, mm_routing_info=None, context=Non
     ]
 
 
+@pytest.mark.parametrize(
+    ("raw_reason", "expected"),
+    [
+        ({"type": "stop"}, "STOP"),
+        ({"type": "error", "message": "engine overloaded"}, "ERROR"),
+        ({}, "ERROR"),
+    ],
+)
+def test_map_finish_reason_accepts_router_objects(
+    vllm_processor_module, raw_reason, expected
+):
+    assert vllm_processor_module.map_finish_reason(raw_reason) == getattr(
+        vllm_processor_module.FinishReason, expected
+    )
+
+
 class TestRoutedEnginePath:
+    @pytest.mark.parametrize(
+        "raw_finish_reason", ["stop", {"type": "stop"}], ids=["string", "object"]
+    )
     def test_terminal_chunk_without_vllm_output_flushes_postprocessor(
-        self, vllm_processor_module
+        self, vllm_processor_module, raw_finish_reason
     ):
         routed_engine = _FakeRoutedEngine(
-            [{"token_ids": [], "index": 0, "finish_reason": "stop"}]
+            [{"token_ids": [], "index": 0, "finish_reason": raw_finish_reason}]
         )
         processor = _make_processor(vllm_processor_module, routed_engine)
         processor.output_processor.process_outputs = lambda outputs: SimpleNamespace(
