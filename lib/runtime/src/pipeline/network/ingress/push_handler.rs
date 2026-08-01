@@ -272,10 +272,10 @@ impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
                         .inc();
                 }
             }
-            if saw_success_response {
-                if let Some(notifier) = self.endpoint_health_check_notifier.get() {
-                    notifier.notify_one();
-                }
+            if saw_success_response
+                && let Some(notifier) = self.endpoint_health_check_notifier.get()
+            {
+                notifier.notify_one();
             }
         }
         if saw_stream_failure {

@@ -256,6 +256,7 @@ mod tests {
             requested_streaming: true,
             model: "test-model".to_string(),
             request: Some(Arc::new(create_test_request_with_nvext())),
+            raw_request: None,
             response: Some(Arc::new(create_test_response("final answer"))),
             raw_response: None,
             headers: None,

@@ -162,11 +162,10 @@ mod tests {
 
                 // Emit audit record
                 let request = create_test_request("nemotron", true);
-                let mut handle = handle::create_handle(&request, "test-req-1")
+                let handle = handle::create_handle(&request, "test-req-1")
                     .expect("Failed to create audit handle");
-                handle.set_request(Arc::new(request.clone()));
-                handle.set_response(Arc::new(create_test_response("nemotron", "test response")));
-                handle.emit();
+                handle.emit_request(Some(Arc::new(request.clone())), None, None);
+                handle.emit_response(Arc::new(create_test_response("nemotron", "test response")));
 
                 time::sleep(Duration::from_millis(200)).await;
 
@@ -175,18 +174,29 @@ mod tests {
                     &client,
                     &stream_name,
                     "test-consumer",
-                    1,
+                    2,
                     Duration::from_secs(2),
                 )
                 .await;
 
-                assert_eq!(messages.len(), 1, "Should receive exactly one audit record");
-                let record = &messages[0];
-                assert_eq!(record["schema_version"], 1);
-                assert_eq!(record["request_id"], "test-req-1");
-                assert_eq!(record["model"], "nemotron");
-                assert!(record["request"].is_object());
-                assert!(record["response"].is_object());
+                assert_eq!(
+                    messages.len(),
+                    2,
+                    "Should receive request and response records"
+                );
+                let request_record = &messages[0];
+                assert_eq!(request_record["schema_version"], 1);
+                assert_eq!(request_record["event_type"], "request");
+                assert_eq!(request_record["request_id"], "test-req-1");
+                assert_eq!(request_record["model"], "nemotron");
+                assert!(request_record["request"].is_object());
+
+                let response_record = &messages[1];
+                assert_eq!(response_record["schema_version"], 1);
+                assert_eq!(response_record["event_type"], "response");
+                assert_eq!(response_record["request_id"], "test-req-1");
+                assert_eq!(response_record["model"], "nemotron");
+                assert!(response_record["response"].is_object());
 
                 client.jetstream().delete_stream(&stream_name).await.ok();
             },
@@ -219,9 +229,8 @@ mod tests {
 
                 // Request with store=true (should be audited)
                 let request_true = create_test_request("nemotron", true);
-                if let Some(mut handle) = handle::create_handle(&request_true, "store-true") {
-                    handle.set_request(Arc::new(request_true.clone()));
-                    handle.emit();
+                if let Some(handle) = handle::create_handle(&request_true, "store-true") {
+                    handle.emit_request(Some(Arc::new(request_true.clone())), None, None);
                 }
 
                 // Request with store=false (should NOT be audited)

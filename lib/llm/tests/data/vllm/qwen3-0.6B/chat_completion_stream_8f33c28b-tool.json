@@ -1,7 +1,7 @@
 {
   "request_id": "8f33c28b-cb52-4272-9ac5-0cb9f80386d3",
   "expected_output": {
-      "normal_content": "\n\n",
+      "normal_content": "",
       "reasoning_content": "\nOkay, the user is asking for the weather in San Francisco in Celsius. Let me check the tools provided. There's a function called get_weather that requires location and unit. The location needs to be a city and state, which San Francisco, CA is. The unit they specified is Celsius. So I should call get_weather with location \"San Francisco, CA\" and unit \"celsius\". That should retrieve the current weather data in the requested format.\n",
       "tool_calls": [
         {

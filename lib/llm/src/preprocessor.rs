@@ -3211,7 +3211,8 @@ impl OpenAIPreprocessor {
         matches!(
             reasoning_parser,
             Some(
-                "deepseek_v4"
+                "qwen3"
+                    | "deepseek_v4"
                     | "deepseek-v4"
                     | "deepseekv4"
                     | "glm45"
@@ -3222,8 +3223,7 @@ impl OpenAIPreprocessor {
     }
 
     fn skips_structured_response_when_prompt_injected(reasoning_parser: Option<&str>) -> bool {
-        matches!(reasoning_parser, Some("qwen3"))
-            || Self::skips_guided_json_when_prompt_injected(reasoning_parser)
+        Self::skips_guided_json_when_prompt_injected(reasoning_parser)
     }
 
     fn prompt_injected_reasoning_start(
@@ -3518,12 +3518,9 @@ impl OpenAIPreprocessor {
                                     if choice_state.reasoning_ended {
                                         (String::new(), text.clone())
                                     } else {
-                                        let parser_result = parser
-                                            .parse_reasoning_streaming_incremental(text, &[]);
-                                        (
-                                            parser_result.reasoning_text,
-                                            parser_result.normal_text,
-                                        )
+                                        let parser_result =
+                                            parser.parse_reasoning_streaming_incremental(text, &[]);
+                                        (parser_result.reasoning_text, parser_result.normal_text)
                                     };
 
                                 // The parser API receives no token IDs on this layer. For
@@ -3533,7 +3530,15 @@ impl OpenAIPreprocessor {
                                 if !choice_state.reasoning_ended
                                     && let Some(end_idx) = text.rfind(THINK_END_TOKEN)
                                 {
-                                    delta_reasoning = text[..end_idx].to_string();
+                                    // This textual-boundary fallback must mirror the
+                                    // parser's handling of an explicit opener. Otherwise
+                                    // a single chunk containing
+                                    // `<think>reasoning</think>` leaks `<think>` into the
+                                    // public reasoning_content field.
+                                    delta_reasoning = text[..end_idx]
+                                        .strip_prefix("<think>")
+                                        .unwrap_or(&text[..end_idx])
+                                        .to_string();
                                     normal_text = text[end_idx + THINK_END_TOKEN.len()..]
                                         .trim_start_matches(['\n', '\r'])
                                         .to_string();
@@ -3557,13 +3562,13 @@ impl OpenAIPreprocessor {
                                             &mut normal_text,
                                         ));
                                     normal_text = after_boundary;
-                                    if let Some(boundary_reasoning) = boundary_reasoning {
-                                        if !boundary_reasoning.is_empty() {
-                                            choice_state
-                                                .reasoning_content
-                                                .push_str(&boundary_reasoning);
-                                            delta_reasoning.push_str(&boundary_reasoning);
-                                        }
+                                    if let Some(boundary_reasoning) = boundary_reasoning
+                                        && !boundary_reasoning.is_empty()
+                                    {
+                                        choice_state
+                                            .reasoning_content
+                                            .push_str(&boundary_reasoning);
+                                        delta_reasoning.push_str(&boundary_reasoning);
                                     }
                                 }
 
@@ -4262,6 +4267,7 @@ mod tests {
                 service_tier: None,
             },
             nvext: None,
+            llm_metrics: None,
         };
 
         Annotated {
@@ -5425,8 +5431,8 @@ mod tests {
             (
                 Some("nemotron3"),
                 Some(&force_nonempty_content_true),
-                false,
-                "nemotron3 + force_nonempty_content=true → parser stays enabled",
+                true,
+                "nemotron3 + force_nonempty_content=true → disabled",
             ),
             (
                 Some("nemotron_v3"),
@@ -5437,8 +5443,8 @@ mod tests {
             (
                 Some("nemotron_v3"),
                 Some(&force_nonempty_content_true),
-                false,
-                "nemotron_v3 + force_nonempty_content=true → parser stays enabled",
+                true,
+                "nemotron_v3 + force_nonempty_content=true → disabled",
             ),
             // deepseek_v4 — same convention as deepseek_r1; verify all three aliases
             // (deepseek_v4 / deepseek-v4 / deepseekv4) plus both signal keys.

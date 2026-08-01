@@ -103,6 +103,7 @@ pub const MAX_REPETITION_PENALTY: f32 = 2.0;
 
 /// Extra-body fields accepted for backend-specific handling.
 pub const PASSTHROUGH_EXTRA_FIELDS: &[&str] = &[
+    "request_id",
     "cache_salt",
     "stop_token_ids",
     "detokenize",
@@ -138,6 +139,11 @@ fn validate_no_unsupported_fields_with_ignore(
         .collect();
     if !unknown.is_empty() && !ignore_unsupported_fields {
         anyhow::bail!("Unsupported parameter(s): {}", unknown.join(", "));
+    }
+    if let Some(value) = unsupported_fields.get("request_id")
+        && !value.is_string()
+    {
+        anyhow::bail!("`request_id` must be a string");
     }
     if let Some(value) = unsupported_fields.get("cache_salt")
         && !value.is_string()

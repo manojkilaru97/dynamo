@@ -529,10 +529,8 @@ impl NvCreateChatCompletionRequest {
         self.normalize_template_thinking_aliases();
 
         let explicit_template_thinking = self.has_explicit_template_thinking();
-        if !explicit_template_thinking {
-            if let Some(effort) = self.reasoning_effort_string() {
-                self.apply_reasoning_effort_template_args(&effort);
-            }
+        if !explicit_template_thinking && let Some(effort) = self.reasoning_effort_string() {
+            self.apply_reasoning_effort_template_args(&effort);
         }
 
         let Some(reasoning) = self.unsupported_fields.remove("reasoning") else {
@@ -1169,7 +1167,9 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
 mod tests {
     use super::*;
     use crate::engines::ValidateRequest;
-    use crate::protocols::common::{OutputOptionsProvider, StopConditionsProvider};
+    use crate::protocols::common::{
+        OutputOptionsProvider, SamplingOptionsProvider, StopConditionsProvider,
+    };
     use dynamo_protocols::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
     use serde_json::json;
     use std::sync::Mutex;
@@ -1421,7 +1421,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("When using `tool_choice`, `tools` must be set")
+                .contains("tool_choice is \"required\" but tools is empty")
         );
     }
 
@@ -1693,7 +1693,7 @@ mod tests {
             "model": "nvidia/nemotron-3-nano-30b-a3b",
             "messages": [{
                 "role": "user",
-                "content": "Send this exact long body: ".to_string() + &"abcdef ".repeat(600)
+                "content": "Send this exact long body: ".to_string() + &"abcdef ".repeat(1200)
             }],
             "tools": [{
                 "type": "function",

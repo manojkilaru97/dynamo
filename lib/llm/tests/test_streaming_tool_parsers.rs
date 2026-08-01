@@ -559,10 +559,10 @@ mod tests {
         // Aggregate content from output chunks
         let aggregated = aggregate_content_from_chunks(&output_chunks);
 
-        // Assert that output content matches input content exactly (no parsing applied)
+        // Assert that parser-owned leading separators are removed from content.
         assert_eq!(
             aggregated.normal_content, test_data.expected_normal_content,
-            "When parsing is disabled, output should match input exactly"
+            "Normal content should match the normalized fixture output"
         );
 
         // Verify tool calls match expectations

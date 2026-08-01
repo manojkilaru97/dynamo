@@ -131,6 +131,9 @@ pub(crate) struct ErrorMessage {
     #[serde(rename = "type")]
     error_type: String,
     code: u16,
+    // Retained for internal error-conversion assertions; the custom OpenAI
+    // serializer deliberately excludes backend details from public responses.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<Box<serde_json::Value>>,
 }
@@ -1336,7 +1339,7 @@ async fn embeddings(
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
 
     // todo - error handling should be more robust
-    let engine = state.manager().get_embeddings_engine(&model).map_err(|e| {
+    let engine = state.manager().get_embeddings_engine(model).map_err(|e| {
         let err_response = ErrorMessage::from_model_error(&e);
         inflight.mark_error(extract_error_type_from_response(&err_response));
         err_response
@@ -1448,7 +1451,13 @@ async fn handler_chat_completions(
 ) -> Result<Response, ErrorResponse> {
     ensure_json_content_type(&headers)?;
     let raw_request: serde_json::Value = parse_json_request("chat completions", &body)?;
-    let request_id = get_or_create_request_id(&headers);
+    let request_id = raw_request
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|request_id| !request_id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| get_or_create_request_id(&headers));
     let mut request = NvCreateChatCompletionRequest::deserialize(&raw_request).map_err(|err| {
         let err_response = (
             StatusCode::BAD_REQUEST,
@@ -4342,12 +4351,12 @@ mod tests {
                 let body = axum::body::to_bytes(response.into_body(), get_body_limit())
                     .await
                     .unwrap();
-                let error: ErrorMessage = serde_json::from_slice(&body).unwrap();
+                let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(
-                    error.message,
-                    format!(
+                    error["error"]["message"],
+                    serde_json::Value::String(format!(
                         "{VALIDATION_PREFIX}`nvext.extra_fields=[\"{field}\"]` is not supported by the Responses API."
-                    )
+                    ))
                 );
             }
         }

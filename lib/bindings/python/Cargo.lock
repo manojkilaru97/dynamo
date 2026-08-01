@@ -2231,7 +2231,7 @@ dependencies = [
  "parking_lot",
  "prometheus",
  "prost 0.13.5",
- "prost 0.14.3",
+ "prost 0.14.4",
  "rand 0.9.4",
  "rayon",
  "reqwest",

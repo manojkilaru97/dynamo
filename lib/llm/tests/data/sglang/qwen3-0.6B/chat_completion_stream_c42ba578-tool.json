@@ -1,7 +1,7 @@
 {
   "request_id": "c42ba578-445b-4613-9574-87683bd990df",
   "expected_output": {
-      "normal_content": "\n\n",
+      "normal_content": "",
       "reasoning_content": "\nOkay, the user is asking for the weather in Tokyo in Celsius. Let me check the tools provided. There's a function called get_weather that requires location and unit. The location should be \"Tokyo\" and the unit should be \"celsius\". I need to make sure both parameters are included. The user specified Celsius, so that's correct. I'll call the function with those arguments.\n",
       "tool_calls": [
         {

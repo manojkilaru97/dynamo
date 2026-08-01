@@ -574,6 +574,7 @@ mod tests {
             index: Some(0),
             completion_usage: None,
             disaggregated_params: None,
+            extra_args: None,
             worker_trace_link: None,
             // routed_experts rides the engine's opaque passthrough.
             engine_data: Some(serde_json::json!({
@@ -598,7 +599,10 @@ mod tests {
             completion_usage: None,
             disaggregated_params: None,
             extra_args: None,
+            encoder_result: None,
+            worker_trace_link: None,
             engine_data: None,
+            routing_data: None,
         }
     }
 
@@ -703,6 +707,7 @@ mod tests {
             index: Some(0),
             completion_usage: None,
             disaggregated_params: None,
+            extra_args: None,
             encoder_result: None,
             worker_trace_link: None,
             engine_data: Some(serde_json::json!({
@@ -919,6 +924,7 @@ mod tests {
             index: Some(0),
             completion_usage: None,
             disaggregated_params: None,
+            extra_args: None,
             encoder_result: None,
             worker_trace_link: None,
             engine_data: None, // engine didn't provide any data
@@ -960,7 +966,10 @@ mod tests {
             extra_args: Some(serde_json::json!({
                 "dynamo_error_type": "service_overloaded",
             })),
+            encoder_result: None,
+            worker_trace_link: None,
             engine_data: None,
+            routing_data: None,
         };
 
         let err = generator

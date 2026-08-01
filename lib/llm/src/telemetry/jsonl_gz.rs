@@ -290,14 +290,12 @@ mod tests {
         name: String,
     }
 
-    fn read_gzip_jsonl(path: &Path) -> String {
-        let bytes = std::fs::read(path).expect("gzip segment readable");
+    fn read_gzip_jsonl(path: &Path) -> std::io::Result<String> {
+        let bytes = std::fs::read(path)?;
         let mut decoder = MultiGzDecoder::new(bytes.as_slice());
         let mut content = String::new();
-        decoder
-            .read_to_string(&mut content)
-            .expect("gzip segment decompresses");
-        content
+        decoder.read_to_string(&mut content)?;
+        Ok(content)
     }
 
     #[tokio::test]
@@ -334,8 +332,10 @@ mod tests {
         let segment = segment_path(&path, 0);
         let mut content = String::new();
         for _ in 0..100 {
-            if segment.exists() {
-                content = read_gzip_jsonl(&segment);
+            if segment.exists()
+                && let Ok(candidate) = read_gzip_jsonl(&segment)
+            {
+                content = candidate;
                 if content.matches("\"name\":").count() == 2 {
                     break;
                 }
@@ -382,9 +382,13 @@ mod tests {
         let mut first_content = String::new();
         let mut second_content = String::new();
         for _ in 0..100 {
-            if first.exists() && second.exists() {
-                first_content = read_gzip_jsonl(&first);
-                second_content = read_gzip_jsonl(&second);
+            if first.exists()
+                && second.exists()
+                && let (Ok(first_candidate), Ok(second_candidate)) =
+                    (read_gzip_jsonl(&first), read_gzip_jsonl(&second))
+            {
+                first_content = first_candidate;
+                second_content = second_candidate;
                 if first_content.contains("\"name\":\"first\"")
                     && second_content.contains("\"name\":\"second\"")
                 {

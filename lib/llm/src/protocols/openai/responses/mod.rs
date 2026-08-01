@@ -895,11 +895,6 @@ fn convert_top_logprobs(input: Option<u8>) -> Option<u8> {
     input.map(|x| x.min(20))
 }
 
-fn convert_reasoning_effort<T: Serialize>(effort: Option<&T>) -> Option<ChatReasoningEffort> {
-    let value = serde_json::to_value(effort?).ok()?;
-    serde_json::from_value(value).ok()
-}
-
 /// Parse `<tool_call>` blocks from model text output.
 /// Returns a list of (name, arguments_json) tuples.
 /// Returns an empty vec immediately if no `<tool_call>` tag is present.
@@ -2797,8 +2792,6 @@ thinking
     fn test_response_echoes_reasoning() {
         use dynamo_protocols::types::responses::Reasoning;
 
-        let mut input_reasoning = Reasoning::default();
-        input_reasoning.effort = Some(serde_json::from_value(serde_json::json!("high")).unwrap());
         let params = ResponseParams {
             reasoning: Some(Reasoning {
                 effort: Some(serde_json::from_value(serde_json::json!("high")).unwrap()),

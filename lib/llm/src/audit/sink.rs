@@ -278,14 +278,12 @@ mod tests {
         }
     }
 
-    fn read_gzip_jsonl(path: &std::path::Path) -> String {
-        let bytes = std::fs::read(path).expect("gzip audit segment readable");
+    fn read_gzip_jsonl(path: &std::path::Path) -> std::io::Result<String> {
+        let bytes = std::fs::read(path)?;
         let mut decoder = MultiGzDecoder::new(bytes.as_slice());
         let mut content = String::new();
-        decoder
-            .read_to_string(&mut content)
-            .expect("gzip audit segment decompresses");
-        content
+        decoder.read_to_string(&mut content)?;
+        Ok(content)
     }
 
     #[tokio::test]
@@ -310,8 +308,10 @@ mod tests {
         let segment = segment_path(&path, 0);
         let mut content = String::new();
         for _ in 0..100 {
-            if segment.exists() {
-                content = read_gzip_jsonl(&segment);
+            if segment.exists()
+                && let Ok(candidate) = read_gzip_jsonl(&segment)
+            {
+                content = candidate;
                 if content.matches("\"request_id\":\"req-abc\"").count() == 2 {
                     break;
                 }

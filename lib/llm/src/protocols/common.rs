@@ -533,6 +533,7 @@ impl GuidedDecodingOptions {
     }
 
     /// Construct only if one field is Some, including json_object and structural tag (fallible).
+    #[allow(clippy::too_many_arguments)]
     pub fn from_optional_with_json_object_and_structural_tag(
         json: Option<serde_json::Value>,
         json_object: Option<bool>,

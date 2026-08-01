@@ -1790,18 +1790,9 @@ async fn tool_choice_matrix_non_force_required_prompt_injected_with_close_marker
 }
 
 /// CASE 5 — non-force parser + required + `prompt_injected_reasoning=true`
-/// + bare JSON (no `</think>`). Documents the **backend contract** rather
-/// than asserting recovery: when `--dyn-reasoning-parser X` is set, vLLM's
-/// auto-forward in `components/src/dynamo/vllm/main.py:506-507` instantiates
-/// a reasoner whose `should_fill_bitmask` gate (vLLM
-/// `v1/structured_output/__init__.py:301`) keeps the xgrammar bitmask off
-/// until `</think>` appears in the output. Consequently any "bare guided
-/// JSON" emitted before `</think>` was never grammar-constrained — it's a
-/// backend-bug shape, not a normal production output.
-///
-/// This test pins the current behavior so future regressions are loud: if
-/// we later add an EOF fallback to `BasicReasoningParser` to flush
-/// accumulated reasoning as content, this assertion needs to flip.
+/// + bare JSON (no `</think>`). Even though this is an abnormal backend
+/// shape, the tool parser should recover the required call instead of
+/// leaving JSON in reasoning content.
 #[tokio::test]
 async fn tool_choice_matrix_non_force_required_prompt_injected_bare_json_contract() {
     let bare_json = r#"[{"name":"get_weather","parameters":{"location":"San Francisco"}}]"#;
@@ -1822,19 +1813,12 @@ async fn tool_choice_matrix_non_force_required_prompt_injected_bare_json_contrac
         ..
     } = drain_stream(output_stream).await;
 
-    let case = "5 (contract): non-force + required + prompt_injected=true + bare JSON";
+    let case = "5: non-force + required + prompt_injected=true + bare JSON";
     assert!(
-        tool_calls.is_empty(),
-        "{case}: contract case currently extracts no tool_calls (backend bug shape), got: {tool_calls:?}"
+        reasoning.is_empty(),
+        "{case}: recovered tool JSON must not leak into reasoning_content, got: {reasoning:?}"
     );
-    assert!(
-        content.is_empty(),
-        "{case}: content must remain empty (no leak), got: {content:?}"
-    );
-    assert!(
-        reasoning.contains("get_weather"),
-        "{case}: parser pins the JSON in reasoning_content under the broken contract, got: {reasoning:?}"
-    );
+    assert_clean_tool_call(case, &content, &tool_calls, "San Francisco");
 }
 
 /// `enable_thinking=true` still preserves genuine reasoning followed by a

@@ -314,9 +314,7 @@ impl SystemHealth {
         }
         {
             let mut real_traffic = self.endpoint_real_traffic_health.write().unwrap();
-            real_traffic
-                .entry(key.clone())
-                .or_insert_with(RealTrafficWindow::default);
+            real_traffic.entry(key.clone()).or_default();
         }
 
         if let Err(e) = self.new_endpoint_tx.send(key.clone()) {
@@ -382,10 +380,11 @@ impl SystemHealth {
     fn record_endpoint_request_outcome(&self, endpoint: &str, outcome: RequestOutcome) {
         let now = Instant::now();
         let mut windows = self.endpoint_real_traffic_health.write().unwrap();
-        windows
-            .entry(endpoint.to_string())
-            .or_insert_with(RealTrafficWindow::default)
-            .record(now, outcome, &self.real_traffic_health_config);
+        windows.entry(endpoint.to_string()).or_default().record(
+            now,
+            outcome,
+            &self.real_traffic_health_config,
+        );
     }
 
     pub fn get_endpoint_real_traffic_health_status(&self, endpoint: &str) -> Option<HealthStatus> {

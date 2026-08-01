@@ -103,7 +103,7 @@ impl DeltaChoice {
         if let Some(end_idx) = self.text.rfind(THINK_END) {
             let before = self.text[..end_idx].to_string();
             let after = self.text[end_idx + THINK_END.len()..]
-                .trim_start_matches(|ch| ch == '\n' || ch == '\r')
+                .trim_start_matches(['\n', '\r'])
                 .to_string();
             if !before.is_empty() {
                 self.reasoning_content
@@ -112,10 +112,7 @@ impl DeltaChoice {
             }
             self.text = after;
         } else {
-            self.text = self
-                .text
-                .trim_start_matches(|ch| ch == '\n' || ch == '\r')
-                .to_string();
+            self.text = self.text.trim_start_matches(['\n', '\r']).to_string();
         }
     }
 }
@@ -307,7 +304,7 @@ impl DeltaAggregator {
             let state_choice = self.choices.entry(choice.index).or_insert(DeltaChoice {
                 index: choice.index,
                 text: "".to_string(),
-                role: choice.delta.role.clone(),
+                role: choice.delta.role,
                 finish_reason: None,
                 logprobs: None,
                 tool_call_chunks: BTreeMap::new(),
@@ -317,7 +314,7 @@ impl DeltaAggregator {
             });
 
             if state_choice.role.is_none() {
-                state_choice.role = choice.delta.role.clone();
+                state_choice.role = choice.delta.role;
             }
 
             if let Some(content) = &choice.delta.content {
@@ -361,7 +358,7 @@ impl DeltaAggregator {
             }
 
             if let Some(finish_reason) = &choice.finish_reason {
-                state_choice.finish_reason = Some(finish_reason.clone());
+                state_choice.finish_reason = Some(*finish_reason);
             }
 
             if let Some(logprobs) = &choice.logprobs {
@@ -539,14 +536,18 @@ fn try_jsonish_tool_call_parse_aggregate_finalize(
     message: &str,
     tool_names: &[String],
 ) -> anyhow::Result<(Vec<ToolCallResponse>, Option<String>)> {
-    let mut tagged_config = JsonParserConfig::default();
-    tagged_config.tool_call_start_tokens = vec!["<tools>".to_string()];
-    tagged_config.tool_call_end_tokens = vec!["</tools>".to_string()];
-    tagged_config.allow_eof_recovery = true;
+    let tagged_config = JsonParserConfig {
+        tool_call_start_tokens: vec!["<tools>".to_string()],
+        tool_call_end_tokens: vec!["</tools>".to_string()],
+        allow_eof_recovery: true,
+        ..Default::default()
+    };
 
-    let mut bare_config = JsonParserConfig::default();
-    bare_config.bare_json_mode = true;
-    bare_config.allow_eof_recovery = true;
+    let bare_config = JsonParserConfig {
+        bare_json_mode: true,
+        allow_eof_recovery: true,
+        ..Default::default()
+    };
 
     for config in [&tagged_config, &bare_config] {
         let (parsed, content) = try_tool_call_parse_json(message, config, None)?;
