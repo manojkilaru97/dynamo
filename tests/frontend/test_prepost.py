@@ -1676,6 +1676,35 @@ def test_terminal_tool_delta_is_repaired_after_merge(
 
 
 @pytest.mark.vllm
+def test_raw_tool_capture_prefers_marker_bearing_token_delta(
+    tokenizer, qwen3_coder_request_for_sampling, sampling_params
+):
+    """A hidden raw marker must win over a non-empty visible text delta."""
+    proc = StreamingPostProcessor(
+        tokenizer=tokenizer,
+        request_for_sampling=qwen3_coder_request_for_sampling,
+        sampling_params=sampling_params,
+        prompt_token_ids=PROMPT_TOKEN_IDS,
+        tool_parser=_make_qwen3_tool_parser(
+            tokenizer, qwen3_coder_request_for_sampling.tools
+        ),
+        reasoning_parser_class=None,
+        chat_template_kwargs={"reasoning_effort": None},
+        stream_response=True,
+    )
+
+    start_token_id = tokenizer.encode("<tool_call>", add_special_tokens=False)[0]
+    proc._maybe_capture_raw_tool_text(
+        delta_text="visible text without the parser marker",
+        raw_delta_token_ids=[start_token_id],
+        get_raw_delta_text=lambda: "<tool_call><function=bash>",
+    )
+
+    assert proc._raw_tool_capture_started
+    assert proc._raw_tool_text_buffer == "<tool_call><function=bash>"
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize("with_tools", [False, True])
 def test_non_streaming_unclosed_reasoning_is_not_duplicated_as_content(
     tokenizer,

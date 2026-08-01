@@ -784,10 +784,15 @@ class StreamingPostProcessor:
         ):
             return
 
-        # Prefer vLLM's incrementally decoded text whenever it is available.
-        # Re-decoding token IDs is only a fallback for parser markers that
-        # vLLM intentionally omits from the visible delta.
-        raw_delta_text = delta_text or get_raw_delta_text()
+        # Prefer vLLM's incrementally decoded text unless the raw token IDs
+        # prove that this chunk contains a parser marker. vLLM may omit that
+        # marker from a non-empty visible delta, so using ``delta_text`` merely
+        # because it is non-empty can prevent raw tool capture from starting.
+        raw_delta_text = (
+            get_raw_delta_text()
+            if saw_marker_id
+            else delta_text or get_raw_delta_text()
+        )
         if not raw_delta_text:
             return
 
