@@ -122,6 +122,34 @@ def test_parser_visible_engine_text_preserves_utf8_buffering():
     assert visible is output
     assert visible.text == ""
 
+def test_reasoning_parser_plugin_is_loaded_before_lookup(monkeypatch):
+    from dynamo.frontend import vllm_processor
+
+    events = []
+    plugin_path = "/models/custom_reasoning_parser.py"
+    parser_class = object()
+
+    monkeypatch.setattr(
+        vllm_processor.ReasoningParserManager,
+        "import_reasoning_parser",
+        lambda path: events.append(("import", path)),
+    )
+    monkeypatch.setattr(
+        vllm_processor.ReasoningParserManager,
+        "get_reasoning_parser",
+        lambda name: events.append(("get", name)) or parser_class,
+    )
+
+    flags = SimpleNamespace(
+        reasoning_parser="custom",
+        reasoning_parser_plugin=plugin_path,
+    )
+    resolved = vllm_processor._resolve_reasoning_parser(flags, {})
+
+    assert resolved is parser_class
+    assert events == [("import", plugin_path), ("get", "custom")]
+
+
 @pytest.fixture(scope="module")
 def tokenizer():
     return AutoTokenizer.from_pretrained(MODEL)

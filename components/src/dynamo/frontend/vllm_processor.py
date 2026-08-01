@@ -1572,6 +1572,21 @@ class VllmProcessor:
                     )
 
 
+def _resolve_reasoning_parser(
+    flags: Namespace, runtime_config: dict[str, Any]
+) -> type[Any] | None:
+    reasoning_parser_plugin = getattr(flags, "reasoning_parser_plugin", None)
+    if reasoning_parser_plugin:
+        ReasoningParserManager.import_reasoning_parser(reasoning_parser_plugin)
+
+    reasoning_parser_name = getattr(
+        flags, "reasoning_parser", None
+    ) or runtime_config.get("reasoning_parser")
+    if not reasoning_parser_name:
+        return None
+    return ReasoningParserManager.get_reasoning_parser(reasoning_parser_name)
+
+
 class EngineFactory:
     def __init__(
         self,
@@ -1705,15 +1720,9 @@ class EngineFactory:
         else:
             tool_parser_class = None
 
-        reasoning_parser_name = self.flags.reasoning_parser or mdc.runtime_config().get(
-            "reasoning_parser"
+        reasoning_parser_class = _resolve_reasoning_parser(
+            self.flags, mdc.runtime_config()
         )
-        if reasoning_parser_name:
-            reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(
-                reasoning_parser_name
-            )
-        else:
-            reasoning_parser_class = None
         default_thinking_mode = runtime_default_thinking_mode(mdc.runtime_config())
         (
             structural_tag_mode,
