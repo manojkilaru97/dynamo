@@ -1398,6 +1398,30 @@ fn decode_base64_embedding_to_floats(s: &str) -> Result<Vec<f32>, anyhow::Error>
     Ok(floats)
 }
 
+fn normalize_assistant_reasoning_alias(raw_request: &mut serde_json::Value) {
+    let Some(messages) = raw_request
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for message in messages {
+        let Some(message) = message.as_object_mut() else {
+            continue;
+        };
+        if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if let Some(reasoning) = message
+            .get("reasoning")
+            .filter(|reasoning| !reasoning.is_null())
+            .cloned()
+        {
+            message.insert("reasoning_content".to_string(), reasoning);
+        }
+    }
+}
+
 #[tracing::instrument(skip_all)]
 async fn classify(
     State(state): State<Arc<service_v2::State>>,
@@ -1808,7 +1832,19 @@ async fn handler_chat_completions(
     body: Bytes,
 ) -> Result<Response, ErrorResponse> {
     ensure_json_content_type(&headers)?;
-    let mut request: NvCreateChatCompletionRequest = parse_json_request("chat completions", &body)?;
+    let mut raw_request: serde_json::Value = parse_json_request("chat completions", &body)?;
+    normalize_assistant_reasoning_alias(&mut raw_request);
+    let mut request = NvCreateChatCompletionRequest::deserialize(&raw_request).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorMessage {
+                message: err.to_string(),
+                error_type: map_error_code_to_error_type(StatusCode::BAD_REQUEST),
+                code: StatusCode::BAD_REQUEST.as_u16(),
+                details: None,
+            }),
+        )
+    })?;
     if *FORCE_INCLUDE_USAGE && request.inner.stream.unwrap_or(false) {
         delta_common::force_include_usage(&mut request.inner.stream_options);
     }

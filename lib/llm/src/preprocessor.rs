@@ -391,6 +391,7 @@ struct ReasoningState {
 #[derive(Default)]
 struct ReasoningChoiceState {
     reasoning_content: String,
+    reasoning_ended: bool,
     emitted_content: bool,
     emitted_tool_calls: bool,
 }
@@ -3729,22 +3730,55 @@ impl OpenAIPreprocessor {
                 } else if let Some(ref mut parser) = state.reasoning_parser {
                     let mut response = response;
                     if let Some(mut data) = response.data.take() {
-                        // Process all choices, not just the first one
+                        // Process all choices, not just the first one.
                         for choice in data.inner.choices.iter_mut() {
-                            // Reasoning parsing only applies to text content
+                            let choice_state = state.choices.entry(choice.index).or_default();
+                            if choice
+                                .delta
+                                .tool_calls
+                                .as_ref()
+                                .is_some_and(|tool_calls| !tool_calls.is_empty())
+                            {
+                                choice_state.emitted_tool_calls = true;
+                            }
+                            if let Some(reasoning_content) = &choice.delta.reasoning_content
+                                && !reasoning_content.is_empty()
+                            {
+                                choice_state.reasoning_content.push_str(reasoning_content);
+                            }
+
                             if let Some(ChatCompletionMessageContent::Text(text)) =
                                 choice.delta.content.as_ref()
                             {
-                                let parser_result =
-                                    parser.parse_reasoning_streaming_incremental(text, &[]);
+                                let (mut delta_reasoning, mut normal_text) =
+                                    if choice_state.reasoning_ended {
+                                        (String::new(), text.clone())
+                                    } else {
+                                        let parser_result =
+                                            parser.parse_reasoning_streaming_incremental(text, &[]);
+                                        (parser_result.reasoning_text, parser_result.normal_text)
+                                    };
 
-                                // Update this specific choice with parsed content
-                                let mut delta_reasoning = parser_result.reasoning_text;
+                                if !choice_state.reasoning_ended
+                                    && let Some(end_idx) = text.rfind(THINK_END_TOKEN)
+                                {
+                                    delta_reasoning = text[..end_idx]
+                                        .strip_prefix("<think>")
+                                        .unwrap_or(&text[..end_idx])
+                                        .to_string();
+                                    normal_text = text[end_idx + THINK_END_TOKEN.len()..]
+                                        .trim_start_matches(['\n', '\r'])
+                                        .to_string();
+                                    choice_state.reasoning_ended = true;
+                                } else if !normal_text.is_empty()
+                                    && !choice_state.reasoning_content.is_empty()
+                                {
+                                    choice_state.reasoning_ended = true;
+                                }
+
                                 if !delta_reasoning.is_empty() {
                                     choice_state.reasoning_content.push_str(&delta_reasoning);
                                 }
-
-                                let mut normal_text = parser_result.normal_text;
                                 if !normal_text.is_empty()
                                     && !choice_state.reasoning_content.is_empty()
                                 {
@@ -3752,14 +3786,14 @@ impl OpenAIPreprocessor {
                                         split_content_after_reasoning_boundary(std::mem::take(
                                             &mut normal_text,
                                         ));
-                                    if let Some(boundary_reasoning) = boundary_reasoning {
-                                        if !boundary_reasoning.is_empty() {
-                                            choice_state
-                                                .reasoning_content
-                                                .push_str(&boundary_reasoning);
-                                            delta_reasoning.push_str(&boundary_reasoning);
-                                        }
-                                        normal_text = after_boundary;
+                                    normal_text = after_boundary;
+                                    if let Some(boundary_reasoning) = boundary_reasoning
+                                        && !boundary_reasoning.is_empty()
+                                    {
+                                        choice_state
+                                            .reasoning_content
+                                            .push_str(&boundary_reasoning);
+                                        delta_reasoning.push_str(&boundary_reasoning);
                                     }
                                 }
 
@@ -3781,10 +3815,10 @@ impl OpenAIPreprocessor {
                                         Some(ChatCompletionMessageContent::Text(normal_text));
                                 }
                             }
-                            // For multimodal content, pass through unchanged
                         }
-                        Ok(data)
-                    })
+                        response.data = Some(data);
+                    }
+                    response
                 } else {
                     // No reasoning parser configured, pass through unchanged
                     response
