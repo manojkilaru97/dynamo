@@ -1444,13 +1444,45 @@ fn decode_base64_embedding_to_floats(s: &str) -> Result<Vec<f32>, anyhow::Error>
     Ok(floats)
 }
 
+fn normalize_assistant_reasoning_alias(raw_request: &mut serde_json::Value) {
+    let Some(messages) = raw_request
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for message in messages {
+        let Some(message) = message.as_object_mut() else {
+            continue;
+        };
+        if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+            continue;
+        }
+
+        // vLLM's OpenAI API exposes prior assistant thinking as `reasoning`.
+        // Dynamo's protocol type currently calls the same field
+        // `reasoning_content`, so normalize before typed deserialization can
+        // discard the standard spelling. Match vLLM by preferring `reasoning`
+        // when clients send both names.
+        if let Some(reasoning) = message
+            .get("reasoning")
+            .filter(|reasoning| !reasoning.is_null())
+            .cloned()
+        {
+            message.insert("reasoning_content".to_string(), reasoning);
+        }
+    }
+}
+
 async fn handler_chat_completions(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ErrorResponse> {
     ensure_json_content_type(&headers)?;
-    let raw_request: serde_json::Value = parse_json_request("chat completions", &body)?;
+    let mut raw_request: serde_json::Value = parse_json_request("chat completions", &body)?;
+    normalize_assistant_reasoning_alias(&mut raw_request);
     let request_id = raw_request
         .get("request_id")
         .and_then(serde_json::Value::as_str)
@@ -3925,6 +3957,36 @@ mod tests {
             panic!("expected text content");
         };
         assert_eq!(content, "raw \u{fffd} data");
+    }
+
+    #[test]
+    fn test_normalize_assistant_reasoning_alias_before_deserialization() {
+        let mut raw_request = serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Inspect the repository."},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "Standard reasoning wins.",
+                    "reasoning_content": "Legacy reasoning loses.",
+                    "tool_calls": []
+                },
+                {"role": "user", "content": "Continue."}
+            ]
+        });
+
+        normalize_assistant_reasoning_alias(&mut raw_request);
+        let request = NvCreateChatCompletionRequest::deserialize(&raw_request)
+            .expect("normalized request should deserialize");
+        let ChatCompletionRequestMessage::Assistant(assistant) = &request.inner.messages[1] else {
+            panic!("expected assistant message");
+        };
+
+        assert_eq!(
+            serde_json::to_value(&assistant.reasoning_content).unwrap(),
+            serde_json::json!("Standard reasoning wins.")
+        );
     }
 
     #[test]
