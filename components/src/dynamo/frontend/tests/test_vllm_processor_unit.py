@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 from _routed_engine_fakes import FakeRoutedEngine as _FakeRoutedEngine
 from transformers import AutoTokenizer
+from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 
 from dynamo.frontend.prepost import StreamingPostProcessor, _prepare_request
@@ -984,10 +985,123 @@ def test_runtime_config_context_length(vllm_processor_module, runtime_config, ex
 
 class _ToolMarkerTokenizer:
     def encode(self, text, add_special_tokens=False):
-        return {"<tool_call>": [14], "</tool_call>": [15]}.get(text, [])
+        return {
+            "<think>": [12],
+            "</think>": [13],
+            "<tool_call>": [14],
+            "</tool_call>": [15],
+        }.get(text, [])
 
     def decode(self, token_ids, skip_special_tokens=False):
-        return {14: "<tool_call>", 15: "</tool_call>"}.get(token_ids[0], "")
+        token_text = {
+            12: "<think>",
+            13: "</think>",
+            14: "<tool_call>",
+            15: "</tool_call>",
+        }
+        return "".join(token_text.get(token_id, "") for token_id in token_ids)
+
+
+class _ThinkingParser:
+    start_token = "<think>"
+    end_token = "</think>"
+    start_token_id = 12
+    end_token_id = 13
+
+    def __init__(self, tokenizer, **kwargs):
+        pass
+
+    def extract_reasoning_streaming(
+        self,
+        previous_text,
+        current_text,
+        delta_text,
+        previous_token_ids,
+        current_token_ids,
+        delta_token_ids,
+    ):
+        if self.end_token_id in delta_token_ids:
+            _, _, content = delta_text.partition(self.end_token)
+            return DeltaMessage(content=content or None)
+        return DeltaMessage(reasoning=delta_text or None)
+
+    def is_reasoning_end_streaming(self, current_token_ids, delta_token_ids):
+        return self.end_token_id in delta_token_ids
+
+
+def _postprocessor_output(text, token_ids, finish_reason=None):
+    return SimpleNamespace(
+        index=0,
+        text=text,
+        token_ids=token_ids,
+        finish_reason=finish_reason,
+        logprobs=None,
+    )
+
+
+def _plain_request():
+    return SimpleNamespace(
+        tool_choice=None,
+        tools=None,
+        structured_outputs=None,
+        response_format=None,
+        include_reasoning=True,
+    )
+
+
+def test_duplicate_reasoning_end_marker_is_not_emitted_after_budget_cutoff():
+    post = StreamingPostProcessor(
+        tokenizer=_ToolMarkerTokenizer(),
+        request_for_sampling=_plain_request(),
+        sampling_params=SamplingParams(max_tokens=128),
+        prompt_token_ids=[],
+        tool_parser=None,
+        reasoning_parser_class=_ThinkingParser,
+        chat_template_kwargs={"enable_thinking": True},
+    )
+    post.reasoning_is_done = True
+
+    marker_choice = post.process_output(
+        _postprocessor_output("</think>", [13])
+    )
+    content_choice = post.process_output(
+        _postprocessor_output("answer", [21], "stop")
+    )
+
+    assert marker_choice is None
+    assert content_choice["delta"]["content"] == "answer"
+
+
+def test_structured_json_with_reasoning_parses_content_after_thinking():
+    post = StreamingPostProcessor(
+        tokenizer=_ToolMarkerTokenizer(),
+        request_for_sampling=_plain_request(),
+        sampling_params=SamplingParams(
+            max_tokens=128,
+            structured_outputs=StructuredOutputsParams(
+                json={"type": "object"}
+            ),
+        ),
+        prompt_token_ids=[],
+        tool_parser=None,
+        reasoning_parser_class=_ThinkingParser,
+        chat_template_kwargs={"enable_thinking": True},
+    )
+
+    reasoning_choice = post.process_output(
+        _postprocessor_output("analysis", [21])
+    )
+    marker_choice = post.process_output(
+        _postprocessor_output("</think>", [13])
+    )
+    content_choice = post.process_output(
+        _postprocessor_output('{"answer":4}', [22], "stop")
+    )
+
+    assert reasoning_choice["delta"]["reasoning_content"] == "analysis"
+    assert marker_choice is None
+    assert content_choice["delta"]["content"] == '{"answer":4}'
+    assert content_choice["finish_reason"] == "stop"
 
 
 def test_tool_markup_is_removed_without_frontend_parser():

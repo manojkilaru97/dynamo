@@ -366,7 +366,7 @@ class StreamingPostProcessor:
                 and self._structured_tool_call_name is None
                 and not self._structured_required_tool_choice
             )
-            or self._structured_json_guard
+            or (self._structured_json_guard and self.reasoning_parser is None)
         )
         self._structured_json_buffer = ""
         self._structured_json_emitted = False
@@ -1307,6 +1307,20 @@ class StreamingPostProcessor:
         # vLLM output_processor already applies stop-token/stop-string trimming
         # to text. Re-detokenizing from token_ids can reintroduce stop markers.
         delta_text = output.text or ""
+        if self.reasoning_is_done and self.reasoning_parser:
+            end_token_id = getattr(self.reasoning_parser, "end_token_id", None)
+            end_token = getattr(self.reasoning_parser, "end_token", None)
+            if (
+                isinstance(end_token_id, int)
+                and end_token_id in raw_delta_token_ids
+                and isinstance(end_token, str)
+                and end_token
+            ):
+                # A reasoning budget can inject </think> and let generation
+                # continue. If the model later emits its own closing marker,
+                # the parser is already in content mode; never expose that
+                # duplicate control token to the client.
+                delta_text = delta_text.replace(end_token, "")
         raw_delta_text: str | None = None
 
         def get_raw_delta_text() -> str:
@@ -1592,6 +1606,15 @@ class StreamingPostProcessor:
 
         self._suppress_unclosed_reasoning_content(delta_message, current_text)
         self._strip_tool_markup_from_reasoning(delta_message)
+        if self._structured_json_guard and delta_message is not None:
+            structured_content = self._structured_json_delta(
+                delta_message.content or "",
+                finished=bool(output.finish_reason),
+            )
+            delta_message = self._compose_delta_message(
+                delta_message.reasoning,
+                structured_content,
+            )
         delta_message, structured_tool_choice = self._maybe_emit_structured_tool_call(
             output, delta_message
         )
