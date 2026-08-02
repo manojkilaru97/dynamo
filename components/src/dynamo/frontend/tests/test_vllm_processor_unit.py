@@ -189,11 +189,12 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
 
     def test_structured_outputs_skip_auto_tool_parser(self, tokenizer):
         """Explicit structured outputs stay on grammar path, not auto tool parsing."""
-        _, parser, _, _, _ = _prepare_request(
+        _, parser, template_kwargs, _, _ = _prepare_request(
             {
                 "model": MODEL,
                 "messages": [{"role": "user", "content": "Return JSON"}],
                 "structured_outputs": {"json": {"type": "object"}},
+                "chat_template_kwargs": {"enable_thinking": True},
             },
             tokenizer=tokenizer,
             tool_parser_class=_resolve_qwen3_tool_parser_class(),
@@ -201,6 +202,8 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
         )
 
         assert parser is None
+        assert template_kwargs["enable_thinking"] is False
+        assert template_kwargs["thinking"] is False
 
     def test_omitted_tool_choice_with_tools_defaults_to_auto(self, tokenizer):
         """OpenAI-compatible default: omitted tool_choice plus tools means auto."""
