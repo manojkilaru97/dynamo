@@ -1155,7 +1155,7 @@ class StreamingPostProcessor:
         }
 
     def _process_non_streaming_tool_output(self, output: Any) -> dict[str, Any] | None:
-        delta_token_ids = list(raw_delta_token_ids or output.token_ids or [])
+        delta_token_ids = list(output.token_ids or [])
         raw_delta_token_ids = delta_token_ids
         delta_text = output.text or ""
         raw_delta_text: str | None = None
@@ -1225,10 +1225,42 @@ class StreamingPostProcessor:
         if self._should_buffer_for_non_streaming_tool_parse():
             return self._process_non_streaming_tool_output(output)
 
-        delta_token_ids = list(output.token_ids or [])
+        delta_token_ids = list(raw_delta_token_ids or output.token_ids or [])
+        raw_delta_token_ids = delta_token_ids
         # vLLM output_processor already applies stop-token/stop-string trimming
         # to text. Re-detokenizing from token_ids can reintroduce stop markers.
         delta_text = output.text or ""
+        if self.reasoning_is_done and self.reasoning_parser:
+            end_token_id = getattr(self.reasoning_parser, "end_token_id", None)
+            end_token = getattr(self.reasoning_parser, "end_token", None)
+            if (
+                isinstance(end_token_id, int)
+                and end_token_id in raw_delta_token_ids
+                and isinstance(end_token, str)
+                and end_token
+            ):
+                # A reasoning budget can inject </think> and let generation
+                # continue. If the model later emits its own closing marker,
+                # the parser is already in content mode; never expose that
+                # duplicate control token to the client.
+                delta_text = delta_text.replace(end_token, "")
+        raw_delta_text: str | None = None
+
+        def get_raw_delta_text() -> str:
+            nonlocal raw_delta_text
+            if raw_delta_text is None:
+                raw_delta_text = (
+                    self._decode_token_ids_for_parser(raw_delta_token_ids)
+                    if self._should_parse_tools()
+                    else ""
+                )
+            return raw_delta_text
+
+        self._maybe_capture_raw_tool_text(
+            delta_text=delta_text,
+            raw_delta_token_ids=delta_token_ids,
+            get_raw_delta_text=get_raw_delta_text,
+        )
         delta: dict[str, Any] = {}
         if self._fast_plain_text:
             if delta_text:
