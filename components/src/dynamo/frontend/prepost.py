@@ -452,6 +452,15 @@ def _prepare_request(
     # Don't let an absent top-level field clobber a nested reasoning_effort.
     if request_for_sampling.reasoning_effort is None:
         chat_template_kwargs.setdefault("reasoning_effort", None)
+    if has_structured_output:
+        # vLLM applies structured guidance to final content, not to an
+        # interleaved reasoning prefix. Nemotron can otherwise exhaust the
+        # request while still reasoning and return no schema-valid content.
+        # The explicit output contract takes precedence over hidden thinking.
+        chat_template_kwargs["enable_thinking"] = False
+        chat_template_kwargs["thinking"] = False
+        chat_template_kwargs.pop("low_effort", None)
+        chat_template_kwargs.pop("medium_effort", None)
 
     # Mistral warns that tokenize=False is unsafe for chat templates.
     is_mistral_tokenizer = (

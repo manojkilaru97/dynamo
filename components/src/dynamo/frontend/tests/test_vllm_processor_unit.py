@@ -202,6 +202,37 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
             tools is not None and len(tools) == 1
         ), "tool_choice=auto should keep tools in template"
 
+    def test_structured_outputs_skip_auto_tool_parser(self, tokenizer):
+        """Explicit structured outputs stay on grammar path, not auto tool parsing."""
+        _, parser, template_kwargs, _, _ = _prepare_request(
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Return JSON"}],
+                "structured_outputs": {"json": {"type": "object"}},
+                "chat_template_kwargs": {"enable_thinking": True},
+            },
+            tokenizer=tokenizer,
+            tool_parser_class=_resolve_qwen3_tool_parser_class(),
+            enable_auto_tool_choice=True,
+        )
+
+        assert parser is None
+        assert template_kwargs["enable_thinking"] is False
+        assert template_kwargs["thinking"] is False
+
+    def test_omitted_tool_choice_with_tools_defaults_to_auto(self, tokenizer):
+        """OpenAI-compatible default: omitted tool_choice plus tools means auto."""
+        request_for_sampling, _, _, _, chat_params = _prepare_request(
+            TOOL_REQUEST,
+            tokenizer=tokenizer,
+            tool_parser_class=None,
+            exclude_tools_when_tool_choice_none=True,
+        )
+        assert request_for_sampling.tool_choice == "auto"
+        tools = chat_params.chat_template_kwargs["tools"]
+        assert (
+            tools is not None and len(tools) == 1
+        ), "omitted tool_choice with tools should keep tools in template"
     def test_tool_choice_required_keeps_tools(self, tokenizer):
         """tool_choice=required should always include tools regardless of flag."""
         _, _, _, _, chat_params = _prepare_request(
