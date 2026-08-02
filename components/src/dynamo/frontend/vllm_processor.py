@@ -991,6 +991,8 @@ class VllmProcessor:
             "max_thinking_tokens"
         )
         if nvext_max_thinking_tokens is None:
+            nvext_max_thinking_tokens = chat_template_kwargs.get("reasoning_budget")
+        if nvext_max_thinking_tokens is None:
             nvext_max_thinking_tokens = _default_constrained_max_thinking_tokens(
                 request_for_sampling=request_for_sampling,
                 sampling_params=sampling_params,
@@ -1083,11 +1085,17 @@ class VllmProcessor:
         if reasoning_parser_kwargs is not None:
             dynamo_preproc["reasoning_parser_kwargs"] = reasoning_parser_kwargs
         reasoning_budget = _get_attr_or_item(request_for_sampling, "reasoning_budget")
+        if reasoning_budget is None:
+            reasoning_budget = chat_template_kwargs.get("reasoning_budget")
         if reasoning_budget is not None:
             dynamo_preproc["reasoning_budget"] = reasoning_budget
         reasoning_budget_grace_period = _get_attr_or_item(
             request_for_sampling, "reasoning_budget_grace_period"
         )
+        if reasoning_budget_grace_period is None:
+            reasoning_budget_grace_period = chat_template_kwargs.get(
+                "reasoning_budget_grace_period"
+            )
         if reasoning_budget_grace_period is not None:
             dynamo_preproc["reasoning_budget_grace_period"] = (
                 reasoning_budget_grace_period

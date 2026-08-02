@@ -408,6 +408,7 @@ class StreamingPostProcessor:
         self._reasoning_tool_markup_started = False
         self._tool_marker_ids = self._tool_marker_token_ids()
         self._emitted_reasoning_text = ""
+        self._emitted_content_text = ""
 
     def _is_pure_structured_json_request(self) -> bool:
         if getattr(self.request_for_sampling, "tools", None):
@@ -1208,6 +1209,9 @@ class StreamingPostProcessor:
         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
         if reasoning:
             self._emitted_reasoning_text += reasoning
+        content = delta.get("content")
+        if content:
+            self._emitted_content_text += content
         if (
             output.finish_reason
             and not self.reasoning_is_done
@@ -1215,6 +1219,17 @@ class StreamingPostProcessor:
             and delta["content"] == self._emitted_reasoning_text
         ):
             delta.pop("content")
+            self._emitted_content_text = ""
+        if (
+            output.finish_reason
+            and not delta.get("content")
+            and not delta.get("tool_calls")
+            and not self.in_progress_tool_calls
+            and not self._emitted_content_text
+            and self._emitted_reasoning_text
+        ):
+            delta["content"] = self._emitted_reasoning_text
+            self._emitted_content_text = self._emitted_reasoning_text
         self._strip_tool_markup_from_delta(delta)
         if delta.get("tool_calls"):
             self._tool_call_choices_emitted.add(output.index)

@@ -314,7 +314,8 @@ pub struct NvCreateChatCompletionRequest {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        alias = "chat_template_kwargs"
+        rename = "chat_template_kwargs",
+        alias = "chat_template_args"
     )]
     pub chat_template_args: Option<std::collections::HashMap<String, serde_json::Value>>,
 
@@ -527,6 +528,7 @@ impl NvCreateChatCompletionRequest {
 
     pub fn normalize_reasoning_controls(&mut self) {
         self.normalize_template_thinking_aliases();
+        self.normalize_reasoning_budget_template_args();
 
         let explicit_template_thinking = self.has_explicit_template_thinking();
         if !explicit_template_thinking && let Some(effort) = self.reasoning_effort_string() {
@@ -540,11 +542,8 @@ impl NvCreateChatCompletionRequest {
             return;
         };
 
-        if !self.unsupported_fields.contains_key("reasoning_budget")
-            && let Some(max_tokens) = reasoning.get("max_tokens")
-        {
-            self.unsupported_fields
-                .insert("reasoning_budget".to_string(), max_tokens.clone());
+        if let Some(max_tokens) = reasoning.get("max_tokens") {
+            self.set_chat_template_arg_if_absent("reasoning_budget", max_tokens.clone());
         }
 
         if reasoning
@@ -596,6 +595,14 @@ impl NvCreateChatCompletionRequest {
         };
 
         self.set_chat_template_arg_if_absent("enable_thinking", serde_json::json!(thinking));
+    }
+
+    fn normalize_reasoning_budget_template_args(&mut self) {
+        for key in ["reasoning_budget", "reasoning_budget_grace_period"] {
+            if let Some(value) = self.unsupported_fields.remove(key) {
+                self.set_chat_template_arg_if_absent(key, value);
+            }
+        }
     }
 
     fn reasoning_effort_string(&self) -> Option<String> {
@@ -1346,6 +1353,48 @@ mod tests {
         assert_eq!(args.get("enable_thinking"), Some(&json!(false)));
         assert!(!args.contains_key("low_effort"));
         assert!(!args.contains_key("medium_effort"));
+    }
+
+    #[test]
+    fn test_reasoning_controls_serialize_for_vllm_frontend() {
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "reasoning_budget": 32,
+            "reasoning_budget_grace_period": 4,
+            "chat_template_kwargs": {"enable_thinking": false}
+        }))
+        .unwrap();
+
+        request.normalize_reasoning_controls();
+
+        assert!(request.unsupported_fields.is_empty());
+        let wire = serde_json::to_value(request).unwrap();
+        assert!(wire.get("chat_template_args").is_none());
+        assert_eq!(wire["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(wire["chat_template_kwargs"]["reasoning_budget"], 32);
+        assert_eq!(
+            wire["chat_template_kwargs"]["reasoning_budget_grace_period"],
+            4
+        );
+    }
+
+    #[test]
+    fn test_chat_template_args_input_alias_still_deserializes() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "chat_template_args": {"enable_thinking": false}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request
+                .chat_template_args
+                .as_ref()
+                .and_then(|args| args.get("enable_thinking")),
+            Some(&json!(false))
+        );
     }
 
     #[test]

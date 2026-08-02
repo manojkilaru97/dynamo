@@ -297,6 +297,25 @@ class TestPrepareRequestToolStripping:  # FRONTEND.1 + FRONTEND.3 — tool strip
         assert chat_template_kwargs["enable_thinking"] is False
         assert chat_params.chat_template_kwargs["enable_thinking"] is False
 
+    def test_reasoning_budget_template_kwargs_are_preserved(self, tokenizer):
+        _, _, chat_template_kwargs, _, chat_params = _prepare_request(
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "chat_template_kwargs": {
+                    "reasoning_budget": 24000,
+                    "reasoning_budget_grace_period": 128,
+                },
+            },
+            tokenizer=tokenizer,
+            tool_parser_class=None,
+        )
+
+        assert chat_template_kwargs["reasoning_budget"] == 24000
+        assert chat_template_kwargs["reasoning_budget_grace_period"] == 128
+        assert chat_params.chat_template_kwargs["reasoning_budget"] == 24000
+        assert chat_params.chat_template_kwargs["reasoning_budget_grace_period"] == 128
+
     def test_no_tools_in_request(self, tokenizer):
         """Request without tools should produce None tools in template kwargs."""
         _, _, _, _, chat_params = _prepare_request(
@@ -991,6 +1010,31 @@ def test_tool_markup_is_removed_without_frontend_parser():
     post._strip_tool_markup_from_delta(delta)
 
     assert delta == {"reasoning_content": "Need the file."}
+
+
+def test_terminal_reasoning_only_stream_gets_nonempty_content_fallback():
+    post = StreamingPostProcessor(
+        tokenizer=_ToolMarkerTokenizer(),
+        request_for_sampling=SimpleNamespace(
+            tool_choice=None,
+            tools=None,
+            structured_outputs=None,
+            response_format=None,
+        ),
+        sampling_params=SamplingParams(max_tokens=128),
+        prompt_token_ids=[],
+        tool_parser=None,
+        reasoning_parser_class=None,
+        chat_template_kwargs={"enable_thinking": True},
+    )
+    post._emitted_reasoning_text = "I reached the token limit while reasoning."
+
+    choice = post._build_choice(
+        SimpleNamespace(index=0, finish_reason="length", logprobs=None), {}
+    )
+
+    assert choice["delta"]["content"] == post._emitted_reasoning_text
+    assert choice["finish_reason"] == "length"
 
 
 def test_orphaned_qwen_tool_closing_markup_is_removed():
