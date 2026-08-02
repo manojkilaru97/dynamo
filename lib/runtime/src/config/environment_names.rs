@@ -455,6 +455,10 @@ pub mod llm {
         /// Force audit emission even when the request `store` flag is `false`.
         pub const DYN_AUDIT_FORCE_LOGGING: &str = "DYN_AUDIT_FORCE_LOGGING";
 
+        /// Comma-separated NCA IDs whose request and response payloads must be
+        /// replaced with suppression metadata before reaching any audit sink.
+        pub const VLLM_SUPPRESS_PAYLOAD_NCA_IDS: &str = "VLLM_SUPPRESS_PAYLOAD_NCA_IDS";
+
         /// In-process audit bus capacity.
         pub const DYN_AUDIT_CAPACITY: &str = "DYN_AUDIT_CAPACITY";
 

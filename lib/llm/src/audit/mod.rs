@@ -7,6 +7,7 @@ pub mod handle;
 pub mod otel_sink;
 pub mod sink;
 pub mod stream;
+mod suppression;
 
 use tokio_util::sync::CancellationToken;
 

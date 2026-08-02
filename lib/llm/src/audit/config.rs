@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::OnceLock;
+use std::{collections::HashSet, sync::OnceLock};
 
 use dynamo_runtime::config::environment_names::llm::audit as env_audit;
 
@@ -17,6 +17,7 @@ const DEFAULT_JSONL_GZ_ROLL_BYTES: u64 = 256 * 1024 * 1024;
 pub struct AuditPolicy {
     pub enabled: bool,
     pub force_logging: bool,
+    pub suppressed_nca_ids: HashSet<String>,
     pub capacity: usize,
     pub sinks: Vec<String>,
     pub output_path: Option<String>,
@@ -73,6 +74,11 @@ fn load_from_env() -> AuditPolicy {
             .ok()
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(false),
+        suppressed_nca_ids: std::env::var(env_audit::VLLM_SUPPRESS_PAYLOAD_NCA_IDS)
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(super::suppression::normalize_nca_id)
+            .collect(),
         capacity,
         sinks,
         output_path,
