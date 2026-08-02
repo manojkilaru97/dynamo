@@ -838,6 +838,7 @@ async def register_vllm_model(
         media_fetcher=media_fetcher,
         worker_type=worker_type,
         needs=needs,
+        model_aliases=config.dyn_served_model_alias or None,
         ignore_weights=should_register_model_ignore_weights(config),
         # Advertise LoRA capacity on the BASE card so the frontend can place the first
         # adapter onto an idle worker. Decode, aggregated, and prefill workers all serve

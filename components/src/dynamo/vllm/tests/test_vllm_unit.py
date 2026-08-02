@@ -12,7 +12,7 @@ import sys
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -73,6 +73,73 @@ def test_base_model_lora_capacity(enable_lora, model_type, expected):
 
     vllm_main = importlib.import_module("dynamo.vllm.main")
     assert vllm_main._base_model_lora_capacity(config, model_type) == expected
+
+
+def test_register_vllm_model_propagates_served_model_aliases(monkeypatch):
+    vllm_main = importlib.import_module("dynamo.vllm.main")
+
+    class FakeRuntimeConfig:
+        def set_structural_tag_mode(self, _value):
+            pass
+
+        def set_structural_tag_scope(self, _value):
+            pass
+
+        def set_structural_tag_schema(self, _value):
+            pass
+
+        def set_engine_specific(self, _key, _value):
+            pass
+
+    register_model = AsyncMock()
+    monkeypatch.setattr(vllm_main, "ModelRuntimeConfig", FakeRuntimeConfig)
+    monkeypatch.setattr(
+        vllm_main,
+        "get_engine_cache_info",
+        lambda _engine: {
+            "num_gpu_blocks": 16,
+            "kv_event_block_size": 16,
+            "max_num_seqs": 8,
+            "max_num_batched_tokens": 1024,
+        },
+    )
+    monkeypatch.setattr(vllm_main, "get_dp_range_for_worker", lambda _config: (0, 1))
+    monkeypatch.setattr(vllm_main, "get_spec_decode_runtime_data", lambda *_args: None)
+    monkeypatch.setattr(vllm_main, "apply_topology_config", lambda _config: None)
+    monkeypatch.setattr(vllm_main, "_register_model_source_path", lambda *_args: "/model")
+    monkeypatch.setattr(vllm_main, "should_register_model_ignore_weights", lambda _config: False)
+    monkeypatch.setattr(vllm_main, "register_model", register_model)
+
+    config = SimpleNamespace(
+        enable_local_indexer=True,
+        disaggregation_mode=DisaggregationMode.AGGREGATED,
+        dyn_tool_call_parser="qwen3_coder",
+        dyn_reasoning_parser="nemotron_v3",
+        exclude_tools_when_tool_choice_none=False,
+        dyn_enable_structural_tag=False,
+        dyn_structural_tag_scope=None,
+        dyn_structural_tag_schema=None,
+        engine_args=SimpleNamespace(stream_interval=None, enable_lora=False),
+        frontend_decoding=False,
+        custom_jinja_template=None,
+        dyn_served_model_alias=["alias-one", "alias-two"],
+        served_model_name="canonical",
+    )
+    vllm_config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=4096))
+
+    asyncio.run(
+        vllm_main.register_vllm_model(
+            object(),
+            dynamo_llm.ModelType.Chat,
+            object(),
+            config,
+            object(),
+            vllm_config,
+            object(),
+        )
+    )
+
+    assert register_model.await_args.kwargs["model_aliases"] == ["alias-one", "alias-two"]
 
 
 def test_custom_jinja_template_invalid_path(mock_vllm_cli):
