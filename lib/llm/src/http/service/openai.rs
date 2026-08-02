@@ -2194,6 +2194,14 @@ async fn chat_completions(
         .ok();
     let http_audit_handle = crate::audit::handle::create_handle(request.content(), &request_id)
         .map(|handle| handle.with_headers(http_audit_headers));
+    if let Some(audit) = http_audit_handle.as_ref() {
+        let raw_request = request.get::<serde_json::Value>(AUDIT_RAW_PAYLOAD_KEY).ok();
+        let typed_request = raw_request
+            .is_none()
+            .then(|| Arc::new(request.content().clone()));
+        audit.emit_request(typed_request, raw_request, None);
+        request.insert(crate::audit::handle::HTTP_REQUEST_EMITTED_CONTEXT_KEY, true);
+    }
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {

@@ -3865,7 +3865,13 @@ impl
         // and export off the generation path.
         let audit_handle = crate::audit::handle::create_handle(&request, &request_id);
 
-        if let Some(ref h) = audit_handle {
+        let http_request_emitted = context
+            .get::<bool>(crate::audit::handle::HTTP_REQUEST_EMITTED_CONTEXT_KEY)
+            .ok()
+            .is_some_and(|emitted| *emitted);
+        if let Some(ref h) = audit_handle
+            && !http_request_emitted
+        {
             let headers = context.get::<serde_json::Value>("http_headers").ok();
             let raw_request = context.get::<serde_json::Value>("http_raw_payload").ok();
             let typed_request = raw_request.is_none().then(|| Arc::new(request.clone()));

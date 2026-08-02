@@ -9,6 +9,8 @@ use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
 };
 
+pub const HTTP_REQUEST_EMITTED_CONTEXT_KEY: &str = "http_audit_request_emitted";
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum AuditEventType {
