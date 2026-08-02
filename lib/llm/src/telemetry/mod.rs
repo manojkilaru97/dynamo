@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod bus;
+pub mod capture_metrics;
 pub mod jsonl;
 pub mod jsonl_gz;
 pub mod stream;

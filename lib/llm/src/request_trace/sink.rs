@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::telemetry::capture_metrics::{self, TRACE_CAPTURE_TYPE};
 use crate::telemetry::jsonl::{JsonlSinkOptions, JsonlWriter};
 use crate::telemetry::jsonl_gz::{JsonlGzipSinkOptions, JsonlGzipWriter};
 
@@ -117,6 +118,7 @@ impl JsonlGzipRequestTraceSink {
                 flush_interval: Duration::from_millis(policy.jsonl_flush_interval_ms.max(1)),
                 roll_uncompressed_bytes: policy.jsonl_gz_roll_bytes,
                 roll_lines: policy.jsonl_gz_roll_lines,
+                capture_type: TRACE_CAPTURE_TYPE,
             },
         )
         .await
@@ -131,6 +133,7 @@ impl RequestTraceSink for JsonlGzipRequestTraceSink {
 
     async fn emit(&self, record: &RequestTraceRecord) {
         if self.writer.send(record.clone()).await.is_err() {
+            capture_metrics::record_dropped(TRACE_CAPTURE_TYPE, "sink_closed", 1);
             tracing::warn!("request trace jsonl_gz sink closed; dropping record");
         }
     }
@@ -182,11 +185,20 @@ async fn spawn_workers(shutdown: CancellationToken) -> anyhow::Result<()> {
                         loop {
                             match receiver.try_recv() {
                                 Ok(record) => sink.emit(&record).await,
-                                Err(broadcast::error::TryRecvError::Lagged(count)) => tracing::warn!(
-                                    sink = name,
-                                    dropped = count,
-                                    "request trace bus lagged during shutdown; dropped records"
-                                ),
+                                Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                                    if name == "jsonl_gz" {
+                                        capture_metrics::record_dropped(
+                                            TRACE_CAPTURE_TYPE,
+                                            "bus_lag",
+                                            count,
+                                        );
+                                    }
+                                    tracing::warn!(
+                                        sink = name,
+                                        dropped = count,
+                                        "request trace bus lagged during shutdown; dropped records"
+                                    );
+                                }
                                 Err(
                                     broadcast::error::TryRecvError::Empty
                                     | broadcast::error::TryRecvError::Closed
@@ -198,11 +210,20 @@ async fn spawn_workers(shutdown: CancellationToken) -> anyhow::Result<()> {
                     message = receiver.recv() => {
                         match message {
                             Ok(record) => sink.emit(&record).await,
-                            Err(broadcast::error::RecvError::Lagged(count)) => tracing::warn!(
-                                sink = name,
-                                dropped = count,
-                                "request trace bus lagged; dropped records"
-                            ),
+                            Err(broadcast::error::RecvError::Lagged(count)) => {
+                                if name == "jsonl_gz" {
+                                    capture_metrics::record_dropped(
+                                        TRACE_CAPTURE_TYPE,
+                                        "bus_lag",
+                                        count,
+                                    );
+                                }
+                                tracing::warn!(
+                                    sink = name,
+                                    dropped = count,
+                                    "request trace bus lagged; dropped records"
+                                );
+                            }
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
                     }
@@ -303,6 +324,7 @@ mod tests {
                 flush_interval: Duration::from_secs(60),
                 roll_uncompressed_bytes: 1024 * 1024,
                 roll_lines: Some(1),
+                capture_type: TRACE_CAPTURE_TYPE,
             },
         )
         .await

@@ -12,6 +12,7 @@ use dynamo_runtime::transports::nats;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::telemetry::capture_metrics::{self, AUDIT_CAPTURE_TYPE};
 use crate::telemetry::jsonl::{JsonlSinkOptions, JsonlWriter};
 use crate::telemetry::jsonl_gz::{JsonlGzipSinkOptions, JsonlGzipWriter};
 
@@ -149,6 +150,7 @@ impl JsonlGzipAuditSink {
                 flush_interval: Duration::from_millis(policy.jsonl_flush_interval_ms.max(1)),
                 roll_uncompressed_bytes: policy.jsonl_gz_roll_bytes,
                 roll_lines: policy.jsonl_gz_roll_lines,
+                capture_type: AUDIT_CAPTURE_TYPE,
             },
         )
         .await
@@ -163,6 +165,7 @@ impl AuditSink for JsonlGzipAuditSink {
 
     async fn emit(&self, rec: &AuditRecord) {
         if self.writer.send(rec.clone()).await.is_err() {
+            capture_metrics::record_dropped(AUDIT_CAPTURE_TYPE, "sink_closed", 1);
             tracing::warn!("audit jsonl_gz sink closed; dropping record");
         }
     }
@@ -219,11 +222,20 @@ pub async fn spawn_workers_from_env(shutdown: CancellationToken) -> anyhow::Resu
                         loop {
                             match rx.try_recv() {
                                 Ok(rec) => sink.emit(&rec).await,
-                                Err(broadcast::error::TryRecvError::Lagged(n)) => tracing::warn!(
-                                    sink = name,
-                                    dropped = n,
-                                    "audit bus lagged during shutdown; dropped records"
-                                ),
+                                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                                    if name == "jsonl_gz" {
+                                        capture_metrics::record_dropped(
+                                            AUDIT_CAPTURE_TYPE,
+                                            "bus_lag",
+                                            n,
+                                        );
+                                    }
+                                    tracing::warn!(
+                                        sink = name,
+                                        dropped = n,
+                                        "audit bus lagged during shutdown; dropped records"
+                                    );
+                                }
                                 Err(
                                     broadcast::error::TryRecvError::Empty
                                     | broadcast::error::TryRecvError::Closed,
@@ -235,11 +247,20 @@ pub async fn spawn_workers_from_env(shutdown: CancellationToken) -> anyhow::Resu
                     msg = rx.recv() => {
                         match msg {
                             Ok(rec) => sink.emit(&rec).await,
-                            Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!(
-                                sink = name,
-                                dropped = n,
-                                "audit bus lagged; dropped records"
-                            ),
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                if name == "jsonl_gz" {
+                                    capture_metrics::record_dropped(
+                                        AUDIT_CAPTURE_TYPE,
+                                        "bus_lag",
+                                        n,
+                                    );
+                                }
+                                tracing::warn!(
+                                    sink = name,
+                                    dropped = n,
+                                    "audit bus lagged; dropped records"
+                                );
+                            }
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
                     }
@@ -297,6 +318,7 @@ mod tests {
                 flush_interval: Duration::from_secs(60),
                 roll_uncompressed_bytes: 1024 * 1024,
                 roll_lines: None,
+                capture_type: AUDIT_CAPTURE_TYPE,
             },
         )
         .await

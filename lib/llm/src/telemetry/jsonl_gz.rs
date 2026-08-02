@@ -17,12 +17,16 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use super::capture_metrics;
+
 #[derive(Debug, Clone)]
 pub struct JsonlGzipSinkOptions {
     pub buffer_bytes: usize,
     pub flush_interval: Duration,
     pub roll_uncompressed_bytes: u64,
     pub roll_lines: Option<u64>,
+    /// Stable low-cardinality label used by capture metrics.
+    pub capture_type: &'static str,
 }
 
 impl Default for JsonlGzipSinkOptions {
@@ -32,6 +36,7 @@ impl Default for JsonlGzipSinkOptions {
             flush_interval: Duration::from_millis(1000),
             roll_uncompressed_bytes: 256 * 1024 * 1024,
             roll_lines: None,
+            capture_type: "unknown",
         }
     }
 }
@@ -119,7 +124,13 @@ impl<T: Serialize> GzipBatchWriter<T> {
             timestamp: self.start_time.elapsed().as_millis() as u64,
             event: rec,
         };
-        let mut line = serde_json::to_vec(&entry).context("serializing gzip jsonl record")?;
+        let mut line = match serde_json::to_vec(&entry) {
+            Ok(line) => line,
+            Err(error) => {
+                capture_metrics::record_dropped(self.options.capture_type, "serialize", 1);
+                return Err(error).context("serializing gzip jsonl record");
+            }
+        };
         line.push(b'\n');
 
         let line_len = line.len() as u64;
@@ -158,6 +169,7 @@ impl<T: Serialize> GzipBatchWriter<T> {
     }
 
     fn roll_segment(&mut self) {
+        capture_metrics::record_segment_rolled(self.options.capture_type);
         self.current_index = self.current_index.saturating_add(1);
         self.segment_uncompressed_bytes = 0;
         self.segment_lines = 0;
@@ -170,10 +182,31 @@ impl<T: Serialize> GzipBatchWriter<T> {
 
         let path = segment_path(&self.base_path, self.current_index);
         let batch = std::mem::take(&mut self.batch);
+        let uncompressed_bytes = batch.len() as u64;
+        let records = batch.iter().filter(|byte| **byte == b'\n').count() as u64;
+        let capture_type = self.options.capture_type;
 
-        tokio::task::spawn_blocking(move || write_gzip_member(path, batch))
-            .await
-            .context("gzip jsonl writer task panicked")??;
+        let result = match tokio::task::spawn_blocking(move || write_gzip_member(path, batch)).await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                capture_metrics::record_dropped(capture_type, "writer_panic", records);
+                return Err(error).context("gzip jsonl writer task panicked");
+            }
+        };
+
+        match result {
+            Ok(compressed_bytes) => capture_metrics::record_written(
+                capture_type,
+                records,
+                uncompressed_bytes,
+                compressed_bytes,
+            ),
+            Err(error) => {
+                capture_metrics::record_dropped(capture_type, "write", records);
+                return Err(error);
+            }
+        }
 
         Ok(())
     }
@@ -226,7 +259,7 @@ async fn run_gzip_writer<T: Serialize>(
     }
 }
 
-fn write_gzip_member(path: PathBuf, batch: Vec<u8>) -> anyhow::Result<()> {
+fn write_gzip_member(path: PathBuf, batch: Vec<u8>) -> anyhow::Result<u64> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -239,6 +272,10 @@ fn write_gzip_member(path: PathBuf, batch: Vec<u8>) -> anyhow::Result<()> {
         .append(true)
         .open(&path)
         .with_context(|| format!("opening gzip jsonl segment {}", path.display()))?;
+    let initial_len = file
+        .metadata()
+        .with_context(|| format!("reading gzip jsonl segment size {}", path.display()))?
+        .len();
     let writer = BufWriter::new(file);
     let mut encoder = GzEncoder::new(writer, Compression::default());
     encoder
@@ -250,7 +287,10 @@ fn write_gzip_member(path: PathBuf, batch: Vec<u8>) -> anyhow::Result<()> {
     writer
         .flush()
         .with_context(|| format!("flushing gzip jsonl segment {}", path.display()))?;
-    Ok(())
+    let final_len = std::fs::metadata(&path)
+        .with_context(|| format!("reading gzip jsonl segment size {}", path.display()))?
+        .len();
+    Ok(final_len.saturating_sub(initial_len))
 }
 
 pub fn segment_path(base_path: &Path, index: u64) -> PathBuf {
@@ -309,6 +349,7 @@ mod tests {
                 flush_interval: Duration::from_secs(60),
                 roll_uncompressed_bytes: 1024 * 1024,
                 roll_lines: None,
+                capture_type: "test",
             },
         )
         .await
@@ -357,6 +398,7 @@ mod tests {
                 flush_interval: Duration::from_secs(60),
                 roll_uncompressed_bytes: 1024 * 1024,
                 roll_lines: Some(1),
+                capture_type: "test",
             },
         )
         .await
