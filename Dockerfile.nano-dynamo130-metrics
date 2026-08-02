@@ -20,7 +20,7 @@ core = Path("/usr/local/lib/python3.12/dist-packages/dynamo/_core.abi3.so")
 assert b"dynamo_capture_records_written" in core.read_bytes()
 PY
 
-LABEL org.opencontainers.image.revision="d82ea8ac1aa6629041375f6616622c9bc3408290" \
+LABEL org.opencontainers.image.revision="77d32e6a0f85e499b9df2b3ff703b78fb10a7d6a" \
       ai.dynamo.version="1.3.0" \
       ai.dynamo.vllm.version="0.26.0" \
       ai.dynamo.base.digest="sha256:aaf5d3521bc6c9635e6ff5dba893c4d50c40d4e52d4fb55a652e8105a1762c0b" \
