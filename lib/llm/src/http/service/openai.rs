@@ -651,12 +651,21 @@ pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
 
 fn audit_headers_from_header_map(headers: &HeaderMap) -> serde_json::Value {
     let mut out = serde_json::Map::new();
-    for (name, value) in headers.iter() {
-        let value = match value.to_str() {
-            Ok(value) => serde_json::Value::String(value.to_string()),
-            Err(_) => serde_json::Value::String(
-                base64::engine::general_purpose::STANDARD.encode(value.as_bytes()),
-            ),
+    for name in headers.keys() {
+        let mut values = headers
+            .get_all(name)
+            .iter()
+            .map(|value| match value.to_str() {
+                Ok(value) => serde_json::Value::String(value.to_string()),
+                Err(_) => serde_json::Value::String(
+                    base64::engine::general_purpose::STANDARD.encode(value.as_bytes()),
+                ),
+            })
+            .collect::<Vec<_>>();
+        let value = if values.len() == 1 {
+            values.pop().expect("one header value")
+        } else {
+            serde_json::Value::Array(values)
         };
         out.insert(name.as_str().to_string(), value);
     }
@@ -3897,6 +3906,18 @@ mod tests {
     };
 
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
+
+    #[test]
+    fn audit_headers_preserve_all_values() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-single", "one".parse().unwrap());
+        headers.append("x-multi", "first".parse().unwrap());
+        headers.append("x-multi", "second".parse().unwrap());
+
+        let audit = audit_headers_from_header_map(&headers);
+        assert_eq!(audit["x-single"], "one");
+        assert_eq!(audit["x-multi"], serde_json::json!(["first", "second"]));
+    }
 
     #[test]
     fn test_is_json_content_type() {
