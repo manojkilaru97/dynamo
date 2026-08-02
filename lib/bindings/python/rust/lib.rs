@@ -579,6 +579,7 @@ fn register_model<'p>(
             .source_path(source_path.clone().into())
             // --served_model_name
             .model_name(model_name.clone())
+            .model_aliases(model_aliases)
             .kv_cache_block_size(kv_cache_block_size)
             .router_config(explicit_router_config.clone())
             .runtime_config({
