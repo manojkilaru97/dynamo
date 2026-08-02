@@ -64,6 +64,21 @@ static RECORDS_DROPPED: LazyLock<IntCounterVec> = LazyLock::new(|| {
 });
 
 pub fn register(registry: &Registry) -> Result<(), prometheus::Error> {
+    for capture_type in [TRACE_CAPTURE_TYPE, AUDIT_CAPTURE_TYPE] {
+        RECORDS_WRITTEN.with_label_values(&[capture_type]);
+        UNCOMPRESSED_BYTES_WRITTEN.with_label_values(&[capture_type]);
+        COMPRESSED_BYTES_WRITTEN.with_label_values(&[capture_type]);
+        SEGMENTS_ROLLED.with_label_values(&[capture_type]);
+        for reason in [
+            "bus_lag",
+            "serialize",
+            "sink_closed",
+            "write",
+            "writer_panic",
+        ] {
+            RECORDS_DROPPED.with_label_values(&[capture_type, reason]);
+        }
+    }
     registry.register(Box::new(RECORDS_WRITTEN.clone()))?;
     registry.register(Box::new(UNCOMPRESSED_BYTES_WRITTEN.clone()))?;
     registry.register(Box::new(COMPRESSED_BYTES_WRITTEN.clone()))?;
