@@ -1,4 +1,4 @@
-FROM --platform=linux/arm64 nvcr.io/qc69jvmznzxy/llm_nim/ultra@sha256:4e4378eee85934b2aa7b8492ef58f3169af43a2fd873d217b9ac9bd21d8f26b4
+FROM nvcr.io/qc69jvmznzxy/llm_nim/ultra@sha256:4e4378eee85934b2aa7b8492ef58f3169af43a2fd873d217b9ac9bd21d8f26b4
 
 COPY components/src/dynamo/frontend/vllm_processor.py /usr/local/lib/python3.12/dist-packages/dynamo/frontend/vllm_processor.py
 
