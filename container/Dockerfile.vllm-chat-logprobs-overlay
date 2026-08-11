@@ -1,0 +1,6 @@
+FROM --platform=linux/arm64 nvcr.io/qc69jvmznzxy/llm_nim/ultra@sha256:4e4378eee85934b2aa7b8492ef58f3169af43a2fd873d217b9ac9bd21d8f26b4
+
+COPY components/src/dynamo/frontend/vllm_processor.py /usr/local/lib/python3.12/dist-packages/dynamo/frontend/vllm_processor.py
+
+LABEL org.opencontainers.image.revision="dynamo-fc9120aea+vllm-c56f169d9ae46ca420617e2cf5f0c9135da0f651+6fbbcf2151c34cd9313c223b8cbf19afa77f2ea6" \
+      org.opencontainers.image.title="Ultra Dynamo vLLM 0.26 CUDA 13 parity image with chat logprobs"
