@@ -282,6 +282,90 @@ def _copy_jsonable(value: Any) -> Any:
         return value
 
 
+def _wire_chat_logprobs_content(
+    engine_response: dict[str, Any], tokenizer: TokenizerLike
+) -> list[dict[str, Any]] | None:
+    """Convert Dynamo's per-token wire logprobs to the OpenAI chat shape."""
+    token_ids = list(engine_response.get("token_ids") or [])
+    logprobs = engine_response.get("log_probs")
+    if not token_ids or not isinstance(logprobs, list):
+        return None
+    if len(logprobs) != len(token_ids):
+        logger.warning(
+            "Dropping misaligned logprobs: token_ids=%d logprobs=%d",
+            len(token_ids),
+            len(logprobs),
+        )
+        return None
+
+    top_by_position = engine_response.get("top_logprobs")
+    if not isinstance(top_by_position, list):
+        top_by_position = []
+
+    content: list[dict[str, Any]] = []
+    for position, (token_id, logprob) in enumerate(zip(token_ids, logprobs)):
+        raw_top = (
+            top_by_position[position]
+            if position < len(top_by_position)
+            and isinstance(top_by_position[position], list)
+            else []
+        )
+        selected = next(
+            (
+                item
+                for item in raw_top
+                if isinstance(item, dict) and item.get("token_id") == token_id
+            ),
+            {},
+        )
+        token = selected.get("token")
+        if not isinstance(token, str):
+            try:
+                token = tokenizer.decode([token_id], skip_special_tokens=False)
+            except TypeError:
+                token = tokenizer.decode([token_id])
+
+        token_bytes = selected.get("bytes")
+        if not isinstance(token_bytes, list):
+            token_bytes = list(token.encode("utf-8"))
+
+        top_logprobs: list[dict[str, Any]] = []
+        for item in raw_top:
+            if not isinstance(item, dict) or "logprob" not in item:
+                continue
+            top_token = item.get("token")
+            if not isinstance(top_token, str):
+                top_token_id = item.get("token_id")
+                if not isinstance(top_token_id, int):
+                    continue
+                try:
+                    top_token = tokenizer.decode(
+                        [top_token_id], skip_special_tokens=False
+                    )
+                except TypeError:
+                    top_token = tokenizer.decode([top_token_id])
+            top_bytes = item.get("bytes")
+            if not isinstance(top_bytes, list):
+                top_bytes = list(top_token.encode("utf-8"))
+            top_logprobs.append(
+                {
+                    "token": top_token,
+                    "logprob": float(item["logprob"]),
+                    "bytes": top_bytes,
+                }
+            )
+
+        content.append(
+            {
+                "token": token,
+                "logprob": float(logprob),
+                "bytes": token_bytes,
+                "top_logprobs": top_logprobs,
+            }
+        )
+    return content
+
+
 def _tool_text_budget(request_text_len: int | None) -> int:
     if request_text_len is None or request_text_len < TOOL_LONG_REQUEST_THRESHOLD:
         return DEFAULT_TOOL_SHORT_TEXT_MAX_LENGTH
@@ -1385,6 +1469,9 @@ class VllmProcessor:
         image_count = len(_mm_counts.get("image_url", []))
         video_count = len(_mm_counts.get("video_url", []))
         audio_count = len(_mm_counts.get("audio_url", []))
+        pending_logprobs: dict[int, list[dict[str, Any]]] = {
+            output_idx: [] for output_idx in output_request_ids
+        }
 
         try:
             _inject_routing_metadata(dynamo_preproc, dynamo_preproc, mm_routing_info)
@@ -1445,6 +1532,13 @@ class VllmProcessor:
                 )
                 finish_reason = map_finish_reason(raw_finish_reason)
                 stop_reason = engine_response.get("stop_reason")
+                raw_token_ids = list(engine_response["token_ids"])
+                engine_text = engine_response.get("text") or ""
+                chat_logprobs = _wire_chat_logprobs_content(
+                    engine_response, self.tokenizer
+                )
+                if chat_logprobs:
+                    pending_logprobs[output_idx].extend(chat_logprobs)
 
                 output_kwargs: dict[str, Any] = {
                     "request_id": output_request_id,
@@ -1535,6 +1629,13 @@ class VllmProcessor:
                         choices,
                     )
                     for choice in choices:
+                        choice_index = choice.get("index", 0)
+                        if sp.logprobs is not None:
+                            choice["logprobs"] = {
+                                "content": pending_logprobs[choice_index] or None,
+                                "refusal": None,
+                            }
+                            pending_logprobs[choice_index] = []
                         post = post_processors.get(choice.get("index", 0))
                         strip_tool_markup = getattr(
                             post, "_strip_tool_markup_from_delta", None

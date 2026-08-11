@@ -26,8 +26,16 @@ from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 
 from dynamo.frontend import prepost as prepost_module
-from dynamo.frontend.prepost import _prepare_request, build_tool_call_guided_decoding
+from dynamo.frontend.prepost import (
+    StreamingPostProcessor,
+    _prepare_request,
+    build_tool_call_guided_decoding,
+)
 from dynamo.llm.exceptions import InvalidArgument
+from dynamo.frontend.vllm_processor import (
+    _wire_chat_logprobs_content,
+    _with_parser_visible_engine_text,
+)
 
 # NOTE: dynamo.frontend.vllm_processor is imported lazily inside the tests that
 # need it (and via the vllm_processor_module fixture). Importing it at module
@@ -122,6 +130,56 @@ def test_parser_visible_engine_text_preserves_utf8_buffering():
     )
     assert visible is output
     assert visible.text == ""
+
+def test_wire_chat_logprobs_content_uses_selected_and_top_tokens():
+    tokenizer = SimpleNamespace(
+        decode=lambda token_ids, **_: {7: "yes", 8: "no"}[token_ids[0]]
+    )
+    content = _wire_chat_logprobs_content(
+        {
+            "token_ids": [7],
+            "log_probs": [-0.25],
+            "top_logprobs": [
+                [
+                    {
+                        "token_id": 7,
+                        "token": "yes",
+                        "logprob": -0.25,
+                        "bytes": [121, 101, 115],
+                    },
+                    {"token_id": 8, "token": "no", "logprob": -1.5},
+                ]
+            ],
+        },
+        tokenizer,
+    )
+
+    assert content == [
+        {
+            "token": "yes",
+            "logprob": -0.25,
+            "bytes": [121, 101, 115],
+            "top_logprobs": [
+                {
+                    "token": "yes",
+                    "logprob": -0.25,
+                    "bytes": [121, 101, 115],
+                },
+                {"token": "no", "logprob": -1.5, "bytes": [110, 111]},
+            ],
+        }
+    ]
+
+
+def test_wire_chat_logprobs_content_rejects_misaligned_payload():
+    tokenizer = SimpleNamespace(decode=lambda *_args, **_kwargs: "unused")
+    assert (
+        _wire_chat_logprobs_content(
+            {"token_ids": [7, 8], "log_probs": [-0.25]}, tokenizer
+        )
+        is None
+    )
+
 
 def test_reasoning_parser_plugin_is_loaded_before_lookup(monkeypatch):
     from dynamo.frontend import vllm_processor
