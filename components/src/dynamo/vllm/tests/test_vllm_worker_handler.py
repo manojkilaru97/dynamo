@@ -407,6 +407,99 @@ class TestReasoningParserForwarding:
         np.testing.assert_array_equal(decoded, routed_experts.reshape(-1))
 
     @pytest.mark.asyncio
+    async def test_generate_tokens_does_not_decode_unicode_bytes_as_parser_text(self):
+        """Ordinary byte-fallback tokens must stay with vLLM's detokenizer.
+
+        Nano encodes one rocket emoji as four tokens. Decoding each DELTA token
+        independently produces four U+FFFD replacement characters; only parser
+        marker chunks may carry the worker-side ``text`` escape hatch.
+        """
+        from vllm.sampling_params import SamplingParams
+
+        emoji_token_ids = [1240, 1159, 1154, 1128]
+        handler = _make_handler()
+        handler._extract_logprobs = MagicMock(return_value=(None, None))
+        handler._parser_visible_marker_token_ids = MagicMock(
+            return_value=frozenset({12, 13, 14, 15})
+        )
+        handler._decode_parser_visible_text = MagicMock(return_value="\ufffd")
+
+        async def fake_generate(*args, **kwargs):
+            for token_id in emoji_token_ids:
+                yield SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(
+                            index=0,
+                            token_ids=[token_id],
+                            routed_experts=None,
+                            finish_reason=None,
+                            stop_reason=None,
+                        )
+                    ],
+                    prompt_token_ids=[1],
+                    prompt_logprobs=None,
+                )
+
+        handler.engine_client = MagicMock()
+        handler.engine_client.generate = fake_generate
+
+        chunks = [
+            chunk
+            async for chunk in handler.generate_tokens(
+                PatchedTokensPrompt(prompt_token_ids=[1]),
+                SamplingParams(max_tokens=4),
+                "req-unicode",
+            )
+        ]
+
+        assert [chunk["token_ids"] for chunk in chunks] == [
+            [token_id] for token_id in emoji_token_ids
+        ]
+        assert all("text" not in chunk for chunk in chunks)
+        handler._decode_parser_visible_text.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_generate_tokens_keeps_parser_marker_text_visible(self):
+        from vllm.sampling_params import SamplingParams
+
+        handler = _make_handler()
+        handler._extract_logprobs = MagicMock(return_value=(None, None))
+        handler._parser_visible_marker_token_ids = MagicMock(
+            return_value=frozenset({12, 13, 14, 15})
+        )
+        handler._decode_parser_visible_text = MagicMock(return_value="</think>")
+
+        async def fake_generate(*args, **kwargs):
+            yield SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        index=0,
+                        token_ids=[13],
+                        routed_experts=None,
+                        finish_reason=None,
+                        stop_reason=None,
+                    )
+                ],
+                prompt_token_ids=[1],
+                prompt_logprobs=None,
+            )
+
+        handler.engine_client = MagicMock()
+        handler.engine_client.generate = fake_generate
+
+        chunks = [
+            chunk
+            async for chunk in handler.generate_tokens(
+                PatchedTokensPrompt(prompt_token_ids=[1]),
+                SamplingParams(max_tokens=1),
+                "req-parser-marker",
+            )
+        ]
+
+        assert chunks[0]["text"] == "</think>"
+        handler._decode_parser_visible_text.assert_called_once_with([13])
+
+    @pytest.mark.asyncio
     async def test_generate_tokens_routed_experts_start_echoes_prompt_start(self):
         """routed_experts.start echoes SamplingParams.routed_experts_prompt_start
         (the offset vLLM trimmed) so the RL consumer can align the completion."""

@@ -1,0 +1,22 @@
+ARG BASE_IMAGE=nvcr.io/qc69jvmznzxy/llm_nim/nano@sha256:18e23e58cb7cef424eca80467418bede49361f1d5ad81cd070fda8c120685147
+FROM ${BASE_IMAGE}
+
+ARG SOURCE_REVISION=unknown
+
+COPY components/src/dynamo/vllm/handlers.py \
+  /usr/local/lib/python3.12/dist-packages/dynamo/vllm/handlers.py
+
+RUN python3 -m compileall -q \
+      /usr/local/lib/python3.12/dist-packages/dynamo/vllm/handlers.py \
+ && python3 - <<'PY'
+from pathlib import Path
+
+handlers = Path("/usr/local/lib/python3.12/dist-packages/dynamo/vllm/handlers.py")
+source = handlers.read_text()
+assert "parser_visible_marker_ids.intersection(token_ids)" in source
+assert "Decoding every DELTA chunk independently" in source
+PY
+
+LABEL org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      ai.nvidia.nano.dynamo.utf8-streaming="parser-markers-only" \
+      ai.nvidia.nano.dynamo.regression="emoji-byte-fallback"

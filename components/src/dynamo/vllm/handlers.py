@@ -4637,7 +4637,11 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                         "index": output_idx,
                         "token_ids": token_ids,
                     }
-                    if parser_visible_marker_ids and token_ids:
+                    # Only bypass vLLM's incremental detokenizer for an actual
+                    # parser marker. Decoding every DELTA chunk independently
+                    # corrupts byte-fallback Unicode tokens (for example, the
+                    # four Nano token IDs that make up one rocket emoji).
+                    if parser_visible_marker_ids.intersection(token_ids):
                         decoded_text = self._decode_parser_visible_text(token_ids)
                         if decoded_text is not None:
                             out["text"] = decoded_text
