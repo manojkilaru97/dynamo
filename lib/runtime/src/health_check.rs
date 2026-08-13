@@ -96,14 +96,6 @@ impl HealthCheckManager {
         self.last_success.lock().get(endpoint_subject).copied()
     }
 
-    fn should_probe_on_activity(&self, endpoint_subject: &str) -> bool {
-        !should_keep_endpoint_ready_after_failure(
-            self.last_success(endpoint_subject),
-            Instant::now(),
-            self.config.success_ttl,
-        )
-    }
-
     fn mark_endpoint_ready(&self, endpoint_subject: &str) {
         self.last_success
             .lock()
@@ -248,28 +240,12 @@ impl HealthCheckManager {
                     }
 
                     _ = notifier.notified() => {
-                        if manager.should_probe_on_activity(&endpoint_subject) {
-                            debug!(
-                                "Activity detected for {} with stale health-check success; sending immediate health check",
-                                endpoint_subject
-                            );
-
-                            let target = manager.drt.system_health().lock().get_health_check_target(&endpoint_subject);
-
-                            if let Some(target) = target {
-                                if let Err(e) = manager.send_health_check_request(&endpoint_subject, &target.payload, "activity").await {
-                                    error!("Failed to send activity-triggered health check for {}: {}", endpoint_subject, e);
-                                }
-                            } else {
-                                error!(
-                                    "CRITICAL: Health check target for {} disappeared unexpectedly during activity-triggered probe!",
-                                    endpoint_subject
-                                );
-                                break;
-                            }
-                        } else {
-                            debug!("Activity detected for {}, resetting health check timer", endpoint_subject);
-                        }
+                        // The ingress notifier only fires after a non-error response
+                        // chunk is produced. That is stronger evidence than another
+                        // synthetic request and avoids a probe storm when the prior
+                        // health-check success has expired under sustained traffic.
+                        manager.mark_endpoint_ready(&endpoint_subject);
+                        debug!("Successful activity detected for {}, resetting health check timer", endpoint_subject);
                     }
                 }
             }
@@ -368,49 +344,48 @@ impl HealthCheckManager {
         let payload = payload.clone();
         let timeout = self.config.request_timeout;
 
-        // Spawn task to send health check and wait for response
-        tokio::spawn(async move {
-            let result = tokio::time::timeout(timeout, async {
-                let request = SingleIn::new(payload);
-                match engine.generate(request).await {
-                    Ok(response_stream) => consume_health_check_stream(response_stream).await,
-                    Err(e) => Err(anyhow::anyhow!(
-                        "Health check request failed for {}: {}",
-                        endpoint_subject_owned,
-                        e
-                    )),
-                }
-            })
-            .await;
-
-            match result {
-                Ok(Ok(response_count)) => {
-                    debug!(
-                        "Health check completed successfully for {} after consuming {} response item(s)",
-                        endpoint_subject_owned, response_count
-                    );
-                    manager.mark_endpoint_ready(&endpoint_subject_owned);
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        "Health check error for {} (trigger={}): {}",
-                        endpoint_subject_owned, trigger_owned, e
-                    );
-                    manager
-                        .mark_endpoint_not_ready_if_stale(&endpoint_subject_owned, &e.to_string());
-                }
-                Err(_) => {
-                    let message = format!("Health check timeout after {:?}", timeout);
-                    warn!(
-                        "{} for {} (trigger={})",
-                        message, endpoint_subject_owned, trigger_owned
-                    );
-                    manager.mark_endpoint_not_ready_if_stale(&endpoint_subject_owned, &message);
-                }
+        // Keep exactly one synthetic probe in flight per endpoint. The endpoint
+        // monitor awaits this request, so response activity cannot fan out into
+        // an unbounded set of concurrent probes inside the model scheduler.
+        let result = tokio::time::timeout(timeout, async {
+            let request = SingleIn::new(payload);
+            match engine.generate(request).await {
+                Ok(response_stream) => consume_health_check_stream(response_stream).await,
+                Err(e) => Err(anyhow::anyhow!(
+                    "Health check request failed for {}: {}",
+                    endpoint_subject_owned,
+                    e
+                )),
             }
+        })
+        .await;
 
-            debug!("Health check completed for {}", endpoint_subject_owned);
-        });
+        match result {
+            Ok(Ok(response_count)) => {
+                debug!(
+                    "Health check completed successfully for {} after consuming {} response item(s)",
+                    endpoint_subject_owned, response_count
+                );
+                manager.mark_endpoint_ready(&endpoint_subject_owned);
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "Health check error for {} (trigger={}): {}",
+                    endpoint_subject_owned, trigger_owned, e
+                );
+                manager.mark_endpoint_not_ready_if_stale(&endpoint_subject_owned, &e.to_string());
+            }
+            Err(_) => {
+                let message = format!("Health check timeout after {:?}", timeout);
+                warn!(
+                    "{} for {} (trigger={})",
+                    message, endpoint_subject_owned, trigger_owned
+                );
+                manager.mark_endpoint_not_ready_if_stale(&endpoint_subject_owned, &message);
+            }
+        }
+
+        debug!("Health check completed for {}", endpoint_subject_owned);
 
         Ok(())
     }
@@ -705,14 +680,14 @@ mod push_handler_notify_tests {
     }
 
     // =================================================================
-    // Test 1: Successful streaming → notification → activity canary → Ready
+    // Test 1: Successful streaming activity → Ready
     // =================================================================
     #[tokio::test]
     async fn test_successful_streaming_sets_ready() {
         let drt = create_test_drt_async().await;
         let endpoint = "test.successful_streaming";
 
-        let notifier = register_endpoint(&drt, endpoint, MockStreamingEngine::success(1));
+        let notifier = register_endpoint(&drt, endpoint, MockStreamingEngine::all_errors(1));
         assert_status(&drt, endpoint, HealthStatus::NotReady, "initial");
 
         let ingress = create_ingress(MockStreamingEngine::success(5), notifier);
@@ -723,12 +698,11 @@ mod push_handler_notify_tests {
             .expect("successful stream should complete");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // Ready comes from the activity-triggered canary, not from a blind notify.
         assert_status(
             &drt,
             endpoint,
             HealthStatus::Ready,
-            "successful streaming should trigger a successful health check",
+            "successful streaming activity should mark the endpoint ready",
         );
     }
 
@@ -856,7 +830,7 @@ mod push_handler_notify_tests {
     }
 
     // =================================================================
-    // Test 5: Mixed streaming (success + trailing error) → activity canary → Ready,
+    // Test 5: Mixed streaming (success + trailing error) → activity → Ready,
     // while the handler still returns an error for real-traffic accounting.
     // =================================================================
     #[tokio::test]
@@ -864,7 +838,7 @@ mod push_handler_notify_tests {
         let drt = create_test_drt_async().await;
         let endpoint = "test.mixed_streaming";
 
-        let notifier = register_endpoint(&drt, endpoint, MockStreamingEngine::success(1));
+        let notifier = register_endpoint(&drt, endpoint, MockStreamingEngine::all_errors(1));
         assert_status(&drt, endpoint, HealthStatus::NotReady, "initial");
 
         // 5 chunks: 4 success + error at index 4
@@ -878,13 +852,11 @@ mod push_handler_notify_tests {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // Successful chunks notified before the error chunk, so the activity
-        // canary can still prove the endpoint process is alive.
         assert_status(
             &drt,
             endpoint,
             HealthStatus::Ready,
-            "successful chunks should trigger a successful health check despite trailing error",
+            "successful chunks should keep the endpoint ready despite a trailing error",
         );
     }
 }
