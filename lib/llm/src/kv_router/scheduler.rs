@@ -304,23 +304,8 @@ where
     }
 
     fn observe_schedule_result(&self, response: &Result<SchedulingResponse, KvSchedulerError>) {
-        if let Err(KvSchedulerError::QueueRejected(rejection)) = response
-            && let Some(metrics) = self
-                .queue_metric_indices
-                .get(&rejection.policy_class)
-                .and_then(|index| self.queue_metrics.get(*index))
-        {
-            match rejection.limit_kind {
-                dynamo_kv_router::scheduling::QueueLimitKind::Requests => {
-                    metrics.request_limit_rejections.inc();
-                }
-                dynamo_kv_router::scheduling::QueueLimitKind::RawIslTokens => {
-                    metrics.raw_isl_limit_rejections.inc();
-                }
-                dynamo_kv_router::scheduling::QueueLimitKind::CachedTokens => {
-                    metrics.cached_token_limit_rejections.inc();
-                }
-            }
+        if let Err(error) = response {
+            observe_queue_error(error, &self.queue_metrics, &self.queue_metric_indices);
         }
         self.update_queue_metrics();
     }
@@ -395,6 +380,50 @@ where
     }
 }
 
+fn observe_queue_error(
+    error: &KvSchedulerError,
+    queue_metrics: &[RouterQueueMetricHandles],
+    queue_metric_indices: &HashMap<String, usize>,
+) {
+    match error {
+        KvSchedulerError::QueueRejected(rejection) => {
+            if let Some(metrics) = queue_metric_indices
+                .get(&rejection.policy_class)
+                .and_then(|index| queue_metrics.get(*index))
+            {
+                match rejection.limit_kind {
+                    dynamo_kv_router::scheduling::QueueLimitKind::Requests => {
+                        metrics.request_limit_rejections.inc();
+                    }
+                    dynamo_kv_router::scheduling::QueueLimitKind::RawIslTokens => {
+                        metrics.raw_isl_limit_rejections.inc();
+                    }
+                    dynamo_kv_router::scheduling::QueueLimitKind::CachedTokens => {
+                        metrics.cached_token_limit_rejections.inc();
+                    }
+                }
+            }
+        }
+        KvSchedulerError::QueueFull { policy_class, .. } => {
+            if let Some(metrics) = queue_metric_indices
+                .get(policy_class)
+                .and_then(|index| queue_metrics.get(*index))
+            {
+                metrics.queue_full_rejections.inc();
+            }
+        }
+        KvSchedulerError::QueueWaitTimeout { policy_class, .. } => {
+            if let Some(metrics) = queue_metric_indices
+                .get(policy_class)
+                .and_then(|index| queue_metrics.get(*index))
+            {
+                metrics.queue_wait_timeouts.inc();
+            }
+        }
+        _ => {}
+    }
+}
+
 fn update_queue_metrics(
     handles: &[RouterQueueMetricHandles],
     mut stats_for: impl FnMut(usize) -> Option<dynamo_kv_router::queue::ClassQueueStats>,
@@ -464,6 +493,35 @@ mod tests {
                 stats.pending_cached_tokens as i64
             );
         }
+    }
+
+    #[test]
+    fn queue_capacity_errors_increment_reason_counters() {
+        let handles =
+            vec![ROUTER_QUEUE_METRICS.handles("capacity-error-test", "decode", "default")];
+        let indices = HashMap::from([("default".to_string(), 0)]);
+
+        observe_queue_error(
+            &KvSchedulerError::QueueFull {
+                policy_class: "default".to_string(),
+                pending: 8,
+                limit: 8,
+            },
+            &handles,
+            &indices,
+        );
+        observe_queue_error(
+            &KvSchedulerError::QueueWaitTimeout {
+                policy_class: "default".to_string(),
+                waited_ms: 1_001,
+                limit_ms: 1_000,
+            },
+            &handles,
+            &indices,
+        );
+
+        assert_eq!(handles[0].queue_full_rejections.get(), 1);
+        assert_eq!(handles[0].queue_wait_timeouts.get(), 1);
     }
 
     #[tokio::test]

@@ -105,7 +105,7 @@ pub(super) fn get_body_limit() -> usize {
         .unwrap_or(45 * 1024 * 1024)
 }
 
-fn configured_max_output_tokens() -> Option<u32> {
+pub(super) fn configured_max_output_tokens() -> Option<u32> {
     static CAP: OnceLock<Option<u32>> = OnceLock::new();
     *CAP.get_or_init(|| {
         std::env::var("DYN_MAX_OUTPUT_TOKENS")
@@ -115,12 +115,18 @@ fn configured_max_output_tokens() -> Option<u32> {
     })
 }
 
-fn clamp_max_output_tokens(value: &mut Option<u32>) {
-    if let (Some(cap), Some(value)) = (configured_max_output_tokens(), value.as_mut())
-        && *value > cap
-    {
-        *value = cap;
+pub(super) fn clamp_max_output_tokens_to(value: &mut Option<u32>, cap: Option<u32>) -> bool {
+    match (cap, value.as_mut()) {
+        (Some(cap), Some(value)) if *value > cap => {
+            *value = cap;
+            true
+        }
+        _ => false,
     }
+}
+
+fn clamp_max_output_tokens(value: &mut Option<u32>) -> bool {
+    clamp_max_output_tokens_to(value, configured_max_output_tokens())
 }
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
@@ -180,6 +186,12 @@ fn map_error_code_to_error_type(code: StatusCode) -> String {
 
 /// Classify error for metrics based on status code and message
 fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
+    if code == overload_status_code()
+        && (message == "Overloaded" || message == "Service temporarily overloaded")
+    {
+        return ErrorType::Overload;
+    }
+
     match code {
         StatusCode::BAD_REQUEST => {
             // 400
@@ -448,7 +460,7 @@ impl ErrorMessage {
             );
         }
 
-        // Check for ResourceExhausted anywhere in the error chain → HTTP 529
+        // Check for ResourceExhausted anywhere in the error chain → overload status.
         if super::metrics::request_was_rejected(err.as_ref()) {
             return ErrorMessage::sanitized_with_details(
                 SanitizedError::Overloaded,
@@ -910,8 +922,6 @@ async fn completions(
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
-    clamp_max_output_tokens(&mut request.inner.max_tokens);
-
     // Validate stream_options is only used when streaming (NVBug 5662680)
     validate_completion_stream_options(&request)?;
 
@@ -919,6 +929,11 @@ async fn completions(
 
     let model = state.manager().resolve_canonical_name(&request.inner.model);
     request.inner.model = model;
+    if clamp_max_output_tokens(&mut request.inner.max_tokens) {
+        state
+            .metrics_clone()
+            .inc_output_token_clamp(&request.inner.model, Endpoint::Completions);
+    }
 
     // Detect batch prompts
     let batch_size = get_prompt_batch_size(&request.inner.prompt);
@@ -2105,6 +2120,19 @@ async fn chat_completions(
     let model = request.inner.model.clone();
     let metric_model = state.manager().metric_model_for(&model).to_string();
 
+    let clamped = if request.inner.max_completion_tokens.is_some() {
+        clamp_max_output_tokens(&mut request.inner.max_completion_tokens)
+    } else {
+        #[allow(deprecated)]
+        let legacy_max_tokens = &mut request.inner.max_tokens;
+        clamp_max_output_tokens(legacy_max_tokens)
+    };
+    if clamped {
+        state
+            .metrics_clone()
+            .inc_output_token_clamp(&metric_model, Endpoint::ChatCompletions);
+    }
+
     request.normalize_reasoning_controls();
 
     tracing::trace!("Received chat completions request: {:?}", request.content());
@@ -2658,13 +2686,17 @@ async fn responses(
             request.inner.max_output_tokens = Some(template.max_completion_tokens);
         }
     }
-    clamp_max_output_tokens(&mut request.inner.max_output_tokens);
     tracing::trace!("Received responses request: {:?}", request.inner);
 
     let model = state
         .manager()
         .resolve_canonical_name(request.inner.model.as_deref().unwrap_or_default());
     request.inner.model = Some(model.clone());
+    if clamp_max_output_tokens(&mut request.inner.max_output_tokens) {
+        state
+            .metrics_clone()
+            .inc_output_token_clamp(&model, Endpoint::Responses);
+    }
     let streaming = request.inner.stream.unwrap_or(false);
     let raw_audit_request = request.get::<serde_json::Value>(AUDIT_RAW_PAYLOAD_KEY).ok();
     let raw_audit_headers = request
@@ -3908,6 +3940,21 @@ mod tests {
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
 
     #[test]
+    fn output_token_limit_is_silently_clamped() {
+        let mut over_limit = Some(2_000);
+        assert!(clamp_max_output_tokens_to(&mut over_limit, Some(1_800)));
+        assert_eq!(over_limit, Some(1_800));
+
+        let mut at_limit = Some(1_800);
+        assert!(!clamp_max_output_tokens_to(&mut at_limit, Some(1_800)));
+        assert_eq!(at_limit, Some(1_800));
+
+        let mut omitted = None;
+        assert!(!clamp_max_output_tokens_to(&mut omitted, Some(1_800)));
+        assert_eq!(omitted, None);
+    }
+
+    #[test]
     fn audit_headers_preserve_all_values() {
         let mut headers = HeaderMap::new();
         headers.append("x-single", "one".parse().unwrap());
@@ -4248,9 +4295,9 @@ mod tests {
             .build()
             .into();
         let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
-        assert_eq!(response.0.as_u16(), 529);
-        assert_eq!(response.1.code, 529);
-        assert_eq!(response.1.error_type, "Overloaded");
+        assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.1.code, 503);
+        assert_eq!(response.1.error_type, "Service Unavailable");
         assert_eq!(response.1.message, "Service temporarily overloaded");
         assert!(
             !response.1.message.contains("All workers are busy"),
@@ -4275,7 +4322,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_rejection_maps_to_structured_http_529() {
+    fn queue_rejection_maps_to_structured_http_503() {
         use dynamo_kv_router::scheduling::{QueueLimitKind, QueueRejection};
 
         let rejection = QueueRejection {
@@ -4287,9 +4334,9 @@ mod tests {
         let response =
             ErrorMessage::from_anyhow(anyhow::Error::new(rejection), BACKUP_ERROR_MESSAGE);
 
-        assert_eq!(response.0.as_u16(), 529);
-        assert_eq!(response.1.code, 529);
-        assert_eq!(response.1.error_type, "Overloaded");
+        assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.1.code, 503);
+        assert_eq!(response.1.error_type, "Service Unavailable");
         assert_eq!(
             response.1.details.as_deref(),
             Some(&serde_json::json!({

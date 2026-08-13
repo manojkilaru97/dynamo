@@ -1218,6 +1218,31 @@ mod tests {
         assert_eq!(estimates.cached_tokens.get(&worker_2), Some(&12));
     }
 
+    #[test]
+    fn queue_capacity_errors_map_to_resource_exhausted() {
+        let errors = [
+            KvSchedulerError::QueueFull {
+                policy_class: "default".to_string(),
+                pending: 8,
+                limit: 8,
+            },
+            KvSchedulerError::QueueWaitTimeout {
+                policy_class: "default".to_string(),
+                waited_ms: 1_001,
+                limit_ms: 1_000,
+            },
+        ];
+
+        for error in errors {
+            let error = map_scheduler_error(error);
+            assert!(dynamo_runtime::error::match_error_chain(
+                error.as_ref(),
+                &[dynamo_runtime::error::ErrorType::ResourceExhausted],
+                &[]
+            ));
+        }
+    }
+
     struct FakeSharedCache {
         hits: Option<dynamo_kv_router::protocols::SharedCacheHits>,
         should_error: bool,

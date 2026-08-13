@@ -59,18 +59,33 @@ pub enum KvSchedulerError {
     #[error("failed to initialize event publisher: {0}")]
     InitFailed(String),
 
-    #[error("scheduler queue full: pending={pending}, limit={limit}")]
-    QueueFull { pending: usize, limit: usize },
+    #[error(
+        "scheduler queue full for policy class {policy_class}: pending={pending}, limit={limit}"
+    )]
+    QueueFull {
+        policy_class: String,
+        pending: usize,
+        limit: usize,
+    },
 
-    #[error("scheduler queue wait timeout after {waited_ms}ms (limit {limit_ms}ms)")]
-    QueueWaitTimeout { waited_ms: u64, limit_ms: u64 },
+    #[error(
+        "scheduler queue wait timeout for policy class {policy_class} after {waited_ms}ms (limit {limit_ms}ms)"
+    )]
+    QueueWaitTimeout {
+        policy_class: String,
+        waited_ms: u64,
+        limit_ms: u64,
+    },
 }
 
 impl KvSchedulerError {
     pub fn is_overload(&self) -> bool {
         matches!(
             self,
-            Self::AllEligibleWorkersOverloaded | Self::PinnedWorkerOverloaded { .. }
+            Self::AllEligibleWorkersOverloaded
+                | Self::PinnedWorkerOverloaded { .. }
+                | Self::QueueFull { .. }
+                | Self::QueueWaitTimeout { .. }
         )
     }
 }

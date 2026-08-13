@@ -5,7 +5,8 @@
 //!
 //! The busy thresholds control when workers are marked as "busy" based on their
 //! KV cache block utilization and prefill token utilization. When all workers
-//! for a model exceed their thresholds, new requests are rejected with a 529
+//! for a model exceed their thresholds, new requests are rejected with the
+//! configured overload status (503 by default)
 //! response.
 //!
 //! ## Endpoints

@@ -8,11 +8,11 @@ use dynamo_runtime::config::environment_names::llm as env_llm;
 use thiserror::Error;
 
 /// Overload / admission-control rejection status. Reads
-/// `DYN_HTTP_OVERLOAD_STATUS_CODE` (default 529); cached since env is fixed at
+/// `DYN_HTTP_OVERLOAD_STATUS_CODE` (default 503); cached since env is fixed at
 /// runtime and this is on the rejection path.
 pub(crate) fn overload_status_code() -> StatusCode {
     static CODE: LazyLock<StatusCode> = LazyLock::new(|| {
-        let default = StatusCode::from_u16(529).expect("529 is a valid HTTP status code");
+        let default = StatusCode::SERVICE_UNAVAILABLE;
         std::env::var(env_llm::DYN_HTTP_OVERLOAD_STATUS_CODE)
             .ok()
             .and_then(|s| s.trim().parse::<u16>().ok())
@@ -44,7 +44,7 @@ pub struct HttpError {
 pub enum SanitizedError {
     /// 499 Client Closed Request.
     Cancelled,
-    /// 529 Site Is Overloaded.
+    /// 503 Service Unavailable by default; configurable for compatibility.
     Overloaded,
     /// 503 Service Unavailable.
     Unavailable,
@@ -157,8 +157,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_statuses_distinguish_overload_from_unavailable() {
-        assert_eq!(SanitizedError::Overloaded.status().as_u16(), 529);
+    fn local_overload_and_unavailable_default_to_503() {
+        assert_eq!(
+            SanitizedError::Overloaded.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         assert_eq!(
             SanitizedError::Unavailable.status(),
             StatusCode::SERVICE_UNAVAILABLE

@@ -165,7 +165,7 @@ fn create_operation_for_route(method: &str, path: &str) -> utoipa::openapi::path
     operation = operation.response(
         "503",
         ResponseBuilder::new()
-            .description("Service unavailable")
+            .description("Service unavailable or overloaded")
             .build(),
     );
 

@@ -1199,6 +1199,7 @@ mod tests {
     async fn queued_selection_returns_refreshed_overlap_snapshot() {
         let mut config = test_config(false);
         config.router_queue_threshold = Some(0.0);
+        config.router_max_queue_wait_ms = None;
         let core = Arc::new(SelectionCore::new(config, 1, CancellationToken::new()));
 
         for worker_id in [1, 2] {

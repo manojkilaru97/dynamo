@@ -66,8 +66,8 @@ fn scheduler_error_status(error: &KvSchedulerError) -> StatusCode {
         | KvSchedulerError::InitFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
         KvSchedulerError::AllEligibleWorkersOverloaded
         | KvSchedulerError::PinnedWorkerOverloaded { .. }
-        | KvSchedulerError::QueueFull { .. } => StatusCode::TOO_MANY_REQUESTS,
-        KvSchedulerError::QueueWaitTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+        | KvSchedulerError::QueueFull { .. }
+        | KvSchedulerError::QueueWaitTimeout { .. } => StatusCode::SERVICE_UNAVAILABLE,
         KvSchedulerError::QueueRejected(_) => StatusCode::SERVICE_UNAVAILABLE,
         KvSchedulerError::PinnedWorkerNotAllowed { .. } => StatusCode::BAD_REQUEST,
         KvSchedulerError::BookingFailed(_) => StatusCode::CONFLICT,
@@ -113,17 +113,19 @@ mod tests {
     fn queue_capacity_errors_have_stable_http_statuses() {
         assert_eq!(
             scheduler_error_status(&KvSchedulerError::QueueFull {
+                policy_class: "default".to_string(),
                 pending: 8,
                 limit: 8,
             }),
-            StatusCode::TOO_MANY_REQUESTS
+            StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
             scheduler_error_status(&KvSchedulerError::QueueWaitTimeout {
+                policy_class: "default".to_string(),
                 waited_ms: 1_001,
                 limit_ms: 1_000,
             }),
-            StatusCode::GATEWAY_TIMEOUT
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 }

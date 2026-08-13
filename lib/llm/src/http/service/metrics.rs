@@ -397,6 +397,7 @@ pub struct Metrics {
     cached_tokens: HistogramVec,
     tokenizer_latency: HistogramVec,
     output_tokens_counter: IntCounterVec,
+    output_token_clamp_total: IntCounterVec,
     prompt_tokens_total: IntCounterVec,
     generation_tokens_total: IntCounterVec,
     request_success_total: IntCounterVec,
@@ -530,7 +531,7 @@ pub enum ErrorType {
     Validation,
     /// Model or resource not found (404)
     NotFound,
-    /// Service overloaded or rate limited (429 or 529)
+    /// Service overloaded or rate limited (429, 503, or configured overload status)
     Overload,
     /// Service unavailable because no backend worker can serve the request
     Unavailable,
@@ -775,6 +776,15 @@ impl Metrics {
                 "Total number of output tokens generated (updates in real-time)",
             ),
             &["model"],
+        )
+        .unwrap();
+
+        let output_token_clamp_total = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name("output_token_clamp_total"),
+                "Total requests whose output-token limit was silently clamped",
+            ),
+            &["model", "endpoint"],
         )
         .unwrap();
 
@@ -1085,6 +1095,7 @@ impl Metrics {
             cached_tokens,
             tokenizer_latency,
             output_tokens_counter,
+            output_token_clamp_total,
             prompt_tokens_total,
             generation_tokens_total,
             request_success_total,
@@ -1364,6 +1375,7 @@ impl Metrics {
         registry.register(Box::new(self.cached_tokens.clone()))?;
         registry.register(Box::new(self.tokenizer_latency.clone()))?;
         registry.register(Box::new(self.output_tokens_counter.clone()))?;
+        registry.register(Box::new(self.output_token_clamp_total.clone()))?;
         registry.register(Box::new(self.prompt_tokens_total.clone()))?;
         registry.register(Box::new(self.generation_tokens_total.clone()))?;
         registry.register(Box::new(self.request_success_total.clone()))?;
@@ -1515,6 +1527,12 @@ impl Metrics {
     /// Increment the rejection counter for a request rejected due to resource exhaustion
     pub fn inc_rejection(&self, model: &str, endpoint: Endpoint) {
         self.model_rejection_total
+            .with_label_values(&[model, &endpoint.to_string()])
+            .inc();
+    }
+
+    pub fn inc_output_token_clamp(&self, model: &str, endpoint: Endpoint) {
+        self.output_token_clamp_total
             .with_label_values(&[model, &endpoint.to_string()])
             .inc();
     }
@@ -2663,6 +2681,23 @@ mod tests {
             .with_label_values(&[model])
             .get();
         assert_eq!(counter_value, 22);
+    }
+
+    #[test]
+    fn test_output_token_clamp_counter_increments() {
+        let metrics = Metrics::new();
+        let model = "test-model";
+        let endpoint = Endpoint::ChatCompletions;
+
+        metrics.inc_output_token_clamp(model, endpoint);
+
+        assert_eq!(
+            metrics
+                .output_token_clamp_total
+                .with_label_values(&[model, &endpoint.to_string()])
+                .get(),
+            1
+        );
     }
 
     #[test]

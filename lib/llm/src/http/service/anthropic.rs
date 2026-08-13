@@ -237,6 +237,16 @@ async fn anthropic_messages(
 
     let model = request.model.clone();
     let metric_model = state.manager().metric_model_for(&model).to_string();
+    let mut max_tokens = Some(request.max_tokens);
+    if super::openai::clamp_max_output_tokens_to(
+        &mut max_tokens,
+        super::openai::configured_max_output_tokens(),
+    ) {
+        request.max_tokens = max_tokens.expect("clamped output token limit");
+        state
+            .metrics_clone()
+            .inc_output_token_clamp(&metric_model, Endpoint::AnthropicMessages);
+    }
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
 
     tracing::trace!("Received Anthropic messages request: {:?}", &*request);

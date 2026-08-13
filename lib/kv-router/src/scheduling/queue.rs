@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -468,7 +468,25 @@ impl<
 > SchedulerQueueActor<P, C, Sel, RF>
 {
     async fn run(mut self, mut rx: mpsc::Receiver<AdmissionCommand>) {
-        while let Some(command) = rx.recv().await {
+        loop {
+            let command = if self.pending.pending_count() == 0 {
+                rx.recv().await
+            } else if let Some(max_queue_wait) = self.max_queue_wait {
+                let poll_interval = max_queue_wait.min(Duration::from_millis(100));
+                tokio::select! {
+                    command = rx.recv() => command,
+                    _ = tokio::time::sleep(poll_interval) => {
+                        self.handle_update().await;
+                        continue;
+                    }
+                }
+            } else {
+                rx.recv().await
+            };
+
+            let Some(command) = command else {
+                break;
+            };
             match command {
                 AdmissionCommand::Enqueue {
                     request,
@@ -513,6 +531,7 @@ impl<
     ) {
         let eligibility = request.eligibility();
         let decay_now = Instant::now();
+        let overloaded_worker_ids = self.overloaded_worker_ids();
         // Synthetic and explicit selections avoid cache work. Family
         // classification reuses one worker generation for snapshot and busy checks.
         let (class_index, snapshot, should_queue) = if let Some(class_index) = self
@@ -522,6 +541,10 @@ impl<
             let class = self.profile.class(class_index);
             let should_queue = self.should_queue(class_index, class, || {
                 self.all_workers_prefill_busy(class, eligibility, decay_now)
+                    || self.all_workers_externally_overloaded(
+                        eligibility,
+                        overloaded_worker_ids.as_ref(),
+                    )
             });
             (class_index, None, should_queue)
         } else {
@@ -540,12 +563,16 @@ impl<
                     &workers,
                     class,
                     eligibility,
+                ) || Self::all_workers_externally_overloaded_with(
+                    &workers,
+                    eligibility,
+                    overloaded_worker_ids.as_ref(),
                 )
             });
             (class_index, Some(snapshot), should_queue)
         };
         if !should_queue {
-            self.admit_one(request, decay_now);
+            self.admit_one(request, decay_now, overloaded_worker_ids.as_ref());
             return;
         }
 
@@ -553,7 +580,11 @@ impl<
             let pending = self.pending.pending_count();
             if pending >= limit {
                 let mut request = request;
-                request.respond(Err(KvSchedulerError::QueueFull { pending, limit }));
+                request.respond(Err(KvSchedulerError::QueueFull {
+                    policy_class: self.profile.class(class_index).name.clone(),
+                    pending,
+                    limit,
+                }));
                 return;
             }
         }
@@ -627,6 +658,7 @@ impl<
             let decay_now = Instant::now();
             let active_tokens = self.slots.active_tokens(decay_now);
             let active_requests = self.slots.active_request_counts();
+            let overloaded_worker_ids = self.overloaded_worker_ids();
             let popped = {
                 let configs = self.workers_with_configs.borrow();
                 self.pending.pop_next(|_, class, queued| {
@@ -639,6 +671,10 @@ impl<
                         &configs,
                         class,
                         queued.request.eligibility(),
+                    ) && !Self::all_workers_externally_overloaded_with(
+                        &configs,
+                        queued.request.eligibility(),
+                        overloaded_worker_ids.as_ref(),
                     )
                 })
             };
@@ -692,24 +728,25 @@ impl<
                 policy_class = class.name,
                 "scheduling request from pending queue"
             );
-            self.admit_one(request, admit_now);
+            self.admit_one(request, admit_now, overloaded_worker_ids.as_ref());
         }
     }
 
     /// Run the full scheduling pipeline for a single request:
     /// compute projected load -> select worker -> book tracked state -> respond.
-    fn admit_one(&self, mut request: SchedulingRequest, decay_now: Instant) {
+    fn admit_one(
+        &self,
+        mut request: SchedulingRequest,
+        decay_now: Instant,
+        overloaded_worker_ids: Option<&HashSet<WorkerId>>,
+    ) {
         request.worker_loads = self
             .slots
             .project_worker_loads(request.token_seq.as_deref(), decay_now);
 
         let selection = {
             let workers = self.workers_with_configs.borrow();
-            let overloaded_worker_ids = self
-                .overloaded_worker_provider
-                .as_ref()
-                .and_then(|provider| provider());
-            let eligibility = request.eligibility_with_overloaded(overloaded_worker_ids.as_ref());
+            let eligibility = request.eligibility_with_overloaded(overloaded_worker_ids);
             self.selector
                 .select_worker(&workers, &request, eligibility, self.block_size)
                 .map(|selection| {
@@ -906,6 +943,45 @@ impl<
         checked_any && !has_available
     }
 
+    fn overloaded_worker_ids(&self) -> Option<HashSet<WorkerId>> {
+        self.overloaded_worker_provider
+            .as_ref()
+            .and_then(|provider| provider())
+    }
+
+    fn all_workers_externally_overloaded(
+        &self,
+        eligibility: RoutingEligibility<'_>,
+        overloaded_worker_ids: Option<&HashSet<WorkerId>>,
+    ) -> bool {
+        let configs = self.workers_with_configs.borrow();
+        Self::all_workers_externally_overloaded_with(&configs, eligibility, overloaded_worker_ids)
+    }
+
+    fn all_workers_externally_overloaded_with(
+        configs: &HashMap<WorkerId, C>,
+        eligibility: RoutingEligibility<'_>,
+        overloaded_worker_ids: Option<&HashSet<WorkerId>>,
+    ) -> bool {
+        let Some(overloaded_worker_ids) = overloaded_worker_ids else {
+            return false;
+        };
+
+        if let Some(worker) = eligibility.pinned_worker() {
+            if eligibility.validate_worker_rank(configs, worker).is_err() {
+                return false;
+            }
+            return overloaded_worker_ids.contains(&worker.worker_id);
+        }
+
+        let mut checked_any = false;
+        let has_available = eligibility.any_eligible_worker_rank(configs, |worker, _| {
+            checked_any = true;
+            !overloaded_worker_ids.contains(&worker.worker_id)
+        });
+        checked_any && !has_available
+    }
+
     fn worker_is_busy(
         worker: crate::protocols::WorkerWithDpRank,
         config: &C,
@@ -962,11 +1038,14 @@ impl<
             self.pending_count.fetch_sub(1, AtomicOrdering::Relaxed);
             self.pending_isl_tokens
                 .fetch_sub(snapshot.raw_isl_tokens, AtomicOrdering::Relaxed);
-            self.subtract_class_counters(entry.class_index(), snapshot);
+            let class_index = entry.class_index();
+            self.subtract_class_counters(class_index, snapshot);
+            let policy_class = self.profile.class(class_index).name.clone();
             let queued = entry.into_payload();
             let waited_ms = queued.enqueue_at.elapsed().as_millis() as u64;
             let mut request = queued.request;
             request.respond(Err(KvSchedulerError::QueueWaitTimeout {
+                policy_class,
                 waited_ms,
                 limit_ms: limit.as_millis() as u64,
             }));
@@ -1330,6 +1409,8 @@ mod tests {
         num_workers: usize,
         block_size: u32,
         isl: usize,
+        threshold_frac: Option<f64>,
+        max_pending_per_worker: Option<usize>,
         overloaded_worker_provider: OverloadedWorkerProvider,
     ) -> (
         Arc<SchedulerQueue<NoopSequencePublisher, SimpleWorkerConfig>>,
@@ -1359,15 +1440,18 @@ mod tests {
         let (_cfg_tx, cfg_rx) = watch::channel(configs);
 
         let selector = DefaultWorkerSelector::new(None, "test");
-        let queue = Arc::new(SchedulerQueue::new_with_overload_provider(
+        let queue = Arc::new(SchedulerQueue::new_with_overlap_refresh(
             Arc::clone(&slots),
             cfg_rx,
-            None,
+            threshold_frac,
             block_size,
             selector,
             RouterQueuePolicy::Fcfs,
             None,
+            None,
             Some(overloaded_worker_provider),
+            max_pending_per_worker,
+            None,
         ));
 
         (queue, slots)
@@ -1896,15 +1980,16 @@ mod tests {
         assert!(matches!(
             excess_rx.await.expect("response sender dropped"),
             Err(KvSchedulerError::QueueFull {
+                ref policy_class,
                 pending: 1,
                 limit: 1
-            })
+            }) if policy_class == "default"
         ));
         assert_eq!(queue.pending_count(), 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn queue_wait_timeout_expires_pending_request() {
+    async fn queue_wait_timeout_expires_pending_request_without_external_update() {
         let (queue, _slots, _cfg_tx) = make_queue_with_sender_and_limits(
             1,
             16,
@@ -1922,15 +2007,17 @@ mod tests {
         queue.enqueue(queued).await;
 
         tokio::time::advance(Duration::from_millis(101)).await;
-        queue.update().await;
+        tokio::task::yield_now().await;
         match queued_rx
             .try_recv()
             .expect("expired request was not failed")
         {
             Err(KvSchedulerError::QueueWaitTimeout {
+                policy_class,
                 waited_ms,
                 limit_ms,
             }) => {
+                assert_eq!(policy_class, "default");
                 assert!(waited_ms >= 100);
                 assert_eq!(limit_ms, 100);
             }
@@ -2262,7 +2349,7 @@ policy_classes:
         let overloaded_worker_provider: OverloadedWorkerProvider =
             Arc::new(|| Some(HashSet::from([0])));
         let (queue, _slots) =
-            make_queue_with_overload_provider(1, 16, 256, overloaded_worker_provider);
+            make_queue_with_overload_provider(1, 16, 256, None, None, overloaded_worker_provider);
 
         let (req, rx) = make_request("overloaded", 256);
         queue.enqueue(req).await;
@@ -2272,6 +2359,52 @@ policy_classes:
             resp,
             Err(KvSchedulerError::AllEligibleWorkersOverloaded)
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_external_overload_uses_bounded_queue_until_worker_recovers() {
+        let overloaded = Arc::new(StdMutex::new(HashSet::from([0])));
+        let overloaded_worker_provider: OverloadedWorkerProvider = {
+            let overloaded = Arc::clone(&overloaded);
+            Arc::new(move || Some(overloaded.lock().unwrap().clone()))
+        };
+        let (queue, _slots) = make_queue_with_overload_provider(
+            1,
+            16,
+            256,
+            Some(128.0),
+            Some(1),
+            overloaded_worker_provider,
+        );
+
+        let (queued, mut queued_rx) = make_request("queued", 256);
+        queue.enqueue(queued).await;
+        assert_eq!(queue.pending_count(), 1);
+        assert!(queued_rx.try_recv().is_err());
+
+        queue.update().await;
+        assert_eq!(queue.pending_count(), 1);
+        assert!(queued_rx.try_recv().is_err());
+
+        let (excess, excess_rx) = make_request("excess", 256);
+        queue.enqueue(excess).await;
+        assert!(matches!(
+            excess_rx.await.expect("response sender dropped"),
+            Err(KvSchedulerError::QueueFull {
+                ref policy_class,
+                pending: 1,
+                limit: 1,
+            }) if policy_class == "default"
+        ));
+
+        overloaded.lock().unwrap().clear();
+        queue.update().await;
+        let response = queued_rx
+            .await
+            .expect("response sender dropped")
+            .expect("recovered worker should receive queued request");
+        assert_eq!(response.best_worker.worker_id, 0);
+        assert_eq!(queue.pending_count(), 0);
     }
 
     /// Simulates the EPP path: router starts with zero workers (skip_initial_worker_wait),
