@@ -1,0 +1,12 @@
+ARG WHEEL_IMAGE=dynamo-cap-wheelbuilder-v13:arm64
+FROM ${WHEEL_IMAGE} AS wheel_builder
+
+FROM nvcr.io/qc69jvmznzxy/llm_nim/ultra@sha256:1a4b12e131ac8d6ad6d2c8951fcc8f0c28fdcd984a81cf5b4fc8f28ee7243d76
+
+USER root
+COPY --from=wheel_builder /opt/dynamo/dist/ai_dynamo_runtime-1.3.0-*.whl /tmp/dynamo-wheels/
+RUN uv pip install --system --no-deps --reinstall /tmp/dynamo-wheels/ai_dynamo_runtime-1.3.0-*.whl \
+    && rm -rf /tmp/dynamo-wheels
+
+LABEL org.opencontainers.image.title="Ultra Dynamo vLLM 0.26 with bounded default output" \
+      org.opencontainers.image.revision="dynamo-output-cap"

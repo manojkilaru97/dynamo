@@ -125,8 +125,52 @@ pub(super) fn clamp_max_output_tokens_to(value: &mut Option<u32>, cap: Option<u3
     }
 }
 
-fn clamp_max_output_tokens(value: &mut Option<u32>) -> bool {
-    clamp_max_output_tokens_to(value, configured_max_output_tokens())
+pub(super) fn clamp_or_default_max_output_tokens_to(
+    value: &mut Option<u32>,
+    cap: Option<u32>,
+) -> bool {
+    match (cap, value.as_mut()) {
+        (Some(cap), Some(value)) if *value > cap => {
+            *value = cap;
+            true
+        }
+        (Some(cap), None) => {
+            *value = Some(cap);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn clamp_or_default_max_output_tokens(value: &mut Option<u32>) -> bool {
+    clamp_or_default_max_output_tokens_to(value, configured_max_output_tokens())
+}
+
+fn normalize_chat_max_output_tokens_to(
+    max_completion_tokens: &mut Option<u32>,
+    max_tokens: &mut Option<u32>,
+    cap: Option<u32>,
+) -> bool {
+    let mut changed = clamp_max_output_tokens_to(max_completion_tokens, cap);
+    changed |= clamp_max_output_tokens_to(max_tokens, cap);
+
+    // `max_completion_tokens` takes precedence over the deprecated `max_tokens`.
+    // Install the configured default only when the client omitted both aliases.
+    if max_completion_tokens.is_none() && max_tokens.is_none() {
+        changed |= clamp_or_default_max_output_tokens_to(max_completion_tokens, cap);
+    }
+    changed
+}
+
+fn normalize_chat_max_output_tokens(
+    max_completion_tokens: &mut Option<u32>,
+    max_tokens: &mut Option<u32>,
+) -> bool {
+    normalize_chat_max_output_tokens_to(
+        max_completion_tokens,
+        max_tokens,
+        configured_max_output_tokens(),
+    )
 }
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
@@ -929,7 +973,7 @@ async fn completions(
 
     let model = state.manager().resolve_canonical_name(&request.inner.model);
     request.inner.model = model;
-    if clamp_max_output_tokens(&mut request.inner.max_tokens) {
+    if clamp_or_default_max_output_tokens(&mut request.inner.max_tokens) {
         state
             .metrics_clone()
             .inc_output_token_clamp(&request.inner.model, Endpoint::Completions);
@@ -2120,12 +2164,10 @@ async fn chat_completions(
     let model = request.inner.model.clone();
     let metric_model = state.manager().metric_model_for(&model).to_string();
 
-    let clamped = if request.inner.max_completion_tokens.is_some() {
-        clamp_max_output_tokens(&mut request.inner.max_completion_tokens)
-    } else {
-        #[allow(deprecated)]
-        let legacy_max_tokens = &mut request.inner.max_tokens;
-        clamp_max_output_tokens(legacy_max_tokens)
+    #[allow(deprecated)]
+    let clamped = {
+        let inner = &mut request.inner;
+        normalize_chat_max_output_tokens(&mut inner.max_completion_tokens, &mut inner.max_tokens)
     };
     if clamped {
         state
@@ -2692,7 +2734,7 @@ async fn responses(
         .manager()
         .resolve_canonical_name(request.inner.model.as_deref().unwrap_or_default());
     request.inner.model = Some(model.clone());
-    if clamp_max_output_tokens(&mut request.inner.max_output_tokens) {
+    if clamp_or_default_max_output_tokens(&mut request.inner.max_output_tokens) {
         state
             .metrics_clone()
             .inc_output_token_clamp(&model, Endpoint::Responses);
@@ -3952,6 +3994,49 @@ mod tests {
         let mut omitted = None;
         assert!(!clamp_max_output_tokens_to(&mut omitted, Some(1_800)));
         assert_eq!(omitted, None);
+    }
+
+    #[test]
+    fn output_token_limit_defaults_when_omitted() {
+        let mut omitted = None;
+        assert!(clamp_or_default_max_output_tokens_to(
+            &mut omitted,
+            Some(32_768)
+        ));
+        assert_eq!(omitted, Some(32_768));
+
+        let mut smaller = Some(4_096);
+        assert!(!clamp_or_default_max_output_tokens_to(
+            &mut smaller,
+            Some(32_768)
+        ));
+        assert_eq!(smaller, Some(4_096));
+    }
+
+    #[test]
+    fn chat_output_token_default_does_not_override_legacy_value() {
+        let mut max_completion_tokens = None;
+        let mut max_tokens = Some(4_096);
+        assert!(!normalize_chat_max_output_tokens_to(
+            &mut max_completion_tokens,
+            &mut max_tokens,
+            Some(32_768)
+        ));
+        assert_eq!(max_completion_tokens, None);
+        assert_eq!(max_tokens, Some(4_096));
+    }
+
+    #[test]
+    fn chat_output_token_limit_defaults_when_both_aliases_are_omitted() {
+        let mut max_completion_tokens = None;
+        let mut max_tokens = None;
+        assert!(normalize_chat_max_output_tokens_to(
+            &mut max_completion_tokens,
+            &mut max_tokens,
+            Some(32_768)
+        ));
+        assert_eq!(max_completion_tokens, Some(32_768));
+        assert_eq!(max_tokens, None);
     }
 
     #[test]
