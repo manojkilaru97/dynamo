@@ -2151,6 +2151,16 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
         return collection_size("external_req_ids"), collection_size("parent_requests")
 
+    def _output_processor_external_request_ids(self) -> set[str] | None:
+        output_processor = getattr(self.engine_client, "output_processor", None)
+        external_req_ids = getattr(output_processor, "external_req_ids", None)
+        if external_req_ids is None:
+            return None
+        try:
+            return set(external_req_ids)
+        except (TypeError, RuntimeError):
+            return None
+
     @staticmethod
     def _is_health_check_request(request: Any) -> bool:
         return isinstance(request, dict) and bool(request.get(HEALTH_CHECK_KEY))
@@ -2158,8 +2168,6 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
     async def _try_reserve_request_slot(
         self, request_id: str, request: Any | None = None
     ) -> tuple[bool, int | None, int | None]:
-        if self._is_health_check_request(request):
-            return True, None, None
         limit = self.max_total_requests
         if limit is None:
             return True, None, None
@@ -2177,7 +2185,12 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 )
                 return False, None, limit
             held = len(self._admitted_request_ids)
-            observed = held + max(0, current_total - held)
+            external_request_ids = self._output_processor_external_request_ids()
+            if external_request_ids is None:
+                observed = held + current_total
+            else:
+                pending_ids = self._admitted_request_ids - external_request_ids
+                observed = current_total + len(pending_ids)
             if observed >= limit:
                 now = time.monotonic()
                 last_log_at = self._last_request_admission_log_at

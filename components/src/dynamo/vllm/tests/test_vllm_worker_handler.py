@@ -161,6 +161,92 @@ def test_worker_total_request_limit_honors_explicit_override(monkeypatch):
     assert handler._configured_max_total_requests() == 64
 
 
+def _configure_request_limit(
+    handler, limit: int, unfinished: int = 0, external_request_ids=()
+):
+    handler.max_total_requests = limit
+    handler._request_admission_lock = asyncio.Lock()
+    handler._admitted_request_ids = set()
+    handler._pending_request_admissions = 0
+    handler._last_request_admission_log_at = None
+    handler.engine_client = SimpleNamespace(
+        output_processor=SimpleNamespace(
+            get_num_unfinished_requests=lambda: unfinished,
+            external_req_ids={request_id: [] for request_id in external_request_ids},
+            parent_requests={},
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_request_limit_counts_health_checks():
+    handler = _make_handler()
+    _configure_request_limit(handler, 2)
+
+    first = await handler._try_reserve_request_slot(
+        "health-1", {mod.HEALTH_CHECK_KEY: True}
+    )
+    second = await handler._try_reserve_request_slot("request-1", {})
+    rejected = await handler._try_reserve_request_slot(
+        "health-2", {mod.HEALTH_CHECK_KEY: True}
+    )
+
+    assert first == (True, 1, 2)
+    assert second == (True, 2, 2)
+    assert rejected == (False, 2, 2)
+
+
+@pytest.mark.asyncio
+async def test_worker_request_limit_is_atomic_under_burst():
+    handler = _make_handler()
+    _configure_request_limit(handler, 32)
+
+    results = await asyncio.gather(
+        *(
+            handler._try_reserve_request_slot(f"request-{index}", {})
+            for index in range(128)
+        )
+    )
+
+    assert sum(reserved for reserved, _, _ in results) == 32
+    assert len(handler._admitted_request_ids) == 32
+    assert all(limit == 32 for _, _, limit in results)
+
+
+@pytest.mark.asyncio
+async def test_worker_request_limit_counts_disjoint_pending_and_engine_requests():
+    handler = _make_handler()
+    engine_request_ids = {f"engine-{index}" for index in range(20)}
+    _configure_request_limit(
+        handler,
+        32,
+        unfinished=len(engine_request_ids),
+        external_request_ids=engine_request_ids,
+    )
+    handler._admitted_request_ids = {f"pending-{index}" for index in range(20)}
+
+    result = await handler._try_reserve_request_slot("new-request", {})
+
+    assert result == (False, 40, 32)
+
+
+@pytest.mark.asyncio
+async def test_worker_request_limit_does_not_double_count_engine_overlap():
+    handler = _make_handler()
+    request_ids = {f"request-{index}" for index in range(20)}
+    _configure_request_limit(
+        handler,
+        32,
+        unfinished=len(request_ids),
+        external_request_ids=request_ids,
+    )
+    handler._admitted_request_ids = set(request_ids)
+
+    result = await handler._try_reserve_request_slot("new-request", {})
+
+    assert result == (True, 21, 32)
+
+
 @pytest.mark.asyncio
 async def test_clear_kv_blocks_resets_vllm_external_cache():
     handler = _make_handler()
