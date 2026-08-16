@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from _routed_engine_fakes import FakeRoutedEngine as _FakeRoutedEngine
+from _routed_engine_fakes import FakeRoutedItem as _FakeRoutedItem
 from transformers import AutoTokenizer
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
@@ -869,6 +870,21 @@ class TestRoutedEnginePath:
             "output_tokens": 1,
             "chunk_tokens": 1,
         }
+
+    @pytest.mark.asyncio
+    async def test_routed_overload_propagates_to_http_stream_monitor(
+        self, vllm_processor_module
+    ):
+        message = "ResourceExhausted: Worker local total request limit reached (32/32)"
+        routed_engine = _FakeRoutedEngine(
+            [_FakeRoutedItem(None, is_error=True, comments=[message])]
+        )
+        processor = _make_processor(vllm_processor_module, routed_engine)
+
+        with pytest.raises(RuntimeError, match="ResourceExhausted"):
+            await _run_generate(processor, _base_preproc())
+
+        assert processor.output_processor.request_states == {}
 
 
 OBJECT_TYPED_TOOL_REQUEST = {
