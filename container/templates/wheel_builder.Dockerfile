@@ -249,6 +249,7 @@ ARG USE_SCCACHE
 ARG SCCACHE_BUCKET
 ARG SCCACHE_REGION
 COPY container/use-sccache.sh /tmp/use-sccache.sh
+RUN chmod 755 /tmp/use-sccache.sh
 RUN if [ "$USE_SCCACHE" = "true" ]; then \
         ln -s /opt/sccache/sccache /usr/local/bin/sccache && \
         /tmp/use-sccache.sh install; \
