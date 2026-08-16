@@ -39,6 +39,23 @@ use crate::http::service::metrics::{CancellationLabels, ErrorType, InflightGuard
 
 use dynamo_runtime::config::environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS as BACKEND_STREAM_TIMEOUT_ENV;
 
+fn classify_stream_error(err: &(dyn std::error::Error + 'static)) -> SanitizedError {
+    if crate::http::service::metrics::request_was_rejected(err) {
+        return SanitizedError::Overloaded;
+    }
+
+    let message = err.to_string().to_ascii_lowercase();
+    if message.contains("resourceexhausted")
+        || message.contains("serviceoverloaded")
+        || message.contains("selected worker is overloaded")
+        || message.contains("local total request limit reached")
+    {
+        SanitizedError::Overloaded
+    } else {
+        SanitizedError::Internal
+    }
+}
+
 /// Read the backend stream inactivity timeout from the environment.
 /// Returns `None` if unset or zero (timeout disabled).
 ///
@@ -240,8 +257,13 @@ fn monitor_for_disconnects_with_timeout(
                             yield event;
                         }
                         Some(Err(err)) => {
-                            // Mark error as internal since it's a streaming error
-                            inflight_guard.mark_error(ErrorType::Internal);
+                            let sanitized = classify_stream_error(&err);
+                            let error_type = if matches!(sanitized, SanitizedError::Overloaded) {
+                                ErrorType::Overload
+                            } else {
+                                ErrorType::Internal
+                            };
+                            inflight_guard.mark_error(error_type);
                             // We're terminating the stream intentionally here with a
                             // structured error + [DONE]; disarm so the stream handle
                             // doesn't later record this as ClosedUnexpectedly (which
@@ -252,7 +274,6 @@ fn monitor_for_disconnects_with_timeout(
                             // so naive `data:`-line parsers see both the error and a
                             // stream terminator. Body derived from SanitizedError so
                             // the sanitized message + status live in one place.
-                            let sanitized = SanitizedError::Internal;
                             let err_json = serde_json::json!({
                                 "error": {
                                     "message": sanitized.to_string(),
@@ -671,7 +692,12 @@ mod tests {
     /// carrying the sanitized static message/type/code, positioned before
     /// `[DONE]`, with no bare `event: error` trailer, and crucially with no trace
     /// of `leaked_detail` (the raw backend error) anywhere in the body.
-    fn assert_fault_contract(case: &str, text: &str, leaked_detail: &str) {
+    fn assert_fault_contract(
+        case: &str,
+        text: &str,
+        leaked_detail: &str,
+        expected: SanitizedError,
+    ) {
         let done_pos = text.find("data: [DONE]").unwrap_or_else(|| {
             panic!("[{case}] body does not terminate with `data: [DONE]`. Body:\n{text}")
         });
@@ -701,7 +727,6 @@ mod tests {
             .get("error")
             .and_then(|v| v.as_object())
             .unwrap_or_else(|| panic!("[{case}] `error` field is not an object. Body:\n{text}"));
-        let expected = SanitizedError::Internal;
         let expected_message = expected.to_string();
         assert_eq!(
             error.get("message").and_then(|v| v.as_str()),
@@ -738,7 +763,12 @@ mod tests {
         let stream = simulate_mid_stream_error(3, backend_detail);
         let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
         let body = collect_sse_body(monitored).await;
-        assert_fault_contract("worker_kill", &body, backend_detail);
+        assert_fault_contract(
+            "worker_kill",
+            &body,
+            backend_detail,
+            SanitizedError::Internal,
+        );
     }
 
     /// Python chat-processor raises mid-stream → Rust→Python `tx.send()` fails with
@@ -750,7 +780,12 @@ mod tests {
         let stream = simulate_mid_stream_error(3, backend_detail);
         let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
         let body = collect_sse_body(monitored).await;
-        assert_fault_contract("python_consumer_drop", &body, backend_detail);
+        assert_fault_contract(
+            "python_consumer_drop",
+            &body,
+            backend_detail,
+            SanitizedError::Internal,
+        );
     }
 
     /// A backend error carrying sensitive internals (file paths, panic text,
@@ -763,10 +798,31 @@ mod tests {
         let stream = simulate_mid_stream_error(2, backend_detail);
         let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
         let body = collect_sse_body(monitored).await;
-        assert_fault_contract("internal_detail_leak", &body, backend_detail);
+        assert_fault_contract(
+            "internal_detail_leak",
+            &body,
+            backend_detail,
+            SanitizedError::Internal,
+        );
         // Spot-check the most damaging fragments explicitly.
         assert!(!body.contains("site-packages"), "leaked a filesystem path");
         assert!(!body.contains("panicked at"), "leaked panic text");
         assert!(!body.contains("ValueError"), "leaked exception type");
+    }
+
+    #[tokio::test]
+    async fn test_mid_stream_resource_exhausted_emits_overload_and_done() {
+        let (_metrics, guard, ctx, handle) = setup_test("overload-model", "req-overload");
+        let backend_detail =
+            "Unknown: ResourceExhausted: Worker local total request limit reached (32/32)";
+        let stream = simulate_mid_stream_error(0, backend_detail);
+        let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+        assert_fault_contract(
+            "resource_exhausted",
+            &body,
+            backend_detail,
+            SanitizedError::Overloaded,
+        );
     }
 }

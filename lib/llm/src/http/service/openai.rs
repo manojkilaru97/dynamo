@@ -459,29 +459,20 @@ impl ErrorMessage {
         }
     }
 
-    /// Implementers should only be able to throw 400-499 errors.
     pub fn from_http_error(err: HttpError) -> ErrorResponse {
-        // 499 is part of the 4xx range but its body can carry cancellation
-        // context (queue paths, context IDs) — sanitize separately.
-        if err.code == 499 {
-            return ErrorMessage::sanitized_with_details(SanitizedError::Cancelled, err.message);
-        }
-        // Backend-supplied messages are only forwarded for the documented 4xx
-        // range; for 5xx or codes outside the HTTP space the message may
-        // contain internal paths/details and is kept server-side only.
-        if err.code < 400 || err.code >= 500 {
-            return ErrorMessage::sanitized_with_details(SanitizedError::Internal, err.message);
-        }
         match StatusCode::from_u16(err.code) {
-            Ok(code) => (
-                code,
-                Json(ErrorMessage {
-                    message: err.message,
-                    error_type: map_error_code_to_error_type(code),
-                    code: code.as_u16(),
-                    details: None,
-                }),
-            ),
+            Ok(code) => match SanitizedError::for_backend_status(code) {
+                Some(sanitized) => ErrorMessage::sanitized_with_details(sanitized, err.message),
+                None => (
+                    code,
+                    Json(ErrorMessage {
+                        message: err.message,
+                        error_type: map_error_code_to_error_type(code),
+                        code: code.as_u16(),
+                        details: None,
+                    }),
+                ),
+            },
             Err(_) => ErrorMessage::sanitized_with_details(SanitizedError::Internal, err.message),
         }
     }
@@ -4683,18 +4674,36 @@ mod tests {
     }
 
     #[test]
-    fn test_error_response_from_anyhow_out_of_range() {
-        // Backend-supplied messages outside the 4xx range must NOT be
-        // forwarded to the client — they may include internal paths.
-        for code in [399u16, 500, 501] {
+    fn test_error_response_from_anyhow_sanitizes_non_client_errors() {
+        for (code, expected) in [(399u16, 500u16), (500, 500), (501, 501)] {
             let err = http_error_from_engine(code).unwrap_err();
             let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
-            assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(response.0.as_u16(), expected);
             assert_eq!(response.1.message, "Internal server error");
             assert!(
                 !response.1.message.contains("custom error message"),
                 "client response must not include the backend-supplied HttpError message"
             );
+        }
+    }
+
+    #[test]
+    fn test_from_http_error_preserves_sanitized_overload_status() {
+        for code in [503u16, 529] {
+            let response = ErrorMessage::from_http_error(HttpError {
+                code,
+                message: "selected worker is overloaded at /srv/private.py:42".to_string(),
+            });
+            assert_eq!(response.0.as_u16(), code);
+            assert_eq!(response.1.code, code);
+            let expected_type = if code == 503 {
+                "Service Unavailable"
+            } else {
+                "Overloaded"
+            };
+            assert_eq!(response.1.error_type, expected_type);
+            assert_eq!(response.1.message, "Service temporarily overloaded");
+            assert!(!response.1.message.contains("/srv/private.py"));
         }
     }
 

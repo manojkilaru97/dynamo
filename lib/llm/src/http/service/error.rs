@@ -160,6 +160,9 @@ impl std::fmt::Display for SanitizedError {
             SanitizedError::Cancelled => f.write_str("Request cancelled"),
             SanitizedError::Overloaded => f.write_str("Service temporarily overloaded"),
             SanitizedError::Unavailable => f.write_str("Service temporarily unavailable"),
+            SanitizedError::PreserveServerError(status) if matches!(status.as_u16(), 503 | 529) => {
+                f.write_str("Service temporarily overloaded")
+            }
             SanitizedError::Internal | SanitizedError::PreserveServerError(_) => {
                 f.write_str("Internal server error")
             }

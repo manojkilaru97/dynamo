@@ -43,7 +43,6 @@ from .thinking import runtime_default_thinking_mode
 from .utils import (
     extract_mm_urls,
     handle_engine_error,
-    make_internal_error,
     random_uuid,
     resolve_chat_template,
 )
@@ -1492,8 +1491,7 @@ class VllmProcessor:
                         request_id,
                         message,
                     )
-                    yield make_internal_error(request_id, message)
-                    break
+                    raise RuntimeError(message)
                 engine_response = dynamo_response.data()
 
                 if engine_response is None:
@@ -1672,7 +1670,7 @@ class VllmProcessor:
             _nvtx.end_range(rng_stream)
         except Exception as e:
             logger.exception("Error generating response for request %s", request_id)
-            yield make_internal_error(request_id, str(e))
+            raise
         finally:
             for output_request_id in registered_request_ids:
                 if output_request_id in self.output_processor.request_states:
