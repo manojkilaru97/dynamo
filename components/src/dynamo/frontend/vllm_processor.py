@@ -722,6 +722,8 @@ def _coerce_structured_outputs(
             )
             if structured_outputs.get(key) is not None
         }
+        if not params:
+            return None
         structured_outputs = StructuredOutputsParams(**params)
     if structured_outputs.all_constraints_none():
         return None
