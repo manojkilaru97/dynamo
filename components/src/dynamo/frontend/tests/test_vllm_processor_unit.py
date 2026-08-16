@@ -574,9 +574,12 @@ class TestReasoningParserMetadata:
 
         empty = SimpleNamespace(all_constraints_none=lambda: True)
         active = StructuredOutputsParams(json={"type": "object"})
+        active_dict = {"json": {"type": "object"}}
 
         assert _active_structured_outputs(empty) is None
         assert _active_structured_outputs(active) is active
+        assert _active_structured_outputs({}) is None
+        assert _active_structured_outputs(active_dict) == active
 
     def test_response_format_json_schema_serializes_to_guided_decoding(self):
         from dynamo.frontend.vllm_processor import (

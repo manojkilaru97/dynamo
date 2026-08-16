@@ -622,15 +622,44 @@ def _forced_tool_choice_uses_qwen_xml_parser(
     return (tool_parser_name or "").strip() in QWEN_XML_STRUCTURAL_TAG_TOOL_PARSERS
 
 
-def _has_structured_outputs(structured_outputs: StructuredOutputsParams | None) -> bool:
-    return structured_outputs is not None and not structured_outputs.all_constraints_none()
+def _coerce_structured_outputs(
+    structured_outputs: StructuredOutputsParams | dict[str, Any] | None,
+) -> StructuredOutputsParams | None:
+    if structured_outputs is None:
+        return None
+    if isinstance(structured_outputs, dict):
+        params = {
+            key: structured_outputs[key]
+            for key in (
+                "json",
+                "regex",
+                "choice",
+                "grammar",
+                "json_object",
+                "structural_tag",
+                "disable_any_whitespace",
+                "disable_additional_properties",
+                "whitespace_pattern",
+            )
+            if structured_outputs.get(key) is not None
+        }
+        structured_outputs = StructuredOutputsParams(**params)
+    if structured_outputs.all_constraints_none():
+        return None
+    return structured_outputs
+
+
+def _has_structured_outputs(
+    structured_outputs: StructuredOutputsParams | dict[str, Any] | None,
+) -> bool:
+    return _coerce_structured_outputs(structured_outputs) is not None
 
 
 def _active_structured_outputs(
-    structured_outputs: StructuredOutputsParams | None,
+    structured_outputs: StructuredOutputsParams | dict[str, Any] | None,
 ) -> StructuredOutputsParams | None:
     """Discard request-model placeholders that carry no output constraint."""
-    return structured_outputs if _has_structured_outputs(structured_outputs) else None
+    return _coerce_structured_outputs(structured_outputs)
 
 
 def _parse_int_env(name: str) -> int | None:
