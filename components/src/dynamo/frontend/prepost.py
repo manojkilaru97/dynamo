@@ -650,6 +650,7 @@ class StreamingPostProcessor:
         self.previous_text = ""
         self.previous_token_ids: list[int] = []
         self.reasoning_is_done = False
+        self.num_reasoning_tokens = 0
         self.in_progress_tool_calls: dict[int, DeltaToolCall] = {}
         # Per-choice tracking (https://github.com/ai-dynamo/dynamo/issues/8636) of whether a tool_call delta was
         # emitted on that choice, keyed by `output.index`. Required because
@@ -1231,10 +1232,17 @@ class StreamingPostProcessor:
         output: Any,
         raw_delta_token_ids: Sequence[int] | None = None,
     ) -> dict[str, Any] | None:
+        delta_token_ids = list(raw_delta_token_ids or output.token_ids or [])
+        if self.reasoning_parser is not None and not self.reasoning_is_done:
+            count_reasoning_tokens = getattr(
+                self.reasoning_parser, "count_reasoning_tokens", None
+            )
+            if callable(count_reasoning_tokens):
+                self.num_reasoning_tokens += count_reasoning_tokens(delta_token_ids)
+
         if self._should_buffer_for_non_streaming_tool_parse():
             return self._process_non_streaming_tool_output(output)
 
-        delta_token_ids = list(raw_delta_token_ids or output.token_ids or [])
         raw_delta_token_ids = delta_token_ids
         # vLLM output_processor already applies stop-token/stop-string trimming
         # to text. Re-detokenizing from token_ids can reintroduce stop markers.
