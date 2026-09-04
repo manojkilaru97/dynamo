@@ -934,6 +934,20 @@ def _normalize_vllm_image_parts(messages: list[Any]) -> None:
                 image_url["detail"] = "auto"
 
 
+def _with_reasoning_token_usage(
+    usage: dict[str, Any],
+    post_processors: dict[int, StreamingPostProcessor],
+) -> dict[str, Any]:
+    """Return usage enriched with parser-observed reasoning token counts."""
+    enriched = dict(usage)
+    completion_details = dict(enriched.get("completion_tokens_details") or {})
+    completion_details["reasoning_tokens"] = sum(
+        getattr(post, "num_reasoning_tokens", 0) for post in post_processors.values()
+    )
+    enriched["completion_tokens_details"] = completion_details
+    return enriched
+
+
 class VllmProcessor:
     def __init__(
         self,
@@ -1679,7 +1693,9 @@ class VllmProcessor:
                         "object": "chat.completion.chunk",
                     }
                     if usage := engine_response.get("completion_usage"):
-                        dynamo_out["usage"] = usage
+                        dynamo_out["usage"] = _with_reasoning_token_usage(
+                            usage, post_processors
+                        )
                     envelope["data"] = dynamo_out
 
                 metrics = {

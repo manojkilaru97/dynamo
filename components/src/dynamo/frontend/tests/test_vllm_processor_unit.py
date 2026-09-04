@@ -2201,6 +2201,18 @@ class _ThinkingParser:
     def is_reasoning_end_streaming(self, current_token_ids, delta_token_ids):
         return self.end_token_id in delta_token_ids
 
+    def count_reasoning_tokens(self, token_ids):
+        count = 0
+        depth = 0 if self.start_token_id in token_ids else 1
+        for token_id in token_ids:
+            if token_id == self.start_token_id:
+                depth += 1
+            elif token_id == self.end_token_id:
+                depth = max(0, depth - 1)
+            elif depth > 0:
+                count += 1
+        return count
+
 
 def _postprocessor_output(text, token_ids, finish_reason=None):
     return SimpleNamespace(
@@ -2243,6 +2255,49 @@ def test_duplicate_reasoning_end_marker_is_not_emitted_after_budget_cutoff():
 
     assert marker_choice is None
     assert content_choice["delta"]["content"] == "answer"
+
+
+def test_reasoning_token_usage_tracks_only_reasoning_span():
+    post = StreamingPostProcessor(
+        tokenizer=_ToolMarkerTokenizer(),
+        request_for_sampling=_plain_request(),
+        sampling_params=SamplingParams(max_tokens=128),
+        prompt_token_ids=[12],
+        tool_parser=None,
+        reasoning_parser_class=_ThinkingParser,
+        chat_template_kwargs={"enable_thinking": True},
+    )
+
+    post.process_output(_postprocessor_output("analysis", [21, 22]))
+    post.process_output(_postprocessor_output("</think>answer", [13, 23]))
+    post.process_output(_postprocessor_output(" done", [24], "stop"))
+
+    assert post.num_reasoning_tokens == 2
+
+
+def test_completion_usage_includes_reasoning_tokens(vllm_processor_module):
+    usage = {
+        "prompt_tokens": 10,
+        "completion_tokens": 8,
+        "total_tokens": 18,
+        "completion_tokens_details": {"accepted_prediction_tokens": 1},
+    }
+    post_processors = {
+        0: SimpleNamespace(num_reasoning_tokens=2),
+        1: SimpleNamespace(num_reasoning_tokens=3),
+    }
+
+    enriched = vllm_processor_module._with_reasoning_token_usage(
+        usage, post_processors
+    )
+
+    assert enriched["completion_tokens_details"] == {
+        "accepted_prediction_tokens": 1,
+        "reasoning_tokens": 5,
+    }
+    assert usage["completion_tokens_details"] == {
+        "accepted_prediction_tokens": 1
+    }
 
 
 def test_structured_json_with_reasoning_parses_content_after_thinking():
