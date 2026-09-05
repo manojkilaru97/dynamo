@@ -964,6 +964,7 @@ class VllmProcessor:
         self.routed_engine = routed_engine
         self.output_processor = output_processor
         self.tool_parser_class = tool_parser_class
+        self.tool_parser_name = tool_parser_name
         self.reasoning_parser_class = reasoning_parser_class
         self.exclude_tools_when_tool_choice_none = True
         self.block_size = block_size
