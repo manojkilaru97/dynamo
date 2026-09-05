@@ -24,6 +24,20 @@ _ALLOWED_FIELDS = frozenset(
         "engine_priority",
         "worker_id",
         "dp_rank",
+        "choice_index",
+        "choice_count",
+        "finish_reason",
+        "all_choices_terminated",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "total_tokens_source",
+        "cached_tokens_present",
+        "cached_tokens",
+        "cache_count_source",
+        "reasoning_tokens_present",
+        "reasoning_tokens",
+        "reasoning_count_source",
     }
 )
 _lock = threading.Lock()

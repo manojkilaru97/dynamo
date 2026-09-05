@@ -7,6 +7,7 @@ Tests for the tool-stripping behaviour of _prepare_request when
 tool_choice='none' and the exclude_tools_when_tool_choice_none flag.
 """
 
+import asyncio
 import importlib.util
 import json
 from types import SimpleNamespace
@@ -1031,7 +1032,12 @@ class _FakeOutputProcessor:
 
 
 class _FakePostProcessor:
-    def process_output(self, output):
+    num_reasoning_tokens = None
+
+    def needs_raw_parser_delta(self, raw_token_ids):
+        return False
+
+    def process_output(self, output, raw_delta_token_ids=None):
         return {
             "index": output.index,
             "delta": {"content": "x"},
@@ -1129,6 +1135,7 @@ def _make_processor(module, routed_engine):
     processor = module.VllmProcessor.__new__(module.VllmProcessor)
     processor.routed_engine = routed_engine
     processor.output_processor = _FakeOutputProcessor()
+    processor.tokenizer = SimpleNamespace(decode=lambda *_args, **_kwargs: "x")
     return processor
 
 
@@ -1147,7 +1154,7 @@ def _base_preproc():
 
 async def _run_generate(processor, preproc, *, mm_routing_info=None, context=None):
     vllm_preproc = SimpleNamespace(
-        sampling_params=SimpleNamespace(n=1),
+        sampling_params=SimpleNamespace(n=1, logprobs=None),
         request_id="vllm-request",
         external_req_id=None,
     )
@@ -1162,6 +1169,7 @@ async def _run_generate(processor, preproc, *, mm_routing_info=None, context=Non
             preproc["token_ids"],
             vllm_preproc,
             post_processors,
+            request_for_sampling=SimpleNamespace(tool_choice=None),
             mm_routing_info=mm_routing_info,
             context=context,
         )
@@ -1354,6 +1362,192 @@ class TestRoutedEnginePath:
             await _run_generate(processor, _base_preproc())
 
         assert processor.output_processor.request_states == {}
+
+    def test_terminal_trace_preserves_zero_and_unknown_usage(
+        self, vllm_processor_module, monkeypatch
+    ):
+        usage = {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        }
+        routed_engine = _FakeRoutedEngine(
+            [
+                {
+                    "token_ids": [101, 102],
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "completion_usage": usage,
+                }
+            ]
+        )
+        processor = _make_processor(vllm_processor_module, routed_engine)
+        processor.output_processor.process_outputs = lambda outputs: SimpleNamespace(
+            reqs_to_abort=[],
+            request_outputs=[
+                SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(
+                            index=0,
+                            token_ids=[101, 102],
+                            text="ok",
+                            finish_reason="stop",
+                            logprobs=None,
+                        )
+                    ]
+                )
+            ],
+        )
+
+        class TerminalPostProcessor:
+            num_reasoning_tokens = None
+
+            def needs_raw_parser_delta(self, raw_token_ids):
+                return False
+
+            def process_output(self, output, raw_delta_token_ids=None):
+                return {
+                    "index": output.index,
+                    "delta": {"content": "ok"},
+                    "finish_reason": "stop",
+                }
+
+        observed = []
+        monkeypatch.setattr(
+            vllm_processor_module.priority_trace,
+            "emit",
+            lambda stage, **fields: observed.append((stage, fields)),
+        )
+        context = SimpleNamespace(id=lambda: "context-id")
+        async def run():
+            return [
+                item
+                async for item in processor._generate_and_stream(
+                    "processor-id",
+                    {"model": MODEL},
+                    _base_preproc(),
+                    [1, 2, 3],
+                    SimpleNamespace(
+                        sampling_params=SimpleNamespace(n=1, logprobs=None),
+                        request_id="vllm-request",
+                        external_req_id=None,
+                    ),
+                    {0: TerminalPostProcessor()},
+                    request_for_sampling=SimpleNamespace(tool_choice=None),
+                    context=context,
+                )
+            ]
+
+        chunks = asyncio.run(run())
+
+        terminal = next(fields for stage, fields in observed if stage == "frontend_terminal")
+        assert terminal["request_id"] == "context-id"
+        assert terminal["choice_index"] == 0
+        assert terminal["finish_reason"] == "stop"
+        assert terminal["cached_tokens_present"] is True
+        assert terminal["cached_tokens"] == 0
+        assert terminal["reasoning_tokens_present"] is False
+        assert terminal["all_choices_terminated"] is True
+        assert chunks[0]["data"]["usage"] == usage
+
+        TerminalPostProcessor.num_reasoning_tokens = 0
+        observed.clear()
+        processor = _make_processor(
+            vllm_processor_module,
+            _FakeRoutedEngine(
+                [
+                    {
+                        "token_ids": [],
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "completion_usage": usage,
+                    }
+                ]
+            ),
+        )
+        processor.output_processor.process_outputs = lambda outputs: SimpleNamespace(
+            reqs_to_abort=[],
+            request_outputs=[],
+        )
+        chunks = asyncio.run(run())
+        terminal = next(
+            fields for stage, fields in observed if stage == "frontend_terminal"
+        )
+        assert terminal["reasoning_tokens_present"] is True
+        assert terminal["reasoning_tokens"] == 0
+        assert chunks[0]["data"]["usage"]["completion_tokens_details"] == {
+            "reasoning_tokens": 0
+        }
+
+    def test_error_and_cancel_do_not_emit_terminal(
+        self, vllm_processor_module, monkeypatch
+    ):
+        observed = []
+        monkeypatch.setattr(
+            vllm_processor_module.priority_trace,
+            "emit",
+            lambda stage, **fields: observed.append((stage, fields)),
+        )
+        processor = _make_processor(
+            vllm_processor_module,
+            _FakeRoutedEngine(
+                [_FakeRoutedItem(None, is_error=True, comments=["cancelled"])]
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="cancelled"):
+            asyncio.run(_run_generate(processor, _base_preproc()))
+        assert not any(stage == "frontend_terminal" for stage, _ in observed)
+
+        class CancelledEngine:
+            async def generate(self, preprocessed, **kwargs):
+                async def stream():
+                    yield _FakeRoutedItem(
+                        {"token_ids": [101], "index": 0, "finish_reason": None}
+                    )
+                    await asyncio.Event().wait()
+
+                return stream()
+
+        async def cancel():
+            cancelled_processor = _make_processor(
+                vllm_processor_module, CancelledEngine()
+            )
+            stream = cancelled_processor._generate_and_stream(
+                "processor-id",
+                {"model": MODEL},
+                _base_preproc(),
+                [1, 2, 3],
+                SimpleNamespace(
+                    sampling_params=SimpleNamespace(n=1, logprobs=None),
+                    request_id="vllm-request",
+                    external_req_id=None,
+                ),
+                {0: _FakePostProcessor()},
+                request_for_sampling=SimpleNamespace(tool_choice=None),
+            )
+            await anext(stream)
+            await stream.aclose()
+
+        asyncio.run(cancel())
+        assert not any(stage == "frontend_terminal" for stage, _ in observed)
+
+    def test_trace_toggle_does_not_change_stream_output(
+        self, vllm_processor_module, monkeypatch
+    ):
+        async def collect(enabled):
+            monkeypatch.setenv("DYN_PRIORITY_TRACE", "1" if enabled else "0")
+            vllm_processor_module.priority_trace._reset_for_test()
+            processor = _make_processor(
+                vllm_processor_module,
+                _FakeRoutedEngine(
+                    [{"token_ids": [101], "index": 0, "finish_reason": None}]
+                ),
+            )
+            return await _run_generate(processor, _base_preproc())
+
+        assert asyncio.run(collect(False)) == asyncio.run(collect(True))
 
 
 OBJECT_TYPED_TOOL_REQUEST = {

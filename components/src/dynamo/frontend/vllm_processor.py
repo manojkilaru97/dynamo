@@ -128,6 +128,31 @@ def map_finish_reason(raw_reason: Any) -> FinishReason | None:
     return mapped
 
 
+_TERMINAL_FINISH_REASONS = frozenset(
+    {"stop", "length", "tool_calls", "content_filter"}
+)
+
+
+def _finish_reason_scalar(reason: Any) -> str | None:
+    if reason is None:
+        return None
+    value = getattr(reason, "value", reason)
+    if isinstance(value, str):
+        value = value.lower()
+        if value in _TERMINAL_FINISH_REASONS:
+            return value
+    return None
+
+
+def _usage_scalar(usage: Any, *path: str) -> int | None:
+    value = usage
+    for name in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(name)
+    return value if isinstance(value, int) and value >= 0 else None
+
+
 def _runtime_config_context_length(mdc: ModelDeploymentCard) -> int | None:
     runtime_config = mdc.runtime_config()
     if not isinstance(runtime_config, dict):
@@ -1526,6 +1551,7 @@ class VllmProcessor:
         pending_logprobs: dict[int, list[dict[str, Any]]] = {
             output_idx: [] for output_idx in output_request_ids
         }
+        terminated_choices: set[int] = set()
 
         try:
             _inject_routing_metadata(dynamo_preproc, dynamo_preproc, mm_routing_info)
@@ -1702,8 +1728,31 @@ class VllmProcessor:
                         "model": request["model"],
                         "object": "chat.completion.chunk",
                     }
-                    if usage := engine_response.get("completion_usage"):
-                        dynamo_out["usage"] = usage
+                    usage = engine_response.get("completion_usage")
+                    if isinstance(usage, dict):
+                        enriched_usage = dict(usage)
+                        completion_details = dict(
+                            enriched_usage.get("completion_tokens_details") or {}
+                        )
+                        reasoning_counts = [
+                            getattr(post, "num_reasoning_tokens", None)
+                            for post in post_processors.values()
+                        ]
+                        if (
+                            "reasoning_tokens" not in completion_details
+                            and all(
+                                isinstance(value, int)
+                                for value in reasoning_counts
+                            )
+                        ):
+                            completion_details["reasoning_tokens"] = sum(
+                                reasoning_counts
+                            )
+                        if completion_details:
+                            enriched_usage["completion_tokens_details"] = (
+                                completion_details
+                            )
+                        dynamo_out["usage"] = enriched_usage
                     envelope["data"] = dynamo_out
 
                 metrics = {
@@ -1721,6 +1770,56 @@ class VllmProcessor:
                 envelope["event"] = "llm_metrics"
                 envelope["comment"] = [json.dumps(metrics)]
 
+                data = envelope.get("data") or {}
+                usage = data.get("usage")
+                for choice in data.get("choices") or ():
+                    choice_index = choice.get("index", 0)
+                    finish_reason = _finish_reason_scalar(
+                        choice.get("finish_reason")
+                    )
+                    if (
+                        finish_reason is None
+                        or choice_index in terminated_choices
+                    ):
+                        continue
+                    terminated_choices.add(choice_index)
+                    cached_tokens = _usage_scalar(
+                        usage, "prompt_tokens_details", "cached_tokens"
+                    )
+                    reasoning_tokens = _usage_scalar(
+                        usage,
+                        "completion_tokens_details",
+                        "reasoning_tokens",
+                    )
+                    priority_trace.emit(
+                        "frontend_terminal",
+                        request_id=(
+                            context.id() if context is not None else request_id
+                        ),
+                        processor_request_id=request_id,
+                        choice_index=choice_index,
+                        choice_count=sp.n,
+                        finish_reason=finish_reason,
+                        all_choices_terminated=(
+                            len(terminated_choices) == sp.n
+                        ),
+                        prompt_tokens=_usage_scalar(usage, "prompt_tokens"),
+                        completion_tokens=_usage_scalar(
+                            usage, "completion_tokens"
+                        ),
+                        total_tokens=_usage_scalar(usage, "total_tokens"),
+                        total_tokens_source="worker_completion_usage",
+                        cached_tokens_present=cached_tokens is not None,
+                        cached_tokens=cached_tokens,
+                        cache_count_source="worker_completion_usage",
+                        reasoning_tokens_present=reasoning_tokens is not None,
+                        reasoning_tokens=reasoning_tokens,
+                        reasoning_count_source=(
+                            "frontend_streaming_postprocessors"
+                            if reasoning_tokens is not None
+                            else None
+                        ),
+                    )
                 yield envelope
             _nvtx.end_range(rng_stream)
         except Exception as e:
