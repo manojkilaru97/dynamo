@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use super::{NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse};
 use crate::{
@@ -77,6 +80,8 @@ impl DeltaGenerator {
             usage,
             msg_counter: 0,
             options,
+            structured_json_buffers: HashMap::new(),
+            structured_json_completed: HashSet::new(),
             tracker,
         }
     }
@@ -84,6 +89,14 @@ impl DeltaGenerator {
     /// Returns the request tracker. Tracking is enabled. For sharing with PreprocessedRequest.
     pub fn tracker(&self) -> Arc<RequestTracker> {
         self.tracker.clone()
+    }
+
+    pub fn set_structured_json_guard(&mut self, enabled: bool) {
+        self.options.structured_json_guard = enabled;
+        if !enabled {
+            self.structured_json_buffers.clear();
+            self.structured_json_completed.clear();
+        }
     }
 
     /// Updates the prompt token usage count.
@@ -237,6 +250,60 @@ impl DeltaGenerator {
         usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
         usage
     }
+
+    fn apply_structured_json_guard(
+        &mut self,
+        index: u32,
+        text: Option<String>,
+        finish_reason: Option<dynamo_protocols::types::FinishReason>,
+    ) -> (
+        Option<String>,
+        Option<dynamo_protocols::types::FinishReason>,
+    ) {
+        if !self.options.structured_json_guard {
+            return (text, finish_reason);
+        }
+
+        if self.structured_json_completed.contains(&index) {
+            return (None, finish_reason);
+        }
+
+        if let Some(text) = text {
+            let complete_json = {
+                let buffer = self.structured_json_buffers.entry(index).or_default();
+                buffer.push_str(&text);
+                first_complete_json_value(buffer)
+            };
+            if let Some(json) = complete_json {
+                self.structured_json_completed.insert(index);
+                return (
+                    Some(json),
+                    Some(finish_reason.unwrap_or(dynamo_protocols::types::FinishReason::Stop)),
+                );
+            }
+        }
+
+        if finish_reason.is_some()
+            && let Some(buffer) = self.structured_json_buffers.remove(&index)
+            && !buffer.is_empty()
+        {
+            return (Some(buffer), finish_reason);
+        }
+
+        (None, finish_reason)
+    }
+}
+
+pub(crate) fn first_complete_json_value(input: &str) -> Option<String> {
+    let trimmed = input.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut values = serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>();
+    values.next()?.ok()?;
+    let end = values.byte_offset();
+    (end > 0).then(|| trimmed[..end].to_string())
 }
 
 /// Implements the [`crate::protocols::openai::DeltaGeneratorExt`] trait for [`DeltaGenerator`], allowing
@@ -307,9 +374,12 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
         };
         let stop_reason = delta.stop_reason.clone();
 
-        // Create the streaming response.
         let index = delta.index.unwrap_or(0);
-        let mut stream_response = self.create_choice(index, delta.text, finish_reason, logprobs);
+        let (text, finish_reason) =
+            self.apply_structured_json_guard(index, delta.text, finish_reason);
+
+        // Create the streaming response.
+        let mut stream_response = self.create_choice(index, text, finish_reason, logprobs);
 
         // Record finish for timing/ITL accounting even when timing is not returned to the client.
         // Kept at call site because it's a side effect on the tracker — not a gating decision.
@@ -372,6 +442,11 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
 
     fn is_continuous_usage_enabled(&self) -> bool {
         DeltaGenerator::is_continuous_usage_enabled(self)
+    }
+
+    fn should_terminate_stream(&self) -> bool {
+        self.options.structured_json_guard
+            && (self.structured_json_completed.len() as u32) >= self.options.expected_choices
     }
 
     fn get_usage(&self) -> dynamo_protocols::types::CompletionUsage {
@@ -456,6 +531,103 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_first_complete_json_value_accepts_prefix_and_rejects_incomplete_input() {
+        assert_eq!(
+            first_complete_json_value(" \n {\"answer\":true} trailing"),
+            Some("{\"answer\":true}".to_string())
+        );
+        assert_eq!(first_complete_json_value("{\"answer\":"), None);
+        assert_eq!(first_complete_json_value("not-json"), None);
+        assert_eq!(first_complete_json_value("  "), None);
+    }
+
+    #[test]
+    fn test_structured_json_guard_buffers_valid_and_flushes_truncated_json() {
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-json-guard".to_string());
+        generator.options.structured_json_guard = true;
+
+        assert_eq!(
+            generator.apply_structured_json_guard(0, Some("{\"answer\":".to_string()), None),
+            (None, None)
+        );
+        let complete =
+            generator.apply_structured_json_guard(0, Some("true} ignored".to_string()), None);
+        assert_eq!(complete.0.as_deref(), Some("{\"answer\":true}"));
+        assert_eq!(
+            complete.1,
+            Some(dynamo_protocols::types::FinishReason::Stop)
+        );
+        assert_eq!(
+            generator.apply_structured_json_guard(
+                0,
+                Some("late".to_string()),
+                Some(dynamo_protocols::types::FinishReason::Stop)
+            ),
+            (None, Some(dynamo_protocols::types::FinishReason::Stop))
+        );
+
+        let mut truncated = request.response_generator("req-json-truncated".to_string());
+        truncated.options.structured_json_guard = true;
+        assert_eq!(
+            truncated.apply_structured_json_guard(0, Some("{\"answer\":".to_string()), None),
+            (None, None)
+        );
+        assert_eq!(
+            truncated.apply_structured_json_guard(
+                0,
+                None,
+                Some(dynamo_protocols::types::FinishReason::Length)
+            ),
+            (
+                Some("{\"answer\":".to_string()),
+                Some(dynamo_protocols::types::FinishReason::Length)
+            )
+        );
+    }
+
+    #[test]
+    fn test_structured_json_guard_keeps_choices_isolated_and_plain_text_unchanged() {
+        let request = create_test_request();
+        let mut plain = request.response_generator("req-plain".to_string());
+        assert_eq!(
+            plain.apply_structured_json_guard(
+                0,
+                Some("ordinary text".to_string()),
+                Some(dynamo_protocols::types::FinishReason::Stop)
+            ),
+            (
+                Some("ordinary text".to_string()),
+                Some(dynamo_protocols::types::FinishReason::Stop)
+            )
+        );
+
+        let mut generator = request.response_generator("req-interleaved".to_string());
+        generator.options.structured_json_guard = true;
+        generator.options.expected_choices = 2;
+        assert_eq!(
+            generator.apply_structured_json_guard(0, Some("{\"a\":".to_string()), None),
+            (None, None)
+        );
+        assert_eq!(
+            generator.apply_structured_json_guard(1, Some("{\"b\":2}".to_string()), None),
+            (
+                Some("{\"b\":2}".to_string()),
+                Some(dynamo_protocols::types::FinishReason::Stop)
+            )
+        );
+        assert!(!DeltaGeneratorExt::should_terminate_stream(&generator));
+        assert_eq!(
+            generator.apply_structured_json_guard(0, Some("1}".to_string()), None),
+            (
+                Some("{\"a\":1}".to_string()),
+                Some(dynamo_protocols::types::FinishReason::Stop)
+            )
+        );
+        assert!(DeltaGeneratorExt::should_terminate_stream(&generator));
+    }
+
     fn make_request_with_nvext(
         nvext: crate::protocols::common::extensions::NvExt,
     ) -> NvCreateChatCompletionRequest {
@@ -478,6 +650,7 @@ mod tests {
             completion_usage: None,
             disaggregated_params: None,
             worker_trace_link: None,
+            extra_args: None,
             // routed_experts rides the engine's opaque passthrough.
             engine_data: Some(serde_json::json!({
                 "routed_experts": {"layer_0": [1, 3]}
@@ -563,6 +736,7 @@ mod tests {
             disaggregated_params: None,
             encoder_result: None,
             worker_trace_link: None,
+            extra_args: None,
             engine_data: Some(serde_json::json!({
                 "kv_transfer_time_ms": 12.3,
                 "disaggregated_kv_transfer_time_ms": 8.1,
@@ -779,6 +953,7 @@ mod tests {
             disaggregated_params: None,
             encoder_result: None,
             worker_trace_link: None,
+            extra_args: None,
             engine_data: None, // engine didn't provide any data
             routing_data: None,
         };

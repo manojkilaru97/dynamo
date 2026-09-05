@@ -378,6 +378,7 @@ mod tests {
             completion_usage: None,
             disaggregated_params: None,
             worker_trace_link: None,
+            extra_args: None,
             // routed_experts rides the engine's opaque passthrough.
             engine_data: Some(serde_json::json!({
                 "routed_experts": {"layer_0": [1, 3]}
@@ -424,6 +425,7 @@ mod tests {
             disaggregated_params: None,
             encoder_result: None,
             worker_trace_link: None,
+            extra_args: None,
             engine_data: Some(serde_json::json!({
                 "kv_transfer_time_ms": 12.3,
                 "disaggregated_kv_transfer_time_ms": 8.1,
@@ -704,6 +706,7 @@ mod tests {
             disaggregated_params: None,
             encoder_result: None,
             worker_trace_link: None,
+            extra_args: None,
             engine_data: None, // engine didn't provide any data
             routing_data: None,
         };

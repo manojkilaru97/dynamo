@@ -422,10 +422,9 @@ impl DeltaAggregator {
         // boundary under speculative decoding (guided output + thinking). Only
         // rewrites content that is invalid JSON made valid by dropping a stray
         // leading brace; airtight, off the streaming hot path (non-stream only).
-        for choice in self.choices.values_mut() {
+        for choice in aggregator.choices.values_mut() {
             if !choice.text.is_empty()
-                && let Some(repaired) =
-                    dynamo_parsers::reasoning::repair_boundary_brace_leak(&choice.text)
+                && let Some(repaired) = super::repair_boundary_brace_leak(&choice.text)
             {
                 choice.text = repaired;
             }

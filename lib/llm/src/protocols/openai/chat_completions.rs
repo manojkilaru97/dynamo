@@ -841,8 +841,8 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
 
     /// Guided Decoding Options
     fn get_guided_json(&self) -> Option<serde_json::Value> {
-        if let Some(value) = self.common.guided_json.clone() {
-            return Some(value);
+        if self.uses_qwen_xml_tool_structural_tag() {
+            return None;
         }
 
         if let Some(value) = self.common.guided_json.clone() {
@@ -888,16 +888,11 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
             use dynamo_protocols::types::ResponseFormat;
             match response_format {
                 ResponseFormat::Text => {}
-                ResponseFormat::JsonObject => {
-                    // Minimal JSON Schema for "any JSON object"
-                    return Some(serde_json::json!({
-                        "type": "object"
-                    }));
-                }
+                ResponseFormat::JsonObject => {}
                 ResponseFormat::JsonSchema { json_schema } => {
                     // validate_response_format ensures schema is present when type=json_schema
                     if !json_schema.schema.is_null() {
-                        return Some(json_schema.schema.clone());
+                        return Some(guided_json_schema(json_schema.schema.clone()));
                     }
                 }
             }
@@ -906,16 +901,118 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
         None
     }
 
+    fn get_guided_json_object(&self) -> Option<bool> {
+        if self.uses_qwen_xml_tool_structural_tag() || self.common.guided_json.is_some() {
+            return None;
+        }
+
+        let has_explicit_structural_tag = self
+            .common
+            .structured_outputs
+            .as_ref()
+            .is_some_and(|structured| structured.structural_tag.is_some());
+        if !has_explicit_structural_tag
+            && let (Some(tool_choice), Some(tools)) =
+                (self.inner.tool_choice.as_ref(), self.inner.tools.as_deref())
+            && matches!(
+                tools::get_json_schema_from_tools(
+                    Some(tool_choice),
+                    Some(tools),
+                    self.request_text_len()
+                ),
+                Ok(Some(_))
+            )
+        {
+            return None;
+        }
+
+        if self
+            .common
+            .structured_outputs
+            .as_ref()
+            .is_some_and(|structured| structured.json.is_some())
+        {
+            return None;
+        }
+
+        if self
+            .common
+            .structured_outputs
+            .as_ref()
+            .and_then(|structured| structured.json_object)
+            .unwrap_or(false)
+        {
+            return Some(true);
+        }
+
+        matches!(
+            self.inner.response_format.as_ref(),
+            Some(dynamo_protocols::types::ResponseFormat::JsonObject)
+        )
+        .then_some(true)
+    }
+
+    fn get_guided_structural_tag(&self) -> Option<serde_json::Value> {
+        if let Some(value) = self
+            .common
+            .structured_outputs
+            .as_ref()
+            .and_then(|structured| structured.structural_tag.clone())
+        {
+            return Some(value);
+        }
+
+        if !self.uses_qwen_xml_tool_structural_tag() {
+            return None;
+        }
+
+        if let (Some(tool_choice), Some(tools)) =
+            (self.inner.tool_choice.as_ref(), self.inner.tools.as_deref())
+        {
+            match tools::get_qwen_xml_structural_tag_from_tools(
+                Some(tool_choice),
+                Some(tools),
+                self.request_text_len(),
+            ) {
+                Ok(Some(structural_tag)) => return Some(structural_tag),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to derive structural_tag from tool_choice"
+                    );
+                }
+            }
+        }
+
+        None
+    }
+
     fn get_guided_regex(&self) -> Option<String> {
-        self.common.guided_regex.clone()
+        self.common.guided_regex.clone().or_else(|| {
+            self.common
+                .structured_outputs
+                .as_ref()
+                .and_then(|structured| structured.regex.clone())
+        })
     }
 
     fn get_guided_grammar(&self) -> Option<String> {
-        self.common.guided_grammar.clone()
+        self.common.guided_grammar.clone().or_else(|| {
+            self.common
+                .structured_outputs
+                .as_ref()
+                .and_then(|structured| structured.grammar.clone())
+        })
     }
 
     fn get_guided_choice(&self) -> Option<Vec<String>> {
-        self.common.guided_choice.clone()
+        self.common.guided_choice.clone().or_else(|| {
+            self.common
+                .structured_outputs
+                .as_ref()
+                .and_then(|structured| structured.choice.clone())
+        })
     }
 
     fn get_guided_decoding_backend(&self) -> Option<String> {
@@ -992,6 +1089,35 @@ impl OpenAIStopConditionsProvider for NvCreateChatCompletionRequest {
     /// Returns a reference to the optional `NvExt` extension, if available.
     fn nvext(&self) -> Option<&NvExt> {
         self.nvext.as_ref()
+    }
+
+    fn get_max_thinking_tokens(&self) -> Option<u32> {
+        if let Some(value) = self.nvext.as_ref().and_then(|nv| nv.max_thinking_tokens) {
+            return Some(value);
+        }
+
+        if let Some(value) = self.unsupported_fields.get("reasoning_budget").or_else(|| {
+            self.chat_template_args.as_ref().and_then(|args| {
+                args.get("reasoning_budget")
+                    .or_else(|| args.get("thinking_token_budget"))
+            })
+        }) {
+            if let Some(value) = value.as_u64() {
+                return u32::try_from(value).ok();
+            }
+            if let Some(value) = value.as_i64() {
+                return (value >= 0)
+                    .then(|| u32::try_from(value).ok())
+                    .flatten();
+            }
+            return None;
+        }
+
+        if self.template_thinking_enabled() && self.uses_constrained_decoding() {
+            return default_constrained_max_thinking_tokens();
+        }
+
+        None
     }
 
     /// Get ignore_eos from CommonExt.
@@ -1098,6 +1224,42 @@ mod tests {
     };
     use dynamo_protocols::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
     use serde_json::json;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env_var<T>(key: &str, value: &str, f: impl FnOnce() -> T) -> T {
+        let old = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        struct RestoreEnv<'a> {
+            key: &'a str,
+            old: Option<std::ffi::OsString>,
+        }
+        impl Drop for RestoreEnv<'_> {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.old.take() {
+                        Some(value) => std::env::set_var(self.key, value),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv { key, old };
+        f()
+    }
+
+    fn with_tool_parser<T>(parser: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        with_env_var("DYN_DYNAMO_TOOL_CALL_PARSER", parser, f)
+    }
+
+    fn with_default_constrained_max_thinking_tokens<T>(value: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        with_env_var(DEFAULT_CONSTRAINED_MAX_THINKING_TOKENS_ENV, value, f)
+    }
 
     #[test]
     fn test_top_k_sentinel_contract() {

@@ -429,12 +429,17 @@ pub struct SamplingOptions {
 
 /// Guided Decoding Options
 ///
-/// Only one of `json`, `regex`, `choice`, `grammar`, or `structural_tag` should be set.
+/// Only one of `json`, `json_object`, `regex`, `choice`, `grammar`, or
+/// `structural_tag` should be set.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct GuidedDecodingOptions {
     /// If specified, the output will follow the JSON schema. Can be a string, an object, or null.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json: Option<serde_json::Value>,
+
+    /// If true, the output will be a free-form JSON object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json_object: Option<bool>,
 
     /// If specified, the output will follow the regex pattern. Can be a string or null.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -474,6 +479,7 @@ impl GuidedDecodingOptions {
     ) -> Self {
         Self {
             json,
+            json_object: None,
             regex,
             choice,
             grammar,
@@ -537,8 +543,32 @@ impl GuidedDecodingOptions {
         backend: Option<String>,
         whitespace_pattern: Option<String>,
     ) -> Result<Option<Self>> {
+        Self::from_optional_with_json_object_and_structural_tag(
+            json,
+            None,
+            regex,
+            choice,
+            grammar,
+            structural_tag,
+            backend,
+            whitespace_pattern,
+        )
+    }
+
+    /// Construct only when a constraint is set, including JSON object and structural tag.
+    pub fn from_optional_with_json_object_and_structural_tag(
+        json: Option<serde_json::Value>,
+        json_object: Option<bool>,
+        regex: Option<String>,
+        choice: Option<Vec<String>>,
+        grammar: Option<String>,
+        structural_tag: Option<serde_json::Value>,
+        backend: Option<String>,
+        whitespace_pattern: Option<String>,
+    ) -> Result<Option<Self>> {
         let is_empty_choice = choice.as_ref().is_none_or(|v| v.is_empty());
         if json.is_none()
+            && !json_object.unwrap_or(false)
             && regex.is_none()
             && is_empty_choice
             && grammar.is_none()
@@ -566,6 +596,7 @@ impl GuidedDecodingOptions {
     pub fn validate(&self) -> Result<()> {
         let count = [
             self.json.is_some(),
+            self.json_object.unwrap_or(false),
             self.regex.is_some(),
             self.choice.as_ref().is_some_and(|v| !v.is_empty()),
             self.grammar.is_some(),
@@ -1199,6 +1230,49 @@ mod tests {
         assert!(val.is_some());
         let val = val.unwrap();
         assert_eq!(val.choice, Some(vec!["A".to_string()]));
+    }
+
+    #[test]
+    fn test_guided_decoding_json_object_construction_and_exclusivity() {
+        let options = GuidedDecodingOptions::from_optional_with_json_object_and_structural_tag(
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+            Some("xgrammar".to_string()),
+            None,
+        )
+        .unwrap()
+        .expect("json_object constraint");
+        assert_eq!(options.json_object, Some(true));
+        assert_eq!(options.backend.as_deref(), Some("xgrammar"));
+
+        let disabled = GuidedDecodingOptions::from_optional_with_json_object_and_structural_tag(
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(disabled.is_none());
+
+        let conflicting = GuidedDecodingOptions::from_optional_with_json_object_and_structural_tag(
+            Some(serde_json::json!({"type": "object"})),
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(conflicting.is_err());
     }
 
     #[test]

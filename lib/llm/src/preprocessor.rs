@@ -439,7 +439,19 @@ fn first_complete_repaired_boundary_json(input: &str) -> Option<String> {
         }
     }
 
-    dynamo_parsers::reasoning::repair_boundary_brace_leak(input)
+    crate::protocols::openai::chat_completions::repair_boundary_brace_leak(input)
+}
+
+fn first_complete_json_value(input: &str) -> Option<String> {
+    let trimmed = input.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut values = serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>();
+    values.next()?.ok()?;
+    let end = values.byte_offset();
+    (end > 0).then(|| trimmed[..end].to_string())
 }
 
 fn is_partial_object_key_prefix(prefix: &str) -> bool {
@@ -2681,6 +2693,38 @@ impl OpenAIPreprocessor {
         Ok((builder.build()?, annotations))
     }
 
+    fn reasoning_stream_modes(
+        &self,
+        request: &NvCreateChatCompletionRequest,
+        uses_tool_call_structural_tag: bool,
+    ) -> (bool, bool) {
+        let reasoning_parser = self.runtime_config.reasoning_parser.as_deref();
+        let is_guided_tool_choice = matches!(
+            request.inner.tool_choice,
+            Some(ChatCompletionToolChoiceOption::Required)
+                | Some(ChatCompletionToolChoiceOption::Named(_))
+        );
+        let is_guided_output =
+            is_guided_tool_choice || Self::has_structured_response_format(request);
+        let skip_reasoning_for_guided_json = is_guided_output
+            && !uses_tool_call_structural_tag
+            && Self::is_force_reasoning_parser(reasoning_parser)
+            && !Self::supports_reasoning_before_guided_json(reasoning_parser);
+        let reasoning_disabled_by_request = Self::is_reasoning_disabled_by_request(
+            reasoning_parser,
+            request.chat_template_args.as_ref(),
+        );
+
+        (
+            reasoning_parser.is_some()
+                && !reasoning_disabled_by_request
+                && !skip_reasoning_for_guided_json,
+            reasoning_disabled_by_request
+                && Self::is_nemotron_force_reasoning(reasoning_parser)
+                && !skip_reasoning_for_guided_json,
+        )
+    }
+
     pub fn postprocessor_parsing_stream<S>(
         &self,
         stream: S,
@@ -2720,24 +2764,10 @@ impl OpenAIPreprocessor {
         let bypass_reasoning_for_bare_guided_json = inspect_force_reasoning_guided_output
             || inspect_prompt_injected_guided_output
             || inspect_unsupported_structured_response_reasoning_gate;
-        // Preserve the legacy bypass for force-reasoning parsers not yet opted in.
-        let skip_reasoning_for_guided_json = is_guided_output
-            && !uses_tool_call_structural_tag
-            && Self::is_force_reasoning_parser(reasoning_parser)
-            && !inspect_force_reasoning_guided_output;
-
-        let reasoning_disabled_by_request = Self::is_reasoning_disabled_by_request(
-            self.runtime_config.reasoning_parser.as_deref(),
-            request.chat_template_args.as_ref(),
-        );
-
-        // Try to parse reasoning content only if parser is configured.
-        let should_parse_reasoning = self.runtime_config.reasoning_parser.is_some()
-            && !reasoning_disabled_by_request
-            && !skip_reasoning_for_guided_json;
-        let should_strip_disabled_reasoning_start = reasoning_disabled_by_request
-            && Self::is_nemotron_force_reasoning(self.runtime_config.reasoning_parser.as_deref())
-            && !skip_reasoning_for_guided_json;
+        let (should_parse_reasoning, should_strip_disabled_reasoning_start) =
+            self.reasoning_stream_modes(request, uses_tool_call_structural_tag);
+        let structured_json_guard_after_reasoning =
+            should_parse_reasoning && request.uses_pure_json_structured_output();
         let guided_reasoning_start_token =
             if should_parse_reasoning && bypass_reasoning_for_bare_guided_json {
                 Self::guided_json_reasoning_start_token(reasoning_parser)
@@ -2778,6 +2808,13 @@ impl OpenAIPreprocessor {
             ))
         } else {
             Box::pin(stream)
+        };
+
+        let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if structured_json_guard_after_reasoning
+        {
+            Box::pin(Self::guard_structured_json_content_from_stream(stream))
+        } else {
+            stream
         };
 
         // Check if tools are present and if we should apply jail
@@ -3832,6 +3869,76 @@ impl OpenAIPreprocessor {
         .fuse()
     }
 
+    fn guard_structured_json_content_from_stream<S>(
+        stream: S,
+    ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
+    where
+        S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    {
+        #[derive(Default)]
+        struct StructuredJsonChoiceState {
+            buffer: String,
+            completed: bool,
+        }
+
+        struct StructuredJsonGuardState {
+            stream:
+                Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>,
+            choices: HashMap<u32, StructuredJsonChoiceState>,
+        }
+
+        let state = StructuredJsonGuardState {
+            stream: Box::pin(stream),
+            choices: HashMap::new(),
+        };
+
+        stream::unfold(state, |mut state| async move {
+            let mut response = state.stream.next().await?;
+
+            if let Some(mut data) = response.data.take() {
+                for choice in data.inner.choices.iter_mut() {
+                    let choice_state = state.choices.entry(choice.index).or_default();
+                    let mut content = match choice.delta.content.take() {
+                        Some(ChatCompletionMessageContent::Text(text)) => Some(text),
+                        other => {
+                            choice.delta.content = other;
+                            None
+                        }
+                    };
+
+                    if choice_state.completed {
+                        content = None;
+                    } else if let Some(text) = content {
+                        choice_state.buffer.push_str(&text);
+                        if let Some(json) =
+                            first_complete_structured_json_content(&choice_state.buffer)
+                        {
+                            choice_state.completed = true;
+                            choice_state.buffer.clear();
+                            content = Some(json);
+                        } else if choice.finish_reason.is_some() && !choice_state.buffer.is_empty() {
+                            let buffered = std::mem::take(&mut choice_state.buffer);
+                            content = Some(finalize_structured_json_content(buffered));
+                            choice_state.completed = true;
+                        } else {
+                            content = None;
+                        }
+                    } else if choice.finish_reason.is_some() && !choice_state.buffer.is_empty() {
+                        let buffered = std::mem::take(&mut choice_state.buffer);
+                        content = Some(finalize_structured_json_content(buffered));
+                        choice_state.completed = true;
+                    }
+
+                    choice.delta.content = content.map(ChatCompletionMessageContent::Text);
+                }
+                response.data = Some(data);
+            }
+
+            Some((response, state))
+        })
+        .fuse()
+    }
+
     // Motivation: when Nemotron reasoning is disabled by request flags, the
     // backend may still emit a leading <think>. Buffer the initial stream
     // bytes so split chunks like "<thi" + "nk>answer" are stripped cleanly.
@@ -4090,7 +4197,15 @@ impl
         // Capture media counts before `common_request` is moved into the context.
         let mm_counts = MultimodalCounts::from_preprocessed(&common_request);
 
+        let structured_json_guard_after_reasoning = request.uses_pure_json_structured_output()
+            && self
+                .reasoning_stream_modes(&request, uses_tool_call_structural_tag)
+                .0;
+
         let mut response_generator = Box::new(response_generator);
+        if structured_json_guard_after_reasoning {
+            response_generator.set_structured_json_guard(false);
+        }
 
         // Update ISL only for text prompts (embeddings get sequence length from tensor shape)
         if common_request.prompt_embeds.is_none() {
@@ -4458,6 +4573,136 @@ mod tests {
             b.multi_modal_data(Some(m));
         }
         b.build().unwrap()
+    }
+
+    fn structured_json_guard_delta(
+        index: u32,
+        text: Option<&str>,
+        finish_reason: Option<dynamo_protocols::types::FinishReason>,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "return json"}],
+                "stream": true
+            }))
+            .unwrap();
+        let mut generator = request.response_generator("guard-test".to_string());
+        Annotated {
+            data: Some(generator.create_choice(
+                index,
+                text.map(str::to_string),
+                finish_reason,
+                None,
+            )),
+            id: None,
+            event: None,
+            comment: None,
+            error: None,
+        }
+    }
+
+    fn guarded_choice_text(
+        response: &Annotated<NvCreateChatCompletionStreamResponse>,
+    ) -> Option<&str> {
+        match response
+            .data
+            .as_ref()?
+            .inner
+            .choices
+            .first()?
+            .delta
+            .content
+            .as_ref()?
+        {
+            ChatCompletionMessageContent::Text(text) => Some(text),
+            ChatCompletionMessageContent::Parts(_) => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_json_guard_handles_complete_malformed_and_truncated_content() {
+        let input = stream::iter(vec![
+            structured_json_guard_delta(0, Some(r#"{"answer":"#), None),
+            structured_json_guard_delta(0, Some(r#"true} trailing"#), None),
+            structured_json_guard_delta(
+                1,
+                Some("ordinary text"),
+                Some(dynamo_protocols::types::FinishReason::Stop),
+            ),
+            structured_json_guard_delta(2, Some(r#"{"truncated":"#), None),
+            structured_json_guard_delta(
+                2,
+                None,
+                Some(dynamo_protocols::types::FinishReason::Length),
+            ),
+        ]);
+
+        let output: Vec<_> =
+            OpenAIPreprocessor::guard_structured_json_content_from_stream(input)
+                .collect()
+                .await;
+
+        assert_eq!(guarded_choice_text(&output[0]), None);
+        assert_eq!(guarded_choice_text(&output[1]), Some(r#"{"answer":true}"#));
+        assert_eq!(guarded_choice_text(&output[2]), Some("ordinary text"));
+        assert_eq!(guarded_choice_text(&output[3]), None);
+        assert_eq!(guarded_choice_text(&output[4]), Some(r#"{"truncated":"#));
+    }
+
+    #[tokio::test]
+    async fn structured_json_guard_isolates_choices_and_preserves_non_content_fields() {
+        let mut first = structured_json_guard_delta(0, Some(r#"{"a":"#), None);
+        let first_data = first.data.as_mut().unwrap();
+        let first_choice = first_data.inner.choices.first_mut().unwrap();
+        first_choice.delta.reasoning_content = Some("analysis".to_string());
+        first_choice.delta.tool_calls = Some(
+            serde_json::from_value(serde_json::json!([{
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }]))
+            .unwrap(),
+        );
+        let expected_tool_calls = first_choice.delta.tool_calls.clone();
+        let usage = dynamo_protocols::types::CompletionUsage {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+            total_tokens: 5,
+            ..Default::default()
+        };
+        first_data.inner.usage = Some(usage.clone());
+        first_data.nvext = Some(serde_json::json!({"trace": "kept"}));
+
+        let input = stream::iter(vec![
+            first,
+            structured_json_guard_delta(1, Some(r#"{"b":"#), None),
+            structured_json_guard_delta(0, Some("1}"), None),
+            structured_json_guard_delta(1, Some("2}"), None),
+        ]);
+        let output: Vec<_> =
+            OpenAIPreprocessor::guard_structured_json_content_from_stream(input)
+                .collect()
+                .await;
+
+        assert_eq!(guarded_choice_text(&output[0]), None);
+        assert_eq!(guarded_choice_text(&output[1]), None);
+        assert_eq!(guarded_choice_text(&output[2]), Some(r#"{"a":1}"#));
+        assert_eq!(guarded_choice_text(&output[3]), Some(r#"{"b":2}"#));
+
+        let preserved = output[0].data.as_ref().unwrap();
+        let preserved_choice = preserved.inner.choices.first().unwrap();
+        assert_eq!(
+            preserved_choice.delta.reasoning_content.as_deref(),
+            Some("analysis")
+        );
+        assert_eq!(preserved_choice.delta.tool_calls, expected_tool_calls);
+        assert_eq!(preserved.inner.usage.as_ref(), Some(&usage));
+        assert_eq!(
+            preserved.nvext.as_ref(),
+            Some(&serde_json::json!({"trace": "kept"}))
+        );
     }
 
     #[test]

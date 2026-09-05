@@ -203,10 +203,7 @@ pub fn validate_response_format(
                     "`response_format.json_schema.schema` is required when `response_format.type` is `json_schema`"
                 );
             }
-            if matches!(
-                json_schema.schema.as_ref(),
-                Some(serde_json::Value::Bool(false))
-            ) {
+            if json_schema.schema == serde_json::Value::Bool(false) {
                 anyhow::bail!(
                     "`response_format.json_schema.schema` cannot be boolean false because it cannot match any response"
                 );
