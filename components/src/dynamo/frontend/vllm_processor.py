@@ -1446,6 +1446,7 @@ class VllmProcessor:
                 tokens,
                 vllm_preproc,
                 post_processors,
+                request_for_sampling=request_for_sampling,
                 mm_routing_info=mm_routing_info,
                 context=context,
             ):
@@ -1462,6 +1463,7 @@ class VllmProcessor:
         tokens: list[int],
         vllm_preproc: EngineCoreRequest,
         post_processors: dict[int, StreamingPostProcessor],
+        request_for_sampling: Any,
         mm_routing_info: dict[str, Any] | None = None,
         context: Any | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
