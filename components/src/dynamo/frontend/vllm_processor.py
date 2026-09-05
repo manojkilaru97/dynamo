@@ -12,13 +12,18 @@ import os
 import time
 from argparse import Namespace
 from collections.abc import AsyncGenerator
+from types import SimpleNamespace
 from typing import Any
 
 from msgspec.structs import replace as msgspec_replace
 from vllm.config import CacheConfig, LoadConfig, ModelConfig, VllmConfig
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
-from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.sampling_params import (
+    RequestOutputKind,
+    SamplingParams,
+    StructuredOutputsParams,
+)
 from vllm.tasks import GENERATION_TASKS
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser, ToolParserManager
