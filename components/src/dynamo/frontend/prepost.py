@@ -403,11 +403,20 @@ def _prepare_request(
     )
 
     tool_parser: ToolParser | None = None
+    structured_outputs = request_for_sampling.extract_structured_outputs()
+    has_structured_output = (
+        structured_outputs is not None
+        and not structured_outputs.all_constraints_none()
+    )
     # With enable_auto_tool_choice the model may emit tool calls even when the
     # client did not supply an explicit `tools` list, so we activate the parser
     # whenever the tool_parser_class is available.
     has_tools = bool(request_for_sampling.tools)
-    if tool_parser_class and (has_tools or enable_auto_tool_choice):
+    if (
+        tool_parser_class
+        and (has_tools or enable_auto_tool_choice)
+        and not has_structured_output
+    ):
         if request_for_sampling.tool_choice != "none":
             tool_parser = tool_parser_class(tokenizer, request_for_sampling.tools)
             request_for_sampling = tool_parser.adjust_request(request_for_sampling)
