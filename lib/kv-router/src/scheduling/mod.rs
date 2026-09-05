@@ -10,6 +10,7 @@ pub mod policy;
 pub mod policy_config;
 pub mod policy_queue;
 pub mod prefill_load;
+mod priority_trace;
 pub mod queue;
 mod queue_admission;
 pub mod selector;

@@ -45,6 +45,7 @@ from vllm.sampling_params import (
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from dynamo._core import Context
+from dynamo.common import priority_trace
 from dynamo.common.backend import logprobs as _shared_logprobs
 from dynamo.common.lora.manager import LoRAInfo, get_lora_manager
 from dynamo.common.memory.multimodal_embedding_cache_manager import (
@@ -103,6 +104,7 @@ from .multimodal_utils.request_processor import (
     VllmMultimodalRequestProcessor,
 )
 from .multimodal_utils.vision_encoder_backend import VisionEncoderBackend
+from .priority import engine_priority_from_routing
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
@@ -125,6 +127,27 @@ _DISTRIBUTED_WEIGHT_UPDATE_RESERVED_KEYS: Final = frozenset(
         "weight_version",
     }
 )
+
+
+def _trace_engine_handoff(
+    context: Context,
+    routing: dict[str, Any],
+    priority_present: bool,
+    dynamo_priority: int | None,
+    engine_priority: int,
+) -> None:
+    trace_headers = context.trace_headers() or {}
+    priority_trace.emit(
+        "worker_engine_handoff",
+        request_id=context.id(),
+        client_request_id=trace_headers.get("x-request-id"),
+        priority_present=priority_present,
+        priority=dynamo_priority,
+        strict_priority_present="strict_priority" in routing,
+        strict_priority=routing.get("strict_priority"),
+        engine_priority=engine_priority,
+        dp_rank=routing.get("dp_rank"),
+    )
 
 
 def build_prompt_tokens_details(
@@ -3867,7 +3890,12 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             )
         routing = request.get("routing") or {}
         dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
-        priority = -int(routing.get("priority", 0))
+        priority_present, dynamo_priority, priority = engine_priority_from_routing(
+            routing
+        )
+        _trace_engine_handoff(
+            context, routing, priority_present, dynamo_priority, priority
+        )
 
         trace_headers = context.trace_headers()
         reasoning_ended, reasoning_parser_kwargs = _request_reasoning_metadata(request)
@@ -3963,7 +3991,12 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
         routing = request.get("routing") or {}
         dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
-        priority = -int(routing.get("priority", 0))
+        priority_present, dynamo_priority, priority = engine_priority_from_routing(
+            routing
+        )
+        _trace_engine_handoff(
+            context, routing, priority_present, dynamo_priority, priority
+        )
         openai_request_id = request.get("id") or request.get("request_id", request_id)
         previous_text_per_choice: dict[int, str] = {}
 
@@ -4180,7 +4213,12 @@ class PrefillWorkerHandler(BaseWorkerHandler):
 
         routing = request.get("routing") or {}
         dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
-        priority = -int(routing.get("priority", 0))
+        priority_present, dynamo_priority, priority = engine_priority_from_routing(
+            routing
+        )
+        _trace_engine_handoff(
+            context, routing, priority_present, dynamo_priority, priority
+        )
 
         trace_headers = context.trace_headers()
         reasoning_ended, reasoning_parser_kwargs = _request_reasoning_metadata(request)

@@ -28,6 +28,7 @@ from vllm.v1.engine.output_processor import OutputProcessor, OutputProcessorOutp
 from vllm.v1.engine.parallel_sampling import ParentRequest
 
 from dynamo._internal import ModelDeploymentCard
+from dynamo.common import priority_trace
 from dynamo.common.multimodal.mm_kwargs_transfer import (
     MmKwargsNixlSender,
     MmKwargsSender,
@@ -39,6 +40,7 @@ from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine
 
 from .prepost import StreamingPostProcessor, preprocess_chat_request
+from .priority import normalize_routing_hints
 from .thinking import runtime_default_thinking_mode
 from .utils import (
     extract_mm_urls,
@@ -1309,6 +1311,20 @@ class VllmProcessor:
 
         # Convert to a Python object that has fields that match our PreprocessedRequest
         sp = vllm_preproc.sampling_params
+        routing = normalize_routing_hints(request)
+        hints = (request.get("nvext") or {}).get("agent_hints") or {}
+        trace_headers = context.trace_headers() if context is not None else None
+        priority_trace.emit(
+            "normalization",
+            request_id=context.id() if context is not None else request_id,
+            processor_request_id=request_id,
+            client_request_id=(trace_headers or {}).get("x-request-id"),
+            priority_present="priority" in hints,
+            priority=hints.get("priority"),
+            priority_jump=(routing or {}).get("priority_jump"),
+            strict_priority_present="strict_priority" in hints,
+            strict_priority=hints.get("strict_priority"),
+        )
         dynamo_preproc = {
             "model": request["model"],
             "token_ids": tokens,
@@ -1338,7 +1354,7 @@ class VllmProcessor:
             },
             "eos_token_ids": self._get_eos_token_ids(),
             "annotations": [],
-            "routing": request.get("routing"),
+            "routing": routing,
         }
         if guided_decoding is not None:
             dynamo_preproc["sampling_options"]["guided_decoding"] = guided_decoding

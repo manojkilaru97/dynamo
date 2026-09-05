@@ -4861,6 +4861,30 @@ mod tests {
         assert_eq!(routing_priorities(None), (None, None, None));
     }
 
+    #[test]
+    fn completions_routing_priorities_preserve_zero_and_legacy_fallback() {
+        let explicit_zero = crate::protocols::common::extensions::AgentHints {
+            priority: Some(0),
+            latency_sensitivity: Some(8.0),
+            strict_priority: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            routing_priorities(Some(&explicit_zero)),
+            (Some(0.0), Some(1), Some(0))
+        );
+
+        let legacy_only = crate::protocols::common::extensions::AgentHints {
+            latency_sensitivity: Some(8.0),
+            strict_priority: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            routing_priorities(Some(&legacy_only)),
+            (Some(8.0), Some(1), None)
+        );
+    }
+
     fn test_llm_metrics_annotation() -> LLMMetricAnnotation {
         LLMMetricAnnotation {
             input_tokens: 10,

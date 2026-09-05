@@ -4,8 +4,11 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
-    sync::{Arc, LazyLock},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -45,6 +48,50 @@ use super::{
     },
     service_v2,
 };
+
+static PRIORITY_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static PRIORITY_TRACE_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn emit_priority_ingress(
+    request_id: &str,
+    client_request_id: Option<&str>,
+    request: &NvCreateChatCompletionRequest,
+) {
+    if !env_is_truthy("DYN_PRIORITY_TRACE") {
+        return;
+    }
+    let limit = std::env::var("DYN_PRIORITY_TRACE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(200_000)
+        .min(1_000_000);
+    let sequence = PRIORITY_TRACE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    if sequence > limit {
+        return;
+    }
+
+    let hints = request
+        .nvext
+        .as_ref()
+        .and_then(|nvext| nvext.agent_hints.as_ref());
+    let client_request_id =
+        client_request_id.map(|value| value.chars().take(128).collect::<String>());
+    tracing::info!(
+        target: "dynamo_priority",
+        schema = "dynamo.priority.v1",
+        stage = "ingress",
+        sequence,
+        monotonic_ns = PRIORITY_TRACE_START.elapsed().as_nanos() as u64,
+        process_id = std::process::id(),
+        request_id,
+        client_request_id = client_request_id.as_deref(),
+        priority_present = hints.is_some_and(|hints| hints.priority.is_some()),
+        priority = ?hints.and_then(|hints| hints.priority),
+        strict_priority_present = hints.is_some_and(|hints| hints.strict_priority.is_some()),
+        strict_priority = ?hints.and_then(|hints| hints.strict_priority),
+        "priority_trace"
+    );
+}
 use crate::engines::ValidateRequest;
 use crate::preprocessor::PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY;
 use crate::protocols::common::extensions::{
@@ -1872,6 +1919,13 @@ async fn handler_chat_completions(
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
     let mut request = context_from_headers(request, request_id, &headers)?;
+    emit_priority_ingress(
+        request.id(),
+        headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        &request,
+    );
     if let Some(captured) = crate::request_trace::payload::capture_http_headers(&headers) {
         request.insert(
             crate::request_trace::payload::HTTP_HEADERS_CONTEXT_KEY,

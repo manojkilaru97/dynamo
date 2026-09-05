@@ -116,6 +116,14 @@ impl<T> PolicyQueueEntry<T> {
         self.snapshot
     }
 
+    pub fn enqueue_sequence(&self) -> u64 {
+        self.enqueue_seq
+    }
+
+    pub fn policy_score(&self) -> f64 {
+        self.priority.policy_score.into_inner()
+    }
+
     pub fn payload(&self) -> &T {
         &self.payload
     }

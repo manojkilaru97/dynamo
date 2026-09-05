@@ -61,6 +61,13 @@ struct QueuedRequest {
     admission: Option<RequestAdmission>,
 }
 
+struct PendingDispatchTrace {
+    class_index: usize,
+    enqueue_sequence: u64,
+    policy_score: f64,
+    wait_ms: u64,
+}
+
 struct RequestAdmission {
     ticket: AdmissionTicket,
     progress: RequestProgressUpdater,
@@ -221,6 +228,7 @@ struct SchedulerQueueActor<
     slots: Arc<ActiveSequencesMultiWorker<P>>,
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
     start_time: Instant,
+    priority_trace_queue_id: u64,
     block_size: u32,
     selector: Sel,
     prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
@@ -399,6 +407,7 @@ impl<
             slots: Arc::clone(&slots),
             workers_with_configs: workers_with_configs.clone(),
             start_time: Instant::now(),
+            priority_trace_queue_id: super::priority_trace::next_queue_id(),
             block_size,
             selector,
             prefill_load_estimator,
@@ -890,6 +899,7 @@ impl<
                 request,
                 decay_now,
                 admission.map(|(admission, _)| admission),
+                None,
             );
         }
 
@@ -898,6 +908,24 @@ impl<
         let arrival_offset = self.start_time.elapsed().as_secs_f64();
         let priority_jump = request.priority_jump;
         let strict_priority = request.strict_priority;
+        let trace_context = if super::priority_trace::enabled() {
+            request.mode.request_id().map(|request_id| {
+                let policy_score = match class.queue_policy {
+                    RouterQueuePolicy::Fcfs => priority_jump.max(0.0) - arrival_offset,
+                    RouterQueuePolicy::Lcfs => priority_jump.max(0.0) + arrival_offset,
+                    RouterQueuePolicy::Wspt => {
+                        (1.0 + priority_jump.max(0.0)) / snapshot.scheduling_cost_tokens as f64
+                    }
+                };
+                (
+                    request_id.to_owned(),
+                    self.trace_eligible_workers(&request),
+                    policy_score,
+                )
+            })
+        } else {
+            None
+        };
         let placement = request
             .pinned_worker
             .map_or(WorkerPlacement::Any, WorkerPlacement::Exact);
@@ -967,6 +995,22 @@ impl<
         self.pending_isl_tokens
             .fetch_add(snapshot.raw_isl_tokens, AtomicOrdering::Relaxed);
         self.add_class_counters(queue_class_index, snapshot);
+        if let Some((request_id, trace_candidates, policy_score)) = trace_context {
+            super::priority_trace::emit_router_event(
+                "router_enqueue",
+                self.priority_trace_queue_id,
+                &request_id,
+                &class.name,
+                &class.queue_policy.to_string(),
+                None,
+                priority_jump,
+                strict_priority,
+                Some(policy_score),
+                None,
+                &trace_candidates,
+                None,
+            );
+        }
         (false, true)
     }
 
@@ -994,6 +1038,25 @@ impl<
         // limits, ordering, DRR cost, and counters.
         let context = SchedulingContext::new(request, workers);
         QueueSnapshot::new(request.isl_tokens, context.best_cached_tokens())
+    }
+
+    fn trace_eligible_workers(&self, request: &SchedulingRequest) -> Vec<WorkerWithDpRank> {
+        if !super::priority_trace::enabled() {
+            return Vec::new();
+        }
+        let workers = self.workers_with_configs.borrow();
+        let overloaded_worker_ids = self
+            .overloaded_worker_provider
+            .as_ref()
+            .and_then(|provider| provider());
+        let eligibility = request.eligibility_with_overloaded(overloaded_worker_ids.as_ref());
+        let mut candidates = Vec::new();
+        eligibility.any_eligible_worker_rank(&workers, |worker, _| {
+            candidates.push(worker);
+            candidates.len() > 64
+        });
+        candidates.sort_unstable();
+        candidates
     }
 
     fn handle_dispatched(&mut self, request_id: &str, ticket: AdmissionTicket) -> bool {
@@ -1384,6 +1447,12 @@ impl<
             let admit_now = Instant::now();
             let class_index = popped.class_index();
             let class = self.profile.class(class_index);
+            let pending_trace = super::priority_trace::enabled().then(|| PendingDispatchTrace {
+                class_index,
+                enqueue_sequence: popped.enqueue_sequence(),
+                policy_score: popped.policy_score(),
+                wait_ms,
+            });
             let queued = popped.into_payload();
             let admission = queued.admission;
             let request = queued.request;
@@ -1391,7 +1460,7 @@ impl<
                 policy_class = class.name,
                 "scheduling request from pending queue"
             );
-            let _ = self.admit_one(request, admit_now, admission);
+            let _ = self.admit_one(request, admit_now, admission, pending_trace);
         }
     }
 
@@ -1402,6 +1471,7 @@ impl<
         mut request: SchedulingRequest,
         decay_now: Instant,
         admission: Option<RequestAdmission>,
+        pending_trace: Option<PendingDispatchTrace>,
     ) -> (bool, bool) {
         let admission_key = admission.as_ref().map(|_| {
             request
@@ -1450,6 +1520,25 @@ impl<
                 );
             }
         };
+
+        if let Some(trace) = pending_trace {
+            let class = self.profile.class(trace.class_index);
+            let candidates = self.trace_eligible_workers(&request);
+            super::priority_trace::emit_router_event(
+                "router_dispatch",
+                self.priority_trace_queue_id,
+                request.mode.request_id().unwrap_or("unknown"),
+                &class.name,
+                &class.queue_policy.to_string(),
+                Some(trace.enqueue_sequence),
+                request.priority_jump,
+                request.strict_priority,
+                Some(trace.policy_score),
+                Some(trace.wait_ms),
+                &candidates,
+                Some(selection.worker),
+            );
+        }
 
         let (admission, request_progress) = match admission {
             Some(RequestAdmission { ticket, progress }) => (Some(ticket), Some(progress)),

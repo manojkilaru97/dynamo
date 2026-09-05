@@ -950,6 +950,23 @@ mod tests {
         assert_eq!(r.strict_priority, Some(2));
         assert_eq!(r.priority_jump, Some(5.0));
 
+        // Malformed fields do not suppress a valid override in the other field.
+        let r = resolve_request_priority(Some(&hints), Some("abc"), Some("0"));
+        assert_eq!(r.priority, Some(5));
+        assert_eq!(r.strict_priority, Some(0));
+        let r = resolve_request_priority(Some(&hints), Some("0"), Some("-1"));
+        assert_eq!(r.priority, Some(0));
+        assert_eq!(r.strict_priority, Some(2));
+
+        // Header parsing preserves the full supported signed/unsigned ranges.
+        let r = resolve_request_priority(Some(&hints), Some("-2147483648"), Some("4294967295"));
+        assert_eq!(r.priority, Some(i32::MIN));
+        assert_eq!(r.strict_priority, Some(u32::MAX));
+
+        // Malformed out-of-range headers with no body preserve absence.
+        let r = resolve_request_priority(None, Some("2147483648"), Some("4294967296"));
+        assert_eq!(r, ResolvedPriority::default());
+
         // `latency_sensitivity` drives `priority_jump` only when no priority exists.
         let ls_only = AgentHints {
             latency_sensitivity: Some(2.5),
