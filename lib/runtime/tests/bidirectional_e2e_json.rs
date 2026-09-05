@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use dynamo_runtime::pipeline::network::{
     EncodedResponseFrame, IngressRequestDecoder, IngressResponseEncoder, NetworkStreamWrapper,
-    RequestPlanePayloadCodec,
+    PushWorkHandler, RequestPlanePayloadCodec,
     egress::push_router::{PushRouter, RouterMode},
 };
 use dynamo_runtime::{
@@ -90,6 +90,17 @@ impl AsyncEngine<ManyIn<u64>, ManyOut<NonSerdeResponse>, Error> for FailingRespo
     }
 }
 
+struct EmptyResponseEngine;
+
+#[async_trait]
+impl AsyncEngine<ManyIn<u64>, ManyOut<EchoResponse>, Error> for EmptyResponseEngine {
+    async fn generate(&self, input: ManyIn<u64>) -> Result<ManyOut<EchoResponse>, Error> {
+        let ctx = input.context();
+        let stream: DataStream<EchoResponse> = Box::pin(tokio_stream::empty());
+        Ok(ResponseStream::new(stream, ctx))
+    }
+}
+
 #[derive(Debug)]
 struct FailingResponseAdapter;
 
@@ -135,6 +146,42 @@ impl IngressResponseEncoder<NonSerdeResponse> for FailingResponseAdapter {
             is_error: false,
             stop_stream: false,
         })
+    }
+}
+
+#[derive(Debug)]
+struct FinalFailingResponseAdapter;
+
+impl IngressRequestDecoder<u64> for FinalFailingResponseAdapter {
+    async fn decode_request(
+        &self,
+        payload_codec: RequestPlanePayloadCodec,
+        bytes: Bytes,
+    ) -> Result<u64, PipelineError> {
+        payload_codec.decode(&bytes).map_err(|error| {
+            PipelineError::DeserializationError(format!(
+                "failed decoding test request as {}: {error}",
+                payload_codec.name()
+            ))
+        })
+    }
+}
+
+impl IngressResponseEncoder<EchoResponse> for FinalFailingResponseAdapter {
+    async fn encode_response(
+        &self,
+        _payload_codec: RequestPlanePayloadCodec,
+        response: Option<EchoResponse>,
+        complete_final: bool,
+    ) -> Result<EncodedResponseFrame, PipelineError> {
+        assert!(
+            response.is_none(),
+            "empty engine must not produce a response"
+        );
+        assert!(complete_final, "empty engine only encodes its final frame");
+        Err(PipelineError::SerializationError(
+            "intentional final response encoding failure".to_string(),
+        ))
     }
 }
 
@@ -236,6 +283,78 @@ async fn bidirectional_end_to_end_echo_with_explicit_json_codec() {
     assert!(
         serialization_error.ends_with(" 1"),
         "unexpected serialization error metric: {serialization_error}"
+    );
+
+    let final_failing_endpoint = component.endpoint("final_failing_endpoint".to_string());
+    let final_failing_ingress = Ingress::for_engine_with_adapter(
+        Arc::new(EmptyResponseEngine),
+        FinalFailingResponseAdapter,
+    )
+    .unwrap();
+    let final_notifier = Arc::new(tokio::sync::Notify::new());
+    final_failing_ingress
+        .set_endpoint_health_check_notifier(Arc::clone(&final_notifier))
+        .unwrap();
+    let final_failing_endpoint_for_server = final_failing_endpoint.clone();
+    tokio::spawn(async move {
+        let _ = final_failing_endpoint_for_server
+            .endpoint_builder()
+            .handler(final_failing_ingress)
+            .start()
+            .await;
+    });
+
+    let final_failing_client = final_failing_endpoint.client().await.unwrap();
+    final_failing_client.wait_for_instances().await.unwrap();
+    let final_failing_router =
+        PushRouter::<u64, EchoResponse>::from_client(final_failing_client, RouterMode::RoundRobin)
+            .await
+            .unwrap();
+    let final_failing_input: ManyIn<u64> =
+        Context::new(RequestStream::new(Box::pin(tokio_stream::iter(vec![
+            101u64,
+        ]))));
+    let final_failure_stream = final_failing_router
+        .generate(final_failing_input)
+        .await
+        .unwrap();
+    let final_failure_responses: Vec<EchoResponse> =
+        futures::StreamExt::collect(final_failure_stream).await;
+    let final_error = final_failure_responses
+        .into_iter()
+        .find_map(|response| response.error)
+        .expect("final encoding failure must not be reported as successful completion");
+    assert!(
+        final_error
+            .to_string()
+            .contains("Stream ended before generation completed"),
+        "unexpected client error: {final_error}"
+    );
+
+    let final_metrics = final_failing_endpoint
+        .metrics()
+        .prometheus_expfmt()
+        .unwrap();
+    let final_encoding_error = final_metrics
+        .lines()
+        .find(|line| {
+            !line.starts_with('#')
+                && line.contains("errors_total")
+                && line.contains("error_type=\"publish_final\"")
+        })
+        .expect("final encoding error metric must be present");
+    assert!(
+        final_encoding_error.ends_with(" 1"),
+        "unexpected final encoding error metric: {final_encoding_error}"
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            final_notifier.notified()
+        )
+        .await
+        .is_err(),
+        "final encoding failure must not signal endpoint health"
     );
     rt.shutdown();
 }

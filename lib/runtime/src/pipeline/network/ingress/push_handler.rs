@@ -247,7 +247,7 @@ where
                             .with_label_values(&[work_handler::error_types::PUBLISH_FINAL])
                             .inc();
                     }
-                    return;
+                    return Err(err);
                 }
             };
             let resp_bytes = encoded.bytes;
