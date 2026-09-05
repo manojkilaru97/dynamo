@@ -3916,7 +3916,8 @@ impl OpenAIPreprocessor {
                             choice_state.completed = true;
                             choice_state.buffer.clear();
                             content = Some(json);
-                        } else if choice.finish_reason.is_some() && !choice_state.buffer.is_empty() {
+                        } else if choice.finish_reason.is_some() && !choice_state.buffer.is_empty()
+                        {
                             let buffered = std::mem::take(&mut choice_state.buffer);
                             content = Some(finalize_structured_json_content(buffered));
                             choice_state.completed = true;
@@ -4580,13 +4581,12 @@ mod tests {
         text: Option<&str>,
         finish_reason: Option<dynamo_protocols::types::FinishReason>,
     ) -> Annotated<NvCreateChatCompletionStreamResponse> {
-        let request: NvCreateChatCompletionRequest =
-            serde_json::from_value(serde_json::json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "return json"}],
-                "stream": true
-            }))
-            .unwrap();
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "return json"}],
+            "stream": true
+        }))
+        .unwrap();
         let mut generator = request.response_generator("guard-test".to_string());
         Annotated {
             data: Some(generator.create_choice(
@@ -4638,10 +4638,9 @@ mod tests {
             ),
         ]);
 
-        let output: Vec<_> =
-            OpenAIPreprocessor::guard_structured_json_content_from_stream(input)
-                .collect()
-                .await;
+        let output: Vec<_> = OpenAIPreprocessor::guard_structured_json_content_from_stream(input)
+            .collect()
+            .await;
 
         assert_eq!(guarded_choice_text(&output[0]), None);
         assert_eq!(guarded_choice_text(&output[1]), Some(r#"{"answer":true}"#));
@@ -4681,10 +4680,9 @@ mod tests {
             structured_json_guard_delta(0, Some("1}"), None),
             structured_json_guard_delta(1, Some("2}"), None),
         ]);
-        let output: Vec<_> =
-            OpenAIPreprocessor::guard_structured_json_content_from_stream(input)
-                .collect()
-                .await;
+        let output: Vec<_> = OpenAIPreprocessor::guard_structured_json_content_from_stream(input)
+            .collect()
+            .await;
 
         assert_eq!(guarded_choice_text(&output[0]), None);
         assert_eq!(guarded_choice_text(&output[1]), None);

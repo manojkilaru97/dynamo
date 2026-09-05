@@ -1106,9 +1106,7 @@ impl OpenAIStopConditionsProvider for NvCreateChatCompletionRequest {
                 return u32::try_from(value).ok();
             }
             if let Some(value) = value.as_i64() {
-                return (value >= 0)
-                    .then(|| u32::try_from(value).ok())
-                    .flatten();
+                return (value >= 0).then(|| u32::try_from(value).ok()).flatten();
             }
             return None;
         }
@@ -1252,12 +1250,16 @@ mod tests {
     }
 
     fn with_tool_parser<T>(parser: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         with_env_var("DYN_DYNAMO_TOOL_CALL_PARSER", parser, f)
     }
 
     fn with_default_constrained_max_thinking_tokens<T>(value: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         with_env_var(DEFAULT_CONSTRAINED_MAX_THINKING_TOKENS_ENV, value, f)
     }
 
