@@ -25,6 +25,7 @@ from _tool_guidance_parity import (
 )
 from transformers import AutoTokenizer
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.reasoning import ReasoningParser
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 
 from dynamo.frontend import prepost as prepost_module
@@ -1152,13 +1153,21 @@ def _base_preproc():
     }
 
 
-async def _run_generate(processor, preproc, *, mm_routing_info=None, context=None):
+async def _run_generate(
+    processor,
+    preproc,
+    *,
+    mm_routing_info=None,
+    context=None,
+    post_processors=None,
+):
     vllm_preproc = SimpleNamespace(
         sampling_params=SimpleNamespace(n=1, logprobs=None),
         request_id="vllm-request",
         external_req_id=None,
     )
-    post_processors = {0: _FakePostProcessor()}
+    if post_processors is None:
+        post_processors = {0: _FakePostProcessor()}
 
     return [
         item
@@ -1497,7 +1506,15 @@ class TestRoutedEnginePath:
         )
 
         with pytest.raises(RuntimeError, match="cancelled"):
-            asyncio.run(_run_generate(processor, _base_preproc()))
+            asyncio.run(
+                _run_generate(
+                    processor,
+                    _base_preproc(),
+                    post_processors={
+                        0: _reasoning_postprocessor(_BaseFallbackReasoningParser)
+                    },
+                )
+            )
         assert not any(stage == "frontend_terminal" for stage, _ in observed)
 
         class CancelledEngine:
@@ -1514,6 +1531,11 @@ class TestRoutedEnginePath:
             cancelled_processor = _make_processor(
                 vllm_processor_module, CancelledEngine()
             )
+            cancelled_processor.output_processor.process_outputs = (
+                lambda outputs: SimpleNamespace(
+                    reqs_to_abort=[], request_outputs=[]
+                )
+            )
             stream = cancelled_processor._generate_and_stream(
                 "processor-id",
                 {"model": MODEL},
@@ -1524,7 +1546,7 @@ class TestRoutedEnginePath:
                     request_id="vllm-request",
                     external_req_id=None,
                 ),
-                {0: _FakePostProcessor()},
+                {0: _reasoning_postprocessor(_BaseFallbackReasoningParser)},
                 request_for_sampling=SimpleNamespace(tool_choice=None),
             )
             await anext(stream)
@@ -1539,13 +1561,53 @@ class TestRoutedEnginePath:
         async def collect(enabled):
             monkeypatch.setenv("DYN_PRIORITY_TRACE", "1" if enabled else "0")
             vllm_processor_module.priority_trace._reset_for_test()
+            usage = {
+                "prompt_tokens": 3,
+                "completion_tokens": 1,
+                "total_tokens": 4,
+                "prompt_tokens_details": {"cached_tokens": 0},
+            }
             processor = _make_processor(
                 vllm_processor_module,
                 _FakeRoutedEngine(
-                    [{"token_ids": [101], "index": 0, "finish_reason": None}]
+                    [
+                        {
+                            "token_ids": [21],
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "completion_usage": usage,
+                        }
+                    ]
                 ),
             )
-            return await _run_generate(processor, _base_preproc())
+            processor.output_processor.process_outputs = lambda outputs: SimpleNamespace(
+                reqs_to_abort=[], request_outputs=[]
+            )
+            post = StreamingPostProcessor(
+                tokenizer=_ToolMarkerTokenizer(),
+                request_for_sampling=_plain_request(),
+                sampling_params=SamplingParams(max_tokens=4),
+                prompt_token_ids=[1, 2, 3],
+                tool_parser=None,
+                reasoning_parser_class=_BaseFallbackReasoningParser,
+                chat_template_kwargs={"enable_thinking": True},
+            )
+            return [
+                item
+                async for item in processor._generate_and_stream(
+                    "request-id",
+                    {"model": MODEL},
+                    _base_preproc(),
+                    [1, 2, 3],
+                    SimpleNamespace(
+                        sampling_params=SimpleNamespace(n=1, logprobs=None),
+                        request_id="vllm-request",
+                        external_req_id=None,
+                    ),
+                    {0: post},
+                    request_for_sampling=_plain_request(),
+                )
+            ]
 
         assert asyncio.run(collect(False)) == asyncio.run(collect(True))
 
@@ -2374,6 +2436,7 @@ class _ThinkingParser:
     end_token = "</think>"
     start_token_id = 12
     end_token_id = 13
+    count_reasoning_tokens = ReasoningParser.count_reasoning_tokens
 
     def __init__(self, tokenizer, **kwargs):
         pass
@@ -2396,6 +2459,37 @@ class _ThinkingParser:
         return self.end_token_id in delta_token_ids
 
 
+class _BaseFallbackReasoningParser(ReasoningParser):
+    def is_reasoning_end(self, input_ids):
+        return False
+
+    def extract_content_ids(self, input_ids):
+        return []
+
+    def extract_reasoning(self, model_output, request):
+        return model_output, None
+
+    def extract_reasoning_streaming(
+        self,
+        previous_text,
+        current_text,
+        delta_text,
+        previous_token_ids,
+        current_token_ids,
+        delta_token_ids,
+    ):
+        return DeltaMessage(reasoning=delta_text or None)
+
+
+class _CountingReasoningParser(_BaseFallbackReasoningParser):
+    def count_reasoning_tokens(self, token_ids):
+        return sum(token_id == 21 for token_id in token_ids)
+
+
+class _InheritedCountingReasoningParser(_CountingReasoningParser):
+    pass
+
+
 def _postprocessor_output(text, token_ids, finish_reason=None):
     return SimpleNamespace(
         index=0,
@@ -2414,6 +2508,267 @@ def _plain_request():
         response_format=None,
         include_reasoning=True,
     )
+
+
+def _reasoning_postprocessor(parser_class):
+    return StreamingPostProcessor(
+        tokenizer=_ToolMarkerTokenizer(),
+        request_for_sampling=_plain_request(),
+        sampling_params=SamplingParams(max_tokens=128),
+        prompt_token_ids=[],
+        tool_parser=None,
+        reasoning_parser_class=parser_class,
+        chat_template_kwargs={"enable_thinking": True},
+    )
+
+
+def test_reasoning_counter_capability_uses_actual_parser_override():
+    unsupported = _reasoning_postprocessor(_BaseFallbackReasoningParser)
+    supported = _reasoning_postprocessor(_InheritedCountingReasoningParser)
+
+    assert unsupported.num_reasoning_tokens is None
+    assert supported.num_reasoning_tokens == 0
+
+    unsupported.process_output(_postprocessor_output("analysis", [21]))
+    supported.process_output(_postprocessor_output("other", [22]))
+    assert unsupported.num_reasoning_tokens is None
+    assert supported.num_reasoning_tokens == 0
+
+    supported.process_output(_postprocessor_output("analysis", [21, 21]))
+    assert supported.num_reasoning_tokens == 2
+
+
+def test_mixed_choice_capability_does_not_manufacture_reasoning_usage(
+    vllm_processor_module, monkeypatch
+):
+    usage = {
+        "prompt_tokens": 3,
+        "completion_tokens": 1,
+        "total_tokens": 4,
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
+    routed_engine = _FakeRoutedEngine(
+        [
+            {
+                "token_ids": [22],
+                "index": 0,
+                "finish_reason": "stop",
+                "completion_usage": usage,
+            },
+            {
+                "token_ids": [21],
+                "index": 1,
+                "finish_reason": "stop",
+                "completion_usage": usage,
+            },
+        ]
+    )
+    processor = _make_processor(vllm_processor_module, routed_engine)
+
+    class FakeParentRequest:
+        def __init__(self, preproc):
+            self.preproc = preproc
+
+        def get_child_info(self, output_index):
+            return (
+                f"{output_index}_child",
+                SimpleNamespace(n=1, logprobs=None),
+            )
+
+    def replace(preproc, **changes):
+        fields = vars(preproc).copy()
+        fields.update(changes)
+        return SimpleNamespace(**fields)
+
+    def process_outputs(outputs):
+        output_index = int(outputs[0].request_id.split("_", 1)[0])
+        token_id = 22 if output_index == 0 else 21
+        return SimpleNamespace(
+            reqs_to_abort=[],
+            request_outputs=[
+                SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(
+                            index=output_index,
+                            token_ids=[token_id],
+                            text="other" if output_index == 0 else "analysis",
+                            finish_reason="stop",
+                            logprobs=None,
+                        )
+                    ]
+                )
+            ],
+        )
+
+    monkeypatch.setattr(vllm_processor_module, "ParentRequest", FakeParentRequest)
+    monkeypatch.setattr(vllm_processor_module, "msgspec_replace", replace)
+    processor.output_processor.process_outputs = process_outputs
+    observed = []
+    monkeypatch.setattr(
+        vllm_processor_module.priority_trace,
+        "emit",
+        lambda stage, **fields: observed.append((stage, fields)),
+    )
+
+    async def run():
+        return [
+            item
+            async for item in processor._generate_and_stream(
+                "request-id",
+                {"model": MODEL},
+                _base_preproc(),
+                [1, 2, 3],
+                SimpleNamespace(
+                    sampling_params=SimpleNamespace(n=2, logprobs=None),
+                    request_id="parent",
+                    external_req_id=None,
+                ),
+                {
+                    0: _reasoning_postprocessor(_InheritedCountingReasoningParser),
+                    1: _reasoning_postprocessor(_BaseFallbackReasoningParser),
+                },
+                request_for_sampling=_plain_request(),
+                context=SimpleNamespace(id=lambda: "context-id"),
+            )
+        ]
+
+    chunks = asyncio.run(run())
+    terminals = [
+        fields for stage, fields in observed if stage == "frontend_terminal"
+    ]
+    assert len(chunks) == 2
+    assert all(
+        "completion_tokens_details" not in chunk["data"]["usage"]
+        for chunk in chunks
+    )
+    assert [row["reasoning_tokens_present"] for row in terminals] == [False, False]
+    assert [row["all_choices_terminated"] for row in terminals] == [False, True]
+
+
+@pytest.mark.parametrize(
+    ("parser_class", "token_ids", "expected"),
+    [
+        (_BaseFallbackReasoningParser, [21], None),
+        (_InheritedCountingReasoningParser, [22], 0),
+        (_InheritedCountingReasoningParser, [21, 21], 2),
+    ],
+    ids=["unsupported", "supported-zero", "supported-positive"],
+)
+def test_constructor_counter_capability_controls_outward_usage(
+    vllm_processor_module,
+    monkeypatch,
+    parser_class,
+    token_ids,
+    expected,
+):
+    usage = {
+        "prompt_tokens": 3,
+        "completion_tokens": len(token_ids),
+        "total_tokens": 3 + len(token_ids),
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
+    processor = _make_processor(
+        vllm_processor_module,
+        _FakeRoutedEngine(
+            [
+                {
+                    "token_ids": token_ids,
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "completion_usage": usage,
+                }
+            ]
+        ),
+    )
+    processor.output_processor.process_outputs = lambda outputs: SimpleNamespace(
+        reqs_to_abort=[], request_outputs=[]
+    )
+    observed = []
+    monkeypatch.setattr(
+        vllm_processor_module.priority_trace,
+        "emit",
+        lambda stage, **fields: observed.append((stage, fields)),
+    )
+
+    chunks = asyncio.run(
+        _run_generate(
+            processor,
+            _base_preproc(),
+            post_processors={0: _reasoning_postprocessor(parser_class)},
+            context=SimpleNamespace(id=lambda: "context-id"),
+        )
+    )
+
+    details = chunks[0]["data"]["usage"].get("completion_tokens_details")
+    terminal = next(
+        fields for stage, fields in observed if stage == "frontend_terminal"
+    )
+    if expected is None:
+        assert details is None
+        assert terminal["reasoning_tokens_present"] is False
+        assert terminal["reasoning_tokens"] is None
+        assert terminal["reasoning_count_source"] is None
+    else:
+        assert details == {"reasoning_tokens": expected}
+        assert terminal["reasoning_tokens_present"] is True
+        assert terminal["reasoning_tokens"] == expected
+        assert (
+            terminal["reasoning_count_source"]
+            == "frontend_streaming_postprocessors"
+        )
+
+
+def test_worker_reasoning_usage_wins_over_constructor_counter(
+    vllm_processor_module, monkeypatch
+):
+    usage = {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+        "prompt_tokens_details": {"cached_tokens": 0},
+        "completion_tokens_details": {"reasoning_tokens": 1},
+    }
+    processor = _make_processor(
+        vllm_processor_module,
+        _FakeRoutedEngine(
+            [
+                {
+                    "token_ids": [21, 21],
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "completion_usage": usage,
+                }
+            ]
+        ),
+    )
+    processor.output_processor.process_outputs = lambda outputs: SimpleNamespace(
+        reqs_to_abort=[], request_outputs=[]
+    )
+    observed = []
+    monkeypatch.setattr(
+        vllm_processor_module.priority_trace,
+        "emit",
+        lambda stage, **fields: observed.append((stage, fields)),
+    )
+
+    chunks = asyncio.run(
+        _run_generate(
+            processor,
+            _base_preproc(),
+            post_processors={
+                0: _reasoning_postprocessor(_InheritedCountingReasoningParser)
+            },
+            context=SimpleNamespace(id=lambda: "context-id"),
+        )
+    )
+
+    assert chunks[0]["data"]["usage"] == usage
+    terminal = next(
+        fields for stage, fields in observed if stage == "frontend_terminal"
+    )
+    assert terminal["reasoning_tokens_present"] is True
+    assert terminal["reasoning_tokens"] == 1
+    assert terminal["reasoning_count_source"] == "worker_completion_usage"
 
 
 def test_duplicate_reasoning_end_marker_is_not_emitted_after_budget_cutoff():

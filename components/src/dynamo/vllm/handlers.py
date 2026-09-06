@@ -143,6 +143,7 @@ def _trace_engine_handoff(
         client_request_id=trace_headers.get("x-request-id"),
         priority_present=priority_present,
         priority=dynamo_priority,
+        priority_jump=routing.get("priority_jump"),
         strict_priority_present="strict_priority" in routing,
         strict_priority=routing.get("strict_priority"),
         engine_priority=engine_priority,

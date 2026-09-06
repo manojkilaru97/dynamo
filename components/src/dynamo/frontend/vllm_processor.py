@@ -1772,6 +1772,11 @@ class VllmProcessor:
 
                 data = envelope.get("data") or {}
                 usage = data.get("usage")
+                worker_reasoning_tokens = _usage_scalar(
+                    engine_response.get("completion_usage"),
+                    "completion_tokens_details",
+                    "reasoning_tokens",
+                )
                 for choice in data.get("choices") or ():
                     choice_index = choice.get("index", 0)
                     finish_reason = _finish_reason_scalar(
@@ -1815,9 +1820,13 @@ class VllmProcessor:
                         reasoning_tokens_present=reasoning_tokens is not None,
                         reasoning_tokens=reasoning_tokens,
                         reasoning_count_source=(
-                            "frontend_streaming_postprocessors"
-                            if reasoning_tokens is not None
-                            else None
+                            "worker_completion_usage"
+                            if worker_reasoning_tokens is not None
+                            else (
+                                "frontend_streaming_postprocessors"
+                                if reasoning_tokens is not None
+                                else None
+                            )
                         ),
                     )
                 yield envelope

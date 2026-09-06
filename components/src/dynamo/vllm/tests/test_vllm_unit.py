@@ -31,6 +31,7 @@ from dynamo.vllm.args import (
     update_engine_config_with_dynamo,
 )
 from dynamo.vllm.constants import DisaggregationMode
+from dynamo.vllm.handlers import _trace_engine_handoff
 from dynamo.vllm.headless import build_headless_namespace
 from dynamo.vllm.tests.conftest import make_cli_args_fixture
 
@@ -59,6 +60,64 @@ pytestmark = [
 # Create vLLM-specific CLI args fixture
 # This will use monkeypatch to write to argv
 mock_vllm_cli = make_cli_args_fixture("dynamo.vllm")
+
+
+def test_worker_engine_handoff_includes_projected_priority_jump(monkeypatch):
+    observed = []
+    monkeypatch.setattr(
+        "dynamo.vllm.handlers.priority_trace.emit",
+        lambda stage, **fields: observed.append((stage, fields)),
+    )
+    context = SimpleNamespace(
+        id=lambda: "request-id",
+        trace_headers=lambda: {"x-request-id": "client-id"},
+    )
+
+    _trace_engine_handoff(
+        context,
+        {"priority": 7, "priority_jump": 7.0, "strict_priority": 1},
+        True,
+        7,
+        -7,
+    )
+    _trace_engine_handoff(
+        context,
+        {"priority_jump": 6.5},
+        False,
+        None,
+        0,
+    )
+
+    assert observed == [
+        (
+            "worker_engine_handoff",
+            {
+                "request_id": "request-id",
+                "client_request_id": "client-id",
+                "priority_present": True,
+                "priority": 7,
+                "priority_jump": 7.0,
+                "strict_priority_present": True,
+                "strict_priority": 1,
+                "engine_priority": -7,
+                "dp_rank": None,
+            },
+        ),
+        (
+            "worker_engine_handoff",
+            {
+                "request_id": "request-id",
+                "client_request_id": "client-id",
+                "priority_present": False,
+                "priority": None,
+                "priority_jump": 6.5,
+                "strict_priority_present": False,
+                "strict_priority": None,
+                "engine_priority": 0,
+                "dp_rank": None,
+            },
+        ),
+    ]
 
 
 def _load_vllm_main() -> ModuleType:
