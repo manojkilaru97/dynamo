@@ -10,13 +10,13 @@ use dynamo_llm::protocols::openai::chat_completions::{
 };
 use dynamo_llm::protocols::openai::completions::NvCreateCompletionRequest;
 use dynamo_protocols::types::{
-    ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
+    ChatCompletionMessageContent, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionStreamOptions,
     CreateChatCompletionRequest,
 };
 use dynamo_protocols::types::{
-    CompletionUsage as AoaiCompletionUsage, CreateCompletionRequestArgs, Prompt,
-    PromptTokensDetails,
+    CompletionUsage as AoaiCompletionUsage, CreateCompletionRequestArgs,
+    FinishReason as ChatFinishReason, Prompt, PromptTokensDetails,
 };
 use dynamo_runtime::engine::{AsyncEngineContext, AsyncEngineStream};
 use dynamo_runtime::protocols::annotated::Annotated;
@@ -212,6 +212,42 @@ fn create_chat_request(
     }
 }
 
+fn backend_chat_chunk(
+    index: u32,
+    text: Option<&str>,
+    finish_reason: Option<FinishReason>,
+) -> BackendOutput {
+    BackendOutput {
+        token_ids: text.map(|_| vec![index + 1]).unwrap_or_default(),
+        tokens: text
+            .map(|text| vec![Some(text.to_string())])
+            .unwrap_or_default(),
+        text: text.map(str::to_string),
+        cum_log_probs: None,
+        log_probs: None,
+        top_logprobs: None,
+        finish_reason,
+        stop_reason: None,
+        index: Some(index),
+        completion_usage: None,
+        disaggregated_params: None,
+        encoder_result: None,
+        worker_trace_link: None,
+        extra_args: None,
+        engine_data: None,
+        routing_data: None,
+    }
+}
+
+fn choice_text(
+    response: &dynamo_llm::protocols::openai::chat_completions::NvCreateChatCompletionStreamResponse,
+) -> Option<&str> {
+    match response.inner.choices.first()?.delta.content.as_ref()? {
+        ChatCompletionMessageContent::Text(text) => Some(text),
+        ChatCompletionMessageContent::Parts(_) => None,
+    }
+}
+
 #[tokio::test]
 async fn test_streaming_without_usage() {
     // Create request without stream_options (usage should not be included)
@@ -273,6 +309,229 @@ async fn test_streaming_without_usage() {
             );
         }
     }
+    let finish_count = content_chunks
+        .iter()
+        .filter_map(|chunk| chunk.data.as_ref())
+        .flat_map(|response| response.inner.choices.iter())
+        .filter(|choice| choice.finish_reason.is_some())
+        .count();
+    assert_eq!(finish_count, 1, "plain text must keep one terminal reason");
+}
+
+#[tokio::test]
+async fn test_structured_json_stream_drains_late_backend_chunks_per_choice() {
+    let mut request = create_chat_request(Some(true), None);
+    request.inner.n = Some(2);
+    request.common.structured_outputs = Some(
+        dynamo_llm::protocols::openai::common_ext::StructuredOutputs {
+            json_object: Some(true),
+            ..Default::default()
+        },
+    );
+    let response_generator = Box::new(request.response_generator("json-n2".to_string()));
+    let backend_outputs = vec![
+        backend_chat_chunk(0, Some(r#"{"a":"#), None),
+        backend_chat_chunk(1, Some(r#"{"b":2}"#), None),
+        backend_chat_chunk(0, Some("1}"), None),
+        backend_chat_chunk(1, Some("ignored-one"), None),
+        backend_chat_chunk(1, None, Some(FinishReason::Length)),
+        backend_chat_chunk(0, Some("ignored-zero"), None),
+        backend_chat_chunk(0, None, Some(FinishReason::Stop)),
+    ];
+    let ctx = Arc::new(MockContext::new());
+    use dynamo_runtime::engine::ResponseStream;
+    let backend_stream = ResponseStream::new(
+        Box::pin(stream::iter(
+            backend_outputs.into_iter().map(Annotated::from_data),
+        )),
+        ctx.clone(),
+    );
+
+    let chunks: Vec<_> = OpenAIPreprocessor::transform_postprocessor_stream(
+        backend_stream,
+        response_generator,
+        ctx,
+        false,
+        false,
+        None,
+        Default::default(),
+    )
+    .collect()
+    .await;
+
+    let responses: Vec<_> = chunks
+        .iter()
+        .filter_map(|chunk| chunk.data.as_ref())
+        .collect();
+    let terminals: Vec<_> = responses
+        .iter()
+        .flat_map(|response| response.inner.choices.iter())
+        .filter_map(|choice| choice.finish_reason.map(|reason| (choice.index, reason)))
+        .collect();
+    assert_eq!(
+        terminals,
+        vec![(1, ChatFinishReason::Stop), (0, ChatFinishReason::Stop),]
+    );
+    let choice_zero: String = responses
+        .iter()
+        .filter(|response| {
+            response
+                .inner
+                .choices
+                .first()
+                .is_some_and(|choice| choice.index == 0)
+        })
+        .filter_map(|response| choice_text(response))
+        .collect();
+    let choice_one: String = responses
+        .iter()
+        .filter(|response| {
+            response
+                .inner
+                .choices
+                .first()
+                .is_some_and(|choice| choice.index == 1)
+        })
+        .filter_map(|response| choice_text(response))
+        .collect();
+    assert_eq!(choice_zero, r#"{"a":1}"#);
+    assert_eq!(choice_one, r#"{"b":2}"#);
+
+    let usage_chunks: Vec<_> = responses
+        .iter()
+        .filter(|response| response.inner.choices.is_empty() && response.inner.usage.is_some())
+        .collect();
+    assert_eq!(usage_chunks.len(), 1);
+    assert_eq!(
+        usage_chunks[0]
+            .inner
+            .usage
+            .as_ref()
+            .unwrap()
+            .completion_tokens,
+        5,
+        "suppressed backend content must still contribute to accounting"
+    );
+}
+
+#[tokio::test]
+async fn test_truncated_structured_json_keeps_backend_terminal_and_usage_tail() {
+    let mut request = create_chat_request(Some(true), None);
+    request.common.structured_outputs = Some(
+        dynamo_llm::protocols::openai::common_ext::StructuredOutputs {
+            json_object: Some(true),
+            ..Default::default()
+        },
+    );
+    let response_generator = Box::new(request.response_generator("json-truncated".to_string()));
+    let outputs = vec![
+        backend_chat_chunk(0, Some(r#"{"answer":"#), None),
+        backend_chat_chunk(0, None, Some(FinishReason::Length)),
+    ];
+    let ctx = Arc::new(MockContext::new());
+    use dynamo_runtime::engine::ResponseStream;
+    let backend_stream = ResponseStream::new(
+        Box::pin(stream::iter(outputs.into_iter().map(Annotated::from_data))),
+        ctx.clone(),
+    );
+
+    let chunks: Vec<_> = OpenAIPreprocessor::transform_postprocessor_stream(
+        backend_stream,
+        response_generator,
+        ctx,
+        false,
+        false,
+        None,
+        Default::default(),
+    )
+    .collect()
+    .await;
+    let responses: Vec<_> = chunks
+        .iter()
+        .filter_map(|chunk| chunk.data.as_ref())
+        .collect();
+    let terminals: Vec<_> = responses
+        .iter()
+        .flat_map(|response| response.inner.choices.iter())
+        .filter_map(|choice| choice.finish_reason)
+        .collect();
+    assert_eq!(terminals, vec![ChatFinishReason::Length]);
+    assert_eq!(
+        responses
+            .iter()
+            .filter_map(|response| choice_text(response))
+            .collect::<String>(),
+        r#"{"answer":"#
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response.inner.choices.is_empty() && response.inner.usage.is_some())
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_tool_request_keeps_plain_backend_stream_unguarded() {
+    let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Use the tool if needed"}],
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look up a value",
+                "parameters": {"type": "object"}
+            }
+        }],
+        "structured_outputs": {"json_object": true}
+    }))
+    .expect("tool request must deserialize");
+    let response_generator = Box::new(request.response_generator("tool-stream".to_string()));
+    let outputs = vec![
+        backend_chat_chunk(0, Some(r#"{"value":1} later"#), None),
+        backend_chat_chunk(0, None, Some(FinishReason::Stop)),
+    ];
+    let ctx = Arc::new(MockContext::new());
+    use dynamo_runtime::engine::ResponseStream;
+    let backend_stream = ResponseStream::new(
+        Box::pin(stream::iter(outputs.into_iter().map(Annotated::from_data))),
+        ctx.clone(),
+    );
+
+    let chunks: Vec<_> = OpenAIPreprocessor::transform_postprocessor_stream(
+        backend_stream,
+        response_generator,
+        ctx,
+        false,
+        false,
+        None,
+        Default::default(),
+    )
+    .collect()
+    .await;
+    let responses: Vec<_> = chunks
+        .iter()
+        .filter_map(|chunk| chunk.data.as_ref())
+        .collect();
+    assert_eq!(
+        responses
+            .iter()
+            .filter_map(|response| choice_text(response))
+            .collect::<String>(),
+        r#"{"value":1} later"#
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .flat_map(|response| response.inner.choices.iter())
+            .filter(|choice| choice.finish_reason.is_some())
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

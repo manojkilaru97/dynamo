@@ -1956,11 +1956,15 @@ async fn response_format_qwen3_prompt_injected_reasoning_then_json_preserves_cha
         .postprocessor_parsing_stream(input_stream, &request, true, false)
         .expect("postprocessor_parsing_stream should build");
     let DrainOutput {
-        reasoning, content, ..
+        reasoning,
+        content,
+        finish_reasons,
+        ..
     } = drain_stream(output_stream).await;
 
     assert_eq!(reasoning.trim(), "France is a country in Europe.");
     assert_eq!(content, json);
+    assert_eq!(finish_reasons, vec![FinishReason::Stop]);
 }
 
 /// If SGLang emits response_format JSON immediately after a prompt-injected

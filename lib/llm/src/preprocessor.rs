@@ -3908,6 +3908,7 @@ impl OpenAIPreprocessor {
 
                     if choice_state.completed {
                         content = None;
+                        choice.finish_reason = None;
                     } else if let Some(text) = content {
                         choice_state.buffer.push_str(&text);
                         if let Some(json) =
@@ -3916,6 +3917,9 @@ impl OpenAIPreprocessor {
                             choice_state.completed = true;
                             choice_state.buffer.clear();
                             content = Some(json);
+                            choice
+                                .finish_reason
+                                .get_or_insert(dynamo_protocols::types::FinishReason::Stop);
                         } else if choice.finish_reason.is_some() && !choice_state.buffer.is_empty()
                         {
                             let buffered = std::mem::take(&mut choice_state.buffer);
@@ -4679,6 +4683,11 @@ mod tests {
             structured_json_guard_delta(1, Some(r#"{"b":"#), None),
             structured_json_guard_delta(0, Some("1}"), None),
             structured_json_guard_delta(1, Some("2}"), None),
+            structured_json_guard_delta(
+                0,
+                Some("ignored"),
+                Some(dynamo_protocols::types::FinishReason::Length),
+            ),
         ]);
         let output: Vec<_> = OpenAIPreprocessor::guard_structured_json_content_from_stream(input)
             .collect()
@@ -4688,6 +4697,15 @@ mod tests {
         assert_eq!(guarded_choice_text(&output[1]), None);
         assert_eq!(guarded_choice_text(&output[2]), Some(r#"{"a":1}"#));
         assert_eq!(guarded_choice_text(&output[3]), Some(r#"{"b":2}"#));
+        assert_eq!(guarded_choice_text(&output[4]), None);
+        assert_eq!(
+            output[2].data.as_ref().unwrap().inner.choices[0].finish_reason,
+            Some(dynamo_protocols::types::FinishReason::Stop)
+        );
+        assert_eq!(
+            output[4].data.as_ref().unwrap().inner.choices[0].finish_reason,
+            None
+        );
 
         let preserved = output[0].data.as_ref().unwrap();
         let preserved_choice = preserved.inner.choices.first().unwrap();

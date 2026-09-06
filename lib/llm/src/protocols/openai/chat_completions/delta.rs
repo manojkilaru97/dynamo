@@ -265,7 +265,7 @@ impl DeltaGenerator {
         }
 
         if self.structured_json_completed.contains(&index) {
-            return (None, finish_reason);
+            return (None, None);
         }
 
         if let Some(text) = text {
@@ -445,8 +445,7 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
     }
 
     fn should_terminate_stream(&self) -> bool {
-        self.options.structured_json_guard
-            && (self.structured_json_completed.len() as u32) >= self.options.expected_choices
+        false
     }
 
     fn get_usage(&self) -> dynamo_protocols::types::CompletionUsage {
@@ -565,7 +564,7 @@ mod tests {
                 Some("late".to_string()),
                 Some(dynamo_protocols::types::FinishReason::Stop)
             ),
-            (None, Some(dynamo_protocols::types::FinishReason::Stop))
+            (None, None)
         );
 
         let mut truncated = request.response_generator("req-json-truncated".to_string());
@@ -625,7 +624,7 @@ mod tests {
                 Some(dynamo_protocols::types::FinishReason::Stop)
             )
         );
-        assert!(DeltaGeneratorExt::should_terminate_stream(&generator));
+        assert!(!DeltaGeneratorExt::should_terminate_stream(&generator));
     }
 
     fn make_request_with_nvext(

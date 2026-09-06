@@ -1189,6 +1189,7 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         // none for audio
         validate::validate_presence_penalty(self.inner.presence_penalty)?;
         validate::validate_response_format(&self.inner.response_format)?;
+        validate::validate_structured_outputs(&self.common.structured_outputs)?;
         // none for seed
         validate::validate_service_tier(&self.inner.service_tier)?;
         validate::validate_stop(&self.inner.stop)?;
@@ -1543,6 +1544,71 @@ mod tests {
 
         assert_eq!(request.get_guided_json(), None);
         assert_eq!(request.get_guided_json_object(), Some(true));
+    }
+
+    #[test]
+    fn test_structured_outputs_request_validation_accepts_each_constraint() {
+        for structured_outputs in [
+            json!({"json": {"type": "object"}}),
+            json!({"json_object": true}),
+            json!({"regex": "[A-Z]+"}),
+            json!({"choice": ["PASS", "FAIL"]}),
+            json!({"grammar": "root ::= \"PASS\""}),
+            json!({"structural_tag": {"type": "structural_tag", "format": {"type": "tag"}}}),
+        ] {
+            let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Answer as requested"}],
+                "structured_outputs": structured_outputs
+            }))
+            .expect("structured request must deserialize");
+
+            ValidateRequest::validate(&request).expect("single constraint must be valid");
+        }
+    }
+
+    #[test]
+    fn test_structured_outputs_request_validation_rejects_invalid_options() {
+        for (structured_outputs, expected) in [
+            (json!({}), "structured_outputs requires one constraint"),
+            (
+                json!({"json": {"type": "object"}, "json_object": true}),
+                "Only one structured_outputs constraint",
+            ),
+            (
+                json!({"choice": ["PASS", ""]}),
+                "structured_outputs.choice cannot contain empty choices",
+            ),
+            (json!({"json": false}), "structured_outputs.json=false"),
+            (json!({"grammar": "root ::= (\"PASS\""}), "Grammar error"),
+        ] {
+            let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Answer as requested"}],
+                "structured_outputs": structured_outputs
+            }))
+            .expect("invalid options must still deserialize");
+
+            let error =
+                ValidateRequest::validate(&request).expect_err("invalid options must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_structured_outputs_validation_adds_no_cross_field_restriction() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Answer as JSON"}],
+            "response_format": {"type": "json_object"},
+            "structured_outputs": {"json": {"type": "object"}}
+        }))
+        .expect("request must deserialize");
+
+        ValidateRequest::validate(&request).expect("each field is independently valid");
     }
 
     #[test]
