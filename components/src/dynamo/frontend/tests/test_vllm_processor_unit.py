@@ -2213,6 +2213,27 @@ class _ThinkingParser:
                 count += 1
         return count
 
+    def create_reasoning_token_counter(self, prompt_token_ids):
+        return _ThinkingTokenCounter(
+            in_reasoning=self.start_token_id in (prompt_token_ids or [])
+        )
+
+
+class _ThinkingTokenCounter:
+    def __init__(self, *, in_reasoning):
+        self.in_reasoning = in_reasoning
+        self.total = 0
+
+    def update(self, token_ids, *, finished=False):
+        for token_id in token_ids:
+            if token_id == _ThinkingParser.start_token_id:
+                self.in_reasoning = True
+            elif token_id == _ThinkingParser.end_token_id:
+                self.in_reasoning = False
+            elif self.in_reasoning:
+                self.total += 1
+        return self.total
+
 
 def _postprocessor_output(text, token_ids, finish_reason=None):
     return SimpleNamespace(
@@ -2273,6 +2294,25 @@ def test_reasoning_token_usage_tracks_only_reasoning_span():
     post.process_output(_postprocessor_output(" done", [24], "stop"))
 
     assert post.num_reasoning_tokens == 2
+
+
+def test_reasoning_token_usage_counter_preserves_state_across_deltas():
+    post = StreamingPostProcessor(
+        tokenizer=_ToolMarkerTokenizer(),
+        request_for_sampling=_plain_request(),
+        sampling_params=SamplingParams(max_tokens=128),
+        prompt_token_ids=[12],
+        tool_parser=None,
+        reasoning_parser_class=_ThinkingParser,
+        chat_template_kwargs={"enable_thinking": True},
+    )
+
+    post.process_output(_postprocessor_output("analysis", [21, 22]))
+    post.process_output(_postprocessor_output(" more", [25]))
+    post.process_output(_postprocessor_output("</think>answer", [13, 23]))
+    post.process_output(_postprocessor_output(" done", [24], "stop"))
+
+    assert post.num_reasoning_tokens == 3
 
 
 def test_completion_usage_includes_reasoning_tokens(vllm_processor_module):
