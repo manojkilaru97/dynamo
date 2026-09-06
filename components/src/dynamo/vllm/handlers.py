@@ -109,6 +109,22 @@ from .priority import engine_priority_from_routing
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 
+DEFAULT_TOOL_CALL_MAX_ARRAY_ITEMS = 8
+DEFAULT_SCHEMA_MAX_STRING_LENGTH = 4096
+DEFAULT_SCHEMA_MAX_ARRAY_ITEMS = 32
+DEFAULT_TOOL_SHORT_TEXT_MAX_LENGTH = 256
+DEFAULT_TOOL_LONG_TEXT_MAX_LENGTH = 8192
+TOOL_LONG_REQUEST_THRESHOLD = 2048
+TOOL_LONG_REQUEST_MARGIN = 512
+TOOL_FIELD_STRING_BUDGETS = {
+    "expression": 256,
+}
+TOOL_LONG_TEXT_FIELD_NAMES = {"body", "content", "message"}
+QWEN_XML_STRUCTURAL_TAG_TOOL_PARSERS = {"qwen3_coder", "qwen3_xml"}
+FORCED_TOOL_STRUCTURAL_TAG_TRIGGERS = ["<tool_call>"]
+UNSUPPORTED_STRUCTURED_REGEX_TOKENS: Final = ("(?=", "(?!", "(?<=", "(?<!")
+TOOL_CHOICE_SCHEMA_MARKER: Final = "x-dynamo-tool-choice-schema"
+
 # Marker set by the Rust conditional-disagg bypass path. When present on a
 # DECODE-mode worker, the request runs as local prefill+decode instead of
 # expecting KV-transfer metadata from an upstream prefill worker.

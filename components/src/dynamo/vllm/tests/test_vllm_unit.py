@@ -1329,6 +1329,156 @@ def test_build_sampling_params_accepts_productive_recursive_guided_json():
     assert sampling_params.structured_outputs.json == schema
 
 
+def test_schema_marker_matches_frontend_without_importing_frontend_from_handler():
+    from dynamo.frontend.vllm_processor import TOOL_CHOICE_SCHEMA_MARKER
+    from dynamo.vllm import handlers
+
+    assert handlers.TOOL_CHOICE_SCHEMA_MARKER == TOOL_CHOICE_SCHEMA_MARKER
+
+
+def test_normalized_response_format_schema_is_bounded_without_mutation():
+    from dynamo.vllm.handlers import build_sampling_params
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "items": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["answer"],
+    }
+    original = json.loads(json.dumps(schema))
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {"guided_decoding": {"json": schema}},
+        "stop_conditions": {},
+        "output_options": {},
+    }
+
+    params = build_sampling_params(request, default_sampling_params={})
+
+    assert schema == original
+    assert params.structured_outputs.json["properties"]["answer"]["maxLength"] == 4096
+    assert params.structured_outputs.json["properties"]["items"]["maxItems"] == 32
+
+
+def test_direct_response_format_schema_is_bounded_without_mutation():
+    from dynamo.vllm.handlers import _structured_outputs_from_openai_request
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "items": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["answer"],
+    }
+    original = json.loads(json.dumps(schema))
+
+    params = _structured_outputs_from_openai_request(
+        {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": schema},
+            }
+        }
+    )
+
+    assert schema == original
+    assert params.json["properties"]["answer"]["maxLength"] == 4096
+    assert params.json["properties"]["items"]["maxItems"] == 32
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        "required",
+        {"type": "function", "function": {"name": "lookup"}},
+    ],
+    ids=["required", "named"],
+)
+def test_forced_tool_schema_marker_exempts_regex_then_is_stripped(tool_choice):
+    from dynamo.frontend.vllm_processor import (
+        TOOL_CHOICE_SCHEMA_MARKER,
+        _tool_choice_guided_json_schema,
+    )
+    from dynamo.vllm.handlers import _structured_outputs_from_fields
+
+    request = {
+        "messages": [{"role": "user", "content": "Look it up"}],
+        "tool_choice": tool_choice,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "pattern": "(?=generated-tool-pattern)",
+                            }
+                        },
+                        "required": ["query"],
+                    },
+                },
+            }
+        ],
+    }
+    schema = _tool_choice_guided_json_schema(request)
+    original = json.loads(json.dumps(schema))
+
+    params = _structured_outputs_from_fields({"json": schema})
+
+    assert schema == original
+    assert schema[TOOL_CHOICE_SCHEMA_MARKER] is True
+    assert TOOL_CHOICE_SCHEMA_MARKER not in params.json
+    assert "(?=generated-tool-pattern)" in json.dumps(params.json)
+
+
+@pytest.mark.parametrize("tool_choice", [None, "none", "auto"])
+def test_unforced_tool_choices_do_not_add_structured_output(tool_choice):
+    from dynamo.frontend.vllm_processor import _tool_choice_guided_json_schema
+    from dynamo.vllm.handlers import _structured_outputs_from_openai_request
+
+    request = {
+        "tool_choice": tool_choice,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+    }
+
+    assert _tool_choice_guided_json_schema(request) is None
+    assert _structured_outputs_from_openai_request(request) is None
+
+
+def test_unmarked_response_format_rejects_unsupported_regex():
+    from dynamo.vllm.handlers import _structured_outputs_from_openai_request
+
+    with pytest.raises(ValueError, match="lookaround assertions"):
+        _structured_outputs_from_openai_request(
+            {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "schema": {
+                            "type": "string",
+                            "pattern": "(?=unsupported)",
+                        },
+                    },
+                }
+            }
+        )
+
+
 def test_build_sampling_params_caps_omitted_max_tokens_to_generation_default():
     from dynamo.vllm.handlers import build_sampling_params
 
