@@ -2394,7 +2394,7 @@ def test_tool_markup_is_removed_without_frontend_parser():
     assert delta == {"reasoning_content": "Need the file."}
 
 
-def test_terminal_reasoning_only_stream_gets_nonempty_content_fallback():
+def test_terminal_reasoning_only_stream_does_not_duplicate_reasoning_as_content():
     post = StreamingPostProcessor(
         tokenizer=_ToolMarkerTokenizer(),
         request_for_sampling=SimpleNamespace(
@@ -2415,7 +2415,7 @@ def test_terminal_reasoning_only_stream_gets_nonempty_content_fallback():
         SimpleNamespace(index=0, finish_reason="length", logprobs=None), {}
     )
 
-    assert choice["delta"]["content"] == post._emitted_reasoning_text
+    assert "content" not in choice["delta"]
     assert choice["finish_reason"] == "length"
 
 

@@ -1149,16 +1149,6 @@ class StreamingPostProcessor:
         ):
             delta.pop("content")
             self._emitted_content_text = ""
-        if (
-            output.finish_reason
-            and not delta.get("content")
-            and not delta.get("tool_calls")
-            and not self.in_progress_tool_calls
-            and not self._emitted_content_text
-            and self._emitted_reasoning_text
-        ):
-            delta["content"] = self._emitted_reasoning_text
-            self._emitted_content_text = self._emitted_reasoning_text
         self._strip_tool_markup_from_delta(delta)
         if delta.get("tool_calls"):
             self._tool_call_choices_emitted.add(output.index)
