@@ -3,6 +3,7 @@
 
 [workspace]
 members = [
+    "lib/vendor/dynamo-parsers",
     "lib/llm",
     "lib/rl",
     "lib/runtime",
@@ -59,12 +60,12 @@ dynamo-memory = { path = "lib/memory", version = "1.4.1" }
 dynamo-mocker = { path = "lib/mocker", version = "1.4.1" }
 dynamo-kv-router = { path = "lib/kv-router", version = "1.4.1" }
 dynamo-protocols = { version = "=5.0.1" }
-dynamo-parsers = { version = "7.0.1" }
+dynamo-parsers = { version = "=7.0.1" }
 
 # Published on crates.io. To see all available versions:
 #   web:          https://crates.io/crates/dynamo-parsers-v2/versions
 #   sparse index: curl https://index.crates.io/dy/na/dynamo-parsers-v2   (one JSON line per release; read the "vers" field)
-dynamo-parsers-v2 = { version = "0.1.23" }
+dynamo-parsers-v2 = { version = "0.1.23", path = "lib/vendor/dynamo-parsers-v2" }
 dynamo-backend-common = { path = "lib/backend-common", version = "1.4.1" }
 dynamo-sidecar-common = { path = "lib/sidecar/common", version = "1.4.1" }
 fastokens = { version = "0.2.0" }
@@ -203,3 +204,6 @@ lto = "thin"
 inherits = "release"
 debug = true
 strip = false
+
+[patch.crates-io]
+dynamo-parsers = { path = "lib/vendor/dynamo-parsers" }
