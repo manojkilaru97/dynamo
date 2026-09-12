@@ -181,6 +181,16 @@ def test_decode_matches_frame_contract(monkeypatch):
     assert meta["fps"] == 30.0
 
 
+def test_frame_to_rgb_hwc_copies_reused_host_buffer():
+    source = np.zeros((2, 3, 3), dtype=np.uint8)
+
+    frame = nd._frame_to_rgb_hwc(source)
+    source.fill(255)
+
+    assert np.all(frame == 0)
+    assert not np.shares_memory(frame, source)
+
+
 def test_decode_samples_uniformly(monkeypatch):
     monkeypatch.setitem(sys.modules, "PyNvVideoCodec", _fake_pynv(num_frames=100))
     monkeypatch.setattr(

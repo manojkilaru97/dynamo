@@ -361,6 +361,77 @@ def test_build_tokens_prompt_forwards_hashes_kwargs_and_vision_chunk():
     assert prompt["mm_processor_kwargs"] == {"num_crops": 4}
 
 
+def test_build_tokens_prompt_restores_text_marker_for_raw_video():
+    tokenizer = SimpleNamespace(decode=MagicMock(return_value="user: <video>\n"))
+    processor = _processor()
+    processor.engine_client = SimpleNamespace(
+        tokenizer=SimpleNamespace(tokenizer=tokenizer)
+    )
+    video = object()
+
+    prompt = processor.build_tokens_prompt(
+        {"token_ids": [1, 2, 3]},
+        {"video": video},
+        {"fps": 2},
+    )
+
+    tokenizer.decode.assert_called_once_with([1, 2, 3], skip_special_tokens=False)
+    assert prompt["prompt"] == "user: \n<video>\n"
+    assert prompt["multi_modal_data"] == {"video": video}
+    assert prompt["mm_processor_kwargs"] == {"fps": 2}
+
+
+def test_build_tokens_prompt_prefers_frontend_rendered_prompt_for_raw_video():
+    tokenizer = SimpleNamespace(decode=MagicMock(return_value="wrong"))
+    processor = _processor()
+    processor.engine_client = SimpleNamespace(
+        tokenizer=SimpleNamespace(tokenizer=tokenizer)
+    )
+    rendered = "<|im_start|>user\nquestion<video><|im_end|>\n"
+
+    prompt = processor.build_tokens_prompt(
+        {
+            "token_ids": [1, 2, 3],
+            "extra_args": {"formatted_prompt": rendered},
+        },
+        {"video": object()},
+        None,
+    )
+
+    tokenizer.decode.assert_not_called()
+    assert prompt["prompt"] == rendered.replace("question<video>", "question\n<video>")
+
+
+def test_build_tokens_prompt_separates_existing_video_marker_boundary():
+    processor = _processor()
+    rendered = "<|im_start|>user\nDescribe this clip.<video><|im_end|>\n"
+
+    prompt = processor.build_tokens_prompt(
+        {
+            "token_ids": [1, 2, 3],
+            "extra_args": {"formatted_prompt": rendered},
+        },
+        {"video": object()},
+        None,
+    )
+
+    assert "Describe this clip.\n<video>" in prompt["prompt"]
+
+
+def test_build_tokens_prompt_raw_video_preserves_legacy_token_fallback():
+    processor = _processor()
+
+    video = object()
+    prompt = processor.build_tokens_prompt(
+        {"token_ids": [1, 2, 3]},
+        {"video": video},
+        None,
+    )
+
+    assert prompt["prompt_token_ids"] == [1, 2, 3]
+    assert prompt["multi_modal_data"] == {"video": video}
+
+
 def test_build_tokens_prompt_prefers_opaque_user_uuids_without_padding():
     processor = _processor()
     mm_data = {"image": [object(), None]}

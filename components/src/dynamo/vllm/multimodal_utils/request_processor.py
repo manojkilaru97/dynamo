@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
-from vllm.inputs import TokensPrompt
+from vllm.inputs import TextPrompt, TokensPrompt
 from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
 
 from dynamo.common.constants import DisaggregationMode
@@ -48,6 +48,29 @@ IMAGE_URL_KEY = "image_url"
 VIDEO_URL_KEY = "video_url"
 AUDIO_URL_KEY = "audio_url"
 URL_VARIANT_KEY = "Url"
+
+
+def _separate_video_marker_token_boundaries(prompt: str) -> str:
+    """Prevent BPE from merging preceding text with the ``<video>`` opener.
+
+    Nano Nemotron's processor locates video placeholders by the tokenization of
+    the standalone marker. For example, ``.<video>`` tokenizes with a merged
+    ``.<`` token and therefore cannot match that sequence. A newline preserves
+    message meaning while giving the marker the required standalone boundary.
+    """
+    marker = "<video>"
+    pieces: list[str] = []
+    cursor = 0
+    while True:
+        marker_idx = prompt.find(marker, cursor)
+        if marker_idx < 0:
+            pieces.append(prompt[cursor:])
+            return "".join(pieces)
+        pieces.append(prompt[cursor:marker_idx])
+        if marker_idx > 0 and prompt[marker_idx - 1] != "\n":
+            pieces.append("\n")
+        pieces.append(marker)
+        cursor = marker_idx + len(marker)
 
 
 def pad_mm_hashes_to_64(
@@ -605,8 +628,16 @@ class VllmMultimodalRequestProcessor:
         request: dict[str, Any],
         multi_modal_data: Optional[dict[str, Any]],
         mm_processor_kwargs: Optional[dict[str, Any]],
-    ) -> TokensPrompt:
-        """Create a TokensPrompt with stable multimodal UUIDs."""
+    ) -> TextPrompt | TokensPrompt:
+        """Create an engine prompt with stable multimodal UUIDs.
+
+        Video processors may expand a textual ``<video>`` marker into the
+        model's actual placeholder-token sequence.  Dynamo's default frontend
+        sends token IDs plus its exact rendered prompt in ``extra_args``.  Use
+        that authoritative prompt for raw video, falling back to decoding only
+        for older frontends.  Text and image requests retain the existing
+        token-input path.
+        """
         extra_args = request.get("extra_args") or {}
         mm_uuids = _build_user_mm_uuids(
             request.get("multi_modal_uuids"),
@@ -625,14 +656,42 @@ class VllmMultimodalRequestProcessor:
                     "image UUIDs may not match routing decisions"
                 )
 
-        prompt_kwargs: dict[str, Any] = {
-            "prompt_token_ids": request["token_ids"],
-            "multi_modal_data": multi_modal_data,
-        }
+        prompt_kwargs: dict[str, Any]
+        if multi_modal_data and multi_modal_data.get("video") is not None:
+            formatted_prompt = extra_args.get("formatted_prompt")
+            if not isinstance(formatted_prompt, str):
+                tokenizer_group = getattr(self.engine_client, "tokenizer", None)
+                tokenizer = getattr(tokenizer_group, "tokenizer", tokenizer_group)
+                if tokenizer is not None and hasattr(tokenizer, "decode"):
+                    formatted_prompt = tokenizer.decode(
+                        request["token_ids"], skip_special_tokens=False
+                    )
+            if isinstance(formatted_prompt, str):
+                formatted_prompt = _separate_video_marker_token_boundaries(
+                    formatted_prompt
+                )
+                prompt_kwargs = {
+                    "prompt": formatted_prompt,
+                    "multi_modal_data": multi_modal_data,
+                }
+            else:
+                # Preserve the legacy token-input behavior for older frontends
+                # and engine clients that do not expose a tokenizer.
+                prompt_kwargs = {
+                    "prompt_token_ids": request["token_ids"],
+                    "multi_modal_data": multi_modal_data,
+                }
+        else:
+            prompt_kwargs = {
+                "prompt_token_ids": request["token_ids"],
+                "multi_modal_data": multi_modal_data,
+            }
         if mm_uuids is not None:
             prompt_kwargs["multi_modal_uuids"] = mm_uuids
         if mm_processor_kwargs is not None:
             prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        if "prompt" in prompt_kwargs:
+            return TextPrompt(**prompt_kwargs)
         return TokensPrompt(**prompt_kwargs)
 
     async def prepare_input(

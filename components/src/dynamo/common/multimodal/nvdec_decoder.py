@@ -169,7 +169,11 @@ def _frame_to_rgb_hwc(frame) -> np.ndarray:
         tensor = torch.from_dlpack(frame)
     except Exception:  # noqa: BLE001 - fall back to the CUDA-array-interface path
         tensor = torch.as_tensor(frame, device="cuda")
-    arr = tensor.cpu().numpy()
+    # ``use_device_memory=False`` yields a host tensor whose ``.cpu()`` is a
+    # no-op. PyNvVideoCodec reuses that host decode buffer for later frames, so
+    # returning the NumPy view aliases every sampled frame to the last decode.
+    # Always take the copy promised by this function's contract.
+    arr = tensor.cpu().numpy().copy()
     if arr.dtype != np.uint8:
         arr = arr.astype(np.uint8)
     return arr
