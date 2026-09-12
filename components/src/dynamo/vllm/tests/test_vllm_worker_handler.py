@@ -68,6 +68,8 @@ def _make_config(
     config.engine_args.create_model_config.return_value.get_diff_sampling_param.return_value = (
         {}
     )
+    config.engine_args.reasoning_parser = None
+    config.engine_args.reasoning_parser_plugin = None
     return config
 
 
@@ -98,6 +100,8 @@ def _make_handler(
     # BaseWorkerHandler.__init__ is bypassed above; the decode generate path
     # registers per-request deferred-abort guards here.
     handler._deferred_aborts = {}
+    handler._reasoning_parser_class = None
+    handler._reasoning_tokenizer = None
     return handler
 
 
@@ -174,6 +178,144 @@ async def test_clear_kv_blocks_reports_reset_failure():
 
 
 class TestReasoningParserForwarding:
+    @pytest.mark.asyncio
+    async def test_generate_tokens_reports_reasoning_token_usage(self):
+        from vllm.sampling_params import SamplingParams
+
+        class CountingReasoningParser:
+            start_token_id = 10
+            end_token_id = 20
+
+            def __init__(self, tokenizer):
+                assert tokenizer == "tokenizer"
+
+        handler = _make_handler()
+        handler._reasoning_parser_class = CountingReasoningParser
+        handler._reasoning_tokenizer = "tokenizer"
+        handler._extract_logprobs = MagicMock(return_value=(None, None))
+
+        async def fake_generate(*args, **kwargs):
+            yield SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        index=0,
+                        token_ids=[31, 32],
+                        routed_experts=None,
+                        finish_reason=None,
+                        stop_reason=None,
+                    ),
+                    SimpleNamespace(
+                        index=1,
+                        token_ids=[41],
+                        routed_experts=None,
+                        finish_reason=None,
+                        stop_reason=None,
+                    ),
+                ],
+                prompt_token_ids=[1, 2],
+                prompt_logprobs=None,
+                num_cached_tokens=0,
+            )
+            yield SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        index=0,
+                        token_ids=[20, 51],
+                        routed_experts=None,
+                        finish_reason="stop",
+                        stop_reason=None,
+                    ),
+                    SimpleNamespace(
+                        index=1,
+                        token_ids=[42],
+                        routed_experts=None,
+                        finish_reason=None,
+                        stop_reason=None,
+                    ),
+                ],
+                prompt_token_ids=[1, 2],
+                prompt_logprobs=None,
+                num_cached_tokens=0,
+            )
+            yield SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        index=1,
+                        token_ids=[20, 61],
+                        routed_experts=None,
+                        finish_reason="stop",
+                        stop_reason=None,
+                    ),
+                ],
+                prompt_token_ids=[1, 2],
+                prompt_logprobs=None,
+                num_cached_tokens=0,
+            )
+
+        handler.engine_client = MagicMock()
+        handler.engine_client.generate = fake_generate
+
+        chunks = [
+            chunk
+            async for chunk in handler.generate_tokens(
+                PatchedTokensPrompt(prompt_token_ids=[1, 10]),
+                SamplingParams(max_tokens=8, n=2),
+                "req-reasoning-usage",
+            )
+        ]
+
+        assert chunks[-1]["completion_usage"]["completion_tokens_details"] == {
+            "reasoning_tokens": 4
+        }
+
+    @pytest.mark.asyncio
+    async def test_generate_tokens_reports_zero_when_prompt_closes_thinking(self):
+        from vllm.sampling_params import SamplingParams
+
+        class CountingReasoningParser:
+            start_token_id = 10
+            end_token_id = 20
+
+            def __init__(self, tokenizer):
+                assert tokenizer == "tokenizer"
+
+        handler = _make_handler()
+        handler._reasoning_parser_class = CountingReasoningParser
+        handler._reasoning_tokenizer = "tokenizer"
+        handler._extract_logprobs = MagicMock(return_value=(None, None))
+
+        async def fake_generate(*args, **kwargs):
+            yield SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        index=0,
+                        token_ids=[31, 32],
+                        routed_experts=None,
+                        finish_reason="stop",
+                        stop_reason=None,
+                    )
+                ],
+                prompt_token_ids=[1, 10, 20],
+                prompt_logprobs=None,
+                num_cached_tokens=0,
+            )
+
+        handler.engine_client = MagicMock()
+        handler.engine_client.generate = fake_generate
+
+        chunks = [
+            chunk
+            async for chunk in handler.generate_tokens(
+                PatchedTokensPrompt(prompt_token_ids=[1, 10, 20]),
+                SamplingParams(max_tokens=2),
+                "req-reasoning-disabled-usage",
+            )
+        ]
+
+        assert chunks[-1]["completion_usage"]["completion_tokens_details"] == {
+            "reasoning_tokens": 0
+        }
+
     def test_request_reasoning_metadata_reads_extra_args(self):
         request = {
             "extra_args": {

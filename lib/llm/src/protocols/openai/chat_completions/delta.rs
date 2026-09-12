@@ -38,7 +38,16 @@ impl NvCreateChatCompletionRequest {
         );
         options.structured_json_guard = self.uses_pure_json_structured_output();
         options.expected_choices = self.inner.n.unwrap_or(1).max(1) as u32;
-        DeltaGenerator::new(self.inner.model.clone(), options, request_id)
+        let mut generator = DeltaGenerator::new(self.inner.model.clone(), options, request_id);
+        if dynamo_renderer::thinking_bool_from_args(self.chat_template_args.as_ref()) == Some(false)
+        {
+            generator.usage.completion_tokens_details =
+                Some(dynamo_protocols::types::CompletionTokensDetails {
+                    reasoning_tokens: Some(0),
+                    ..Default::default()
+                });
+        }
+        generator
     }
 }
 
@@ -515,6 +524,23 @@ mod tests {
             !request.inner.stream_options.unwrap().continuous_usage_stats,
             "Non-streaming request should have continuous_usage_stats=false for OpenAI compliance"
         );
+    }
+
+    #[test]
+    fn test_disabled_thinking_initializes_zero_reasoning_usage() {
+        let mut request = create_test_request();
+        request.chat_template_args = Some(HashMap::from([(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
+        )]));
+
+        let generator = request.response_generator("req-no-thinking".to_string());
+        let details = generator
+            .get_usage()
+            .completion_tokens_details
+            .expect("disabled thinking must expose zero reasoning usage");
+
+        assert_eq!(details.reasoning_tokens, Some(0));
     }
 
     #[test]

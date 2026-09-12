@@ -36,6 +36,7 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
+from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
 from vllm.renderers.embed_utils import safe_load_prompt_embeds
 from vllm.sampling_params import (
     RequestOutputKind,
@@ -106,6 +107,7 @@ from .multimodal_utils.vision_encoder_backend import VisionEncoderBackend
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
+TOOL_CHOICE_SCHEMA_MARKER = "x-dynamo-tool-choice-schema"
 
 # Marker set by the Rust conditional-disagg bypass path. When present on a
 # DECODE-mode worker, the request runs as local prefill+decode instead of
@@ -852,6 +854,46 @@ def _value_from_mapping_or_object(obj: Any, key: str, default: Any = None) -> An
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+class _ThinkingTokenCounter:
+    """Bounded per-choice counter for start/end-token reasoning parsers."""
+
+    def __init__(self, start_token_id: int, end_token_id: int, in_reasoning: bool):
+        self.start_token_id = start_token_id
+        self.end_token_id = end_token_id
+        self.in_reasoning = in_reasoning
+        self.total = 0
+
+    @classmethod
+    def from_prompt(
+        cls, start_token_id: int, end_token_id: int, prompt_token_ids: Any
+    ) -> "_ThinkingTokenCounter":
+        in_reasoning = False
+        # Only the last unmatched marker determines the generated suffix state.
+        # Search backward so the normal chat-template marker near the prompt tail
+        # does not add a second full-prompt scan or allocation.
+        for token_id in reversed(prompt_token_ids):
+            if token_id == start_token_id:
+                in_reasoning = True
+                break
+            if token_id == end_token_id:
+                break
+        return cls(start_token_id, end_token_id, in_reasoning)
+
+    def clone_initial(self) -> "_ThinkingTokenCounter":
+        return _ThinkingTokenCounter(
+            self.start_token_id, self.end_token_id, self.in_reasoning
+        )
+
+    def update(self, token_ids: list[int]) -> None:
+        for token_id in token_ids:
+            if token_id == self.start_token_id:
+                self.in_reasoning = True
+            elif token_id == self.end_token_id:
+                self.in_reasoning = False
+            elif self.in_reasoning:
+                self.total += 1
 
 
 def bound_json_schema_for_constrained_decoding(
@@ -1728,6 +1770,20 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         self.temp_dirs: list[tempfile.TemporaryDirectory] = []
         self.model_max_len = model_max_len
         self.model_config = model_config
+        reasoning_parser_plugin = config.engine_args.reasoning_parser_plugin
+        if reasoning_parser_plugin:
+            ReasoningParserManager.import_reasoning_parser(reasoning_parser_plugin)
+        reasoning_parser_name = config.engine_args.reasoning_parser
+        self._reasoning_parser_class = (
+            ReasoningParserManager.get_reasoning_parser(reasoning_parser_name)
+            if reasoning_parser_name is not None
+            else None
+        )
+        self._reasoning_tokenizer = (
+            getattr(engine, "tokenizer", None)
+            if self._reasoning_parser_class is not None
+            else None
+        )
         # LoRA tracking: name -> LoRAInfo(id, path)
         self.loaded_loras: dict[str, LoRAInfo] = {}
         # Adapters known to have been handed to vLLM. Prefill registration is
@@ -3349,6 +3405,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
     def _build_completion_usage(
         request_output: RequestOutput,
         completion_token_counts: dict[int, int] | None = None,
+        reasoning_tokens: int | None = None,
     ) -> Dict[str, Any]:
         """
         Build completion usage statistics.
@@ -3375,7 +3432,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 len(output.token_ids) for output in request_output.outputs
             )
 
-        return {
+        usage = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": (
@@ -3385,6 +3442,28 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 getattr(request_output, "num_cached_tokens", None)
             ),
         }
+        if reasoning_tokens is not None:
+            usage["completion_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
+        return usage
+
+    def _new_reasoning_token_counter(self, prompt: Any) -> _ThinkingTokenCounter | None:
+        if self._reasoning_parser_class is None or self._reasoning_tokenizer is None:
+            return None
+        parser = self._reasoning_parser_class(self._reasoning_tokenizer)
+        start_token_id = getattr(parser, "start_token_id", None)
+        end_token_id = getattr(parser, "end_token_id", None)
+        prompt_token_ids = _value_from_mapping_or_object(
+            prompt, "prompt_token_ids", None
+        )
+        if (
+            not isinstance(start_token_id, int)
+            or not isinstance(end_token_id, int)
+            or prompt_token_ids is None
+        ):
+            return None
+        return _ThinkingTokenCounter.from_prompt(
+            start_token_id, end_token_id, prompt_token_ids
+        )
 
     @staticmethod
     def _extract_logprobs(
@@ -3471,6 +3550,8 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             )
 
             total_output_tokens_by_index: dict[int, int] = {}
+            reasoning_counter_seed = self._new_reasoning_token_counter(prompt)
+            reasoning_counters_by_index: dict[int, _ThinkingTokenCounter] = {}
             raw_routed_experts_by_output: dict[int, Any] = {}
             # vLLM surfaces prompt_logprobs once (at end-of-prefill) and clears
             # them on subsequent chunks, so the generation-finish chunk often
@@ -3509,6 +3590,12 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                     total_output_tokens_by_index[
                         output_idx
                     ] = total_output_tokens_by_index.get(output_idx, 0) + len(token_ids)
+                    if reasoning_counter_seed is not None:
+                        counter = reasoning_counters_by_index.get(output_idx)
+                        if counter is None:
+                            counter = reasoning_counter_seed.clone_initial()
+                            reasoning_counters_by_index[output_idx] = counter
+                        counter.update(token_ids)
                     finish_reason = getattr(output, "finish_reason", None)
                     stop_reason = getattr(output, "stop_reason", None)
                     if not token_ids and not finish_reason and not stop_reason:
@@ -3553,6 +3640,14 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                         ] = BaseWorkerHandler._build_completion_usage(
                             request_output=res,
                             completion_token_counts=total_output_tokens_by_index,
+                            reasoning_tokens=(
+                                sum(
+                                    counter.total
+                                    for counter in reasoning_counters_by_index.values()
+                                )
+                                if reasoning_counter_seed is not None
+                                else None
+                            ),
                         )
                         if prompt_logprobs_payload is not None:
                             _attach_prompt_logprobs_engine_data(

@@ -44,7 +44,7 @@ use dynamo_runtime::metrics::frontend_perf::{
 };
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Write,
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
@@ -3388,6 +3388,10 @@ impl OpenAIPreprocessor {
         }
         let pending = Arc::new(Mutex::new(PendingMetrics::default()));
         let pending_in = Arc::clone(&pending);
+        let suppress_qwen_tool_framing_whitespace =
+            tool_call_parser.as_deref() == Some("qwen3_coder");
+        let mut choices_with_tool_calls = HashSet::new();
+        let mut pending_tool_whitespace = HashMap::new();
 
         // dynamo `Annotated<Nv>` -> jail `Annotated<Create>` (buffer llm_metrics)
         let jail_input = stream.map(move |mut a| {
@@ -3425,18 +3429,84 @@ impl OpenAIPreprocessor {
                     metrics
                 })
             });
+            let mut data = a.data.map(|inner| NvCreateChatCompletionStreamResponse {
+                inner,
+                nvext: None,
+                llm_metrics,
+            });
+            if suppress_qwen_tool_framing_whitespace && let Some(response) = data.as_mut() {
+                Self::normalize_qwen_tool_framing_whitespace(
+                    response,
+                    &mut choices_with_tool_calls,
+                    &mut pending_tool_whitespace,
+                );
+            }
             Annotated {
-                data: a.data.map(|inner| NvCreateChatCompletionStreamResponse {
-                    inner,
-                    nvext: None,
-                    llm_metrics,
-                }),
+                data,
                 id: a.id,
                 event: a.event,
                 comment: a.comment,
                 error: a.error.map(DynamoError::msg),
             }
         })
+    }
+
+    fn normalize_qwen_tool_framing_whitespace(
+        response: &mut NvCreateChatCompletionStreamResponse,
+        choices_with_tool_calls: &mut HashSet<u32>,
+        pending_tool_whitespace: &mut HashMap<u32, String>,
+    ) {
+        for choice in &mut response.inner.choices {
+            let has_tool_calls = choice
+                .delta
+                .tool_calls
+                .as_ref()
+                .is_some_and(|tool_calls| !tool_calls.is_empty());
+            let follows_tool_call = choices_with_tool_calls.contains(&choice.index);
+            let finishes_tool_calls = matches!(
+                choice.finish_reason,
+                Some(dynamo_protocols::types::FinishReason::ToolCalls)
+            );
+            match choice.delta.content.take() {
+                Some(ChatCompletionMessageContent::Text(text))
+                    if !text.is_empty()
+                        && text.chars().all(char::is_whitespace)
+                        && (follows_tool_call || has_tool_calls) =>
+                {
+                    if finishes_tool_calls {
+                        pending_tool_whitespace.remove(&choice.index);
+                    } else {
+                        pending_tool_whitespace
+                            .entry(choice.index)
+                            .or_default()
+                            .push_str(&text);
+                    }
+                    choice.delta.content = None;
+                }
+                Some(ChatCompletionMessageContent::Text(mut text)) => {
+                    if let Some(prefix) = pending_tool_whitespace.remove(&choice.index) {
+                        text.insert_str(0, &prefix);
+                    }
+                    choice.delta.content = Some(ChatCompletionMessageContent::Text(text));
+                }
+                other => {
+                    choice.delta.content = other;
+                    if has_tool_calls {
+                        // Whitespace separating two parsed calls is framing.
+                        pending_tool_whitespace.remove(&choice.index);
+                    } else if choice.finish_reason.is_some() {
+                        if finishes_tool_calls {
+                            pending_tool_whitespace.remove(&choice.index);
+                        } else if let Some(text) = pending_tool_whitespace.remove(&choice.index) {
+                            choice.delta.content = Some(ChatCompletionMessageContent::Text(text));
+                        }
+                    }
+                }
+            }
+            if has_tool_calls {
+                choices_with_tool_calls.insert(choice.index);
+            }
+        }
     }
 
     /// Whether the selected tool-call or reasoning parser depends on the
@@ -4291,6 +4361,30 @@ impl
             &self.formatter,
             &self.tokenizer,
         );
+
+        let final_stream: Pin<Box<dyn Stream<Item = _> + Send>> =
+            if self.tool_call_parser.as_deref() == Some("qwen3_coder")
+                && request
+                    .inner
+                    .tools
+                    .as_ref()
+                    .is_some_and(|tools| !tools.is_empty())
+            {
+                let mut choices_with_tool_calls = HashSet::new();
+                let mut pending_tool_whitespace = HashMap::new();
+                Box::pin(final_stream.map(move |mut annotation| {
+                    if let Some(response) = annotation.data.as_mut() {
+                        Self::normalize_qwen_tool_framing_whitespace(
+                            response,
+                            &mut choices_with_tool_calls,
+                            &mut pending_tool_whitespace,
+                        );
+                    }
+                    annotation
+                }))
+            } else {
+                final_stream
+            };
 
         let final_stream = crate::request_trace::wrap_chat_request_end_stream(
             final_stream,
@@ -6287,5 +6381,193 @@ mod tests {
             s3a, s3b,
             "s3:// query params identify objects and must not collide"
         );
+    }
+
+    fn qwen_tool_whitespace_test_chunk(
+        index: u32,
+        content: Option<&str>,
+        has_tool_call: bool,
+        finish_reason: Option<&str>,
+    ) -> NvCreateChatCompletionStreamResponse {
+        let tool_calls = has_tool_call.then(|| {
+            serde_json::json!([{
+                "index": 0,
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{}"}
+            }])
+        });
+        serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": index,
+                "delta": {
+                    "content": content,
+                    "tool_calls": tool_calls
+                },
+                "finish_reason": finish_reason,
+                "logprobs": null
+            }]
+        }))
+        .expect("valid chat completion chunk")
+    }
+
+    fn qwen_tool_whitespace_content(
+        response: &NvCreateChatCompletionStreamResponse,
+    ) -> Option<&str> {
+        match response.inner.choices[0].delta.content.as_ref() {
+            Some(ChatCompletionMessageContent::Text(text)) => Some(text),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn qwen_tool_framing_whitespace_is_dropped_on_tool_finish() {
+        let mut choices_with_tool_calls = HashSet::new();
+        let mut pending_tool_whitespace = HashMap::new();
+
+        let mut tool = qwen_tool_whitespace_test_chunk(0, Some(""), true, None);
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut tool,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+        let mut whitespace = qwen_tool_whitespace_test_chunk(0, Some("\n"), false, None);
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut whitespace,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+        assert_eq!(qwen_tool_whitespace_content(&whitespace), None);
+
+        let mut finish = qwen_tool_whitespace_test_chunk(0, None, false, Some("tool_calls"));
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut finish,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+        assert_eq!(qwen_tool_whitespace_content(&finish), None);
+        assert!(pending_tool_whitespace.is_empty());
+    }
+
+    #[test]
+    fn qwen_tool_whitespace_is_preserved_before_later_text() {
+        let mut choices_with_tool_calls = HashSet::new();
+        let mut pending_tool_whitespace = HashMap::new();
+
+        let mut tool = qwen_tool_whitespace_test_chunk(0, Some(""), true, None);
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut tool,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+        let mut whitespace = qwen_tool_whitespace_test_chunk(0, Some("\n"), false, None);
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut whitespace,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+        let mut text = qwen_tool_whitespace_test_chunk(0, Some("answer"), false, None);
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut text,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+
+        assert_eq!(qwen_tool_whitespace_content(&text), Some("\nanswer"));
+        assert!(pending_tool_whitespace.is_empty());
+    }
+
+    #[test]
+    fn qwen_terminal_tool_whitespace_is_dropped() {
+        let mut choices_with_tool_calls = HashSet::new();
+        let mut pending_tool_whitespace = HashMap::new();
+
+        let mut tool = qwen_tool_whitespace_test_chunk(0, None, true, None);
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut tool,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+        let mut finish = qwen_tool_whitespace_test_chunk(0, Some("\n"), false, Some("tool_calls"));
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut finish,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+
+        assert_eq!(qwen_tool_whitespace_content(&finish), None);
+        assert!(pending_tool_whitespace.is_empty());
+    }
+
+    #[test]
+    fn qwen_pending_whitespace_is_preserved_with_content_and_tool_call() {
+        let mut choices_with_tool_calls = HashSet::new();
+        let mut pending_tool_whitespace = HashMap::new();
+
+        let mut first_tool = qwen_tool_whitespace_test_chunk(0, None, true, None);
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut first_tool,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+        let mut whitespace = qwen_tool_whitespace_test_chunk(0, Some("\n"), false, None);
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut whitespace,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+        let mut content_and_tool = qwen_tool_whitespace_test_chunk(0, Some("answer"), true, None);
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut content_and_tool,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+
+        assert_eq!(
+            qwen_tool_whitespace_content(&content_and_tool),
+            Some("\nanswer")
+        );
+        assert!(pending_tool_whitespace.is_empty());
+    }
+
+    #[test]
+    fn qwen_tool_whitespace_state_is_isolated_by_choice() {
+        let mut choices_with_tool_calls = HashSet::new();
+        let mut pending_tool_whitespace = HashMap::new();
+
+        let mut tool_choice_zero = qwen_tool_whitespace_test_chunk(0, None, true, None);
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut tool_choice_zero,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+        let mut whitespace_choice_zero =
+            qwen_tool_whitespace_test_chunk(0, Some("\n"), false, None);
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut whitespace_choice_zero,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+        let mut whitespace_choice_one = qwen_tool_whitespace_test_chunk(1, Some("\t"), false, None);
+        OpenAIPreprocessor::normalize_qwen_tool_framing_whitespace(
+            &mut whitespace_choice_one,
+            &mut choices_with_tool_calls,
+            &mut pending_tool_whitespace,
+        );
+
+        assert_eq!(qwen_tool_whitespace_content(&whitespace_choice_zero), None);
+        assert_eq!(
+            qwen_tool_whitespace_content(&whitespace_choice_one),
+            Some("\t")
+        );
+        assert_eq!(
+            pending_tool_whitespace.get(&0).map(String::as_str),
+            Some("\n")
+        );
+        assert!(!pending_tool_whitespace.contains_key(&1));
     }
 }

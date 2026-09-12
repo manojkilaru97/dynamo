@@ -2725,7 +2725,9 @@ fn normalize_chat_reasoning_template_args(
             code: 400,
             message: VALIDATION_PREFIX.to_string() + &e.to_string(),
         })
-    })
+    })?;
+    request.normalize_reasoning_controls();
+    Ok(())
 }
 
 /// Validates that required fields are present and valid in the chat completion request
@@ -5129,6 +5131,30 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn test_normalize_chat_reasoning_budget_before_validation() {
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "reasoning_budget": 32,
+                "reasoning_budget_grace_period": 4
+            }))
+            .unwrap();
+
+        normalize_chat_reasoning_template_args(&mut request).unwrap();
+
+        assert!(request.unsupported_fields.is_empty());
+        assert_eq!(
+            request.chat_template_args.as_ref().unwrap()["reasoning_budget"],
+            serde_json::json!(32)
+        );
+        assert_eq!(
+            request.chat_template_args.as_ref().unwrap()["reasoning_budget_grace_period"],
+            serde_json::json!(4)
+        );
     }
 
     #[test]

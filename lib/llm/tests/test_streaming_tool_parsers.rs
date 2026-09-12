@@ -1716,6 +1716,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_qwen3_coder_jail_drops_only_trailing_tool_framing_newline() {
+        let chunks = vec![
+            make_chunk(
+                "<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n</function>\n</tool_call>",
+                None,
+            ),
+            make_chunk("\n", None),
+            make_chunk("", Some(FinishReason::Stop)),
+        ];
+        let output = parse_response_stream(
+            stream::iter(chunks),
+            true,
+            false,
+            Some("qwen3_coder".to_string()),
+            None,
+        )
+        .await;
+        let aggregated = aggregate_content_from_chunks(&output);
+
+        assert!(aggregated.has_tool_calls);
+        assert_eq!(aggregated.tool_calls.len(), 1);
+        assert_eq!(aggregated.normal_content, "");
+        assert!(validate_finish_reason(&output, FinishReason::ToolCalls));
+    }
+
     /// False-positive: content with no tool-call markers passes through verbatim
     /// (suppression must not eat ordinary prose).
     #[tokio::test]

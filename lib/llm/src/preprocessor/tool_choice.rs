@@ -18,6 +18,17 @@ fn invalid_argument(message: impl Into<String>) -> DynamoError {
         .build()
 }
 
+fn prefer_structural_tag_over_legacy_json(common_request: &mut PreprocessedRequest) {
+    if let Some(guided_decoding) = common_request.sampling_options.guided_decoding.as_mut()
+        && guided_decoding.structural_tag.is_some()
+    {
+        // Request conversion may already have installed the legacy forced-tool
+        // JSON schema. A backend accepts only one structured-output constraint,
+        // and the native structural tag is the preferred tool-call constraint.
+        guided_decoding.json = None;
+    }
+}
+
 impl OpenAIPreprocessor {
     /// Apply guided decoding for OpenAI tool-choice requests.
     ///
@@ -73,6 +84,7 @@ impl OpenAIPreprocessor {
             prompt_injected_reasoning,
             common_request,
         )? {
+            prefer_structural_tag_over_legacy_json(common_request);
             return Ok(true);
         }
 
@@ -94,6 +106,74 @@ impl OpenAIPreprocessor {
         // Auto/None requests can reach here when neither structural tags nor a
         // tool-choice JSON fallback were needed.
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::common::{
+        GuidedDecodingOptions, OutputOptions, SamplingOptions, StopConditions,
+    };
+
+    fn request_with_guided_decoding(guided_decoding: GuidedDecodingOptions) -> PreprocessedRequest {
+        let mut builder = PreprocessedRequest::builder();
+        builder
+            .model("test-model".to_string())
+            .token_ids(vec![1])
+            .stop_conditions(StopConditions::default())
+            .sampling_options(SamplingOptions {
+                guided_decoding: Some(guided_decoding),
+                ..Default::default()
+            })
+            .output_options(OutputOptions::default());
+        builder.build().expect("valid preprocessed request")
+    }
+
+    #[test]
+    fn structural_tag_replaces_legacy_forced_tool_json_constraint() {
+        let structural_tag = serde_json::json!({"type": "structural_tag"});
+        let mut request = request_with_guided_decoding(GuidedDecodingOptions::new(
+            Some(serde_json::json!({"type": "object"})),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(structural_tag.clone()),
+        ));
+
+        prefer_structural_tag_over_legacy_json(&mut request);
+
+        let guided_decoding = request
+            .sampling_options
+            .guided_decoding
+            .expect("guided decoding remains configured");
+        assert_eq!(guided_decoding.json, None);
+        assert_eq!(guided_decoding.structural_tag, Some(structural_tag));
+    }
+
+    #[test]
+    fn legacy_json_constraint_is_preserved_without_structural_tag() {
+        let guided_json = serde_json::json!({"type": "object"});
+        let mut request = request_with_guided_decoding(GuidedDecodingOptions::new(
+            Some(guided_json.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        prefer_structural_tag_over_legacy_json(&mut request);
+
+        let guided_decoding = request
+            .sampling_options
+            .guided_decoding
+            .expect("guided decoding remains configured");
+        assert_eq!(guided_decoding.json, Some(guided_json));
+        assert_eq!(guided_decoding.structural_tag, None);
     }
 }
 
