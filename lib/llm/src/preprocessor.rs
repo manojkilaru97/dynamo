@@ -1496,12 +1496,10 @@ impl OpenAIPreprocessor {
         } else {
             stop_conditions.stop_token_ids_hidden = Some(hidden_eos_token_ids);
         }
-        // Some tool-call parsers terminate on a token that is also a model
-        // EOS (e.g. Harmony's `<|call|>` for gpt-oss). Left in the hidden
-        // set, the engine stops AND strips it, so the parser sees a
-        // truncated envelope and drops the call. Move such tokens to the
-        // visible set so the engine still stops on them but the token
-        // survives into output for the parser to consume. See PR #9778.
+        // Some tool-call parsers terminate on a token that must remain visible
+        // to the parser. Move parser end tokens that are also model EOS tokens
+        // to the visible set. A named qwen3_coder choice is likewise exactly
+        // one call, so its closing marker is an explicit visible engine stop.
         let mut visible_tool_parser_end_token_ids = Vec::new();
         if let Some(stop_tokens) = &mut stop_conditions.stop_token_ids_hidden {
             visible_tool_parser_end_token_ids =
@@ -1648,6 +1646,10 @@ impl OpenAIPreprocessor {
         else {
             return Ok(Vec::new());
         };
+        let qwen_named_choice = tool_call_parser == "qwen3_coder"
+            && request
+                .tool_choice()
+                .is_some_and(|tool_choice| tool_choice.as_str().is_none());
         let Some(tool_call_config) = get_tool_parser_map().get(tool_call_parser) else {
             return Ok(Vec::new());
         };
@@ -1664,7 +1666,7 @@ impl OpenAIPreprocessor {
             })?;
             let was_hidden_eos =
                 Self::remove_single_token_marker(hidden_stop_token_ids, encoded.token_ids());
-            if !was_hidden_eos {
+            if !was_hidden_eos && !qwen_named_choice {
                 tracing::debug!(
                     token_ids = ?encoded.token_ids(),
                     end_token,

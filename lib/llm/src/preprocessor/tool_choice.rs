@@ -18,13 +18,12 @@ fn invalid_argument(message: impl Into<String>) -> DynamoError {
         .build()
 }
 
-fn prefer_structural_tag_over_legacy_json(common_request: &mut PreprocessedRequest) -> bool {
+fn clear_legacy_json_constraint(common_request: &mut PreprocessedRequest) -> bool {
     if let Some(guided_decoding) = common_request.sampling_options.guided_decoding.as_mut()
         && guided_decoding.structural_tag.is_some()
     {
         // Request conversion may already have installed the legacy forced-tool
-        // JSON schema. A backend accepts only one structured-output constraint,
-        // and the native structural tag is the preferred tool-call constraint.
+        // JSON schema. vLLM accepts only one structured-output constraint.
         guided_decoding.json = None;
         return true;
     }
@@ -80,13 +79,6 @@ impl OpenAIPreprocessor {
             gd.json = None;
         }
 
-        // Request conversion can already provide a model-specific structural
-        // tag. Preserve that normalized constraint instead of replacing it
-        // with the generic parser builder's format.
-        if is_forced_tool_choice && prefer_structural_tag_over_legacy_json(common_request) {
-            return Ok(true);
-        }
-
         if self.apply_tool_choice_structural_tag(
             &convert_tool_choice(tool_choice),
             &convert_tools(tools),
@@ -94,8 +86,8 @@ impl OpenAIPreprocessor {
             prompt_injected_reasoning,
             common_request,
         )? {
-            let removed_conflict = prefer_structural_tag_over_legacy_json(common_request);
-            debug_assert!(removed_conflict);
+            let cleared = clear_legacy_json_constraint(common_request);
+            debug_assert!(cleared);
             return Ok(true);
         }
 
@@ -123,54 +115,9 @@ impl OpenAIPreprocessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_card::ModelDeploymentCard;
     use crate::protocols::common::{
         GuidedDecodingOptions, OutputOptions, SamplingOptions, StopConditions,
     };
-
-    const TEST_MODEL_PATH: &str = "tests/data/sample-models/mock-llama-3.1-8b-instruct";
-
-    fn test_preprocessor() -> std::sync::Arc<OpenAIPreprocessor> {
-        let mut mdc = ModelDeploymentCard::load_from_disk(TEST_MODEL_PATH, None)
-            .expect("load test model deployment card");
-        mdc.set_name("test-model");
-        OpenAIPreprocessor::new(mdc).expect("construct test preprocessor")
-    }
-
-    fn tool_request(tool_choice: serde_json::Value) -> NvCreateChatCompletionRequest {
-        serde_json::from_value(serde_json::json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Call get_weather for Paris"}],
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": "get_weather",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"city": {"type": "string"}},
-                        "required": ["city"],
-                        "additionalProperties": false
-                    }
-                }
-            }],
-            "tool_choice": tool_choice
-        }))
-        .expect("valid chat request")
-    }
-
-    fn forced_single_tool_structural_tag() -> serde_json::Value {
-        serde_json::json!({
-            "type": "structural_tag",
-            "format": {
-                "type": "tags_with_separator",
-                "tags": [],
-                "triggers": [""],
-                "separator": "",
-                "at_least_one": true,
-                "stop_after_first": true,
-            }
-        })
-    }
 
     fn request_with_guided_decoding(guided_decoding: GuidedDecodingOptions) -> PreprocessedRequest {
         let mut builder = PreprocessedRequest::builder();
@@ -187,73 +134,19 @@ mod tests {
     }
 
     #[test]
-    fn existing_forced_single_tool_tag_is_preserved_over_legacy_json() {
-        let structural_tag = forced_single_tool_structural_tag();
-        let mut request = request_with_guided_decoding(GuidedDecodingOptions::new(
-            Some(serde_json::json!({"type": "object"})),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(structural_tag.clone()),
-        ));
-
-        assert!(prefer_structural_tag_over_legacy_json(&mut request));
-
-        let guided_decoding = request
-            .sampling_options
-            .guided_decoding
-            .expect("guided decoding remains configured");
-        assert_eq!(guided_decoding.json, None);
-        assert_eq!(guided_decoding.structural_tag, Some(structural_tag));
-        let format = guided_decoding
-            .structural_tag
-            .as_ref()
-            .and_then(|tag| tag.get("format"))
-            .expect("preserved structural-tag format");
-        assert_eq!(format["type"], "tags_with_separator");
-        assert_eq!(format["stop_after_first"], true);
-    }
-
-    #[test]
-    fn guided_decoding_preserves_existing_forced_qwen_single_tool_tag() {
-        let structural_tag = forced_single_tool_structural_tag();
-        let mut common_request = request_with_guided_decoding(GuidedDecodingOptions::new(
-            Some(serde_json::json!({"type": "object"})),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(structural_tag.clone()),
-        ));
-        let request = tool_request(serde_json::json!({
-            "type": "function",
-            "function": {"name": "get_weather"}
-        }));
-
-        let uses_tool_call_structural_tag = test_preprocessor()
-            .apply_tool_choice_guided_decoding(&request, &mut common_request, true)
-            .expect("apply forced tool-choice guidance");
-
-        assert!(uses_tool_call_structural_tag);
-        let guided_decoding = common_request
-            .sampling_options
-            .guided_decoding
-            .expect("guided decoding remains configured");
-        assert_eq!(guided_decoding.json, None);
-        assert_eq!(guided_decoding.structural_tag, Some(structural_tag));
-    }
-
-    #[test]
-    fn guided_decoding_does_not_mislabel_existing_auto_structural_tag() {
+    fn structural_tag_replaces_legacy_json_constraint() {
         let structural_tag = serde_json::json!({
             "type": "structural_tag",
-            "format": {"type": "tag", "begin": "<custom>", "content": {"type": "any_text"}, "end": "</custom>"}
+            "format": {
+                "type": "triggered_tags",
+                "tags": [],
+                "triggers": ["<tool_call>\n<function="],
+                "at_least_one": true,
+                "stop_after_first": true,
+            }
         });
-        let mut common_request = request_with_guided_decoding(GuidedDecodingOptions::new(
-            None,
+        let mut request = request_with_guided_decoding(GuidedDecodingOptions::new(
+            Some(serde_json::json!({"type": "object"})),
             None,
             None,
             None,
@@ -261,25 +154,21 @@ mod tests {
             None,
             Some(structural_tag.clone()),
         ));
-        let request = tool_request(serde_json::json!("auto"));
 
-        let uses_tool_call_structural_tag = test_preprocessor()
-            .apply_tool_choice_guided_decoding(&request, &mut common_request, false)
-            .expect("apply automatic tool-choice guidance");
-
-        assert!(!uses_tool_call_structural_tag);
-        let guided_decoding = common_request
+        assert!(clear_legacy_json_constraint(&mut request));
+        let guided = request
             .sampling_options
             .guided_decoding
             .expect("guided decoding remains configured");
-        assert_eq!(guided_decoding.structural_tag, Some(structural_tag));
+        assert_eq!(guided.json, None);
+        assert_eq!(guided.structural_tag, Some(structural_tag));
     }
 
     #[test]
-    fn legacy_json_constraint_is_preserved_without_structural_tag() {
-        let guided_json = serde_json::json!({"type": "object"});
+    fn legacy_json_is_unchanged_without_structural_tag() {
+        let legacy_json = serde_json::json!({"type": "object"});
         let mut request = request_with_guided_decoding(GuidedDecodingOptions::new(
-            Some(guided_json.clone()),
+            Some(legacy_json.clone()),
             None,
             None,
             None,
@@ -288,15 +177,17 @@ mod tests {
             None,
         ));
 
-        assert!(!prefer_structural_tag_over_legacy_json(&mut request));
-
-        let guided_decoding = request
-            .sampling_options
-            .guided_decoding
-            .expect("guided decoding remains configured");
-        assert_eq!(guided_decoding.json, Some(guided_json));
-        assert_eq!(guided_decoding.structural_tag, None);
+        assert!(!clear_legacy_json_constraint(&mut request));
+        assert_eq!(
+            request
+                .sampling_options
+                .guided_decoding
+                .expect("guided decoding remains configured")
+                .json,
+            Some(legacy_json)
+        );
     }
+
 }
 
 fn has_explicit_guided_decoding(request: &NvCreateChatCompletionRequest) -> bool {

@@ -795,7 +795,7 @@ def build_sampling_params(
                 continue
             setattr(sampling_params, key, value)
         if (
-            key == "stop_token_ids_hidden"
+            key in ("stop_token_ids_hidden", "stop_token_ids_visible")
             and value is not None
             and hasattr(sampling_params, "stop_token_ids")
         ):
