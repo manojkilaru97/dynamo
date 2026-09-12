@@ -1,0 +1,7 @@
+FROM nvcr.io/qc69jvmznzxy/llm_nim/super:dynamo-v1.4.1-vllm-v0.27.1-super35-iter12500-prod-vllm-parity-amd64-v12-tool-parity
+
+COPY components/src/dynamo/vllm/multimodal_utils/request_processor.py /usr/local/lib/python3.12/dist-packages/dynamo/vllm/multimodal_utils/request_processor.py
+COPY components/src/dynamo/common/multimodal/nvdec_decoder.py /usr/local/lib/python3.12/dist-packages/dynamo/common/multimodal/nvdec_decoder.py
+
+LABEL ai.nvidia.nemotron.video-placeholder-fallback="rendered-text-boundary"
+LABEL ai.nvidia.nemotron.nvdec-frame-buffer="copied"
