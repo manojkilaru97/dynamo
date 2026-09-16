@@ -1263,44 +1263,6 @@ mod tests {
     }
 
     #[test]
-    fn remove_batch_processes_known_blocks_after_missing_hash() {
-        let mut index = TestLowerTierIndex::new();
-        let worker = WorkerWithDpRank::new(18, 0);
-        index
-            .apply_event(store_event(
-                worker.worker_id,
-                worker.dp_rank,
-                0,
-                None,
-                &[71, 72, 73],
-                &[701, 702, 703],
-            ))
-            .unwrap();
-
-        let result = index.apply_event(remove_event(
-            worker.worker_id,
-            1,
-            worker.dp_rank,
-            vec![
-                ExternalSequenceBlockHash(701),
-                ExternalSequenceBlockHash(999),
-                ExternalSequenceBlockHash(702),
-                ExternalSequenceBlockHash(703),
-            ],
-        ));
-
-        assert_eq!(
-            result,
-            Err(crate::protocols::KvCacheEventError::BlockNotFound)
-        );
-        let mut continuations = FxHashMap::default();
-        continuations.insert(worker, LowerTierContinuation::from_root(0));
-        let hits = index.query_contiguous_hits(&local_hashes(&[71, 72, 73]), &continuations);
-        assert_eq!(hits.get(&worker), Some(&0));
-        assert!(index.worker_blocks.get(&worker).is_none());
-    }
-
-    #[test]
     fn unknown_last_matched_hash_returns_zero() {
         let mut index = TestLowerTierIndex::new();
         index

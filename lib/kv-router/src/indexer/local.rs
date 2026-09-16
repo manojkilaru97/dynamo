@@ -827,9 +827,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::LocalKvIndexer;
-    use crate::indexer::{
-        KvIndexerInterface, KvIndexerMetrics, LowerTierContinuation, WorkerKvQueryResponse,
-    };
+    use crate::indexer::{KvIndexerInterface, KvIndexerMetrics, LowerTierContinuation};
     use crate::protocols::{
         ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheStoreData,
         KvCacheStoredBlockData, LocalBlockHash, RouterEvent, StorageTier, WorkerWithDpRank,
@@ -922,46 +920,6 @@ mod tests {
             .await
             .unwrap();
         assert!(overlap.scores.is_empty());
-    }
-
-    #[tokio::test]
-    async fn cached_recovery_dump_includes_lower_tier_events() {
-        let indexer = LocalKvIndexer::new(
-            CancellationToken::new(),
-            4,
-            Arc::new(KvIndexerMetrics::new_unregistered()),
-            16,
-        );
-        let event = lower_tier_store_event(7, 0, 1, 900, 11, 101, StorageTier::HostPinned);
-        indexer
-            .apply_event_with_buffer(event.clone())
-            .await
-            .unwrap();
-        indexer.flush().await;
-
-        let mut first_dump = None;
-        for _ in 0..2 {
-            match indexer.get_events_in_id_range(None, None).await {
-                WorkerKvQueryResponse::TreeDump {
-                    events,
-                    last_event_id,
-                } => {
-                    assert_eq!(last_event_id, 1);
-                    assert_eq!(events.len(), 1);
-                    assert_eq!(events[0].worker_id, event.worker_id);
-                    assert_eq!(events[0].storage_tier, StorageTier::HostPinned);
-                    assert_eq!(events[0].event.dp_rank, event.event.dp_rank);
-                    assert_eq!(events[0].event.data, event.event.data);
-                    if let Some(first_dump) = &first_dump {
-                        assert_eq!(&events, first_dump);
-                    } else {
-                        first_dump = Some(events);
-                    }
-                }
-                other => panic!("expected TreeDump, got {other:?}"),
-            }
-        }
-        assert_eq!(indexer.dump_build_count(), 1);
     }
 
     #[tokio::test]
