@@ -255,6 +255,7 @@ impl LowerTierIndexer {
         worker: WorkerWithDpRank,
         block_hashes: &[ExternalSequenceBlockHash],
     ) -> Result<(), KvCacheEventError> {
+        let mut missing_block = false;
         let remove_worker_entry = {
             let Some(worker_map) = worker_blocks.get_mut(&worker) else {
                 return Err(KvCacheEventError::BlockNotFound);
@@ -262,7 +263,8 @@ impl LowerTierIndexer {
 
             for block_hash in block_hashes {
                 let Some(key) = worker_map.remove(block_hash) else {
-                    return Err(KvCacheEventError::BlockNotFound);
+                    missing_block = true;
+                    continue;
                 };
 
                 self.remove_worker_from_edge(key, worker);
@@ -275,7 +277,11 @@ impl LowerTierIndexer {
             worker_blocks.remove(&worker);
         }
 
-        Ok(())
+        if missing_block {
+            Err(KvCacheEventError::BlockNotFound)
+        } else {
+            Ok(())
+        }
     }
 
     fn clear_worker_impl(&self, worker_blocks: &mut WorkerBlockIndex, worker_id: u64) {
@@ -1254,6 +1260,44 @@ mod tests {
 
         let hits = index.query_contiguous_hits(&query, &continuations);
         assert_eq!(hits.get(&WorkerWithDpRank::new(17, 0)), Some(&1));
+    }
+
+    #[test]
+    fn remove_batch_processes_known_blocks_after_missing_hash() {
+        let mut index = TestLowerTierIndex::new();
+        let worker = WorkerWithDpRank::new(18, 0);
+        index
+            .apply_event(store_event(
+                worker.worker_id,
+                worker.dp_rank,
+                0,
+                None,
+                &[71, 72, 73],
+                &[701, 702, 703],
+            ))
+            .unwrap();
+
+        let result = index.apply_event(remove_event(
+            worker.worker_id,
+            1,
+            worker.dp_rank,
+            vec![
+                ExternalSequenceBlockHash(701),
+                ExternalSequenceBlockHash(999),
+                ExternalSequenceBlockHash(702),
+                ExternalSequenceBlockHash(703),
+            ],
+        ));
+
+        assert_eq!(
+            result,
+            Err(crate::protocols::KvCacheEventError::BlockNotFound)
+        );
+        let mut continuations = FxHashMap::default();
+        continuations.insert(worker, LowerTierContinuation::from_root(0));
+        let hits = index.query_contiguous_hits(&local_hashes(&[71, 72, 73]), &continuations);
+        assert_eq!(hits.get(&worker), Some(&0));
+        assert!(index.worker_blocks.get(&worker).is_none());
     }
 
     #[test]
