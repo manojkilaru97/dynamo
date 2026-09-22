@@ -14,6 +14,7 @@
 #[cfg(feature = "mm-routing")]
 pub mod lightseek_mm;
 pub mod media;
+mod nemotron_reasoning;
 pub mod prompt;
 pub mod speculative_prefill;
 mod structural_tag;
@@ -62,7 +63,8 @@ use crate::protocols::common::timing::RequestTracker;
 use crate::tokenizers::Encoding;
 
 use dynamo_parsers::{
-    ReasoningParser, ReasoningParserType, tool_calling::parsers::get_tool_parser_map,
+    ReasoningParser, ReasoningParserType,
+    tool_calling::parsers::get_tool_parser_map,
 };
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContextProvider, ResponseStream};
 use dynamo_runtime::pipeline::{
@@ -392,6 +394,7 @@ struct ReasoningState {
 struct ReasoningChoiceState {
     reasoning_content: String,
     reasoning_ended: bool,
+    implicit_tool_handoff: bool,
     emitted_content: bool,
     emitted_tool_calls: bool,
 }
@@ -1503,7 +1506,7 @@ impl OpenAIPreprocessor {
         let mut visible_tool_parser_end_token_ids = Vec::new();
         if let Some(stop_tokens) = &mut stop_conditions.stop_token_ids_hidden {
             visible_tool_parser_end_token_ids =
-                self.remove_tool_parser_end_tokens_from_hidden_stops(request, stop_tokens)?;
+                self.remove_tool_parser_end_tokens_from_hidden_stops(request, stop_tokens, false)?;
         }
         if !visible_tool_parser_end_token_ids.is_empty() {
             let visible_stops = stop_conditions
@@ -1626,6 +1629,7 @@ impl OpenAIPreprocessor {
         &self,
         request: &R,
         hidden_stop_token_ids: &mut Vec<TokenIdType>,
+        force_qwen_single_call_stop: bool,
     ) -> Result<Vec<TokenIdType>> {
         let has_tools = request
             .tools()
@@ -1646,10 +1650,11 @@ impl OpenAIPreprocessor {
         else {
             return Ok(Vec::new());
         };
-        let qwen_named_choice = tool_call_parser == "qwen3_coder"
-            && request
-                .tool_choice()
-                .is_some_and(|tool_choice| tool_choice.as_str().is_none());
+        let qwen_single_call_choice = tool_call_parser == "qwen3_coder"
+            && (force_qwen_single_call_stop
+                || request
+                    .tool_choice()
+                    .is_some_and(|tool_choice| tool_choice.as_str().is_none()));
         let Some(tool_call_config) = get_tool_parser_map().get(tool_call_parser) else {
             return Ok(Vec::new());
         };
@@ -1666,7 +1671,7 @@ impl OpenAIPreprocessor {
             })?;
             let was_hidden_eos =
                 Self::remove_single_token_marker(hidden_stop_token_ids, encoded.token_ids());
-            if !was_hidden_eos && !qwen_named_choice {
+            if !was_hidden_eos && !qwen_single_call_choice {
                 tracing::debug!(
                     token_ids = ?encoded.token_ids(),
                     end_token,
@@ -2797,7 +2802,17 @@ impl OpenAIPreprocessor {
                 Box::pin(stream)
             };
 
-        let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if should_parse_reasoning {
+        let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if reasoning_parser == Some("nemotron_v3")
+            && (should_parse_reasoning || should_strip_disabled_reasoning_start)
+        {
+            let force_nonempty = request.chat_template_args.as_ref()
+                .and_then(|args| args.get("force_nonempty_content"))
+                == Some(&serde_json::Value::Bool(true));
+            Box::pin(nemotron_reasoning::parse_stream_with_options(
+                stream, bypass_reasoning_for_bare_guided_json, should_parse_reasoning,
+                force_nonempty, request.inner.stream.unwrap_or(false),
+            ))
+        } else if should_parse_reasoning {
             Box::pin(Self::parse_reasoning_content_from_stream_inner(
                 stream,
                 self.runtime_config.reasoning_parser.clone().unwrap(), // Safety: We already checked that parser is some, so gtg
@@ -2855,11 +2870,15 @@ impl OpenAIPreprocessor {
         let parser_name = self.tool_call_parser.as_deref();
         let use_parsers_v2 = tool_parser_v2::enabled()
             && parser_name.is_some_and(tool_parser_v2::supports_family)
-            && !uses_tool_call_structural_tag
-            && matches!(
-                request.inner.tool_choice.as_ref(),
-                None | Some(dynamo_protocols::types::ChatCompletionToolChoiceOption::Auto)
-            );
+            && ((parser_name == Some("qwen3_coder") && uses_tool_call_structural_tag)
+                || (!uses_tool_call_structural_tag
+                    && matches!(
+                        request.inner.tool_choice.as_ref(),
+                        None
+                            | Some(
+                                dynamo_protocols::types::ChatCompletionToolChoiceOption::Auto,
+                            )
+                    )));
 
         // Apply jail conditionally
         let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> =
@@ -3714,7 +3733,8 @@ impl OpenAIPreprocessor {
                 if dynamo_renderer::thinking_bool_from_args(chat_template_args) == Some(false) {
                     return true;
                 }
-                if let Some(args) = chat_template_args
+                if parser != Some("nemotron_v3")
+                    && let Some(args) = chat_template_args
                     && let Some(force_nonempty) = args.get("force_nonempty_content")
                     && force_nonempty == &serde_json::Value::Bool(true)
                 {
@@ -3784,7 +3804,10 @@ impl OpenAIPreprocessor {
     where
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     {
-        // Initialize reasoning parser from parser_name
+        if parser_name == "nemotron_v3" {
+            return Box::pin(nemotron_reasoning::parse_stream(stream, bypass_bare_guided_json))
+                as Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>>;
+        }
         let mut reasoning_parser = Box::new(ReasoningParserType::get_reasoning_parser_from_name(
             parser_name.as_ref(),
         )) as Box<dyn ReasoningParser>;
@@ -3801,7 +3824,7 @@ impl OpenAIPreprocessor {
             guided_json_bypass_decision: None,
         };
 
-        stream::unfold(state, |mut state| async move {
+        Box::pin(stream::unfold(state, |mut state| async move {
             if let Some(response) = state.stream.next().await {
                 let guided_json_bypass_decision = if state.bypass_bare_guided_json {
                     match state.guided_json_bypass_decision {
@@ -3869,6 +3892,14 @@ impl OpenAIPreprocessor {
                                     };
 
                                 if !choice_state.reasoning_ended
+                                    && normal_text.contains("<tool_call>")
+                                {
+                                    choice_state.reasoning_ended = true;
+                                    choice_state.implicit_tool_handoff = true;
+                                }
+
+                                if !choice_state.implicit_tool_handoff
+                                    && !choice_state.reasoning_ended
                                     && let Some(end_idx) = text.rfind(THINK_END_TOKEN)
                                 {
                                     delta_reasoning = text[..end_idx]
@@ -3888,7 +3919,8 @@ impl OpenAIPreprocessor {
                                 if !delta_reasoning.is_empty() {
                                     choice_state.reasoning_content.push_str(&delta_reasoning);
                                 }
-                                if !normal_text.is_empty()
+                                if !choice_state.implicit_tool_handoff
+                                    && !normal_text.is_empty()
                                     && !choice_state.reasoning_content.is_empty()
                                 {
                                     let (boundary_reasoning, after_boundary) =
@@ -3924,6 +3956,36 @@ impl OpenAIPreprocessor {
                                         Some(ChatCompletionMessageContent::Text(normal_text));
                                 }
                             }
+
+                            // A delimiter prefix may be buffered across backend
+                            // chunks. Flush it when the backend marks this choice
+                            // complete so no generated bytes are dropped.
+                            if choice.finish_reason.is_some() && !choice_state.reasoning_ended {
+                                let parser_result = parser.finish_reasoning_stream();
+                                if !parser_result.reasoning_text.is_empty() {
+                                    choice_state
+                                        .reasoning_content
+                                        .push_str(&parser_result.reasoning_text);
+                                    choice
+                                        .delta
+                                        .reasoning_content
+                                        .get_or_insert_with(String::new)
+                                        .push_str(&parser_result.reasoning_text);
+                                }
+                                if !parser_result.normal_text.is_empty() {
+                                    match choice.delta.content.as_mut() {
+                                        Some(ChatCompletionMessageContent::Text(content)) => {
+                                            content.push_str(&parser_result.normal_text);
+                                        }
+                                        _ => {
+                                            choice.delta.content =
+                                                Some(ChatCompletionMessageContent::Text(
+                                                    parser_result.normal_text,
+                                                ));
+                                        }
+                                    }
+                                }
+                            }
                         }
                         response.data = Some(data);
                     }
@@ -3938,7 +4000,7 @@ impl OpenAIPreprocessor {
                 None
             }
         })
-        .fuse()
+        .fuse())
     }
 
     fn guard_structured_json_content_from_stream<S>(
@@ -4313,12 +4375,17 @@ impl
             image_tokens,
         );
 
+        // Backend generation is always streamed internally, but parser finalization
+        // must honor the caller's transport (e.g. Nemotron's batch-only reasoning
+        // swap for force_nonempty_content). Do not pass the internal override.
+        request.inner.stream = Some(original_stream_flag);
         let transformed_stream = self.postprocessor_parsing_stream(
             stream,
             &request,
             prompt_injected_reasoning,
             uses_tool_call_structural_tag,
         )?;
+        request.inner.stream = Some(true);
 
         // Apply request payload aggregation strategy.
         // The payload branch already returns Pin<Box<...>> from scan/fold_aggregate_with_future,
@@ -6173,8 +6240,8 @@ mod tests {
             (
                 Some("nemotron_v3"),
                 Some(&force_nonempty_content_true),
-                true,
-                "nemotron_v3 + force_nonempty_content=true → disabled",
+                false,
+                "nemotron_v3 + force_nonempty_content=true → EOF fallback, reasoning remains enabled",
             ),
             // deepseek_v4 — same convention as deepseek_r1; verify all three aliases
             // (deepseek_v4 / deepseek-v4 / deepseekv4) plus both signal keys.
