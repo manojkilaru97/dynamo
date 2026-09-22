@@ -12,13 +12,19 @@ import os
 import time
 from argparse import Namespace
 from collections.abc import AsyncGenerator
+from types import SimpleNamespace
 from typing import Any
 
 from msgspec.structs import replace as msgspec_replace
-from vllm.config import CacheConfig, LoadConfig, ModelConfig, VllmConfig
-from vllm.entrypoints.chat_utils import load_chat_template
+from vllm.config import CacheConfig, DeviceConfig, LoadConfig, ModelConfig, VllmConfig
+from vllm.entrypoints.chat_utils import load_chat_template, make_tool_call_id
+from vllm.exceptions import VLLMValidationError
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
-from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.sampling_params import (
+    RequestOutputKind,
+    SamplingParams,
+    StructuredOutputsParams,
+)
 from vllm.tasks import GENERATION_TASKS
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser, ToolParserManager
@@ -37,6 +43,7 @@ from dynamo.common.multimodal.routing_utils import build_mm_routing_info_from_fe
 from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine
+from dynamo.llm.exceptions import InvalidArgument
 
 from .prepost import StreamingPostProcessor, preprocess_chat_request
 from .thinking import runtime_default_thinking_mode
@@ -102,6 +109,58 @@ def _normalize_router_finish_reason(raw_reason: Any) -> str | None:
         logger.warning("Malformed finish_reason from router: %r", raw_reason)
         return "error"
     return raw_reason
+
+
+_SERVICE_OVERLOADED_ERROR_TYPE = "service_overloaded"
+_PUBLIC_OVERLOAD_MESSAGE = "Service temporarily overloaded"
+_PUBLIC_OVERLOAD_STATUS = 529
+
+
+def _public_overload_envelope() -> dict[str, Any]:
+    return {
+        "_dynamo_annotated": True,
+        "event": "error",
+        "comment": [
+            json.dumps(
+                {
+                    "message": _PUBLIC_OVERLOAD_MESSAGE,
+                    "code": _PUBLIC_OVERLOAD_STATUS,
+                }
+            )
+        ],
+    }
+
+
+def _is_router_overload_error(error: Any) -> bool:
+    message = str(error).lower().replace("_", "")
+    return any(
+        marker in message
+        for marker in (
+            "resourceexhausted",
+            "serviceoverloaded",
+            "scheduler queue full",
+            "scheduler queue wait timeout",
+        )
+    )
+
+
+def _router_overload_envelope(engine_response: Any) -> dict[str, Any] | None:
+    """Translate a worker overload marker before vLLM parses finish_reason.
+
+    vLLM's ``FinishReason`` intentionally has no error variant.  Feeding the
+    worker's internal error finish reason through ``EngineCoreOutput`` changes
+    it into an invalid public chat-completion finish reason and the Rust HTTP
+    layer returns 500.  An annotated error frame preserves the HTTP status
+    out-of-band and lets Dynamo apply its canonical sanitized 529 response.
+    """
+    if not isinstance(engine_response, dict):
+        return None
+    extra_args = engine_response.get("extra_args")
+    if not isinstance(extra_args, dict) or extra_args.get(
+        "dynamo_error_type"
+    ) != _SERVICE_OVERLOADED_ERROR_TYPE:
+        return None
+    return _public_overload_envelope()
 
 
 def map_finish_reason(raw_reason: Any) -> FinishReason | None:
@@ -529,9 +588,7 @@ def _complete_json_text(text: str) -> str | None:
 
 
 def _structured_tool_choice_name(request: Any) -> str | None:
-    if _request_has_user_structured_output(request) or not _get_attr_or_item(
-        request, "tools"
-    ):
+    if not _get_attr_or_item(request, "tools"):
         return None
     tool_choice = _get_attr_or_item(request, "tool_choice")
     if tool_choice in (None, "none", "auto", "required"):
@@ -542,7 +599,6 @@ def _structured_tool_choice_name(request: Any) -> str | None:
 def _structured_tool_choice_required(request: Any) -> bool:
     return (
         bool(_get_attr_or_item(request, "tools"))
-        and not _request_has_user_structured_output(request)
         and _get_attr_or_item(request, "tool_choice") == "required"
     )
 
@@ -597,6 +653,8 @@ def _structured_tool_calls_from_content(
 def _bridge_structured_tool_content_choices(
     request: Any,
     choices: list[dict[str, Any]],
+    pending_content: dict[int, str],
+    completed_choices: set[int],
 ) -> list[dict[str, Any]]:
     if (
         _structured_tool_choice_name(request) is None
@@ -607,14 +665,20 @@ def _bridge_structured_tool_content_choices(
     bridged: list[dict[str, Any]] = []
     for choice in choices:
         delta = choice.get("delta") or {}
+        choice_index = choice.get("index", 0)
         if delta.get("tool_calls"):
+            completed_choices.add(choice_index)
+            pending_content.pop(choice_index, None)
             bridged.append(choice)
             continue
 
         content = delta.get("content")
         if isinstance(content, str):
-            tool_calls = _structured_tool_calls_from_content(request, content)
+            buffered_content = pending_content.get(choice_index, "") + content
+            tool_calls = _structured_tool_calls_from_content(request, buffered_content)
             if tool_calls:
+                pending_content.pop(choice_index, None)
+                completed_choices.add(choice_index)
                 new_delta = {k: v for k, v in delta.items() if k != "content"}
                 new_delta.setdefault("role", "assistant")
                 new_delta["tool_calls"] = tool_calls
@@ -622,11 +686,56 @@ def _bridge_structured_tool_content_choices(
                     {
                         **choice,
                         "delta": new_delta,
-                        "finish_reason": "tool_calls",
+                        "finish_reason": (
+                            "tool_calls" if choice.get("finish_reason") else None
+                        ),
                     }
                 )
                 continue
+            pending_content[choice_index] = buffered_content
 
+            # Guided JSON is commonly split across streaming deltas. Hold it
+            # until complete, but preserve it exactly if generation terminates
+            # without producing valid tool arguments.
+            new_delta = {k: v for k, v in delta.items() if k != "content"}
+            if choice.get("finish_reason"):
+                pending_content.pop(choice_index, None)
+                new_delta["content"] = buffered_content
+            bridged.append({**choice, "delta": new_delta})
+            continue
+
+        if choice.get("finish_reason") in {
+            "stop",
+            "length",
+            FinishReason.STOP,
+            FinishReason.LENGTH,
+        }:
+            if choice_index in completed_choices:
+                bridged.append({**choice, "finish_reason": "tool_calls"})
+                continue
+            if choice_index in pending_content:
+                buffered_content = pending_content.pop(choice_index)
+                tool_calls = _structured_tool_calls_from_content(request, buffered_content)
+                if tool_calls:
+                    completed_choices.add(choice_index)
+                    new_delta = dict(delta)
+                    new_delta.setdefault("role", "assistant")
+                    new_delta["tool_calls"] = tool_calls
+                    bridged.append(
+                        {
+                            **choice,
+                            "delta": new_delta,
+                            "finish_reason": "tool_calls",
+                        }
+                    )
+                else:
+                    bridged.append(
+                        {
+                            **choice,
+                            "delta": {**delta, "content": buffered_content},
+                        }
+                    )
+                continue
         if choice.get("finish_reason") in {
             "stop",
             "length",
@@ -665,12 +774,15 @@ def _tool_choice_guided_json_schema(request: Any) -> dict[str, Any] | None:
             )
         if not any_of:
             return None
+        array_schema: dict[str, Any] = {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "object", "anyOf": any_of},
+        }
+        if _get_attr_or_item(request, "parallel_tool_calls") is False:
+            array_schema["maxItems"] = 1
         schema = _bound_tool_schema(
-            {
-                "type": "array",
-                "minItems": 1,
-                "items": {"type": "object", "anyOf": any_of},
-            },
+            array_schema,
             request_text_len=request_text_len,
         )
         schema[TOOL_CHOICE_SCHEMA_MARKER] = True
@@ -934,20 +1046,6 @@ def _normalize_vllm_image_parts(messages: list[Any]) -> None:
                 image_url["detail"] = "auto"
 
 
-def _with_reasoning_token_usage(
-    usage: dict[str, Any],
-    post_processors: dict[int, StreamingPostProcessor],
-) -> dict[str, Any]:
-    """Return usage enriched with parser-observed reasoning token counts."""
-    enriched = dict(usage)
-    completion_details = dict(enriched.get("completion_tokens_details") or {})
-    completion_details["reasoning_tokens"] = sum(
-        getattr(post, "num_reasoning_tokens", 0) for post in post_processors.values()
-    )
-    enriched["completion_tokens_details"] = completion_details
-    return enriched
-
-
 class VllmProcessor:
     def __init__(
         self,
@@ -971,6 +1069,7 @@ class VllmProcessor:
         self.routed_engine = routed_engine
         self.output_processor = output_processor
         self.tool_parser_class = tool_parser_class
+        self.tool_parser_name = tool_parser_name
         self.reasoning_parser_class = reasoning_parser_class
         self.exclude_tools_when_tool_choice_none = True
         self.block_size = block_size
@@ -1157,8 +1256,13 @@ class VllmProcessor:
         model inference to a backend using the router.
         """
         with _nvtx.annotate("mm_frontend:generator", color="blue"):
-            async for item in self._generator_inner(request, context=context):
-                yield item
+            try:
+                async for item in self._generator_inner(request, context=context):
+                    yield item
+            except VLLMValidationError as error:
+                raise InvalidArgument(
+                    f"Input exceeds the context window: {error}"
+                ) from error
 
     async def _generator_inner(
         self, request: dict[str, Any], context: Any | None = None
@@ -1188,6 +1292,20 @@ class VllmProcessor:
                 structural_tag_mode=self.structural_tag_mode,
                 structural_tag_scope=self.structural_tag_scope,
                 structural_tag_schema=self.structural_tag_schema,
+                tokenizer_workers=max(
+                    1,
+                    int(
+                        getattr(
+                            getattr(
+                                self.input_processor.renderer,
+                                "model_config",
+                                None,
+                            ),
+                            "renderer_num_workers",
+                            1,
+                        )
+                    ),
+                ),
             )
 
         request_for_sampling = pre.request_for_sampling
@@ -1313,14 +1431,6 @@ class VllmProcessor:
         # vLLM 0.17.0 removed EngineCoreRequest.eos_token_id. Dynamo now uses
         # tokenizer metadata for EOS ids when constructing the router payload.
 
-        reasoning_ended, reasoning_parser_kwargs = _build_reasoning_parser_metadata(
-            self.reasoning_parser_class,
-            self.tokenizer,
-            chat_template_kwargs,
-            request_for_sampling,
-            tokens,
-        )
-
         # Convert to a Python object that has fields that match our PreprocessedRequest
         sp = vllm_preproc.sampling_params
         dynamo_preproc = {
@@ -1351,7 +1461,7 @@ class VllmProcessor:
                 "skip_special_tokens": sp.skip_special_tokens,
             },
             "eos_token_ids": self._get_eos_token_ids(),
-            "annotations": [],
+            "annotations": ["dynamo.vllm.worker-detokenize"],
             "routing": request.get("routing"),
         }
         if guided_decoding is not None:
@@ -1438,6 +1548,7 @@ class VllmProcessor:
                 tokens,
                 vllm_preproc,
                 post_processors,
+                request_for_sampling=request_for_sampling,
                 mm_routing_info=mm_routing_info,
                 context=context,
             ):
@@ -1454,18 +1565,29 @@ class VllmProcessor:
         tokens: list[int],
         vllm_preproc: EngineCoreRequest,
         post_processors: dict[int, StreamingPostProcessor],
+        request_for_sampling: Any | None = None,
         mm_routing_info: dict[str, Any] | None = None,
         context: Any | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         sp = vllm_preproc.sampling_params
-        output_request_ids: dict[int, str]
-        registered_request_ids: list[str]
+        stream_mode: str | None = None
+        legacy_output_state_initialized = False
+        output_request_ids: dict[int, str] = {}
+        registered_request_ids: list[str] = []
 
-        if sp.n == 1:
-            self.output_processor.add_request(vllm_preproc, None)
-            output_request_ids = {0: vllm_preproc.request_id}
-            registered_request_ids = [vllm_preproc.request_id]
-        else:
+        def ensure_legacy_output_state() -> dict[int, str]:
+            """Lazily create frontend vLLM state for no-text workers only."""
+            nonlocal legacy_output_state_initialized, output_request_ids
+            nonlocal registered_request_ids
+            if legacy_output_state_initialized:
+                return output_request_ids
+            legacy_output_state_initialized = True
+            if sp.n == 1:
+                self.output_processor.add_request(vllm_preproc, None)
+                output_request_ids = {0: vllm_preproc.request_id}
+                registered_request_ids.append(vllm_preproc.request_id)
+                return output_request_ids
+
             # vLLM's normal engine path fans out SamplingParams.n>1 into
             # ParentRequest children before registering with OutputProcessor.
             # Dynamo bypasses that path here: the backend generates indexed
@@ -1503,6 +1625,7 @@ class VllmProcessor:
                 )
                 output_request_ids[output_idx] = child_request_id
                 registered_request_ids.append(child_request_id)
+            return output_request_ids
 
         # Rust postprocessor is bypassed on this path, so emit the multimodal
         # content-part counts here too (else frontend metrics report zero media).
@@ -1513,16 +1636,29 @@ class VllmProcessor:
         image_count = len(_mm_counts.get("image_url", []))
         video_count = len(_mm_counts.get("video_url", []))
         audio_count = len(_mm_counts.get("audio_url", []))
-        pending_logprobs: dict[int, list[dict[str, Any]]] = {
-            output_idx: [] for output_idx in output_request_ids
-        }
+        logprobs_requested = getattr(sp, "logprobs", None) is not None
+        pending_logprobs: dict[int, list[dict[str, Any]]] = (
+            {output_idx: [] for output_idx in range(sp.n)}
+            if logprobs_requested
+            else {}
+        )
+        pending_structured_tool_content: dict[int, str] = {}
+        completed_structured_tool_choices: set[int] = set()
+        created = int(time.time())
 
         try:
             _inject_routing_metadata(dynamo_preproc, dynamo_preproc, mm_routing_info)
-            with _nvtx.annotate("mm_frontend:routed_engine_generate", color="red"):
-                dynamo_stream = await self.routed_engine.generate(
-                    dynamo_preproc, context=context
-                )
+            try:
+                with _nvtx.annotate("mm_frontend:routed_engine_generate", color="red"):
+                    dynamo_stream = await self.routed_engine.generate(
+                        dynamo_preproc, context=context
+                    )
+            except Exception as exc:
+                if not _is_router_overload_error(exc):
+                    raise
+                logger.warning("router rejected request %s as overloaded", request_id)
+                yield _public_overload_envelope()
+                return
 
             rng_stream = _nvtx.start_range(
                 "mm_frontend:stream_response", color="purple"
@@ -1531,6 +1667,12 @@ class VllmProcessor:
                 if dynamo_response.is_error():
                     comments = dynamo_response.comments() or []
                     message = "; ".join(comments) or "unknown routed_engine error"
+                    if _is_router_overload_error(message):
+                        logger.warning(
+                            "router rejected request %s as overloaded", request_id
+                        )
+                        yield _public_overload_envelope()
+                        break
                     logger.error(
                         "routed_engine error for request %s: %s",
                         request_id,
@@ -1547,6 +1689,10 @@ class VllmProcessor:
                     # I'm not sure what those are used for, so TODO. Skip for now.
                     continue
 
+                if overload_envelope := _router_overload_envelope(engine_response):
+                    yield overload_envelope
+                    break
+
                 if "token_ids" not in engine_response:
                     yield handle_engine_error(engine_response, request_id, logger)
                     break
@@ -1556,9 +1702,30 @@ class VllmProcessor:
                 chunk_tokens = len(engine_response.get("token_ids") or [])
                 cumulative_output_tokens += chunk_tokens
 
+                worker_processed_text = engine_response.get("text") is not None
+                frame_mode = "worker_text" if worker_processed_text else "legacy"
+                if stream_mode is None:
+                    stream_mode = frame_mode
+                    if stream_mode == "legacy":
+                        ensure_legacy_output_state()
+                elif stream_mode != frame_mode:
+                    yield {
+                        "error": {
+                            "message": (
+                                "Backend response mode changed during request "
+                                f"{request_id}: {stream_mode} to {frame_mode}"
+                            ),
+                            "type": "internal_error",
+                        }
+                    }
+                    break
+
                 output_idx = engine_response.get("index", 0) or 0
-                output_request_id = output_request_ids.get(output_idx)
-                if output_request_id is None:
+                if (
+                    not isinstance(output_idx, int)
+                    or output_idx < 0
+                    or output_idx >= sp.n
+                ):
                     yield {
                         "error": {
                             "message": (
@@ -1573,47 +1740,93 @@ class VllmProcessor:
                 raw_finish_reason = _normalize_router_finish_reason(
                     engine_response.get("finish_reason")
                 )
-                finish_reason = map_finish_reason(raw_finish_reason)
-                stop_reason = engine_response.get("stop_reason")
-                raw_token_ids = list(engine_response["token_ids"])
-                engine_text = engine_response.get("text") or ""
-                chat_logprobs = _wire_chat_logprobs_content(
-                    engine_response, self.tokenizer
+                wire_token_ids = engine_response["token_ids"]
+                raw_token_ids = (
+                    wire_token_ids
+                    if isinstance(wire_token_ids, list)
+                    else list(wire_token_ids)
                 )
+                engine_text = engine_response.get("text") or ""
+                chat_logprobs = None
+                if (
+                    logprobs_requested
+                    and engine_response.get("log_probs") is not None
+                ):
+                    chat_logprobs = _wire_chat_logprobs_content(
+                        engine_response, self.tokenizer
+                    )
                 if chat_logprobs:
                     pending_logprobs[output_idx].extend(chat_logprobs)
 
-                output_kwargs: dict[str, Any] = {
-                    "request_id": output_request_id,
-                    "new_token_ids": engine_response["token_ids"],
-                    "finish_reason": finish_reason,
-                    "stop_reason": stop_reason,
-                }
-                output_fields = getattr(EngineCoreOutput, "__struct_fields__", ())
-                if "is_segment_finished" in output_fields:
-                    output_kwargs["is_segment_finished"] = engine_response.get(
-                        "is_segment_finished", False
+                if worker_processed_text:
+                    # The backend vLLM OutputProcessor already emitted a
+                    # trimmed DELTA text chunk. Feeding the same token IDs
+                    # through this frontend's OutputProcessor duplicates
+                    # detokenization and stop processing on every stream frame,
+                    # which is especially expensive at high concurrency.
+                    vllm_out = None
+                else:
+                    output_request_id = output_request_ids[output_idx]
+                    output_kwargs: dict[str, Any] = {
+                        "request_id": output_request_id,
+                        "new_token_ids": wire_token_ids,
+                        "finish_reason": map_finish_reason(raw_finish_reason),
+                        "stop_reason": engine_response.get("stop_reason"),
+                    }
+                    output_fields = getattr(
+                        EngineCoreOutput, "__struct_fields__", ()
                     )
-                if "new_prompt_len_snapshot" in output_fields:
-                    output_kwargs["new_prompt_len_snapshot"] = engine_response.get(
-                        "new_prompt_len_snapshot"
+                    if "is_segment_finished" in output_fields:
+                        output_kwargs["is_segment_finished"] = engine_response.get(
+                            "is_segment_finished", False
+                        )
+                    if "new_prompt_len_snapshot" in output_fields:
+                        output_kwargs["new_prompt_len_snapshot"] = engine_response.get(
+                            "new_prompt_len_snapshot"
+                        )
+                    vllm_response = EngineCoreOutput(**output_kwargs)
+                    vllm_out = self.output_processor.process_outputs(
+                        [vllm_response]
                     )
-                vllm_response = EngineCoreOutput(**output_kwargs)
 
-                vllm_out: OutputProcessorOutput = self.output_processor.process_outputs(
-                    [vllm_response]
-                )
-
-                if vllm_out.reqs_to_abort:
+                if vllm_out is not None and vllm_out.reqs_to_abort:
                     pass
 
                 choices = []
                 postprocess_error = False
-                if not vllm_out.request_outputs:
+                if worker_processed_text:
+                    post = post_processors.get(output_idx)
+                    if post is None:
+                        yield {
+                            "error": {
+                                "message": (
+                                    f"Invalid postprocessor choice index {output_idx} "
+                                    f"for request {request_id}"
+                                ),
+                                "type": "internal_error",
+                            }
+                        }
+                        postprocess_error = True
+                    else:
+                        choice = post.process_output(
+                            SimpleNamespace(
+                                index=output_idx,
+                                token_ids=raw_token_ids,
+                                text=engine_text,
+                                finish_reason=raw_finish_reason,
+                                logprobs=None,
+                            ),
+                            raw_delta_token_ids=raw_token_ids,
+                        )
+                        if choice:
+                            choices.append(choice)
+                elif not vllm_out.request_outputs:
                     post = post_processors.get(output_idx)
                     parser_needs_raw_delta = bool(
                         post is not None
-                        and post.needs_raw_parser_delta(raw_token_ids)
+                        and getattr(
+                            post, "needs_raw_parser_delta", lambda _token_ids: False
+                        )(raw_token_ids)
                     )
                     if post is not None and (
                         raw_finish_reason or parser_needs_raw_delta
@@ -1650,9 +1863,11 @@ class VllmProcessor:
                         output = _with_parser_visible_engine_text(
                             output,
                             engine_text,
-                            parser_needs_raw_delta=post.needs_raw_parser_delta(
-                                raw_token_ids
-                            ),
+                            parser_needs_raw_delta=getattr(
+                                post,
+                                "needs_raw_parser_delta",
+                                lambda _token_ids: False,
+                            )(raw_token_ids),
                         )
                         choice = post.process_output(
                             output, raw_delta_token_ids=raw_token_ids
@@ -1662,41 +1877,6 @@ class VllmProcessor:
 
                 if postprocess_error:
                     continue
-
-                # One envelope per iteration carries both data and metrics so
-                # client cancellation can't drop the annotation between yields.
-                envelope: dict[str, Any] = {"_dynamo_annotated": True}
-                if choices:
-                    choices = _bridge_structured_tool_content_choices(
-                        request_for_sampling,
-                        choices,
-                    )
-                    for choice in choices:
-                        choice_index = choice.get("index", 0)
-                        if sp.logprobs is not None:
-                            choice["logprobs"] = {
-                                "content": pending_logprobs[choice_index] or None,
-                                "refusal": None,
-                            }
-                            pending_logprobs[choice_index] = []
-                        post = post_processors.get(choice.get("index", 0))
-                        strip_tool_markup = getattr(
-                            post, "_strip_tool_markup_from_delta", None
-                        )
-                        if strip_tool_markup is not None:
-                            strip_tool_markup(choice.get("delta") or {})
-                    dynamo_out = {
-                        "id": request_id,
-                        "choices": choices,
-                        "created": int(time.time()),
-                        "model": request["model"],
-                        "object": "chat.completion.chunk",
-                    }
-                    if usage := engine_response.get("completion_usage"):
-                        dynamo_out["usage"] = _with_reasoning_token_usage(
-                            usage, post_processors
-                        )
-                    envelope["data"] = dynamo_out
 
                 metrics = {
                     "input_tokens": input_tokens,
@@ -1710,12 +1890,59 @@ class VllmProcessor:
                     metrics["video_count"] = video_count
                 if audio_count:
                     metrics["audio_count"] = audio_count
-                envelope["event"] = "llm_metrics"
-                envelope["comment"] = [json.dumps(metrics)]
+
+                # One envelope per iteration carries both data and metrics so
+                # client cancellation can't drop the accounting for a visible chunk.
+                envelope: dict[str, Any] = {"_dynamo_annotated": True}
+                if choices:
+                    choices = _bridge_structured_tool_content_choices(
+                        request_for_sampling,
+                        choices,
+                        pending_structured_tool_content,
+                        completed_structured_tool_choices,
+                    )
+                    for choice in choices:
+                        choice_index = choice.get("index", 0)
+                        if logprobs_requested:
+                            choice["logprobs"] = {
+                                "content": pending_logprobs[choice_index] or None,
+                                "refusal": None,
+                            }
+                            pending_logprobs[choice_index] = []
+                    dynamo_out = {
+                        "id": request_id,
+                        "choices": choices,
+                        "created": created,
+                        "model": request["model"],
+                        "object": "chat.completion.chunk",
+                        # Internal typed field: Rust observes it and serde omits it
+                        # from the client-facing OpenAI/SSE representation. This
+                        # avoids Python json.dumps + Rust serde_json::from_str on
+                        # every visible streaming frame.
+                        "llm_metrics": metrics,
+                    }
+                    if usage := engine_response.get("completion_usage"):
+                        enriched_usage = dict(usage)
+                        completion_details = dict(
+                            enriched_usage.get("completion_tokens_details") or {}
+                        )
+                        completion_details["reasoning_tokens"] = sum(
+                            getattr(post, "num_reasoning_tokens", 0)
+                            for post in post_processors.values()
+                        )
+                        enriched_usage["completion_tokens_details"] = completion_details
+                        dynamo_out["usage"] = enriched_usage
+                    envelope["data"] = dynamo_out
+                else:
+                    # Parser-buffered frames have no typed response payload to
+                    # carry llm_metrics. Preserve the legacy annotation fallback
+                    # so hidden reasoning/tool tokens remain fully accounted.
+                    envelope["event"] = "llm_metrics"
+                    envelope["comment"] = [json.dumps(metrics)]
 
                 yield envelope
             _nvtx.end_range(rng_stream)
-        except Exception as e:
+        except Exception:
             logger.exception("Error generating response for request %s", request_id)
             raise
         finally:
@@ -1800,6 +2027,9 @@ class EngineFactory:
             "tokenizer_mode": tokenizer_mode,
             "config_format": config_format,
             "trust_remote_code": trust_remote_code,
+            "renderer_num_workers": max(
+                1, int(os.getenv("DYN_VLLM_TOKENIZER_WORKERS", "8"))
+            ),
         }
         context_length = _runtime_config_context_length(mdc)
         if context_length:
@@ -1825,6 +2055,7 @@ class EngineFactory:
             model_config=model_config,
             load_config=LoadConfig(load_format=load_format),
             cache_config=CacheConfig(),
+            device_config=DeviceConfig(device="cpu"),
             # scheduler_config=SchedulerConfig(),
         )
 

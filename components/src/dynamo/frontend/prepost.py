@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,7 @@ from typing import Any, Protocol
 
 from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionNamedFunction,
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
 )
@@ -52,7 +54,7 @@ class PreprocessResult:
     guided_decoding: dict[str, Any] | None = None
 
 
-_ASYNC_TOKENIZER_POOL: dict[int, Callable[..., Awaitable[Any]]] = {}
+_ASYNC_TOKENIZER_POOL: dict[tuple[int, int], Callable[..., Awaitable[Any]]] = {}
 SKIP_REQUEST_VALIDATION = os.getenv("DYN_VLLM_SKIP_REQUEST_VALIDATION", "1") == "1"
 
 
@@ -79,6 +81,12 @@ def _is_named_tool_choice(tool_choice: Any) -> bool:
 
 def _is_forced_tool_choice(tool_choice: Any) -> bool:
     return tool_choice == "required" or _is_named_tool_choice(tool_choice)
+
+
+def _value_from_mapping_or_object(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
 def _has_explicit_output_constraint(request: ChatCompletionRequest) -> bool:
@@ -181,7 +189,21 @@ def _request_for_vllm_structural_tag(
         )
         for tool in request.tools or []
     ]
-    return request.model_copy(update={"tools": tools})
+    updates: dict[str, Any] = {"tools": tools}
+    # xgrammar's qwen_3_coder `required` format permits an unbounded sequence
+    # of tool tags. For the common one-tool + parallel_tool_calls=false case,
+    # the equivalent named choice selects xgrammar's `forced` format, whose
+    # stop_after_first rule ends generation after the first complete call.
+    # Keep the public request unchanged; this is only the grammar input.
+    if (
+        request.tool_choice == "required"
+        and request.parallel_tool_calls is False
+        and len(tools) == 1
+    ):
+        updates["tool_choice"] = ChatCompletionNamedToolChoiceParam(
+            function=ChatCompletionNamedFunction(name=tools[0].function.name)
+        )
+    return request.model_copy(update=updates)
 
 
 def build_tool_call_guided_decoding(
@@ -307,12 +329,19 @@ def _build_assistant_guided_decoding(
     return guided_decoding
 
 
-def _get_async_tokenizer(tokenizer: TokenizerLike) -> Callable[..., Awaitable[Any]]:
-    key = id(tokenizer)
+def _get_async_tokenizer(
+    tokenizer: TokenizerLike, tokenizer_workers: int
+) -> Callable[..., Awaitable[Any]]:
+    workers = max(1, int(tokenizer_workers))
+    key = (id(tokenizer), workers)
     async_tokenizer = _ASYNC_TOKENIZER_POOL.get(key)
     if async_tokenizer is None:
         async_tokenizer = make_async(
-            tokenizer, executor=ThreadPoolExecutor(max_workers=1)
+            tokenizer,
+            executor=ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="dynamo-vllm-tokenizer",
+            ),
         )
         _ASYNC_TOKENIZER_POOL[key] = async_tokenizer
     return async_tokenizer
@@ -407,6 +436,10 @@ def _prepare_request(
     # client did not supply an explicit `tools` list, so we activate the parser
     # whenever the tool_parser_class is available.
     has_tools = bool(request_for_sampling.tools)
+    has_structured_output = (
+        request_for_sampling.extract_structured_outputs() is not None
+        or _has_explicit_output_constraint(request_for_sampling)
+    )
     if tool_parser_class and (has_tools or enable_auto_tool_choice):
         if request_for_sampling.tool_choice != "none":
             tool_parser = tool_parser_class(tokenizer, request_for_sampling.tools)
@@ -437,6 +470,8 @@ def _prepare_request(
             request_for_sampling.chat_template_kwargs or raw_template_args or {},
         )
     )
+    if "thinking" in chat_template_kwargs and "enable_thinking" not in chat_template_kwargs:
+        chat_template_kwargs["enable_thinking"] = chat_template_kwargs["thinking"]
     # reasoning_effort is a request-level thinking control. Put an explicit
     # value into the kwargs before applying the deployment default so the two
     # cannot produce contradictory template controls.
@@ -510,6 +545,7 @@ async def preprocess_chat_request(
     structural_tag_mode: str = "off",
     structural_tag_scope: str = "auto",
     structural_tag_schema: str = "auto",
+    tokenizer_workers: int = 1,
 ) -> PreprocessResult:
     validated_request = _validate_chat_completion_request(request)
     assistant_guided_decoding = _build_assistant_guided_decoding(validated_request)
@@ -586,7 +622,7 @@ async def preprocess_chat_request(
     if "prompt_token_ids" in engine_prompt:
         tokens = list(engine_prompt["prompt_token_ids"])
     else:
-        async_tokenizer = _get_async_tokenizer(tokenizer)
+        async_tokenizer = _get_async_tokenizer(tokenizer, tokenizer_workers)
         encoded = await async_tokenizer(
             engine_prompt["prompt"],
             add_special_tokens=request_for_sampling.add_special_tokens,
@@ -759,6 +795,59 @@ class StreamingPostProcessor:
             return None
         return self._decode_token_ids_for_parser([token_id]) or None
 
+    def _reasoning_end_marker(self) -> str | None:
+        """Return the active reasoning parser's closing delimiter.
+
+        Parser-engine adapters introduced in vLLM 0.27 expose this as
+        ``reasoning_end_str`` and keep the token metadata on their nested
+        engine.  Older parsers expose ``end_token`` directly.  Supporting
+        both shapes keeps the budget-cutoff sanitization effective across
+        vLLM parser implementations.
+        """
+        parser = self.reasoning_parser
+        if parser is None:
+            return None
+        engine = getattr(parser, "_parser_engine", None)
+        for owner, attr in (
+            (parser, "end_token"),
+            (parser, "reasoning_end_str"),
+            (engine, "end_token"),
+            (engine, "reasoning_end_str"),
+        ):
+            marker = getattr(owner, attr, None) if owner is not None else None
+            if isinstance(marker, str) and marker:
+                return marker
+        config = getattr(engine, "config", None) or getattr(
+            engine, "parser_engine_config", None
+        )
+        terminals = getattr(config, "terminals", None)
+        marker = terminals.get("THINK_END") if isinstance(terminals, dict) else None
+        return marker if isinstance(marker, str) and marker else None
+
+    def _reasoning_end_token_id(self) -> int | None:
+        parser = self.reasoning_parser
+        if parser is None:
+            return None
+        engine = getattr(parser, "_parser_engine", None)
+        for owner, attr in (
+            (parser, "end_token_id"),
+            (parser, "_reasoning_end_token_id"),
+            (engine, "end_token_id"),
+            (engine, "_reasoning_end_token_id"),
+        ):
+            token_id = getattr(owner, attr, None) if owner is not None else None
+            if isinstance(token_id, int):
+                return token_id
+        marker = self._reasoning_end_marker()
+        if marker:
+            try:
+                token_ids = self.tokenizer.encode(marker, add_special_tokens=False)
+            except Exception:
+                return None
+            if len(token_ids) == 1 and isinstance(token_ids[0], int):
+                return token_ids[0]
+        return None
+
     def _single_token_marker(self, marker: str) -> str | None:
         try:
             token_ids = self.tokenizer.encode(marker, add_special_tokens=False)
@@ -856,7 +945,7 @@ class StreamingPostProcessor:
             or not delta_message.content
         ):
             return
-        end_token = getattr(self.reasoning_parser, "end_token", None)
+        end_token = self._reasoning_end_marker()
         if (
             (not end_token or end_token not in current_text)
             and delta_message.content == delta_message.reasoning
@@ -879,7 +968,7 @@ class StreamingPostProcessor:
     ) -> str:
         if not self.reasoning_parser:
             return raw_delta_text
-        end_token = getattr(self.reasoning_parser, "end_token", None)
+        end_token = self._reasoning_end_marker()
         if not end_token:
             return raw_delta_text
         raw_current_text = self._decode_token_ids_for_parser(current_token_ids)
@@ -904,7 +993,7 @@ class StreamingPostProcessor:
                 if isinstance(token_id, int):
                     marker_ids.add(token_id)
         if self.reasoning_parser:
-            token_id = getattr(self.reasoning_parser, "end_token_id", None)
+            token_id = self._reasoning_end_token_id()
             if isinstance(token_id, int):
                 marker_ids.add(token_id)
         return marker_ids
@@ -1008,7 +1097,7 @@ class StreamingPostProcessor:
                 if marker_offsets:
                     original_prefix = text[: min(marker_offsets)]
                     if original_prefix.strip() == content.strip():
-                        content = original_prefix
+                        content = original_prefix.rstrip()
             return self._compose_delta_message(saved_reasoning, content)
 
         return self._compose_delta_message(saved_reasoning, extracted.content or None)
@@ -1114,7 +1203,10 @@ class StreamingPostProcessor:
         # choice. Per-choice tracking is required for `n > 1` requests —
         # choice 0 emitting tool_calls must not remap choice 1's stop.
         # Spec: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
-        if finish_reason == "stop" and output_index in self._tool_call_choices_emitted:
+        if (
+            finish_reason in {"stop", "length"}
+            and output_index in self._tool_call_choices_emitted
+        ):
             return "tool_calls"
         return finish_reason
 
@@ -1193,7 +1285,7 @@ class StreamingPostProcessor:
                 current_text,
                 request=self.request_for_sampling,
             )
-            end_token = getattr(self.reasoning_parser, "end_token", None)
+            end_token = self._reasoning_end_marker()
             if (
                 saved_reasoning
                 and content == current_text
@@ -1253,8 +1345,8 @@ class StreamingPostProcessor:
         # to text. Re-detokenizing from token_ids can reintroduce stop markers.
         delta_text = output.text or ""
         if self.reasoning_is_done and self.reasoning_parser:
-            end_token_id = getattr(self.reasoning_parser, "end_token_id", None)
-            end_token = getattr(self.reasoning_parser, "end_token", None)
+            end_token_id = self._reasoning_end_token_id()
+            end_token = self._reasoning_end_marker()
             if (
                 isinstance(end_token_id, int)
                 and end_token_id in raw_delta_token_ids
