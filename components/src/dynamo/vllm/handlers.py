@@ -886,7 +886,7 @@ class _ThinkingTokenCounter:
             self.start_token_id, self.end_token_id, self.in_reasoning
         )
 
-    def update(self, token_ids: list[int]) -> None:
+    def update(self, token_ids: list[int], *, finished: bool = False) -> None:
         for token_id in token_ids:
             if token_id == self.start_token_id:
                 self.in_reasoning = True
@@ -3446,15 +3446,21 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             usage["completion_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
         return usage
 
-    def _new_reasoning_token_counter(self, prompt: Any) -> _ThinkingTokenCounter | None:
+    def _new_reasoning_token_counter(self, prompt: Any) -> Any | None:
         if self._reasoning_parser_class is None or self._reasoning_tokenizer is None:
             return None
         parser = self._reasoning_parser_class(self._reasoning_tokenizer)
-        start_token_id = getattr(parser, "start_token_id", None)
-        end_token_id = getattr(parser, "end_token_id", None)
         prompt_token_ids = _value_from_mapping_or_object(
             prompt, "prompt_token_ids", None
         )
+        create_counter = getattr(parser, "create_reasoning_token_counter", None)
+        if callable(create_counter):
+            counter = create_counter(prompt_token_ids)
+            if counter is not None:
+                return counter
+
+        start_token_id = getattr(parser, "start_token_id", None)
+        end_token_id = getattr(parser, "end_token_id", None)
         if (
             not isinstance(start_token_id, int)
             or not isinstance(end_token_id, int)
@@ -3550,8 +3556,10 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             )
 
             total_output_tokens_by_index: dict[int, int] = {}
-            reasoning_counter_seed = self._new_reasoning_token_counter(prompt)
-            reasoning_counters_by_index: dict[int, _ThinkingTokenCounter] = {}
+            reasoning_counter_prompt = prompt
+            reasoning_counter_seed = None
+            reasoning_counter_initialized = False
+            reasoning_counters_by_index: dict[int, Any] = {}
             raw_routed_experts_by_output: dict[int, Any] = {}
             # vLLM surfaces prompt_logprobs once (at end-of-prefill) and clears
             # them on subsequent chunks, so the generation-finish chunk often
@@ -3583,6 +3591,20 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                     }
                     break
 
+                if not reasoning_counter_initialized:
+                    # TextPrompt (for example raw video) has no input token IDs.
+                    # Seed from the engine's authoritative, processed prompt before
+                    # consuming the first generated token, for every choice.
+                    engine_prompt_ids = getattr(res, "prompt_token_ids", None)
+                    if engine_prompt_ids is not None:
+                        reasoning_counter_prompt = {
+                            "prompt_token_ids": engine_prompt_ids
+                        }
+                    reasoning_counter_seed = self._new_reasoning_token_counter(
+                        reasoning_counter_prompt
+                    )
+                    reasoning_counter_initialized = True
+
                 prepared_outputs = []
                 for output in res.outputs:
                     output_idx = getattr(output, "index", 0) or 0
@@ -3593,11 +3615,24 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                     if reasoning_counter_seed is not None:
                         counter = reasoning_counters_by_index.get(output_idx)
                         if counter is None:
-                            counter = reasoning_counter_seed.clone_initial()
-                            reasoning_counters_by_index[output_idx] = counter
-                        counter.update(token_ids)
+                            if not reasoning_counters_by_index:
+                                counter = reasoning_counter_seed
+                            else:
+                                counter = self._new_reasoning_token_counter(
+                                    reasoning_counter_prompt
+                                )
+                            if counter is None:
+                                reasoning_counter_seed = None
+                                reasoning_counters_by_index.clear()
+                            else:
+                                reasoning_counters_by_index[output_idx] = counter
                     finish_reason = getattr(output, "finish_reason", None)
                     stop_reason = getattr(output, "stop_reason", None)
+                    if reasoning_counter_seed is not None:
+                        counter.update(
+                            token_ids,
+                            finished=finish_reason is not None or stop_reason is not None,
+                        )
                     if not token_ids and not finish_reason and not stop_reason:
                         continue
                     prepared_outputs.append(

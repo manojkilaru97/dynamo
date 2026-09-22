@@ -179,6 +179,77 @@ async def test_clear_kv_blocks_reports_reset_failure():
 
 class TestReasoningParserForwarding:
     @pytest.mark.asyncio
+    async def test_generate_tokens_uses_parser_native_reasoning_counter(self):
+        from vllm.sampling_params import SamplingParams
+
+        created_counters = []
+        finished_values = []
+
+        class NativeReasoningCounter:
+            def __init__(self):
+                self.total = 0
+
+            def update(self, token_ids, *, finished=False):
+                finished_values.append(finished)
+                self.total += sum(token_id >= 30 for token_id in token_ids)
+
+        class NativeReasoningParser:
+            def __init__(self, tokenizer):
+                assert tokenizer == "tokenizer"
+
+            def create_reasoning_token_counter(self, prompt_token_ids):
+                assert prompt_token_ids == [1, 2]
+                counter = NativeReasoningCounter()
+                created_counters.append(counter)
+                return counter
+
+        handler = _make_handler()
+        handler._reasoning_parser_class = NativeReasoningParser
+        handler._reasoning_tokenizer = "tokenizer"
+        handler._extract_logprobs = MagicMock(return_value=(None, None))
+
+        async def fake_generate(*args, **kwargs):
+            yield SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        index=0,
+                        token_ids=[31, 32],
+                        routed_experts=None,
+                        finish_reason="stop",
+                        stop_reason=None,
+                    ),
+                    SimpleNamespace(
+                        index=1,
+                        token_ids=[41],
+                        routed_experts=None,
+                        finish_reason="stop",
+                        stop_reason=None,
+                    ),
+                ],
+                prompt_token_ids=[1, 2],
+                prompt_logprobs=None,
+                num_cached_tokens=0,
+            )
+
+        handler.engine_client = MagicMock()
+        handler.engine_client.generate = fake_generate
+
+        chunks = [
+            chunk
+            async for chunk in handler.generate_tokens(
+                PatchedTokensPrompt(prompt_token_ids=[1, 2]),
+                SamplingParams(max_tokens=2, n=2),
+                "req-native-reasoning-usage",
+            )
+        ]
+
+        assert len(created_counters) == 2
+        assert finished_values == [True, True]
+        assert chunks[-1]["completion_usage"]["completion_tokens_details"] == {
+            "reasoning_tokens": 3
+        }
+
+    @pytest.mark.asyncio
     async def test_generate_tokens_reports_reasoning_token_usage(self):
         from vllm.sampling_params import SamplingParams
 
