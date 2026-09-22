@@ -1,0 +1,15 @@
+FROM nvcr.io/qc69jvmznzxy/llm_nim/super:dynamo-v1.4.1-vllm-v0.27.1-super35-video-hotfix-amd64-v4
+
+USER root
+
+COPY --chown=dynamo:0 --chmod=755 container/build-artifacts/_core.abi3.so \
+    /usr/local/lib/python3.12/dist-packages/dynamo/_core.abi3.so
+COPY --chown=dynamo:0 --chmod=664 components/src/dynamo/vllm/handlers.py \
+    /usr/local/lib/python3.12/dist-packages/dynamo/vllm/handlers.py
+
+RUN python3 -c 'import dynamo._core; import dynamo.vllm.handlers'
+
+LABEL ai.dynamo.base-revision="f27c1ffd1" \
+      ai.dynamo.super35.swe-fix="engine-stop-for-named-qwen-tool-choice-v9"
+
+USER dynamo

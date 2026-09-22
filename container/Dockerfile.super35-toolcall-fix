@@ -1,0 +1,16 @@
+FROM nvcr.io/qc69jvmznzxy/llm_nim/super:dynamo-v1.4.1-vllm-v0.27.1-super35-swe-fix-amd64-v9
+
+USER root
+
+# Replace only the Dynamo runtime package.  The base image retains the exact
+# validated vLLM build and serving configuration; this wheel contains the
+# required-single-tool and Nemotron reasoning/tool handoff fixes.
+COPY --chmod=644 container/build-artifacts/toolcall-v10/ai_dynamo_runtime-1.4.1-cp310-abi3-manylinux_2_35_x86_64.whl /tmp/ai_dynamo_runtime-1.4.1-cp310-abi3-manylinux_2_35_x86_64.whl
+RUN python3 -m pip install --no-deps --force-reinstall /tmp/ai_dynamo_runtime-1.4.1-cp310-abi3-manylinux_2_35_x86_64.whl \
+    && rm /tmp/ai_dynamo_runtime-1.4.1-cp310-abi3-manylinux_2_35_x86_64.whl \
+    && python3 -c 'import dynamo._core; import dynamo.vllm.handlers'
+
+LABEL ai.dynamo.base-image="super35-swe-fix-amd64-v9" \
+      ai.dynamo.super35.toolcall-fix="required-single-tool-and-nemotron-handoff-v10"
+
+USER dynamo
