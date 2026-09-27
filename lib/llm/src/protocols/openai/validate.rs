@@ -111,6 +111,15 @@ pub const PASSTHROUGH_EXTRA_FIELDS: &[&str] = &[
     "logprob_token_ids",
 ];
 
+/// Documented OpenAI Chat Completions fields that the pinned protocol types predate.
+/// They have no effect on generation here, so they are accepted and dropped.
+pub const OPENAI_ACCEPTED_IGNORED_FIELDS: &[&str] = &[
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "safety_identifier",
+    "verbosity",
+];
+
 static IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS: LazyLock<bool> =
     LazyLock::new(|| env_is_truthy(DYN_IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS));
 
@@ -134,11 +143,28 @@ fn validate_no_unsupported_fields_with_ignore(
 ) -> Result<(), anyhow::Error> {
     let unknown: Vec<_> = unsupported_fields
         .keys()
-        .filter(|k| !PASSTHROUGH_EXTRA_FIELDS.contains(&k.as_str()))
+        .filter(|k| {
+            !PASSTHROUGH_EXTRA_FIELDS.contains(&k.as_str())
+                && !OPENAI_ACCEPTED_IGNORED_FIELDS.contains(&k.as_str())
+        })
         .map(|s| format!("`{}`", s))
         .collect();
     if !unknown.is_empty() && !ignore_unsupported_fields {
         anyhow::bail!("Unsupported parameter(s): {}", unknown.join(", "));
+    }
+    for key in ["prompt_cache_key", "prompt_cache_retention", "safety_identifier"] {
+        if let Some(value) = unsupported_fields.get(key)
+            && !value.is_string()
+            && !value.is_null()
+        {
+            anyhow::bail!("`{key}` must be a string");
+        }
+    }
+    if let Some(value) = unsupported_fields.get("verbosity")
+        && !value.is_null()
+        && !matches!(value.as_str(), Some("low" | "medium" | "high"))
+    {
+        anyhow::bail!("`verbosity` must be one of \"low\", \"medium\", \"high\"");
     }
     if let Some(value) = unsupported_fields.get("cache_salt")
         && !value.is_string()
@@ -989,6 +1015,30 @@ mod tests {
     #[test]
     fn validate_no_unsupported_fields_ignores_unknown_fields_when_configured() {
         validate_no_unsupported_fields_with_ignore(&unknown_fields(), true).unwrap();
+    }
+
+    #[test]
+    fn validate_no_unsupported_fields_accepts_documented_openai_fields() {
+        let fields = HashMap::from([
+            ("prompt_cache_key".to_string(), json!("ck-1")),
+            ("prompt_cache_retention".to_string(), json!("24h")),
+            ("safety_identifier".to_string(), json!("user-hash")),
+            ("verbosity".to_string(), json!("low")),
+        ]);
+        validate_no_unsupported_fields_with_ignore(&fields, false).unwrap();
+    }
+
+    #[test]
+    fn validate_no_unsupported_fields_rejects_malformed_openai_fields() {
+        for (key, bad) in [
+            ("prompt_cache_key", json!(7)),
+            ("safety_identifier", json!({"id": 1})),
+            ("verbosity", json!("loud")),
+        ] {
+            let fields = HashMap::from([(key.to_string(), bad)]);
+            let err = validate_no_unsupported_fields_with_ignore(&fields, false).unwrap_err();
+            assert!(err.to_string().contains(key), "{key}: {err}");
+        }
     }
 
     #[test]

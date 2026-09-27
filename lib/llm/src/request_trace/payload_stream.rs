@@ -134,25 +134,24 @@ where
             }
             Err(e) => {
                 tracing::warn!("fold aggregation failed: {e}");
-                // Drop tx without sending so the request payload future resolves to None.
-                // The client still receives a (best-effort) empty fallback chunk so
-                // the HTTP response shape stays valid; the combined request payload record is
-                // emitted with `response = None`.
+                // Drop tx without sending so the request payload future resolves to None
+                // and the record is emitted with `response = None`. Forward the error so
+                // the HTTP layer reports it instead of a successful empty completion.
                 drop(tx);
-                let fallback = NvCreateChatCompletionResponse {
-                    inner: dynamo_protocols::types::CreateChatCompletionResponse {
-                        id: String::new(),
-                        created: 0,
-                        usage: None,
-                        model: String::new(),
-                        object: "chat.completion".to_string(),
-                        system_fingerprint: None,
-                        choices: vec![],
-                        service_tier: None,
-                    },
-                    nvext: None,
+                let error_chunk: Annotated<NvCreateChatCompletionStreamResponse> = Annotated {
+                    data: None,
+                    id: None,
+                    event: Some("error".to_string()),
+                    comment: None,
+                    error: Some(e),
                 };
-                final_response_to_one_chunk_stream(fallback)
+                Box::pin(futures::stream::once(async move { error_chunk }))
+                    as Pin<
+                        Box<
+                            dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>>
+                                + Send,
+                        >,
+                    >
             }
         }
     };
@@ -617,6 +616,24 @@ mod tests {
             final_resp.is_none(),
             "Empty stream should resolve request payload future to None, not a fallback record"
         );
+    }
+
+    #[tokio::test]
+    async fn test_fold_forwards_backend_error_instead_of_empty_response() {
+        let chunks = vec![
+            create_mock_chunk("partial".to_string(), 0),
+            Annotated::<NvCreateChatCompletionStreamResponse>::from_error("worker failed"),
+        ];
+
+        let (single, future) = fold_aggregate_with_future(stream::iter(chunks));
+        let results: Vec<_> = single.collect().await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].event.as_deref(), Some("error"));
+        assert!(results[0].data.is_none());
+        let error = results[0].error.as_ref().expect("error forwarded");
+        assert!(error.to_string().contains("worker failed"), "{error}");
+        assert!(future.await.is_none());
     }
 
     #[tokio::test]
