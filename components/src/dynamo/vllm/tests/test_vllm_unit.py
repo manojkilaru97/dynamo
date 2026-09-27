@@ -1692,6 +1692,96 @@ def test_build_sampling_params_openai_maps_max_thinking_tokens():
     assert sp.thinking_token_budget == 1024
 
 
+def test_build_sampling_params_caps_omitted_max_tokens(monkeypatch):
+    from dynamo.vllm.handlers import build_sampling_params
+
+    monkeypatch.setenv("DYN_MAX_OUTPUT_TOKENS", "128")
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {},
+        "stop_conditions": {},
+        "output_options": {},
+    }
+    sp = build_sampling_params(
+        request, default_sampling_params={}, model_max_len=1_000_000
+    )
+    assert sp.max_tokens == 128
+
+
+def test_build_sampling_params_keeps_smaller_explicit_max_tokens(monkeypatch):
+    from dynamo.vllm.handlers import build_sampling_params
+
+    monkeypatch.setenv("DYN_MAX_OUTPUT_TOKENS", "128")
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {},
+        "stop_conditions": {"max_tokens": 16},
+        "output_options": {},
+    }
+    sp = build_sampling_params(
+        request, default_sampling_params={}, model_max_len=1_000_000
+    )
+    assert sp.max_tokens == 16
+
+
+def test_build_sampling_params_openai_caps_oversized_max_tokens(monkeypatch):
+    from dynamo.vllm.handlers import build_sampling_params_openai
+
+    monkeypatch.delenv("DYN_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.setenv("DYN_MAX_OUTPUT_LEN", "64")
+    sp = build_sampling_params_openai(
+        {"max_tokens": 1_000_000}, default_sampling_params={}
+    )
+    assert sp.max_tokens == 64
+
+
+@pytest.mark.asyncio
+async def test_decode_deadline_aborts_stalled_stream(monkeypatch):
+    import asyncio
+
+    from dynamo.vllm.handlers import (
+        DecodeWallClockTimeoutError,
+        _iterate_with_decode_deadline,
+    )
+
+    monkeypatch.setenv("DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS", "0.2")
+    aborted = []
+
+    async def stalled():
+        yield "first"
+        await asyncio.sleep(30)
+        yield "never"  # pragma: no cover
+
+    async def abort():
+        aborted.append(True)
+
+    seen = []
+    with pytest.raises(DecodeWallClockTimeoutError):
+        async for item in _iterate_with_decode_deadline(stalled(), "req-1", abort):
+            seen.append(item)
+    assert seen == ["first"]
+    assert aborted == [True]
+
+
+@pytest.mark.asyncio
+async def test_decode_deadline_passes_through_when_unset(monkeypatch):
+    from dynamo.vllm.handlers import _iterate_with_decode_deadline
+
+    monkeypatch.delenv("DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS", raising=False)
+
+    async def finite():
+        for item in ("a", "b"):
+            yield item
+
+    async def abort():
+        raise AssertionError("abort must not be called")
+
+    assert [x async for x in _iterate_with_decode_deadline(finite(), "r", abort)] == [
+        "a",
+        "b",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_generate_text_mode_applies_nvext_cache_salt():
     from dynamo.vllm.handlers import DecodeWorkerHandler

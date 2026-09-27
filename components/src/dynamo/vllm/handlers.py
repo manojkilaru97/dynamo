@@ -6,6 +6,7 @@ import base64
 import copy
 import importlib
 import inspect
+import json
 import logging
 import math
 import os
@@ -33,6 +34,7 @@ from typing import (
 import torch
 from vllm import PoolingParams
 from vllm.config import ModelConfig, VllmConfig
+from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
@@ -108,6 +110,20 @@ from .multimodal_utils.vision_encoder_backend import VisionEncoderBackend
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 TOOL_CHOICE_SCHEMA_MARKER = "x-dynamo-tool-choice-schema"
+DEFAULT_TOOL_CALL_MAX_ARRAY_ITEMS = 8
+DEFAULT_SCHEMA_MAX_STRING_LENGTH = 4096
+DEFAULT_SCHEMA_MAX_ARRAY_ITEMS = 32
+DEFAULT_TOOL_SHORT_TEXT_MAX_LENGTH = 256
+DEFAULT_TOOL_LONG_TEXT_MAX_LENGTH = 8192
+TOOL_LONG_REQUEST_THRESHOLD = 2048
+TOOL_LONG_REQUEST_MARGIN = 512
+TOOL_FIELD_STRING_BUDGETS = {
+    "expression": 256,
+}
+TOOL_LONG_TEXT_FIELD_NAMES = {"body", "content", "message"}
+QWEN_XML_STRUCTURAL_TAG_TOOL_PARSERS = {"qwen3_coder", "qwen3_xml"}
+FORCED_TOOL_STRUCTURAL_TAG_TRIGGERS = ["<tool_call>"]
+UNSUPPORTED_STRUCTURED_REGEX_TOKENS: Final = ("(?=", "(?!", "(?<=", "(?<!")
 
 # Marker set by the Rust conditional-disagg bypass path. When present on a
 # DECODE-mode worker, the request runs as local prefill+decode instead of
@@ -735,8 +751,9 @@ def build_sampling_params(
             sampling_params.structured_outputs = StructuredOutputsParams(
                 json=(
                     bound_json_schema_for_constrained_decoding(guided_json)
-                    if guided_json is not None
-                    else None
+                    if isinstance(guided_json, dict)
+                    and guided_json.get(TOOL_CHOICE_SCHEMA_MARKER) is True
+                    else guided_json
                 ),
                 regex=guided_decoding.get("regex"),
                 choice=guided_decoding.get("choice"),
@@ -840,6 +857,7 @@ def build_sampling_params(
         dynamic_default = max(1, model_max_len - input_length)
         configured_default = default_sampling_params.get("max_tokens", dynamic_default)
         sampling_params.max_tokens = min(configured_default, dynamic_default)
+    _apply_max_output_tokens_cap(sampling_params)
 
     # Dynamo's internal token path consumes disjoint token deltas. This mirrors
     # the SGLang integration and lets vLLM's stream_interval gate reduce backend
@@ -848,6 +866,94 @@ def build_sampling_params(
     sampling_params.output_kind = _DELTA_REQUEST_OUTPUT_KIND
 
     return sampling_params
+
+
+def _configured_max_output_tokens_env() -> int | None:
+    for name in ("DYN_MAX_OUTPUT_TOKENS", "DYN_MAX_OUTPUT_LEN"):
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        try:
+            parsed = int(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid %s=%r", name, raw)
+            continue
+        if parsed > 0:
+            return parsed
+    return None
+
+
+def _apply_max_output_tokens_cap(sampling_params: Any) -> None:
+    """Fill an omitted max_tokens and clamp larger ones to DYN_MAX_OUTPUT_TOKENS/LEN."""
+    cap = _configured_max_output_tokens_env()
+    if cap is None:
+        return
+    current = getattr(sampling_params, "max_tokens", None)
+    if current is None or current > cap:
+        sampling_params.max_tokens = cap
+
+
+def _normalize_structural_tag(value: Any) -> Any:
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+class DecodeWallClockTimeoutError(RuntimeError):
+    """A request ran longer than DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS."""
+
+
+def _decode_wall_clock_limit_secs() -> float | None:
+    raw = os.environ.get("DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS")
+    if not raw:
+        return None
+    try:
+        parsed = float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS=%r", raw)
+        return None
+    return parsed if parsed > 0 else None
+
+
+async def _iterate_with_decode_deadline(gen, request_id: str, abort):
+    """Yield from an engine stream, aborting the request once the wall-clock limit passes."""
+    limit = _decode_wall_clock_limit_secs()
+    if limit is None:
+        async for item in gen:
+            yield item
+        return
+    deadline = time.monotonic() + limit
+    iterator = gen.__aiter__()
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(
+                    iterator.__anext__(), timeout=max(0.0, deadline - time.monotonic())
+                )
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Request %s exceeded the %gs generation wall-clock limit; aborting",
+                    request_id,
+                    limit,
+                )
+                try:
+                    await abort()
+                except Exception as abort_error:
+                    logger.warning(
+                        "Failed to abort request %s after wall-clock timeout: %s",
+                        request_id,
+                        abort_error,
+                    )
+                raise DecodeWallClockTimeoutError(
+                    f"Request exceeded the {limit:g}s generation wall-clock limit"
+                ) from None
+            yield item
+    finally:
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
 
 def _value_from_mapping_or_object(obj: Any, key: str, default: Any = None) -> Any:
@@ -1609,6 +1715,7 @@ def build_sampling_params_openai(
     # Handle max_tokens
     if "max_tokens" in request and request["max_tokens"] is not None:
         sampling_params.max_tokens = request["max_tokens"]
+    _apply_max_output_tokens_cap(sampling_params)
 
     # Handle stop sequences
     if "stop" in request and request["stop"] is not None:
@@ -3554,6 +3661,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                     ),
                 ),
             )
+            gen = _iterate_with_decode_deadline(
+                gen, request_id, lambda: self.engine_client.abort(request_id)
+            )
 
             total_output_tokens_by_index: dict[int, int] = {}
             reasoning_counter_prompt = prompt
@@ -4124,13 +4234,19 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             self._abort_monitor(context, request_id, abort_guard=abort_guard),
         ):
             try:
-                gen = self.engine_client.generate(
-                    prompt,
-                    sampling_params,
+                gen = _iterate_with_decode_deadline(
+                    self.engine_client.generate(
+                        prompt,
+                        sampling_params,
+                        request_id,
+                        data_parallel_rank=dp_rank,
+                        trace_headers=trace_headers,
+                        priority=priority,
+                    ),
                     request_id,
-                    data_parallel_rank=dp_rank,
-                    trace_headers=trace_headers,
-                    priority=priority,
+                    abort_guard.abort
+                    if abort_guard is not None
+                    else lambda: self.engine_client.abort(request_id),
                 )
 
                 async for res in gen:
