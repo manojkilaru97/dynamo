@@ -14,9 +14,11 @@
 #[cfg(feature = "mm-routing")]
 pub mod lightseek_mm;
 pub mod media;
+pub(crate) mod nemotron_reasoning;
 pub mod prompt;
 pub mod speculative_prefill;
 mod structural_tag;
+mod super_user_tokenization;
 mod tool_choice;
 pub mod tools;
 use anyhow::Context;
@@ -677,6 +679,7 @@ pub struct OpenAIPreprocessor {
     mdcsum: String,
     formatter: Arc<dyn OAIPromptFormatter>,
     tokenizer: Arc<dyn Tokenizer>,
+    user_data_encoder: Option<Arc<super_user_tokenization::UserDataEncoder>>,
     model_info: Arc<dyn ModelInfo>,
     lora_name: Option<String>,
     /// Per-model runtime configuration propagated to response generator (e.g., reasoning/tool parser)
@@ -1076,6 +1079,7 @@ impl OpenAIPreprocessor {
     ) -> Result<Arc<Self>> {
         let mdcsum = mdc.mdcsum().to_string();
         let tokenizer: Arc<dyn Tokenizer> = (*tokenizer).clone();
+        let user_data_encoder = super_user_tokenization::UserDataEncoder::from_mdc(&mdc)?.map(Arc::new);
         let lora_name = mdc.lora.as_ref().map(|l| l.name.clone());
         let Some(ref model_info) = mdc.model_info else {
             anyhow::bail!(
@@ -1270,6 +1274,7 @@ impl OpenAIPreprocessor {
         Ok(Arc::new(Self {
             formatter,
             tokenizer,
+            user_data_encoder,
             model_info,
             mdcsum,
             lora_name,
@@ -2537,11 +2542,9 @@ impl OpenAIPreprocessor {
                                 tracing::warn!(
                                     "backend_instance_id provided but no token_data; tokenizing prompt"
                                 );
-                                let encoding = self.encode_with_timing(prompt, tracker).await?;
-                                (encoding.token_ids().to_vec(), false)
+                                (self.encode_request_prompt(request, prompt, tracker).await?, false)
                             } else {
-                                let encoding = self.encode_with_timing(prompt, tracker).await?;
-                                (encoding.token_ids().to_vec(), false)
+                                (self.encode_request_prompt(request, prompt, tracker).await?, false)
                             };
 
                             if request.has_annotation(ANNOTATION_TOKEN_IDS)
@@ -2603,6 +2606,25 @@ impl OpenAIPreprocessor {
                 .into());
         }
         Ok(())
+    }
+
+    async fn encode_request_prompt<R: OAIChatLikeRequest + NvExtProvider>(
+        &self, request: &R, prompt: &str, tracker: Option<&RequestTracker>,
+    ) -> Result<Vec<u32>> {
+        if let Some(encoder) = &self.user_data_encoder
+            && request.typed_messages().is_some()
+            && !request.nvext().is_some_and(|ext| ext.use_raw_prompt.unwrap_or(false))
+        {
+            let rendered = self.formatter.render_with_user_spans(request)?;
+            anyhow::ensure!(rendered.text == prompt, "provenance render differs from request prompt");
+            let encode_start = Instant::now();
+            let encoder = encoder.clone();
+            let tokenizer = self.tokenizer.clone();
+            let ids = tokio::task::spawn_blocking(move || encoder.encode(&rendered, tokenizer.as_ref())).await??;
+            if let Some(tracker) = tracker { tracker.record_tokenize_latency(encode_start.elapsed()); }
+            return Ok(ids);
+        }
+        Ok(self.encode_with_timing(prompt, tracker).await?.token_ids().to_vec())
     }
 
     async fn encode_with_timing(
@@ -2797,7 +2819,21 @@ impl OpenAIPreprocessor {
                 Box::pin(stream)
             };
 
-        let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if should_parse_reasoning {
+        let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if self.user_data_encoder.is_some() {
+            // This profile already split reasoning inside DeltaGenerator while
+            // the sampled token IDs were available.
+            Box::pin(stream)
+        } else if reasoning_parser == Some("nemotron_v3")
+            && (should_parse_reasoning || should_strip_disabled_reasoning_start)
+        {
+            let force_nonempty = request.chat_template_args.as_ref()
+                .and_then(|args| args.get("force_nonempty_content"))
+                == Some(&serde_json::Value::Bool(true));
+            Box::pin(nemotron_reasoning::parse_stream_with_options(
+                stream, bypass_reasoning_for_bare_guided_json, should_parse_reasoning,
+                force_nonempty, request.inner.stream.unwrap_or(false),
+            ))
+        } else if should_parse_reasoning {
             Box::pin(Self::parse_reasoning_content_from_stream_inner(
                 stream,
                 self.runtime_config.reasoning_parser.clone().unwrap(), // Safety: We already checked that parser is some, so gtg
@@ -2855,11 +2891,15 @@ impl OpenAIPreprocessor {
         let parser_name = self.tool_call_parser.as_deref();
         let use_parsers_v2 = tool_parser_v2::enabled()
             && parser_name.is_some_and(tool_parser_v2::supports_family)
-            && !uses_tool_call_structural_tag
-            && matches!(
-                request.inner.tool_choice.as_ref(),
-                None | Some(dynamo_protocols::types::ChatCompletionToolChoiceOption::Auto)
-            );
+            && ((parser_name == Some("qwen3_coder") && uses_tool_call_structural_tag)
+                || (!uses_tool_call_structural_tag
+                    && matches!(
+                        request.inner.tool_choice.as_ref(),
+                        None
+                            | Some(
+                                dynamo_protocols::types::ChatCompletionToolChoiceOption::Auto,
+                            )
+                    )));
 
         // Apply jail conditionally
         let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> =
@@ -2942,6 +2982,8 @@ impl OpenAIPreprocessor {
             pending_client_usage: Option<Annotated<Resp>>,
             finished: bool,
             emit_payload_usage_chunk: bool,
+            backend_eof: bool,
+            postprocessor_flushed: bool,
             trace_tokens_enabled: bool,
             trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
             mm_counts: MultimodalCounts,
@@ -2959,6 +3001,8 @@ impl OpenAIPreprocessor {
             pending_client_usage: None,
             finished: false,
             emit_payload_usage_chunk,
+            backend_eof: false,
+            postprocessor_flushed: false,
             trace_tokens_enabled,
             trace_finish_reason_metadata,
             mm_counts,
@@ -2987,7 +3031,8 @@ impl OpenAIPreprocessor {
                     return None;
                 }
 
-                if let Some(mut response) = inner.response_stream.next().await {
+                let response = if inner.backend_eof { None } else { inner.response_stream.next().await };
+                if let Some(mut response) = response {
                     // Split topology: overlay a standalone router's forwarded routing_data
                     // (timing, query-only token_ids) onto this request's tracker so the
                     // frontend's nvext/timing surfaces populate.
@@ -3123,6 +3168,18 @@ impl OpenAIPreprocessor {
 
                     Some((response, inner))
                 } else {
+                    inner.backend_eof = true;
+                    if !inner.postprocessor_flushed {
+                        inner.postprocessor_flushed = true;
+                        match inner.response_generator.flush_postprocessor() {
+                            Ok(Some(response)) => return Some((Annotated::from_data(response), inner)),
+                            Ok(None) => {}
+                            Err(error) => {
+                                inner.finished = true;
+                                return Some((Annotated::from_error(error.to_string()), inner));
+                            }
+                        }
+                    }
                     // Stream has ended - must set finished to true to prevent unfold from polling
                     // again. The stream is exhausted and will panic if polled after None.
                     inner.finished = true;
@@ -3714,7 +3771,8 @@ impl OpenAIPreprocessor {
                 if dynamo_renderer::thinking_bool_from_args(chat_template_args) == Some(false) {
                     return true;
                 }
-                if let Some(args) = chat_template_args
+                if parser != Some("nemotron_v3")
+                    && let Some(args) = chat_template_args
                     && let Some(force_nonempty) = args.get("force_nonempty_content")
                     && force_nonempty == &serde_json::Value::Bool(true)
                 {
@@ -4276,6 +4334,20 @@ impl
                 .0;
 
         let mut response_generator = Box::new(response_generator);
+        if let Some(encoder) = &self.user_data_encoder {
+            let (thinking, _) = self.reasoning_stream_modes(&request, uses_tool_call_structural_tag);
+            let guided = Self::has_structured_response_format(&request) || matches!(
+                request.inner.tool_choice,
+                Some(ChatCompletionToolChoiceOption::Required) | Some(ChatCompletionToolChoiceOption::Named(_))
+            );
+            let force = request.chat_template_args.as_ref()
+                .and_then(|args| args.get("force_nonempty_content")) == Some(&serde_json::Value::Bool(true));
+            response_generator.set_nemotron_reasoning(nemotron_reasoning::TokenAwareReasoning::new(
+                self.tokenizer.clone(), &common_request.token_ids, encoder.controls.clone(),
+                common_request.output_options.skip_special_tokens.unwrap_or(true),
+                guided && !uses_tool_call_structural_tag, thinking, force, original_stream_flag,
+            ));
+        }
         if structured_json_guard_after_reasoning {
             response_generator.set_structured_json_guard(false);
         }
@@ -4313,12 +4385,17 @@ impl
             image_tokens,
         );
 
+        // Backend generation is always streamed internally, but parser finalization
+        // must honor the caller's transport (e.g. Nemotron's batch-only reasoning
+        // swap for force_nonempty_content). Do not pass the internal override.
+        request.inner.stream = Some(original_stream_flag);
         let transformed_stream = self.postprocessor_parsing_stream(
             stream,
             &request,
             prompt_injected_reasoning,
             uses_tool_call_structural_tag,
         )?;
+        request.inner.stream = Some(true);
 
         // Apply request payload aggregation strategy.
         // The payload branch already returns Pin<Box<...>> from scan/fold_aggregate_with_future,
@@ -4362,6 +4439,7 @@ impl
             &next,
             &self.formatter,
             &self.tokenizer,
+            self.user_data_encoder.as_ref(),
         );
 
         let final_stream: Pin<Box<dyn Stream<Item = _> + Send>> =

@@ -555,6 +555,13 @@ impl LocalKvIndexer {
         last_event_id: u64,
     ) -> tokio::task::JoinHandle<BuildTaskResult> {
         let indexer = self.indexer.clone();
+        let lower_tiers = self
+            .lower_tier_indexers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&tier, indexer)| (tier, indexer.clone()))
+            .collect();
         let recovery_cache = self.recovery_cache.clone();
         #[cfg(test)]
         let build_delay = *self.dump_build_delay.lock().unwrap();
@@ -567,7 +574,7 @@ impl LocalKvIndexer {
                 tokio::time::sleep(delay).await;
             }
 
-            let build_output = Self::build_fresh_dump(indexer, last_event_id).await;
+            let build_output = Self::build_fresh_dump(indexer, lower_tiers, last_event_id).await;
             let notify = build.notify.clone();
             let result = recovery_cache.finish_build(&build, build_output).await;
 
@@ -576,8 +583,23 @@ impl LocalKvIndexer {
         })
     }
 
-    async fn build_fresh_dump(indexer: KvIndexer, last_event_id: u64) -> FreshDumpOutput {
-        match indexer.dump_events().await {
+    async fn build_fresh_dump(
+        indexer: KvIndexer,
+        lower_tiers: Vec<(StorageTier, Arc<ThreadPoolIndexer<LowerTierIndexer>>)>,
+        last_event_id: u64,
+    ) -> FreshDumpOutput {
+        let dump = async {
+            let mut events = indexer.dump_events().await?;
+            for (tier, indexer) in lower_tiers {
+                for mut event in indexer.dump_events().await? {
+                    event.storage_tier = tier;
+                    events.push(event);
+                }
+            }
+            Ok::<_, KvRouterError>(events)
+        }
+        .await;
+        match dump {
             Ok(events) => {
                 let represented_blocks = events
                     .iter()

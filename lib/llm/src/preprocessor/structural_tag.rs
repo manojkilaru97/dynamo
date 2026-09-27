@@ -36,10 +36,10 @@ impl OpenAIPreprocessor {
         };
 
         if matches!(tool_choice, ToolChoice::None) {
-            if tools.is_empty() {
-                return Ok(false);
-            }
-            return Self::apply_tool_call_ban(builder, preprocessed_request);
+            // Match stock vLLM: explicit `tool_choice=none` does not install a
+            // guided-decoding constraint. Prompt formatting independently omits
+            // tools when configured to do so.
+            return Ok(false);
         }
 
         if !Self::should_apply_tool_call_format(
@@ -51,12 +51,19 @@ impl OpenAIPreprocessor {
             return Ok(false);
         }
 
+        // Nemotron-v3's native vLLM reasoner owns the prompt-seeded reasoning
+        // phase and consumes its single `</think>` boundary before advancing
+        // guided decoding. Start Qwen3-coder's structural grammar at the tool
+        // suffix so the two layers do not both wait for the same boundary.
+        let native_reasoning_owns_prefix = prompt_injected_reasoning
+            && parser_name == "qwen3_coder"
+            && self.runtime_config.reasoning_parser.as_deref() == Some("nemotron_v3");
         let ctx = dynamo_parsers::tool_calling::ToolCallFormatBuildContext {
             tool_choice,
             tools,
             parallel_tool_calls,
             schema_mode: self.runtime_config.structural_tag_schema,
-            starts_in_reasoning: prompt_injected_reasoning,
+            starts_in_reasoning: prompt_injected_reasoning && !native_reasoning_owns_prefix,
         };
 
         Self::apply_tool_call_format(parser_name, builder, &ctx, preprocessed_request)
@@ -80,28 +87,6 @@ impl OpenAIPreprocessor {
         }
 
         builder
-    }
-
-    /// Apply the `tool_choice=none` ban tag, if configured.
-    fn apply_tool_call_ban(
-        builder: &dynamo_parsers::tool_calling::StructuralTagBuilder,
-        common_request: &mut PreprocessedRequest,
-    ) -> Result<bool, DynamoError> {
-        if let Some(ban_tag) = builder.build_tool_call_ban().map_err(|e| {
-            DynamoError::builder()
-                .error_type(ErrorType::Unknown)
-                .message(format!("failed to build tool-call ban structural tag: {e}"))
-                .build()
-        })? {
-            let gd = common_request
-                .sampling_options
-                .guided_decoding
-                .get_or_insert_default();
-            gd.structural_tag = Some(ban_tag);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 
     /// Build and inject the tool-call format tag, if one is needed.

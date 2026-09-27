@@ -317,6 +317,12 @@ pub trait DeltaGeneratorExt<ResponseType: Send + 'static + std::fmt::Debug>:
         response: common::llm_backend::BackendOutput,
     ) -> Result<ResponseType>;
 
+    /// Flush parser-owned buffered text when a backend ends without a terminal
+    /// choice. This does not manufacture sampled tokens or usage.
+    fn flush_postprocessor(&mut self) -> Result<Option<ResponseType>> {
+        Ok(None)
+    }
+
     /// Gets the current prompt token count (Input Sequence Length).
     fn get_isl(&self) -> Option<u32>;
 

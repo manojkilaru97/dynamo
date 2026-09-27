@@ -50,7 +50,7 @@ dynamo-runtime = { path = "lib/runtime", version = "1.4.1" }
 dynamo-llm = { path = "lib/llm", version = "1.4.1" }
 dynamo-rl = { path = "lib/rl", version = "1.4.1" }
 dynamo-tokenizers = { version = "=1.5.4" }
-dynamo-renderer = { version = "=4.0.0" }
+dynamo-renderer = { version = "=4.0.0", path = "lib/vendor/dynamo-renderer" }
 dynamo-tokens = { path = "lib/tokens", version = "1.4.1" }
 dynamo-truthy = { path = "lib/truthy", version = "1.4.1" }
 dynamo-data-gen = { path = "lib/data-gen", version = "1.4.1" }
@@ -64,7 +64,7 @@ dynamo-parsers = { version = "7.0.1" }
 # Published on crates.io. To see all available versions:
 #   web:          https://crates.io/crates/dynamo-parsers-v2/versions
 #   sparse index: curl https://index.crates.io/dy/na/dynamo-parsers-v2   (one JSON line per release; read the "vers" field)
-dynamo-parsers-v2 = { version = "0.1.23" }
+dynamo-parsers-v2 = { version = "0.1.23", path = "lib/vendor/dynamo-parsers-v2" }
 dynamo-backend-common = { path = "lib/backend-common", version = "1.4.1" }
 dynamo-sidecar-common = { path = "lib/sidecar/common", version = "1.4.1" }
 fastokens = { version = "0.2.0" }

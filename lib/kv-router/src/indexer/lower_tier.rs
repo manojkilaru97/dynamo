@@ -255,24 +255,28 @@ impl LowerTierIndexer {
         worker: WorkerWithDpRank,
         block_hashes: &[ExternalSequenceBlockHash],
     ) -> Result<(), KvCacheEventError> {
-        let remove_worker_entry = {
-            let Some(worker_map) = worker_blocks.get_mut(&worker) else {
-                return Err(KvCacheEventError::BlockNotFound);
-            };
-
-            for block_hash in block_hashes {
-                let Some(key) = worker_map.remove(block_hash) else {
-                    return Err(KvCacheEventError::BlockNotFound);
-                };
-
-                self.remove_worker_from_edge(key, worker);
-            }
-
-            worker_map.is_empty()
+        let Some(worker_map) = worker_blocks.get_mut(&worker) else {
+            return Err(KvCacheEventError::BlockNotFound);
         };
 
-        if remove_worker_entry {
+        // A removal batch may name blocks this index never accepted (the store
+        // walk stops at the first conflicting edge). Apply every known removal
+        // before reporting the miss; returning early would leave the rest of the
+        // batch advertised as resident after the engine has evicted it.
+        let mut missing = false;
+        for block_hash in block_hashes {
+            match worker_map.remove(block_hash) {
+                Some(key) => self.remove_worker_from_edge(key, worker),
+                None => missing = true,
+            }
+        }
+
+        if worker_map.is_empty() {
             worker_blocks.remove(&worker);
+        }
+
+        if missing {
+            return Err(KvCacheEventError::BlockNotFound);
         }
 
         Ok(())
@@ -1254,6 +1258,52 @@ mod tests {
 
         let hits = index.query_contiguous_hits(&query, &continuations);
         assert_eq!(hits.get(&WorkerWithDpRank::new(17, 0)), Some(&1));
+    }
+
+    #[test]
+    fn remove_batch_with_unknown_hash_still_removes_known_blocks() {
+        // The engine evicts a chain whose tail was never indexed (store walk
+        // stopped at a conflicting edge). The removal batch lists the unknown
+        // hash first; every known block in the batch must still be removed or
+        // the router keeps advertising evicted blocks as host-resident.
+        let mut index = TestLowerTierIndex::new();
+        index
+            .apply_event(store_event(
+                29,
+                0,
+                0,
+                None,
+                &[41, 42, 43],
+                &[401, 402, 403],
+            ))
+            .unwrap();
+
+        let result = index.apply_event(remove_event(
+            29,
+            1,
+            0,
+            vec![
+                ExternalSequenceBlockHash(9999),
+                ExternalSequenceBlockHash(401),
+                ExternalSequenceBlockHash(402),
+                ExternalSequenceBlockHash(403),
+            ],
+        ));
+        assert!(matches!(
+            result,
+            Err(crate::protocols::KvCacheEventError::BlockNotFound)
+        ));
+
+        let query = local_hashes(&[41, 42, 43]);
+        let mut continuations = FxHashMap::default();
+        continuations.insert(
+            WorkerWithDpRank::new(29, 0),
+            LowerTierContinuation::from_root(0),
+        );
+        let hits = index.query_contiguous_hits(&query, &continuations);
+        assert_eq!(hits.get(&WorkerWithDpRank::new(29, 0)), Some(&0));
+        assert!(index.root_workers(LocalBlockHash(41)).is_empty());
+        assert!(index.dump_events().is_empty());
     }
 
     #[test]
