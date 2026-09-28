@@ -144,6 +144,53 @@ def test_deprecated_overlap_score_weight_env_flows_to_binding_kwargs(
     assert config.kv_router_kwargs()["overlap_score_weight"] == 2.5
 
 
+@pytest.mark.parametrize("flag", ["--router-reset-states", "--no-router-reset-states"])
+def test_removed_router_reset_states_flag_warns_and_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    flag: str,
+) -> None:
+    _clear_rejection_threshold_env(monkeypatch)
+    monkeypatch.delenv("DYN_ROUTER_RESET_STATES", raising=False)
+    caplog.set_level("WARNING")
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+
+    assert "reset-states" not in parser.format_help()
+    baseline = FrontendConfig.from_cli_args(parser.parse_args(["--router-mode", "kv"]))
+    assert caplog.text == ""
+
+    args, unknown = parser.parse_known_args(["--router-mode", "kv", flag])
+    config = FrontendConfig.from_cli_args(args)
+    config.validate()
+
+    assert unknown == []
+    assert not hasattr(args, "router_reset_states")
+    assert not hasattr(config, "router_reset_states")
+    assert config.kv_router_kwargs() == baseline.kv_router_kwargs()
+    assert config.router_kwargs() == baseline.router_kwargs()
+    assert caplog.text.count(f"{flag} is deprecated and ignored") == 1
+
+
+def test_removed_router_reset_states_environment_warns_and_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("DYN_ROUTER_RESET_STATES", "true")
+    caplog.set_level("WARNING")
+    parser = argparse.ArgumentParser()
+    KvRouterArgGroup().add_arguments(parser)
+
+    args = parser.parse_args([])
+
+    assert not hasattr(args, "router_reset_states")
+    assert (
+        "router_reset_states"
+        not in KvRouterConfigBase.from_cli_args(args).kv_router_kwargs()
+    )
+    assert caplog.text.count("DYN_ROUTER_RESET_STATES is deprecated and ignored") == 1
+
+
 @pytest.mark.parametrize(
     ("canonical_env", "cli_args", "expected_credit", "expected_scale"),
     [

@@ -11,6 +11,7 @@ unpacked directly into ``KvRouterConfig(**config.kv_router_kwargs())``.
 """
 
 import argparse
+import logging
 import os
 import warnings
 from typing import Optional
@@ -22,6 +23,8 @@ from dynamo.common.configuration.utils import (
     add_negatable_bool_argument,
     nullable_float,
 )
+
+logger = logging.getLogger(__name__)
 
 # Authoritative field list — used by kv_router_kwargs() to extract values.
 _KV_ROUTER_FIELDS: tuple[str, ...] = (
@@ -77,6 +80,24 @@ class _DeprecatedOverlapScoreWeightAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None) -> None:
         warnings.warn(_DEPRECATED_OVERLAP_WEIGHT_MESSAGE, FutureWarning, stacklevel=2)
         setattr(namespace, self.dest, values)
+
+
+_REMOVED_RESET_STATES_WARNING = (
+    "%s is deprecated and ignored; durable KV events were removed, so the "
+    "router keeps no state across restarts and always starts fresh"
+)
+_RESET_STATES_ENV_VAR = "DYN_ROUTER_RESET_STATES"
+
+
+class _IgnoredRouterResetStatesAction(argparse.Action):
+    """Accept the removed --[no-]router-reset-states flag; warn and store nothing."""
+
+    def __init__(self, option_strings, dest, **kwargs) -> None:
+        kwargs["nargs"] = 0
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        logger.warning(_REMOVED_RESET_STATES_WARNING, option_string)
 
 
 def _deprecated_overlap_score_weight_from_env() -> Optional[tuple[str, float]]:
@@ -377,6 +398,16 @@ class KvRouterArgGroup(ArgGroup):
                 "'none' keeps static prompt load accounting. "
                 "'aic' decays the oldest active prefill request using AIC-predicted duration."
             ),
+        )
+        if _RESET_STATES_ENV_VAR in os.environ:
+            logger.warning(_REMOVED_RESET_STATES_WARNING, _RESET_STATES_ENV_VAR)
+        g.add_argument(
+            "--router-reset-states",
+            "--no-router-reset-states",
+            dest="router_reset_states",
+            action=_IgnoredRouterResetStatesAction,
+            default=argparse.SUPPRESS,
+            help=argparse.SUPPRESS,
         )
         add_argument(
             g,
