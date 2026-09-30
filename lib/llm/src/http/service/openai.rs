@@ -869,7 +869,7 @@ async fn completions_single(
     if streaming {
         // For streaming, we'll drop the http_queue_guard on the first token
         let mut http_queue_guard = Some(http_queue_guard);
-        let stream = stream
+        let stream = super::metrics::demote_late_rejections(stream)
             .filter(|r| {
                 // Drop empty chunks from multi-byte token assembly
                 futures::future::ready(
@@ -928,9 +928,14 @@ async fn completions_single(
                     request_id,
                     e
                 );
-                let err_response = ErrorMessage::internal_server_error(&format!(
-                    "Failed to fold completions stream for {request_id}"
-                ));
+                let err_response = if find_invalid_argument_in_chain(&e).is_some() {
+                    // A rejection from any prompt of a batch is a client error.
+                    ErrorMessage::from_anyhow(anyhow::Error::new(e), "Request rejected")
+                } else {
+                    ErrorMessage::internal_server_error(&format!(
+                        "Failed to fold completions stream for {request_id}"
+                    ))
+                };
                 inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                 err_response
             })?;
@@ -1157,7 +1162,7 @@ async fn completions_batch(
     if streaming {
         // For streaming, we'll drop the http_queue_guard on the first token
         let mut http_queue_guard = Some(http_queue_guard);
-        let stream = merged_stream
+        let stream = super::metrics::demote_late_rejections(merged_stream)
             .filter(|r| {
                 // Drop empty chunks from multi-byte token assembly
                 futures::future::ready(
@@ -1216,9 +1221,14 @@ async fn completions_batch(
                     request_id,
                     e
                 );
-                let err_response = ErrorMessage::internal_server_error(&format!(
-                    "Failed to fold completions stream for {request_id}"
-                ));
+                let err_response = if find_invalid_argument_in_chain(&e).is_some() {
+                    // A rejection from any prompt of a batch is a client error.
+                    ErrorMessage::from_anyhow(anyhow::Error::new(e), "Request rejected")
+                } else {
+                    ErrorMessage::internal_server_error(&format!(
+                        "Failed to fold completions stream for {request_id}"
+                    ))
+                };
                 inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                 err_response
             })?;
@@ -2584,7 +2594,7 @@ async fn chat_completions(
         //   - `event: tool_call_dispatch`  — complete tool call detected early (tool dispatch)
         //   - `event: reasoning_dispatch`  — complete reasoning block (emitted once)
         let stream = async_stream::stream! {
-            let mut stream = Box::pin(stream);
+            let mut stream = Box::pin(super::metrics::demote_late_rejections(stream));
             let mut events: Vec<Result<Event, axum::Error>> = Vec::with_capacity(4);
 
             while let Some(mut response) = stream.next().await {
