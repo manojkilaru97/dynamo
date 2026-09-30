@@ -257,6 +257,25 @@ fn monitor_for_disconnects_with_timeout(
                             yield event;
                         }
                         Some(Err(err)) => {
+                            if let Some(invalid) =
+                                crate::http::service::openai::find_invalid_argument_in_chain(&err)
+                            {
+                                // A request rejection is a client error: forward its
+                                // message with code 400, as the non-streaming path does.
+                                inflight_guard.mark_error(ErrorType::Validation);
+                                stream_handle.disarm();
+                                tracing::warn!("Streaming request rejected: {}", invalid.message());
+                                let err_json = serde_json::json!({
+                                    "error": {
+                                        "message": invalid.message(),
+                                        "type": "invalid_request_error",
+                                        "code": 400,
+                                    }
+                                });
+                                yield Event::default().data(err_json.to_string());
+                                yield Event::default().data("[DONE]");
+                                break;
+                            }
                             let sanitized = classify_stream_error(&err);
                             let error_type = if matches!(sanitized, SanitizedError::Overloaded) {
                                 ErrorType::Overload
@@ -808,6 +827,34 @@ mod tests {
         assert!(!body.contains("site-packages"), "leaked a filesystem path");
         assert!(!body.contains("panicked at"), "leaked panic text");
         assert!(!body.contains("ValueError"), "leaked exception type");
+    }
+
+    #[tokio::test]
+    async fn test_stream_request_rejection_emits_400_and_done() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as RuntimeErrorType};
+        let (_metrics, guard, ctx, handle) = setup_test("reject-model", "req-reject");
+        let stream = async_stream::try_stream! {
+            Err(axum::Error::new(
+                DynamoError::builder()
+                    .error_type(RuntimeErrorType::Backend(BackendError::InvalidArgument))
+                    .message("ValueError: Grammar error: Invalid type: foo")
+                    .build(),
+            ))?;
+            yield axum::response::sse::Event::default().data("unreachable");
+        };
+        let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+        let frame: serde_json::Value = body
+            .lines()
+            .find_map(|line| serde_json::from_str(line.strip_prefix("data: ")?).ok())
+            .expect("error frame");
+        assert_eq!(frame["error"]["code"], 400, "{body}");
+        assert_eq!(frame["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(
+            frame["error"]["message"], "ValueError: Grammar error: Invalid type: foo",
+            "{body}"
+        );
+        assert!(body.contains("data: [DONE]"), "{body}");
     }
 
     #[tokio::test]

@@ -2506,6 +2506,19 @@ fn annotated_to_sse_event<T: Serialize>(
 
     if let Some(ref msg) = annotated.event {
         if msg == "error" {
+            // Keep request rejections typed so the stream monitor can report them
+            // as client errors instead of a sanitized internal error.
+            if let Some(ref dynamo_err) = annotated.error
+                && matches!(
+                    dynamo_err.error_type(),
+                    dynamo_runtime::error::ErrorType::InvalidArgument
+                        | dynamo_runtime::error::ErrorType::Backend(
+                            dynamo_runtime::error::BackendError::InvalidArgument
+                        )
+                )
+            {
+                return Err(axum::Error::new(dynamo_err.clone()));
+            }
             let error_message = if let Some(ref dynamo_err) = annotated.error
                 && !dynamo_err.message().is_empty()
             {
