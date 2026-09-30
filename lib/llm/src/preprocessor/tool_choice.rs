@@ -72,17 +72,6 @@ impl OpenAIPreprocessor {
                 "tool_choice=\"required\" or a named tool_choice.",
             )));
         }
-        let has_client_structural_tag = request
-            .common
-            .structured_outputs
-            .as_ref()
-            .is_some_and(|params| params.structural_tag.is_some());
-        if is_forced_tool_choice && has_client_structural_tag {
-            return Err(invalid_argument(concat!(
-                "structured_outputs.structural_tag cannot be used in the same request as ",
-                "tool_choice=\"required\" or a named tool_choice.",
-            )));
-        }
 
         // For non-forced tool choice, explicit guided decoding and response_format
         // constrain assistant content, so tool-choice guided decoding stays inactive.
@@ -120,9 +109,20 @@ impl OpenAIPreprocessor {
                     .sampling_options
                     .guided_decoding
                     .get_or_insert_default();
-                // A tool-call structural tag from request conversion already constrains
-                // the call; adding the JSON fallback would send two constraints.
+                // A structural tag is already set: either the tool-call tag from request
+                // conversion (keep it) or a client tag that would replace the forced call.
                 if gd.structural_tag.is_some() {
+                    let has_client_structural_tag = request
+                        .common
+                        .structured_outputs
+                        .as_ref()
+                        .is_some_and(|params| params.structural_tag.is_some());
+                    if has_client_structural_tag {
+                        return Err(invalid_argument(concat!(
+                            "structured_outputs.structural_tag cannot be used in the same ",
+                            "request as tool_choice=\"required\" or a named tool_choice.",
+                        )));
+                    }
                     return Ok(true);
                 }
                 gd.json = Some(schema);
