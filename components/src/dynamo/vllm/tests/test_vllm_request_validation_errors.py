@@ -7,7 +7,10 @@ import pytest
 from vllm.exceptions import VLLMValidationError
 from vllm.v1.engine.exceptions import EngineGenerateError
 
-from dynamo.vllm.handlers import _map_request_validation_errors
+from dynamo.vllm.handlers import (
+    _map_request_validation_errors,
+    build_sampling_params_openai,
+)
 
 pytestmark = [
     pytest.mark.unit,
@@ -124,3 +127,47 @@ async def test_structured_output_compile_failure_is_a_value_error(finished):
 )
 async def test_other_error_finishes_pass_through(items, structured_output):
     assert len(await _collect(_outputs(*items), structured_output)) == len(items)
+
+
+@pytest.mark.parametrize(
+    "request_fields, expected",
+    [
+        pytest.param(
+            {
+                "guided_json": {"type": "object"},
+                "guided_whitespace_pattern": "[ ]?",
+            },
+            {"json_is_set": True, "whitespace_pattern": "[ ]?"},
+            id="legacy_json_with_pattern",
+        ),
+        pytest.param(
+            {
+                "guided_json": {"type": "object"},
+                "structured_outputs": {"whitespace_pattern": "[ ]?"},
+            },
+            {"json_is_set": True, "whitespace_pattern": "[ ]?"},
+            id="legacy_json_with_alias_pattern",
+        ),
+        pytest.param(
+            {"response_format": {"type": "json_object"}},
+            {"json_object": True, "whitespace_pattern": None},
+            id="json_object",
+        ),
+    ],
+)
+def test_text_mode_sampling_params_carry_structured_outputs(request_fields, expected):
+    """--use-vllm-tokenizer builds SamplingParams from the OpenAI request."""
+    params = build_sampling_params_openai(
+        {"max_tokens": 8, **request_fields}, default_sampling_params={}
+    ).structured_outputs
+    assert params is not None
+    if expected.get("json_is_set"):
+        assert params.json is not None
+    if "json_object" in expected:
+        assert params.json_object is expected["json_object"]
+    assert params.whitespace_pattern == expected["whitespace_pattern"]
+
+
+def test_text_mode_without_constraints_has_no_structured_outputs():
+    params = build_sampling_params_openai({"max_tokens": 8}, default_sampling_params={})
+    assert params.structured_outputs is None

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import dataclasses
 import base64
 import copy
 import importlib
@@ -1782,7 +1783,26 @@ def build_sampling_params_openai(
     ):
         sampling_params.thinking_token_budget = nvext_max_thinking_tokens
 
+    structured_outputs = _structured_outputs_from_openai_request(request)
+    if structured_outputs is not None:
+        whitespace_pattern = _openai_whitespace_pattern(request)
+        if whitespace_pattern is not None and (
+            structured_outputs.json is not None or structured_outputs.json_object
+        ):
+            structured_outputs = dataclasses.replace(
+                structured_outputs, whitespace_pattern=whitespace_pattern
+            )
+        sampling_params.structured_outputs = structured_outputs
+
     return sampling_params
+
+
+def _openai_whitespace_pattern(request: Dict[str, Any]) -> str | None:
+    """The whitespace-pattern modifier: legacy field first, then the alias."""
+    pattern = request.get("guided_whitespace_pattern")
+    if pattern is None and isinstance(request.get("structured_outputs"), dict):
+        pattern = request["structured_outputs"].get("whitespace_pattern")
+    return pattern
 
 
 def _engine_generate_reasoning_kwargs(
