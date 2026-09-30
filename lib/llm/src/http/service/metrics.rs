@@ -2495,6 +2495,43 @@ fn observe_annotation_metrics<T>(
     }
 }
 
+/// Report a request rejection as a client error only before any model output.
+///
+/// A rejection (`InvalidArgument`) that arrives after model data has been
+/// streamed is turned into an untyped error comment, so the SSE stream monitor
+/// sends the sanitized internal-error frame instead of a 4xx with its message.
+/// Annotation frames such as `request_id` do not count as output.
+pub fn demote_late_rejections<T>(
+    stream: impl futures::Stream<Item = crate::types::Annotated<T>>,
+) -> impl futures::Stream<Item = crate::types::Annotated<T>> {
+    use futures::StreamExt;
+    let mut data_seen = false;
+    stream.map(move |mut annotated| {
+        if annotated.data.is_some() {
+            data_seen = true;
+        } else if data_seen
+            && annotated.event.as_deref() == Some("error")
+            && annotated.error.as_ref().is_some_and(|error| {
+                matches!(
+                    error.error_type(),
+                    dynamo_runtime::error::ErrorType::InvalidArgument
+                        | dynamo_runtime::error::ErrorType::Backend(
+                            dynamo_runtime::error::BackendError::InvalidArgument
+                        )
+                )
+            })
+        {
+            let message = annotated
+                .error
+                .take()
+                .map(|error| error.message().to_string())
+                .unwrap_or_default();
+            annotated.comment = Some(vec![message]);
+        }
+        annotated
+    })
+}
+
 fn annotated_to_sse_event<T: Serialize>(
     annotated: crate::types::Annotated<T>,
 ) -> Result<Option<Event>, axum::Error> {
@@ -4388,6 +4425,55 @@ mod tests {
         assert!(
             found,
             "embedding_latency_seconds histogram must be registered with the registry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod demote_late_rejections_tests {
+    use super::demote_late_rejections;
+    use crate::types::Annotated;
+    use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
+    use futures::StreamExt;
+
+    fn rejection() -> Annotated<String> {
+        Annotated {
+            data: None,
+            id: None,
+            event: Some("error".to_string()),
+            comment: None,
+            error: Some(
+                DynamoError::builder()
+                    .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+                    .message("bad schema")
+                    .build(),
+            ),
+        }
+    }
+
+    fn annotation() -> Annotated<String> {
+        Annotated::from_annotation("request_id", &"req-1".to_string()).expect("annotation")
+    }
+
+    #[tokio::test]
+    async fn rejection_after_annotation_stays_typed() {
+        let out: Vec<_> =
+            demote_late_rejections(futures::stream::iter(vec![annotation(), rejection()]))
+                .collect()
+                .await;
+        assert!(out[1].error.is_some());
+    }
+
+    #[tokio::test]
+    async fn rejection_after_model_output_is_demoted() {
+        let data = Annotated::from_data("token".to_string());
+        let out: Vec<_> = demote_late_rejections(futures::stream::iter(vec![data, rejection()]))
+            .collect()
+            .await;
+        assert!(out[1].error.is_none());
+        assert_eq!(
+            out[1].comment.as_deref(),
+            Some(&["bad schema".to_string()][..])
         );
     }
 }
