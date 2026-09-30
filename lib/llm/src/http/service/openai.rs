@@ -196,6 +196,22 @@ fn responses_conversion_error_response(error: anyhow::Error) -> ErrorResponse {
 /// Match `InvalidArgument` at top-level OR under `Backend()`.
 /// `py_err_to_dynamo` wraps Python `ValueError`/`TypeError` as
 /// `Backend(InvalidArgument)`; both variants are 400-worthy.
+/// Build the 4xx response for a backend rejection, unwrapping a Python
+/// `HttpError` envelope (`{"message": ..., "code": 4xx}`) when present.
+fn rejection_error_response(invalid: &dynamo_runtime::error::DynamoError) -> ErrorResponse {
+    let (message, code) = super::disconnect::rejection_message_and_code(invalid.message());
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
+    (
+        status,
+        Json(ErrorMessage {
+            message,
+            error_type: map_error_code_to_error_type(status),
+            code: status.as_u16(),
+            details: None,
+        }),
+    )
+}
+
 pub(crate) fn find_invalid_argument_in_chain<'a>(
     err: &'a (dyn std::error::Error + 'static),
 ) -> Option<&'a dynamo_runtime::error::DynamoError> {
@@ -928,9 +944,9 @@ async fn completions_single(
                     request_id,
                     e
                 );
-                let err_response = if find_invalid_argument_in_chain(&e).is_some() {
+                let err_response = if let Some(invalid) = find_invalid_argument_in_chain(&e) {
                     // A rejection from any prompt of a batch is a client error.
-                    ErrorMessage::from_anyhow(anyhow::Error::new(e), "Request rejected")
+                    rejection_error_response(invalid)
                 } else {
                     ErrorMessage::internal_server_error(&format!(
                         "Failed to fold completions stream for {request_id}"
@@ -1221,9 +1237,9 @@ async fn completions_batch(
                     request_id,
                     e
                 );
-                let err_response = if find_invalid_argument_in_chain(&e).is_some() {
+                let err_response = if let Some(invalid) = find_invalid_argument_in_chain(&e) {
                     // A rejection from any prompt of a batch is a client error.
-                    ErrorMessage::from_anyhow(anyhow::Error::new(e), "Request rejected")
+                    rejection_error_response(invalid)
                 } else {
                     ErrorMessage::internal_server_error(&format!(
                         "Failed to fold completions stream for {request_id}"
@@ -4279,6 +4295,24 @@ mod tests {
     };
 
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
+
+    #[test]
+    fn test_rejection_error_response_unwraps_http_error_envelope() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
+        let rejection = |message: &str| {
+            DynamoError::builder()
+                .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+                .message(message)
+                .build()
+        };
+        let (status, Json(body)) =
+            rejection_error_response(&rejection(r#"{"message":"bad schema","code":422}"#));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body.message, "bad schema");
+        let (status, Json(body)) = rejection_error_response(&rejection("ValueError: bad"));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.message, "ValueError: bad");
+    }
 
     fn binary_pooling_response() -> NvCreatePoolingResponse {
         NvCreatePoolingResponse {

@@ -717,6 +717,28 @@ pub struct OpenAIPreprocessor {
 
 pub(crate) const LORA_NAME_CONTEXT_KEY: &str = "discovery.lora_name";
 
+/// Typed errors that entered the tool-call jail, which carries errors as strings.
+#[derive(Default)]
+struct TypedJailErrors(std::sync::Mutex<std::collections::VecDeque<DynamoError>>);
+
+impl TypedJailErrors {
+    fn stash(&self, error: DynamoError) -> String {
+        let text = error.to_string();
+        self.0.lock().expect("jail error buffer poisoned").push_back(error);
+        text
+    }
+
+    /// Return the typed error the jail passed through, or a generic one for an
+    /// error the jail produced itself.
+    fn restore(&self, text: String) -> DynamoError {
+        let mut errors = self.0.lock().expect("jail error buffer poisoned");
+        if let Some(position) = errors.iter().position(|error| error.to_string() == text) {
+            return errors.remove(position).expect("position is in range");
+        }
+        DynamoError::msg(text)
+    }
+}
+
 impl OpenAIPreprocessor {
     fn omitted_max_tokens_default(
         prompt_len: usize,
@@ -3409,6 +3431,10 @@ impl OpenAIPreprocessor {
         }
         let pending = Arc::new(Mutex::new(PendingMetrics::default()));
         let pending_in = Arc::clone(&pending);
+        // The jail carries errors as strings; keep the typed errors so a request
+        // rejection (InvalidArgument) still maps to a 4xx after the jail.
+        let typed_errors = Arc::new(TypedJailErrors::default());
+        let typed_errors_in = Arc::clone(&typed_errors);
         let suppress_qwen_tool_framing_whitespace =
             tool_call_parser.as_deref() == Some("qwen3_coder");
         let mut choices_with_tool_calls = HashSet::new();
@@ -3426,7 +3452,7 @@ impl OpenAIPreprocessor {
                 id: a.id,
                 event: a.event,
                 comment: a.comment,
-                error: a.error.map(|e| e.to_string()),
+                error: a.error.map(|e| typed_errors_in.stash(e)),
             }
         });
 
@@ -3467,7 +3493,7 @@ impl OpenAIPreprocessor {
                 id: a.id,
                 event: a.event,
                 comment: a.comment,
-                error: a.error.map(DynamoError::msg),
+                error: a.error.map(|e| typed_errors.restore(e)),
             }
         })
     }
@@ -4718,6 +4744,25 @@ mod strip_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_typed_jail_errors_restore_the_original_error() {
+        use dynamo_runtime::error::{BackendError, ErrorType};
+        let errors = TypedJailErrors::default();
+        let rejection = DynamoError::builder()
+            .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+            .message("bad schema")
+            .build();
+        let text = errors.stash(rejection);
+        let restored = errors.restore(text);
+        assert!(matches!(
+            restored.error_type(),
+            ErrorType::Backend(BackendError::InvalidArgument)
+        ));
+        assert_eq!(restored.message(), "bad schema");
+        let generated = errors.restore("jail error".to_string());
+        assert_eq!(generated.message(), "jail error");
+    }
     use super::*;
     use crate::protocols::common::preprocessor::MultimodalData;
     use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
