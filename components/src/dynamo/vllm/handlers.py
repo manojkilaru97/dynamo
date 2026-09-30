@@ -930,6 +930,8 @@ async def _map_request_validation_errors(gen):
             produced = True
             yield item
     except VLLMClientError as e:
+        if produced:
+            raise
         raise ValueError(str(e)) from e
     except EngineGenerateError as e:
         if not produced and isinstance(e.__cause__, ValueError):
