@@ -934,10 +934,10 @@ async def _map_request_validation_errors(gen, structured_output: bool = False):
     produced = False
     try:
         async for item in gen:
+            # With n > 1 a failed child can arrive before the parent finishes.
             if (
                 not produced
                 and structured_output
-                and item.finished
                 and item.outputs
                 and all(
                     output.finish_reason == "error"

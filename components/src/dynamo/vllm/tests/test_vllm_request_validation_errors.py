@@ -104,9 +104,12 @@ async def test_other_failures_stay_server_errors(error, outputs, expected):
 
 
 @pytest.mark.asyncio
-async def test_structured_output_compile_failure_is_a_value_error():
+@pytest.mark.parametrize("finished", [True, False], ids=["n1", "child_of_n2"])
+async def test_structured_output_compile_failure_is_a_value_error(finished):
+    failure = _compile_error()
+    failure.finished = finished
     with pytest.raises(ValueError, match="could not be compiled"):
-        await _collect(_outputs(_compile_error()), structured_output=True)
+        await _collect(_outputs(failure), structured_output=True)
 
 
 @pytest.mark.asyncio
