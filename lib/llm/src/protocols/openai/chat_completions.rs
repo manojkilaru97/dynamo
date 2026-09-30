@@ -1020,7 +1020,12 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
     }
 
     fn get_guided_whitespace_pattern(&self) -> Option<String> {
-        self.common.guided_whitespace_pattern.clone()
+        self.common.guided_whitespace_pattern.clone().or_else(|| {
+            self.common
+                .structured_outputs
+                .as_ref()
+                .and_then(|params| params.whitespace_pattern.clone())
+        })
     }
 
     fn get_top_k(&self) -> Option<i32> {
@@ -1569,6 +1574,71 @@ mod tests {
             let request: NvCreateChatCompletionRequest =
                 serde_json::from_value(body).expect("Failed to deserialize request");
             assert!(ValidateRequest::validate(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn test_structured_outputs_whitespace_pattern_and_exclusivity() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "structured_outputs": {"json": {"type": "object"}, "whitespace_pattern": "[ ]?"}
+        }))
+        .expect("Failed to deserialize request");
+        ValidateRequest::validate(&request).expect("structured_outputs json + whitespace");
+        assert_eq!(
+            request.get_guided_whitespace_pattern().as_deref(),
+            Some("[ ]?")
+        );
+
+        let long_pattern = "x".repeat(1025);
+        for body in [
+            json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "structured_outputs": {"json": {"type": "object"}, "json_object": true}
+            }),
+            json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "structured_outputs": {"whitespace_pattern": "[ ]?"}
+            }),
+            json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "guided_json": {"type": "object"},
+                "guided_whitespace_pattern": ""
+            }),
+            json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "guided_json": {"type": "object"},
+                "guided_whitespace_pattern": long_pattern
+            }),
+        ] {
+            let request: NvCreateChatCompletionRequest =
+                serde_json::from_value(body.clone()).expect("Failed to deserialize request");
+            assert!(
+                ValidateRequest::validate(&request).is_err(),
+                "accepted {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_response_format_json_accepts_whitespace_pattern() {
+        for response_format in [
+            json!({"type": "json_object"}),
+            json!({"type": "json_schema", "json_schema": {"name": "r", "schema": {"type": "object"}}}),
+        ] {
+            let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "response_format": response_format,
+                "guided_whitespace_pattern": "[ ]?"
+            }))
+            .expect("Failed to deserialize request");
+            ValidateRequest::validate(&request).expect("JSON response_format + whitespace");
         }
     }
 

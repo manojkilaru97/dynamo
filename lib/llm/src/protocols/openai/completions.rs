@@ -260,7 +260,12 @@ impl CommonExtProvider for NvCreateCompletionRequest {
     }
 
     fn get_guided_whitespace_pattern(&self) -> Option<String> {
-        self.common.guided_whitespace_pattern.clone()
+        self.common.guided_whitespace_pattern.clone().or_else(|| {
+            self.common
+                .structured_outputs
+                .as_ref()
+                .and_then(|params| params.whitespace_pattern.clone())
+        })
     }
 
     fn get_top_k(&self) -> Option<i32> {
@@ -542,6 +547,35 @@ mod tests {
     use crate::protocols::common::OutputOptionsProvider;
     use base64::Engine;
     use serde_json::json;
+
+    #[test]
+    fn test_completions_validate_guided_decoding() {
+        let request: NvCreateCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "prompt": "JSON:",
+            "guided_json": {"type": "object"},
+            "guided_whitespace_pattern": "[ ]?"
+        }))
+        .expect("Failed to deserialize request");
+        ValidateRequest::validate(&request).expect("json + whitespace_pattern is valid");
+
+        for body in [
+            json!({"model": "test-model", "prompt": "x", "guided_whitespace_pattern": "[ ]?"}),
+            json!({
+                "model": "test-model",
+                "prompt": "x",
+                "guided_json": {"type": "object"},
+                "guided_regex": "\\d+"
+            }),
+        ] {
+            let request: NvCreateCompletionRequest =
+                serde_json::from_value(body.clone()).expect("Failed to deserialize request");
+            assert!(
+                ValidateRequest::validate(&request).is_err(),
+                "accepted {body}"
+            );
+        }
+    }
 
     #[test]
     fn test_skip_special_tokens_none() {
