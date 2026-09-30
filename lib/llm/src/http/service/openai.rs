@@ -4562,6 +4562,32 @@ mod tests {
         assert_eq!(prompt, "raw \u{fffd} data");
     }
 
+    #[test]
+    fn test_invalid_guided_decoding_returns_400_for_chat_and_completions() {
+        let chat: NvCreateChatCompletionRequest = parse_json_request(
+            "chat_completions",
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"guided_json":{"type":"object"},"guided_regex":"a"}"#,
+        )
+        .expect("request should parse");
+        let (status, _) = validate_chat_completion_fields_generic(&chat).expect_err("rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let chat_ok: NvCreateChatCompletionRequest = parse_json_request(
+            "chat_completions",
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"guided_json":{"type":"object"},"guided_whitespace_pattern":"[ ]?"}"#,
+        )
+        .expect("request should parse");
+        validate_chat_completion_fields_generic(&chat_ok).expect("json + whitespace accepted");
+
+        let completion: NvCreateCompletionRequest = parse_json_request(
+            "completions",
+            br#"{"model":"m","prompt":"x","guided_whitespace_pattern":"[ ]?"}"#,
+        )
+        .expect("request should parse");
+        let (status, _) = validate_completion_fields_generic(&completion).expect_err("rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     fn http_error_from_engine(code: u16) -> Result<(), anyhow::Error> {
         Err(HttpError {
             code,

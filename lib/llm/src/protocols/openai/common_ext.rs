@@ -29,6 +29,9 @@ pub struct StructuredOutputs {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structural_tag: Option<serde_json::Value>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whitespace_pattern: Option<String>,
 }
 
 /// Common extensions for OpenAI API requests that are not part of the standard OpenAI spec
@@ -103,7 +106,6 @@ pub struct CommonExt {
     /// If specified, the output will follow the whitespace pattern. Can be a string or null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
-    #[allow(unused)] // Not used
     pub guided_whitespace_pattern: Option<String>,
 
     /// Whether to skip special tokens in the decoded output.
@@ -142,7 +144,23 @@ pub trait CommonExtProvider {
     fn get_guided_whitespace_pattern(&self) -> Option<String>;
 
     /// Reject invalid guided decoding combinations before the request reaches the engine.
+    ///
+    /// Skipped when the request sets no guided-decoding extension field, so requests
+    /// constrained only by `response_format` or tools avoid recomputing tool schemas.
     fn validate_guided_decoding(&self) -> anyhow::Result<()> {
+        let Some(ext) = self.common_ext() else {
+            return Ok(());
+        };
+        if ext.guided_json.is_none()
+            && ext.guided_regex.is_none()
+            && ext.guided_grammar.is_none()
+            && ext.guided_choice.is_none()
+            && ext.guided_whitespace_pattern.is_none()
+            && ext.structured_outputs.is_none()
+        {
+            return Ok(());
+        }
+        crate::protocols::openai::validate::validate_structured_outputs(&ext.structured_outputs)?;
         crate::protocols::common::GuidedDecodingOptions::from_optional_with_json_object_and_structural_tag(
             self.get_guided_json(),
             self.get_guided_json_object(),

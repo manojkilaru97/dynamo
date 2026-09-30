@@ -305,10 +305,9 @@ def _build_assistant_guided_decoding(
     # request outright, so `guided_json` + `guided_regex` is a 400 through the Rust
     # frontend and a silent single-constraint request here. Rejecting is the
     # correct behavior; it is left as-is only to avoid adding a second new 400 to
-    # this change. Note that validate() also counts whitespace_pattern toward its
-    # exclusivity limit, so the {"json": ..., "whitespace_pattern": ...} pair built
-    # below is accepted here and rejected there -- whitespace_pattern modifies a
-    # grammar rather than being one, so that counter is the side that is wrong.
+    # this change. validate() treats whitespace_pattern as a modifier of a JSON
+    # constraint, so the {"json": ..., "whitespace_pattern": ...} pair built below
+    # is accepted on both paths.
     legacy_guidance: dict[str, Any] = {}
     for key, value in (
         ("json", request_extra.get("guided_json")),

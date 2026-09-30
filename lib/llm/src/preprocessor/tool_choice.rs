@@ -4,6 +4,7 @@
 //! Tool-choice guided decoding policy for OpenAI chat requests.
 
 use crate::preprocessor::{OpenAIPreprocessor, PreprocessedRequest};
+use crate::protocols::common::GuidedDecodingOptions;
 use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
 use crate::protocols::openai::tools::get_json_schema_from_tools;
 
@@ -18,13 +19,22 @@ fn invalid_argument(message: impl Into<String>) -> DynamoError {
         .build()
 }
 
+/// Remove the JSON schema constraint together with the whitespace pattern that only
+/// modifies it, unless a JSON-object constraint remains for the pattern to apply to.
+fn drop_json_constraint(guided_decoding: &mut GuidedDecodingOptions) {
+    guided_decoding.json = None;
+    if !guided_decoding.json_object.unwrap_or(false) {
+        guided_decoding.whitespace_pattern = None;
+    }
+}
+
 fn clear_legacy_json_constraint(common_request: &mut PreprocessedRequest) -> bool {
     if let Some(guided_decoding) = common_request.sampling_options.guided_decoding.as_mut()
         && guided_decoding.structural_tag.is_some()
     {
         // Request conversion may already have installed the legacy forced-tool
         // JSON schema. vLLM accepts only one structured-output constraint.
-        guided_decoding.json = None;
+        drop_json_constraint(guided_decoding);
         return true;
     }
 
@@ -76,7 +86,7 @@ impl OpenAIPreprocessor {
             && let Some(gd) = common_request.sampling_options.guided_decoding.as_mut()
         {
             // OpenAI `response_format` applies to assistant content, not tool calls.
-            gd.json = None;
+            drop_json_constraint(gd);
         }
 
         if self.apply_tool_choice_structural_tag(
@@ -165,6 +175,27 @@ mod tests {
     }
 
     #[test]
+    fn replacing_json_drops_its_whitespace_pattern() {
+        let mut json_only = GuidedDecodingOptions {
+            json: Some(serde_json::json!({"type": "object"})),
+            whitespace_pattern: Some("[ ]?".to_string()),
+            ..Default::default()
+        };
+        drop_json_constraint(&mut json_only);
+        assert_eq!(json_only.json, None);
+        assert_eq!(json_only.whitespace_pattern, None);
+
+        let mut with_json_object = GuidedDecodingOptions {
+            json: Some(serde_json::json!({"type": "object"})),
+            json_object: Some(true),
+            whitespace_pattern: Some("[ ]?".to_string()),
+            ..Default::default()
+        };
+        drop_json_constraint(&mut with_json_object);
+        assert_eq!(with_json_object.whitespace_pattern.as_deref(), Some("[ ]?"));
+    }
+
+    #[test]
     fn legacy_json_is_unchanged_without_structural_tag() {
         let legacy_json = serde_json::json!({"type": "object"});
         let mut request = request_with_guided_decoding(GuidedDecodingOptions::new(
@@ -199,6 +230,18 @@ fn has_explicit_guided_decoding(request: &NvCreateChatCompletionRequest) -> bool
             .as_ref()
             .is_some_and(|v| !v.is_empty())
         || request.common.guided_grammar.is_some()
+        || request
+            .common
+            .structured_outputs
+            .as_ref()
+            .is_some_and(|params| {
+                params.json.is_some()
+                    || params.json_object.unwrap_or(false)
+                    || params.regex.is_some()
+                    || params.grammar.is_some()
+                    || params.choice.as_ref().is_some_and(|v| !v.is_empty())
+                    || params.structural_tag.is_some()
+            })
 }
 
 fn has_response_format_constraint(request: &NvCreateChatCompletionRequest) -> bool {

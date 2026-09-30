@@ -22,6 +22,7 @@ use dynamo_protocols::types::StopReason;
 
 /// Maximum nesting depth allowed in guided_grammar EBNF strings.
 const MAX_GRAMMAR_NESTING_DEPTH: usize = 500;
+const MAX_WHITESPACE_PATTERN_LEN: usize = 1024;
 
 pub mod extensions;
 pub mod llm_backend;
@@ -612,13 +613,17 @@ impl GuidedDecodingOptions {
             ));
         }
 
-        if self.whitespace_pattern.is_some()
-            && self.json.is_none()
-            && !self.json_object.unwrap_or(false)
-        {
-            return Err(anyhow::anyhow!(
-                "whitespace_pattern only applies to JSON constraints; set it together with guided_json or a JSON response_format"
-            ));
+        if let Some(pattern) = self.whitespace_pattern.as_deref() {
+            if pattern.is_empty() || pattern.len() > MAX_WHITESPACE_PATTERN_LEN {
+                return Err(anyhow::anyhow!(
+                    "whitespace_pattern must be between 1 and {MAX_WHITESPACE_PATTERN_LEN} bytes"
+                ));
+            }
+            if self.json.is_none() && !self.json_object.unwrap_or(false) {
+                return Err(anyhow::anyhow!(
+                    "whitespace_pattern only applies to a JSON constraint (guided_json, a JSON response_format, or structured_outputs.json); it cannot be used without one or with a tool-call structural tag"
+                ));
+            }
         }
 
         if let Some(ref grammar) = self.grammar {
