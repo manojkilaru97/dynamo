@@ -196,7 +196,7 @@ fn responses_conversion_error_response(error: anyhow::Error) -> ErrorResponse {
 /// Match `InvalidArgument` at top-level OR under `Backend()`.
 /// `py_err_to_dynamo` wraps Python `ValueError`/`TypeError` as
 /// `Backend(InvalidArgument)`; both variants are 400-worthy.
-fn find_invalid_argument_in_chain<'a>(
+pub(crate) fn find_invalid_argument_in_chain<'a>(
     err: &'a (dyn std::error::Error + 'static),
 ) -> Option<&'a dynamo_runtime::error::DynamoError> {
     use dynamo_runtime::error::{BackendError, ErrorType};
