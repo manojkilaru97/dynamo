@@ -171,3 +171,53 @@ def test_text_mode_sampling_params_carry_structured_outputs(request_fields, expe
 def test_text_mode_without_constraints_has_no_structured_outputs():
     params = build_sampling_params_openai({"max_tokens": 8}, default_sampling_params={})
     assert params.structured_outputs is None
+
+
+_TOOLS = [
+    {
+        "type": "function",
+        "function": {"name": "record", "parameters": {"type": "object"}},
+    }
+]
+
+
+def test_text_mode_forced_tool_takes_precedence_over_output_constraints():
+    params = build_sampling_params_openai(
+        {
+            "max_tokens": 8,
+            "tools": _TOOLS,
+            "tool_choice": "required",
+            "response_format": {"type": "json_object"},
+        },
+        default_sampling_params={},
+    )
+    assert params.structured_outputs is None
+
+
+def test_text_mode_rejects_structural_tag_with_forced_tool():
+    with pytest.raises(ValueError, match="structural_tag"):
+        build_sampling_params_openai(
+            {
+                "max_tokens": 8,
+                "tools": _TOOLS,
+                "tool_choice": {"type": "function", "function": {"name": "record"}},
+                "structured_outputs": {
+                    "structural_tag": '{"type": "structural_tag", "format": '
+                    '{"type": "const_string", "value": "x"}}'
+                },
+            },
+            default_sampling_params={},
+        )
+
+
+def test_text_mode_auto_tools_keep_output_constraints():
+    params = build_sampling_params_openai(
+        {
+            "max_tokens": 8,
+            "tools": _TOOLS,
+            "response_format": {"type": "json_object"},
+        },
+        default_sampling_params={},
+    )
+    assert params.structured_outputs is not None
+    assert params.structured_outputs.json_object is True

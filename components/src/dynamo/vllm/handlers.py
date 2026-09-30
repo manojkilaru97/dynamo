@@ -1783,7 +1783,7 @@ def build_sampling_params_openai(
     ):
         sampling_params.thinking_token_budget = nvext_max_thinking_tokens
 
-    structured_outputs = _structured_outputs_from_openai_request(request)
+    structured_outputs = _text_mode_structured_outputs(request)
     if structured_outputs is not None:
         whitespace_pattern = _openai_whitespace_pattern(request)
         if whitespace_pattern is not None and (
@@ -1795,6 +1795,33 @@ def build_sampling_params_openai(
         sampling_params.structured_outputs = structured_outputs
 
     return sampling_params
+
+
+def _text_mode_structured_outputs(
+    request: Dict[str, Any],
+) -> StructuredOutputsParams | None:
+    """The request's own output constraints for --use-vllm-tokenizer mode.
+
+    Tool calls are not constrained in this mode. A forced tool call takes
+    precedence over output constraints, as on the token path, so they are not
+    applied; a client structural tag with a forced tool is rejected there too.
+    """
+    tool_choice = request.get("tool_choice")
+    forced_tool = tool_choice == "required" or isinstance(tool_choice, dict)
+    without_tools = {
+        key: value
+        for key, value in request.items()
+        if key not in ("tools", "tool_choice")
+    }
+    structured_outputs = _structured_outputs_from_openai_request(without_tools)
+    if not forced_tool:
+        return structured_outputs
+    if structured_outputs is not None and structured_outputs.structural_tag:
+        raise ValueError(
+            "structured_outputs.structural_tag cannot be combined with a forced "
+            "tool_choice"
+        )
+    return None
 
 
 def _openai_whitespace_pattern(request: Dict[str, Any]) -> str | None:
