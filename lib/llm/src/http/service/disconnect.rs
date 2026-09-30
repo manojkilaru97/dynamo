@@ -56,6 +56,20 @@ fn classify_stream_error(err: &(dyn std::error::Error + 'static)) -> SanitizedEr
     }
 }
 
+/// A Python `HttpError` rejection carries `{"message": ..., "code": 4xx}` as its
+/// message; unwrap it so the frame shows the backend's own message and status.
+fn rejection_message_and_code(message: &str) -> (String, u16) {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        message: String,
+        code: u16,
+    }
+    match serde_json::from_str::<Envelope>(message) {
+        Ok(envelope) if (400..500).contains(&envelope.code) => (envelope.message, envelope.code),
+        _ => (message.to_string(), 400),
+    }
+}
+
 /// Read the backend stream inactivity timeout from the environment.
 /// Returns `None` if unset or zero (timeout disabled).
 ///
@@ -268,12 +282,13 @@ fn monitor_for_disconnects_with_timeout(
                                 // message with code 400, as the non-streaming path does.
                                 inflight_guard.mark_error(ErrorType::Validation);
                                 stream_handle.disarm();
-                                tracing::warn!("Streaming request rejected: {}", invalid.message());
+                                let (message, code) = rejection_message_and_code(invalid.message());
+                                tracing::warn!("Streaming request rejected ({code}): {message}");
                                 let err_json = serde_json::json!({
                                     "error": {
-                                        "message": invalid.message(),
+                                        "message": message,
                                         "type": "invalid_request_error",
-                                        "code": 400,
+                                        "code": code,
                                     }
                                 });
                                 yield Event::default().data(err_json.to_string());
@@ -859,6 +874,18 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("data: [DONE]"), "{body}");
+    }
+
+    #[test]
+    fn test_rejection_message_unwraps_http_error_envelope() {
+        assert_eq!(
+            rejection_message_and_code(r#"{"message":"bad schema","code":422}"#),
+            ("bad schema".to_string(), 422)
+        );
+        assert_eq!(
+            rejection_message_and_code("ValueError: bad"),
+            ("ValueError: bad".to_string(), 400)
+        );
     }
 
     #[tokio::test]
