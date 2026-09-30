@@ -1811,6 +1811,9 @@ mod tests {
         .expect("Failed to deserialize request");
 
         with_tool_parser("qwen3_coder", || {
+            let mut oversized = request.clone();
+            oversized.common.guided_whitespace_pattern = Some("x".repeat(1025));
+            assert!(ValidateRequest::validate(&oversized).is_err());
             ValidateRequest::validate(&request).expect("tool structural tag supersedes JSON");
             let guided = request
                 .extract_sampling_options()

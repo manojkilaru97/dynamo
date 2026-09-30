@@ -109,7 +109,11 @@ impl OpenAIPreprocessor {
                     .sampling_options
                     .guided_decoding
                     .get_or_insert_default();
-                gd.json = Some(schema);
+                // A tool-call structural tag from request conversion already constrains
+                // the call; adding the JSON fallback would send two constraints.
+                if gd.structural_tag.is_none() {
+                    gd.json = Some(schema);
+                }
             }
             Ok(None) => {}
             Err(err) => {
