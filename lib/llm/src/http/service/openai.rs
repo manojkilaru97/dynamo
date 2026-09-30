@@ -170,6 +170,16 @@ fn extract_error_type_from_response(response: &ErrorResponse) -> ErrorType {
     classify_error_for_metrics(response.0, &response.1.message)
 }
 
+/// ErrorType for a response built from a backend error: a forwarded 4xx is a
+/// request rejection, whatever its message prefix.
+fn backend_error_type_from_response(response: &ErrorResponse) -> ErrorType {
+    if response.0.is_client_error() && response.0.as_u16() != 499 {
+        ErrorType::Validation
+    } else {
+        extract_error_type_from_response(response)
+    }
+}
+
 fn responses_conversion_error_type(error: &anyhow::Error) -> ErrorType {
     match error.downcast_ref::<ResponsesConversionError>() {
         Some(ResponsesConversionError::InvalidArgument(_)) => ErrorType::Validation,
@@ -193,9 +203,6 @@ fn responses_conversion_error_response(error: anyhow::Error) -> ErrorResponse {
     }
 }
 
-/// Match `InvalidArgument` at top-level OR under `Backend()`.
-/// `py_err_to_dynamo` wraps Python `ValueError`/`TypeError` as
-/// `Backend(InvalidArgument)`; both variants are 400-worthy.
 /// Build the 4xx response for a backend rejection, unwrapping a Python
 /// `HttpError` envelope (`{"message": ..., "code": 4xx}`) when present.
 fn rejection_error_response(invalid: &dynamo_runtime::error::DynamoError) -> ErrorResponse {
@@ -212,6 +219,9 @@ fn rejection_error_response(invalid: &dynamo_runtime::error::DynamoError) -> Err
     )
 }
 
+/// Match `InvalidArgument` at top-level OR under `Backend()`.
+/// `py_err_to_dynamo` wraps Python `ValueError`/`TypeError` as
+/// `Backend(InvalidArgument)`; both variants are 400-worthy.
 pub(crate) fn find_invalid_argument_in_chain<'a>(
     err: &'a (dyn std::error::Error + 'static),
 ) -> Option<&'a dynamo_runtime::error::DynamoError> {
@@ -922,7 +932,7 @@ async fn completions_single(
             .await
             .map_err(|error_response| {
                 tracing::error!(request_id, "Backend error detected: {:?}", error_response);
-                inflight_guard.mark_error(extract_error_type_from_response(&error_response));
+                inflight_guard.mark_error(backend_error_type_from_response(&error_response));
                 error_response
             })?;
         // Tap the stream to collect metrics for non-streaming requests without altering items
@@ -952,7 +962,7 @@ async fn completions_single(
                         "Failed to fold completions stream for {request_id}"
                     ))
                 };
-                inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+                inflight_guard.mark_error(backend_error_type_from_response(&err_response));
                 err_response
             })?;
 
@@ -1215,7 +1225,7 @@ async fn completions_batch(
             .await
             .map_err(|error_response| {
                 tracing::error!(request_id, "Backend error detected: {:?}", error_response);
-                inflight_guard.mark_error(extract_error_type_from_response(&error_response));
+                inflight_guard.mark_error(backend_error_type_from_response(&error_response));
                 error_response
             })?;
         // Tap the stream to collect metrics for non-streaming requests without altering items
@@ -1245,7 +1255,7 @@ async fn completions_batch(
                         "Failed to fold completions stream for {request_id}"
                     ))
                 };
-                inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+                inflight_guard.mark_error(backend_error_type_from_response(&err_response));
                 err_response
             })?;
 
@@ -2687,7 +2697,7 @@ async fn chat_completions(
                 .await
                 .map_err(|error_response| {
                     tracing::error!(request_id, "Backend error detected: {:?}", error_response);
-                    inflight_guard.mark_error(extract_error_type_from_response(&error_response));
+                    inflight_guard.mark_error(backend_error_type_from_response(&error_response));
                     error_response
                 })?;
 
@@ -3176,7 +3186,7 @@ async fn responses(
                 .await
                 .map_err(|error_response| {
                     tracing::error!(request_id, "Backend error detected: {:?}", error_response);
-                    inflight_guard.mark_error(extract_error_type_from_response(&error_response));
+                    inflight_guard.mark_error(backend_error_type_from_response(&error_response));
                     error_response
                 })?;
 
@@ -4295,6 +4305,35 @@ mod tests {
     };
 
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
+
+    #[test]
+    fn test_backend_rejections_are_validation_errors_in_metrics() {
+        let response = |status: StatusCode, message: &str| -> ErrorResponse {
+            (
+                status,
+                Json(ErrorMessage {
+                    message: message.to_string(),
+                    error_type: map_error_code_to_error_type(status),
+                    code: status.as_u16(),
+                    details: None,
+                }),
+            )
+        };
+        let rejected = response(StatusCode::BAD_REQUEST, "ValueError: Grammar error");
+        assert_eq!(
+            extract_error_type_from_response(&rejected),
+            ErrorType::Internal
+        );
+        assert_eq!(
+            backend_error_type_from_response(&rejected),
+            ErrorType::Validation
+        );
+        let failed = response(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error");
+        assert_eq!(
+            backend_error_type_from_response(&failed),
+            ErrorType::Internal
+        );
+    }
 
     #[test]
     fn test_rejection_error_response_unwraps_http_error_envelope() {
