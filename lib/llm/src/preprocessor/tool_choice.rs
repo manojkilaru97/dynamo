@@ -19,8 +19,8 @@ fn invalid_argument(message: impl Into<String>) -> DynamoError {
         .build()
 }
 
-/// Remove the JSON schema constraint together with the whitespace pattern that only
-/// modifies it, unless a JSON-object constraint remains for the pattern to apply to.
+/// Remove the JSON schema constraint a structural tag replaces, together with the
+/// whitespace pattern that only modifies it, unless a JSON-object constraint remains.
 fn drop_json_constraint(guided_decoding: &mut GuidedDecodingOptions) {
     guided_decoding.json = None;
     if !guided_decoding.json_object.unwrap_or(false) {
@@ -75,8 +75,9 @@ impl OpenAIPreprocessor {
 
         // For non-forced tool choice, explicit guided decoding and response_format
         // constrain assistant content, so tool-choice guided decoding stays inactive.
-        let has_assistant_constraint =
-            has_explicit_guided_decoding || has_response_format_constraint;
+        let has_assistant_constraint = has_explicit_guided_decoding
+            || has_response_format_constraint
+            || has_structured_outputs_constraint(request);
         if !is_forced_tool_choice && has_assistant_constraint {
             return Ok(false);
         }
@@ -86,7 +87,7 @@ impl OpenAIPreprocessor {
             && let Some(gd) = common_request.sampling_options.guided_decoding.as_mut()
         {
             // OpenAI `response_format` applies to assistant content, not tool calls.
-            drop_json_constraint(gd);
+            gd.json = None;
         }
 
         if self.apply_tool_choice_structural_tag(
@@ -196,6 +197,26 @@ mod tests {
     }
 
     #[test]
+    fn structured_outputs_constrains_content_but_keeps_forced_tool_precedence() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "structured_outputs": {"json": {"type": "object"}}
+        }))
+        .expect("valid request");
+        assert!(has_structured_outputs_constraint(&request));
+        assert!(!has_explicit_guided_decoding(&request));
+
+        let empty: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "structured_outputs": {"choice": []}
+        }))
+        .expect("valid request");
+        assert!(!has_structured_outputs_constraint(&empty));
+    }
+
+    #[test]
     fn legacy_json_is_unchanged_without_structural_tag() {
         let legacy_json = serde_json::json!({"type": "object"});
         let mut request = request_with_guided_decoding(GuidedDecodingOptions::new(
@@ -230,18 +251,23 @@ fn has_explicit_guided_decoding(request: &NvCreateChatCompletionRequest) -> bool
             .as_ref()
             .is_some_and(|v| !v.is_empty())
         || request.common.guided_grammar.is_some()
-        || request
-            .common
-            .structured_outputs
-            .as_ref()
-            .is_some_and(|params| {
-                params.json.is_some()
-                    || params.json_object.unwrap_or(false)
-                    || params.regex.is_some()
-                    || params.grammar.is_some()
-                    || params.choice.as_ref().is_some_and(|v| !v.is_empty())
-                    || params.structural_tag.is_some()
-            })
+}
+
+/// `structured_outputs` constrains assistant content like `guided_*`, but a forced
+/// tool choice keeps precedence over it (the tool schema wins).
+fn has_structured_outputs_constraint(request: &NvCreateChatCompletionRequest) -> bool {
+    request
+        .common
+        .structured_outputs
+        .as_ref()
+        .is_some_and(|params| {
+            params.json.is_some()
+                || params.json_object.unwrap_or(false)
+                || params.regex.is_some()
+                || params.grammar.is_some()
+                || params.choice.as_ref().is_some_and(|v| !v.is_empty())
+                || params.structural_tag.is_some()
+        })
 }
 
 fn has_response_format_constraint(request: &NvCreateChatCompletionRequest) -> bool {

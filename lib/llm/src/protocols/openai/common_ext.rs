@@ -160,7 +160,24 @@ pub trait CommonExtProvider {
         {
             return Ok(());
         }
-        crate::protocols::openai::validate::validate_structured_outputs(&ext.structured_outputs)?;
+        if let Some(params) = ext.structured_outputs.as_ref() {
+            let constraints = [
+                params.json.is_some(),
+                params.json_object.unwrap_or(false),
+                params.regex.is_some(),
+                params.choice.as_ref().is_some_and(|c| !c.is_empty()),
+                params.grammar.is_some(),
+                params.structural_tag.is_some(),
+            ]
+            .into_iter()
+            .filter(|&present| present)
+            .count();
+            if constraints > 1 {
+                anyhow::bail!(
+                    "Only one structured_outputs constraint may be set at a time (`json`, `json_object`, `regex`, `choice`, `grammar`, or `structural_tag`)"
+                );
+            }
+        }
         crate::protocols::common::GuidedDecodingOptions::from_optional_with_json_object_and_structural_tag(
             self.get_guided_json(),
             self.get_guided_json_object(),

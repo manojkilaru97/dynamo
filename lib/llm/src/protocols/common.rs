@@ -567,11 +567,12 @@ impl GuidedDecodingOptions {
         backend: Option<String>,
         whitespace_pattern: Option<String>,
     ) -> Result<Option<Self>> {
-        let is_empty_choice = choice.as_ref().is_none_or(|v| v.is_empty());
+        // An empty choice list is not a constraint; do not forward it to the backend.
+        let choice = choice.filter(|v| !v.is_empty());
         if json.is_none()
             && !json_object.unwrap_or(false)
             && regex.is_none()
-            && is_empty_choice
+            && choice.is_none()
             && grammar.is_none()
             && whitespace_pattern.is_none()
             && structural_tag.is_none()

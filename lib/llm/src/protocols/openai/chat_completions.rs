@@ -1020,6 +1020,10 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
     }
 
     fn get_guided_whitespace_pattern(&self) -> Option<String> {
+        // The tool-call structural tag replaces the JSON constraints the pattern modifies.
+        if self.uses_qwen_xml_tool_structural_tag() {
+            return None;
+        }
         self.common.guided_whitespace_pattern.clone().or_else(|| {
             self.common
                 .structured_outputs
@@ -1786,6 +1790,73 @@ mod tests {
                 }))
             );
         });
+    }
+
+    #[test]
+    fn test_qwen_tool_structural_tag_drops_whitespace_pattern() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Call send_message"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "send_message",
+                    "parameters": {"type": "object", "properties": {"note": {"type": "string"}}}
+                }
+            }],
+            "tool_choice": {"type": "function", "function": {"name": "send_message"}},
+            "response_format": {"type": "json_object"},
+            "guided_whitespace_pattern": "[ ]?"
+        }))
+        .expect("Failed to deserialize request");
+
+        with_tool_parser("qwen3_coder", || {
+            ValidateRequest::validate(&request).expect("tool structural tag supersedes JSON");
+            let guided = request
+                .extract_sampling_options()
+                .expect("sampling options")
+                .guided_decoding
+                .expect("guided decoding");
+            assert!(guided.structural_tag.is_some());
+            assert_eq!(guided.whitespace_pattern, None);
+        });
+    }
+
+    #[test]
+    fn test_structured_outputs_modifier_and_empty_choice() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "guided_json": {"type": "object"},
+            "structured_outputs": {"whitespace_pattern": "[ ]?"}
+        }))
+        .expect("Failed to deserialize request");
+        ValidateRequest::validate(&request).expect("structured_outputs modifier on guided_json");
+
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "structured_outputs": {"json": {"type": "object"}, "choice": []}
+        }))
+        .expect("Failed to deserialize request");
+        ValidateRequest::validate(&request).expect("empty choice is not a constraint");
+        let guided = request
+            .extract_sampling_options()
+            .expect("sampling options")
+            .guided_decoding
+            .expect("guided decoding");
+        assert!(guided.json.is_some());
+        assert_eq!(guided.choice, None);
+
+        for structured_outputs in [json!({}), json!({"grammar": "root ::= [^\"\\\\]* | [(]+"})] {
+            let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "structured_outputs": structured_outputs
+            }))
+            .expect("Failed to deserialize request");
+            ValidateRequest::validate(&request).expect("previously accepted structured_outputs");
+        }
     }
 
     #[test]
