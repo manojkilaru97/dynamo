@@ -916,17 +916,34 @@ def _decode_wall_clock_limit_secs() -> float | None:
     return parsed if parsed > 0 else None
 
 
-async def _map_request_validation_errors(gen):
+async def _map_request_validation_errors(gen, structured_output: bool = False):
     """Report vLLM request rejections as ValueError, which Dynamo maps to HTTP 400.
 
     vLLM validates a request while adding it to the engine: VLLMClientError
     propagates as-is, other validation errors (for example a schema no
     structured-output backend accepts) arrive as EngineGenerateError caused by a
-    ValueError. Only failures before the first output are request rejections.
+    ValueError. A structured-output grammar that fails to compile (for example an
+    outlines regex compile timeout) finishes the request with finish_reason
+    "error" and no tokens. Only failures before the first output are request
+    rejections.
     """
     produced = False
     try:
         async for item in gen:
+            if (
+                not produced
+                and structured_output
+                and item.finished
+                and item.outputs
+                and all(
+                    output.finish_reason == "error" and not output.token_ids
+                    for output in item.outputs
+                )
+            ):
+                raise ValueError(
+                    "The structured output constraint could not be compiled for this "
+                    "request; simplify the schema or grammar"
+                )
             produced = True
             yield item
     except VLLMClientError as e:
@@ -3686,7 +3703,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 ),
             )
             gen = _iterate_with_decode_deadline(
-                _map_request_validation_errors(gen),
+                _map_request_validation_errors(
+                    gen, sampling_params.structured_outputs is not None
+                ),
                 request_id,
                 lambda: self.engine_client.abort(request_id),
             )
@@ -4269,7 +4288,8 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                             data_parallel_rank=dp_rank,
                             trace_headers=trace_headers,
                             priority=priority,
-                        )
+                        ),
+                        sampling_params.structured_outputs is not None,
                     ),
                     request_id,
                     abort_guard.abort
@@ -4478,7 +4498,9 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                         ),
                     ),
                 )
-                gen = _map_request_validation_errors(gen)
+                gen = _map_request_validation_errors(
+                    gen, sampling_params.structured_outputs is not None
+                )
             except EngineDeadError as e:
                 logger.error(f"vLLM EngineDeadError: {e}")
                 logger.warning("Initiating Dynamo Runtime shutdown.")

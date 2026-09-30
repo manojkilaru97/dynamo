@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
-from dynamo.vllm.handlers import _map_request_validation_errors
 from vllm.exceptions import VLLMValidationError
 from vllm.v1.engine.exceptions import EngineGenerateError
+
+from dynamo.vllm.handlers import _map_request_validation_errors
 
 pytestmark = [
     pytest.mark.unit,
@@ -27,8 +30,24 @@ async def _stream(error: Exception, outputs: int = 0):
     raise error
 
 
-async def _collect(stream):
-    return [item async for item in _map_request_validation_errors(stream)]
+async def _collect(stream, structured_output: bool = False):
+    return [
+        item async for item in _map_request_validation_errors(stream, structured_output)
+    ]
+
+
+def _output(finish_reason, token_ids=(), finished=True):
+    return SimpleNamespace(
+        finished=finished,
+        outputs=[
+            SimpleNamespace(finish_reason=finish_reason, token_ids=list(token_ids))
+        ],
+    )
+
+
+async def _outputs(*items):
+    for item in items:
+        yield item
 
 
 @pytest.mark.asyncio
@@ -74,3 +93,22 @@ async def test_rejection_before_output_is_a_value_error(error):
 async def test_other_failures_stay_server_errors(error, outputs, expected):
     with pytest.raises(expected):
         await _collect(_stream(error, outputs=outputs))
+
+
+@pytest.mark.asyncio
+async def test_structured_output_compile_failure_is_a_value_error():
+    with pytest.raises(ValueError, match="could not be compiled"):
+        await _collect(_outputs(_output("error")), structured_output=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "items, structured_output",
+    [
+        pytest.param([_output("error")], False, id="not_structured"),
+        pytest.param([_output(None, [1], False), _output("error")], True, id="late"),
+        pytest.param([_output("stop", [1])], True, id="normal"),
+    ],
+)
+async def test_other_error_finishes_pass_through(items, structured_output):
+    assert len(await _collect(_outputs(*items), structured_output)) == len(items)
