@@ -45,7 +45,8 @@ from vllm.sampling_params import (
     SamplingParams,
     StructuredOutputsParams,
 )
-from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.exceptions import VLLMClientError
+from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from dynamo._core import Context
 from dynamo.common.backend import logprobs as _shared_logprobs
@@ -913,6 +914,27 @@ def _decode_wall_clock_limit_secs() -> float | None:
         logger.warning("Ignoring invalid DYN_REQUEST_MAX_DECODE_WALL_CLOCK_SECS=%r", raw)
         return None
     return parsed if parsed > 0 else None
+
+
+async def _map_request_validation_errors(gen):
+    """Report vLLM request rejections as ValueError, which Dynamo maps to HTTP 400.
+
+    vLLM validates a request while adding it to the engine: VLLMClientError
+    propagates as-is, other validation errors (for example a schema no
+    structured-output backend accepts) arrive as EngineGenerateError caused by a
+    ValueError. Only failures before the first output are request rejections.
+    """
+    produced = False
+    try:
+        async for item in gen:
+            produced = True
+            yield item
+    except VLLMClientError as e:
+        raise ValueError(str(e)) from e
+    except EngineGenerateError as e:
+        if not produced and isinstance(e.__cause__, ValueError):
+            raise ValueError(str(e.__cause__)) from e
+        raise
 
 
 async def _iterate_with_decode_deadline(gen, request_id: str, abort):
@@ -3662,7 +3684,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 ),
             )
             gen = _iterate_with_decode_deadline(
-                gen, request_id, lambda: self.engine_client.abort(request_id)
+                _map_request_validation_errors(gen),
+                request_id,
+                lambda: self.engine_client.abort(request_id),
             )
 
             total_output_tokens_by_index: dict[int, int] = {}
@@ -4235,13 +4259,15 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         ):
             try:
                 gen = _iterate_with_decode_deadline(
-                    self.engine_client.generate(
-                        prompt,
-                        sampling_params,
-                        request_id,
-                        data_parallel_rank=dp_rank,
-                        trace_headers=trace_headers,
-                        priority=priority,
+                    _map_request_validation_errors(
+                        self.engine_client.generate(
+                            prompt,
+                            sampling_params,
+                            request_id,
+                            data_parallel_rank=dp_rank,
+                            trace_headers=trace_headers,
+                            priority=priority,
+                        )
                     ),
                     request_id,
                     abort_guard.abort
@@ -4450,6 +4476,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                         ),
                     ),
                 )
+                gen = _map_request_validation_errors(gen)
             except EngineDeadError as e:
                 logger.error(f"vLLM EngineDeadError: {e}")
                 logger.warning("Initiating Dynamo Runtime shutdown.")
