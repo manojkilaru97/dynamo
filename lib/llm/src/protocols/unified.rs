@@ -374,7 +374,7 @@ impl CommonExtProvider for UnifiedRequest {
     }
 
     fn get_guided_whitespace_pattern(&self) -> Option<String> {
-        self.inner.common.guided_whitespace_pattern.clone()
+        CommonExtProvider::get_guided_whitespace_pattern(&self.inner)
     }
 
     fn get_top_k(&self) -> Option<i32> {

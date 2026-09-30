@@ -160,6 +160,20 @@ pub trait CommonExtProvider {
         {
             return Ok(());
         }
+        let max_len = crate::protocols::common::MAX_WHITESPACE_PATTERN_LEN;
+        let raw_patterns = [
+            ext.guided_whitespace_pattern.as_deref(),
+            ext.structured_outputs
+                .as_ref()
+                .and_then(|params| params.whitespace_pattern.as_deref()),
+        ];
+        if raw_patterns
+            .into_iter()
+            .flatten()
+            .any(|pattern| pattern.is_empty() || pattern.len() > max_len)
+        {
+            anyhow::bail!("whitespace_pattern must be between 1 and {max_len} bytes");
+        }
         if let Some(params) = ext.structured_outputs.as_ref() {
             let constraints = [
                 params.json.is_some(),

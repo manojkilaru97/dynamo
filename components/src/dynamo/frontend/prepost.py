@@ -306,8 +306,8 @@ def _build_assistant_guided_decoding(
     # frontend and a silent single-constraint request here. Rejecting is the
     # correct behavior; it is left as-is only to avoid adding a second new 400 to
     # this change. validate() treats whitespace_pattern as a modifier of a JSON
-    # constraint, so the {"json": ..., "whitespace_pattern": ...} pair built below
-    # is accepted on both paths.
+    # constraint, so a {"json": ..., "whitespace_pattern": ...} pair built below is
+    # accepted on both paths; this path does not check the pattern otherwise.
     legacy_guidance: dict[str, Any] = {}
     for key, value in (
         ("json", request_extra.get("guided_json")),
