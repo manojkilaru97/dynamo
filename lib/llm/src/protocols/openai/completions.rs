@@ -544,7 +544,7 @@ impl ValidateRequest for NvCreateCompletionRequest {
 mod tests {
     use super::*;
     use crate::engines::ValidateRequest;
-    use crate::protocols::common::OutputOptionsProvider;
+    use crate::protocols::common::{OutputOptionsProvider, SamplingOptionsProvider};
     use base64::Engine;
     use serde_json::json;
 
@@ -574,6 +574,46 @@ mod tests {
                 ValidateRequest::validate(&request).is_err(),
                 "accepted {body}"
             );
+        }
+    }
+
+    #[test]
+    fn test_completions_whitespace_pattern_aliases_reach_sampling_options() {
+        for body in [
+            json!({
+                "model": "test-model",
+                "prompt": "JSON:",
+                "guided_json": {"type": "object"},
+                "guided_whitespace_pattern": "[ ]?"
+            }),
+            json!({
+                "model": "test-model",
+                "prompt": "JSON:",
+                "guided_json": {"type": "object"},
+                "structured_outputs": {"whitespace_pattern": "[ ]?"}
+            }),
+        ] {
+            let request: NvCreateCompletionRequest =
+                serde_json::from_value(body.clone()).expect("Failed to deserialize request");
+            ValidateRequest::validate(&request).expect("json + whitespace_pattern is valid");
+            let guided = request
+                .extract_sampling_options()
+                .expect("sampling options")
+                .guided_decoding
+                .expect("guided decoding");
+            assert!(guided.json.is_some(), "{body}");
+            assert_eq!(guided.whitespace_pattern.as_deref(), Some("[ ]?"), "{body}");
+        }
+
+        for pattern in [String::new(), "x".repeat(1025)] {
+            let request: NvCreateCompletionRequest = serde_json::from_value(json!({
+                "model": "test-model",
+                "prompt": "JSON:",
+                "guided_json": {"type": "object"},
+                "structured_outputs": {"whitespace_pattern": pattern}
+            }))
+            .expect("Failed to deserialize request");
+            assert!(ValidateRequest::validate(&request).is_err());
         }
     }
 
