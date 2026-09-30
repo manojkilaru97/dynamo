@@ -299,11 +299,16 @@ def _build_assistant_guided_decoding(
         # Legacy guided_* takes precedence over structured_outputs (prior
         # behavior), but as a single constraint.
         guided_decoding = legacy_guidance
-        whitespace_pattern = request_extra.get("guided_whitespace_pattern")
-        if whitespace_pattern is None and structured_outputs is not None:
-            whitespace_pattern = structured_outputs.whitespace_pattern
-        if whitespace_pattern is not None:
-            guided_decoding["whitespace_pattern"] = whitespace_pattern
+    whitespace_pattern = request_extra.get("guided_whitespace_pattern")
+    if whitespace_pattern is None and structured_outputs is not None:
+        whitespace_pattern = structured_outputs.whitespace_pattern
+    if (
+        whitespace_pattern is not None
+        and guided_decoding is not None
+        and "json" in guided_decoding
+        and guided_decoding.get("whitespace_pattern") is None
+    ):
+        guided_decoding["whitespace_pattern"] = whitespace_pattern
     return guided_decoding
 
 
@@ -347,12 +352,56 @@ def _materialize_assistant_tool_calls(
     return normalized
 
 
+_STRUCTURED_OUTPUT_CONSTRAINTS = (
+    "json",
+    "regex",
+    "choice",
+    "grammar",
+    "json_object",
+    "structural_tag",
+)
+
+
+def _lift_pattern_only_structured_outputs(request: dict[str, Any]) -> dict[str, Any]:
+    """Move a constraint-free `structured_outputs.whitespace_pattern` to the
+    top-level `guided_whitespace_pattern` modifier.
+
+    vLLM's StructuredOutputsParams rejects an object without a constraint, but
+    Dynamo accepts the pattern alias as a modifier of a JSON constraint given
+    elsewhere (for example `guided_json` or `response_format`).
+    """
+    structured_outputs = request.get("structured_outputs")
+    if (
+        not isinstance(structured_outputs, dict)
+        or structured_outputs.get("whitespace_pattern") is None
+        or any(
+            structured_outputs.get(key) not in (None, False)
+            for key in _STRUCTURED_OUTPUT_CONSTRAINTS
+        )
+    ):
+        return request
+    request = dict(request)
+    rest = {
+        key: value
+        for key, value in structured_outputs.items()
+        if key != "whitespace_pattern"
+    }
+    if request.get("guided_whitespace_pattern") is None:
+        request["guided_whitespace_pattern"] = structured_outputs["whitespace_pattern"]
+    if any(value is not None for value in rest.values()):
+        request["structured_outputs"] = rest
+    else:
+        request.pop("structured_outputs")
+    return request
+
+
 # Fully validate nested fields only when the fast path leaves raw dictionaries.
 def _validate_chat_completion_request(
     request: dict[str, Any] | ChatCompletionRequest,
 ) -> ChatCompletionRequest:
     if isinstance(request, ChatCompletionRequest):
         return request
+    request = _lift_pattern_only_structured_outputs(request)
     if not SKIP_REQUEST_VALIDATION:
         return ChatCompletionRequest.model_validate(request)
 
