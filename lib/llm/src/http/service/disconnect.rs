@@ -58,7 +58,7 @@ fn classify_stream_error(err: &(dyn std::error::Error + 'static)) -> SanitizedEr
 
 /// A Python `HttpError` rejection carries `{"message": ..., "code": 4xx}` as its
 /// message; unwrap it so the frame shows the backend's own message and status.
-fn rejection_message_and_code(message: &str) -> (String, u16) {
+pub(crate) fn rejection_message_and_code(message: &str) -> (String, u16) {
     #[derive(serde::Deserialize)]
     struct Envelope {
         message: String,
