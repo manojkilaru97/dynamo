@@ -249,16 +249,20 @@ fn monitor_for_disconnects_with_timeout(
         // stopped, drain the stream to its end so the trailing usage chunk + [DONE]
         // aren't lost to the select! race.
         let mut engine_stopped = false;
+        // A request rejection is reported as a client error only before any output.
+        let mut sent_output = false;
         loop {
             tokio::select! {
                 event = stream.next() => {
                     match event {
                         Some(Ok(event)) => {
+                            sent_output = true;
                             yield event;
                         }
                         Some(Err(err)) => {
-                            if let Some(invalid) =
-                                crate::http::service::openai::find_invalid_argument_in_chain(&err)
+                            if let Some(invalid) = (!sent_output)
+                                .then(|| crate::http::service::openai::find_invalid_argument_in_chain(&err))
+                                .flatten()
                             {
                                 // A request rejection is a client error: forward its
                                 // message with code 400, as the non-streaming path does.
@@ -855,6 +859,30 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("data: [DONE]"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_argument_after_output_stays_sanitized() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as RuntimeErrorType};
+        let (_metrics, guard, ctx, handle) = setup_test("late-model", "req-late");
+        let detail = "ValueError: late failure with internal detail";
+        let stream = async_stream::try_stream! {
+            yield axum::response::sse::Event::default().data("chunk-0");
+            Err(axum::Error::new(
+                DynamoError::builder()
+                    .error_type(RuntimeErrorType::Backend(BackendError::InvalidArgument))
+                    .message(detail)
+                    .build(),
+            ))?;
+        };
+        let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+        assert_fault_contract(
+            "late_invalid_argument",
+            &body,
+            detail,
+            SanitizedError::Internal,
+        );
     }
 
     #[tokio::test]

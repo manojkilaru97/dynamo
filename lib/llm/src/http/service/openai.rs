@@ -901,6 +901,14 @@ async fn completions_single(
 
         Ok(sse_stream.into_response())
     } else {
+        // Check first event for backend errors before aggregating (non-streaming only)
+        let stream = check_for_backend_error(Box::pin(stream))
+            .await
+            .map_err(|error_response| {
+                tracing::error!(request_id, "Backend error detected: {:?}", error_response);
+                inflight_guard.mark_error(extract_error_type_from_response(&error_response));
+                error_response
+            })?;
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = stream.inspect(move |response| {
@@ -1181,6 +1189,14 @@ async fn completions_batch(
 
         Ok(sse_stream.into_response())
     } else {
+        // Check first event for backend errors before aggregating (non-streaming only)
+        let merged_stream = check_for_backend_error(Box::pin(merged_stream))
+            .await
+            .map_err(|error_response| {
+                tracing::error!(request_id, "Backend error detected: {:?}", error_response);
+                inflight_guard.mark_error(extract_error_type_from_response(&error_response));
+                error_response
+            })?;
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = merged_stream.inspect(move |response| {
@@ -2193,18 +2209,12 @@ const MAX_LEADING_ANNOTATIONS: usize = 16;
 /// Returns Err(ErrorResponse) if error detected, Ok(stream) otherwise — the
 /// returned stream replays any buffered annotation frames in their original
 /// order before yielding the remaining items.
-pub(super) async fn check_for_backend_error(
-    mut stream: impl futures::Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>>
-    + Send
-    + Unpin
-    + 'static,
-) -> Result<
-    impl futures::Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send,
-    ErrorResponse,
-> {
+pub(super) async fn check_for_backend_error<T: Serialize + Send + 'static>(
+    mut stream: impl futures::Stream<Item = Annotated<T>> + Send + Unpin + 'static,
+) -> Result<impl futures::Stream<Item = Annotated<T>> + Send, ErrorResponse> {
     use futures::stream::StreamExt;
 
-    let mut buffered: Vec<Annotated<NvCreateChatCompletionStreamResponse>> = Vec::new();
+    let mut buffered: Vec<Annotated<T>> = Vec::new();
     while let Some(event) = stream.next().await {
         if is_annotation_frame(&event) && buffered.len() < MAX_LEADING_ANNOTATIONS {
             buffered.push(event);
