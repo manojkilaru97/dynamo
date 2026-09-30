@@ -916,6 +916,10 @@ def _decode_wall_clock_limit_secs() -> float | None:
     return parsed if parsed > 0 else None
 
 
+# vLLM sets this stop_reason when a structured-output grammar fails to compile.
+STRUCTURED_OUTPUT_COMPILE_ERROR = "structured_output_compile_error"
+
+
 async def _map_request_validation_errors(gen, structured_output: bool = False):
     """Report vLLM request rejections as ValueError, which Dynamo maps to HTTP 400.
 
@@ -924,8 +928,8 @@ async def _map_request_validation_errors(gen, structured_output: bool = False):
     structured-output backend accepts) arrive as EngineGenerateError caused by a
     ValueError. A structured-output grammar that fails to compile (for example an
     outlines regex compile timeout) finishes the request with finish_reason
-    "error" and no tokens. Only failures before the first output are request
-    rejections.
+    "error", no tokens, and stop_reason STRUCTURED_OUTPUT_COMPILE_ERROR. Only
+    failures before the first output are request rejections.
     """
     produced = False
     try:
@@ -936,7 +940,9 @@ async def _map_request_validation_errors(gen, structured_output: bool = False):
                 and item.finished
                 and item.outputs
                 and all(
-                    output.finish_reason == "error" and not output.token_ids
+                    output.finish_reason == "error"
+                    and output.stop_reason == STRUCTURED_OUTPUT_COMPILE_ERROR
+                    and not output.token_ids
                     for output in item.outputs
                 )
             ):

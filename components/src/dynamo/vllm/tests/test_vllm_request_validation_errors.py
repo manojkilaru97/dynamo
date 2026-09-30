@@ -36,13 +36,21 @@ async def _collect(stream, structured_output: bool = False):
     ]
 
 
-def _output(finish_reason, token_ids=(), finished=True):
+def _output(finish_reason, token_ids=(), finished=True, stop_reason=None):
     return SimpleNamespace(
         finished=finished,
         outputs=[
-            SimpleNamespace(finish_reason=finish_reason, token_ids=list(token_ids))
+            SimpleNamespace(
+                finish_reason=finish_reason,
+                token_ids=list(token_ids),
+                stop_reason=stop_reason,
+            )
         ],
     )
+
+
+def _compile_error():
+    return _output("error", stop_reason="structured_output_compile_error")
 
 
 async def _outputs(*items):
@@ -98,15 +106,16 @@ async def test_other_failures_stay_server_errors(error, outputs, expected):
 @pytest.mark.asyncio
 async def test_structured_output_compile_failure_is_a_value_error():
     with pytest.raises(ValueError, match="could not be compiled"):
-        await _collect(_outputs(_output("error")), structured_output=True)
+        await _collect(_outputs(_compile_error()), structured_output=True)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "items, structured_output",
     [
-        pytest.param([_output("error")], False, id="not_structured"),
-        pytest.param([_output(None, [1], False), _output("error")], True, id="late"),
+        pytest.param([_compile_error()], False, id="not_structured"),
+        pytest.param([_output(None, [1], False), _compile_error()], True, id="late"),
+        pytest.param([_output("error")], True, id="other_engine_error"),
         pytest.param([_output("stop", [1])], True, id="normal"),
     ],
 )
