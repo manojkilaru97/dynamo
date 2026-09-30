@@ -577,7 +577,7 @@ impl GuidedDecodingOptions {
         {
             return Ok(None);
         }
-        let mut instance = Self::validated(
+        let mut instance = Self::new(
             json,
             regex,
             choice,
@@ -585,7 +585,7 @@ impl GuidedDecodingOptions {
             backend,
             whitespace_pattern,
             structural_tag,
-        )?;
+        );
         instance.json_object = json_object;
         instance.validate()?;
         Ok(Some(instance))
@@ -600,7 +600,6 @@ impl GuidedDecodingOptions {
             self.regex.is_some(),
             self.choice.as_ref().is_some_and(|v| !v.is_empty()),
             self.grammar.is_some(),
-            self.whitespace_pattern.is_some(),
             self.structural_tag.is_some(),
         ]
         .iter()
@@ -609,8 +608,16 @@ impl GuidedDecodingOptions {
 
         if count > 1 {
             return Err(anyhow::anyhow!(
-                "Only one of json, json_object, regex, choice, grammar, structural_tag, or whitespace_pattern can be set, but multiple are specified: {:?}",
-                self
+                "Only one of json, json_object, regex, choice, grammar, or structural_tag can be set, but multiple are specified"
+            ));
+        }
+
+        if self.whitespace_pattern.is_some()
+            && self.json.is_none()
+            && !self.json_object.unwrap_or(false)
+        {
+            return Err(anyhow::anyhow!(
+                "whitespace_pattern only applies to JSON constraints; set it together with guided_json or a JSON response_format"
             ));
         }
 
@@ -1084,10 +1091,22 @@ mod tests {
         assert!(opts.choice.is_none());
         assert!(opts.whitespace_pattern.is_none());
 
-        // Only whitespace_pattern set
-        let whitespace_pattern = Some(r"\s+".to_string());
+        // whitespace_pattern alone has nothing to modify
+        let whitespace_pattern = Some(r"[\n ]?".to_string());
         let opts = GuidedDecodingOptions::validated(
             None,
+            None,
+            None,
+            None,
+            None,
+            whitespace_pattern.clone(),
+            None,
+        );
+        assert!(opts.is_err());
+
+        // whitespace_pattern modifies a JSON schema constraint
+        let opts = GuidedDecodingOptions::validated(
+            Some(serde_json::json!({"type": "object"})),
             None,
             None,
             None,
@@ -1098,10 +1117,32 @@ mod tests {
         assert!(opts.is_ok());
         let opts = opts.unwrap();
         assert_eq!(opts.whitespace_pattern, whitespace_pattern);
-        assert!(opts.json.is_none());
-        assert!(opts.regex.is_none());
-        assert!(opts.choice.is_none());
-        assert!(opts.grammar.is_none());
+        assert!(opts.json.is_some());
+
+        // whitespace_pattern modifies a JSON object constraint
+        let opts = GuidedDecodingOptions::from_optional_with_json_object_and_structural_tag(
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+            None,
+            whitespace_pattern.clone(),
+        );
+        assert!(opts.is_ok_and(|o| o.is_some_and(|o| o.whitespace_pattern == whitespace_pattern)));
+
+        // whitespace_pattern does not apply to non-JSON constraints
+        let opts = GuidedDecodingOptions::validated(
+            None,
+            Some(r"\d+".to_string()),
+            None,
+            None,
+            None,
+            whitespace_pattern.clone(),
+            None,
+        );
+        assert!(opts.is_err());
 
         // Only structural_tag set
         let structural_tag = Some(serde_json::json!({"type": "structural_tag"}));

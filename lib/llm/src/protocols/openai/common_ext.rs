@@ -139,8 +139,22 @@ pub trait CommonExtProvider {
     fn get_guided_choice(&self) -> Option<Vec<String>>;
     fn get_guided_structural_tag(&self) -> Option<serde_json::Value>;
     fn get_guided_decoding_backend(&self) -> Option<String>;
-    #[allow(unused)] // Not used
     fn get_guided_whitespace_pattern(&self) -> Option<String>;
+
+    /// Reject invalid guided decoding combinations before the request reaches the engine.
+    fn validate_guided_decoding(&self) -> anyhow::Result<()> {
+        crate::protocols::common::GuidedDecodingOptions::from_optional_with_json_object_and_structural_tag(
+            self.get_guided_json(),
+            self.get_guided_json_object(),
+            self.get_guided_regex(),
+            self.get_guided_choice(),
+            self.get_guided_grammar(),
+            self.get_guided_structural_tag(),
+            self.get_guided_decoding_backend(),
+            self.get_guided_whitespace_pattern(),
+        )
+        .map(|_| ())
+    }
 
     /// Other sampling Options
     fn get_top_k(&self) -> Option<i32>;

@@ -1206,6 +1206,7 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         validate::validate_repetition_penalty(self.get_repetition_penalty())?;
         validate::validate_min_p(self.get_min_p())?;
         validate::validate_top_k(self.get_top_k())?;
+        self.validate_guided_decoding()?;
         // Cross-field validation
         validate::validate_n_with_temperature(self.inner.n, self.inner.temperature)?;
 
@@ -1528,6 +1529,47 @@ mod tests {
             request.get_guided_structural_tag(),
             Some(json!({"type": "structural_tag", "format": {"type": "tag"}}))
         );
+    }
+
+    #[test]
+    fn test_guided_whitespace_pattern_modifies_guided_json() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Answer as JSON"}],
+            "guided_json": {"type": "object", "properties": {"answer": {"type": "string"}}},
+            "guided_whitespace_pattern": "[\\n ]?"
+        }))
+        .expect("Failed to deserialize request");
+
+        ValidateRequest::validate(&request).expect("json + whitespace_pattern is valid");
+        let guided = request
+            .extract_sampling_options()
+            .expect("sampling options")
+            .guided_decoding
+            .expect("guided decoding");
+        assert!(guided.json.is_some());
+        assert_eq!(guided.whitespace_pattern.as_deref(), Some("[\\n ]?"));
+    }
+
+    #[test]
+    fn test_invalid_guided_decoding_is_rejected_by_validate() {
+        for body in [
+            json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "guided_json": {"type": "object"},
+                "guided_regex": "\\d+"
+            }),
+            json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "guided_whitespace_pattern": "[\\n ]?"
+            }),
+        ] {
+            let request: NvCreateChatCompletionRequest =
+                serde_json::from_value(body).expect("Failed to deserialize request");
+            assert!(ValidateRequest::validate(&request).is_err());
+        }
     }
 
     #[test]
