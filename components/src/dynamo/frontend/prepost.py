@@ -289,9 +289,8 @@ def _guided_decoding_from_structured_outputs(
 def _build_assistant_guided_decoding(
     request: ChatCompletionRequest,
 ) -> dict[str, Any] | None:
-    guided_decoding = _guided_decoding_from_structured_outputs(
-        request.extract_structured_outputs()
-    )
+    structured_outputs = request.extract_structured_outputs()
+    guided_decoding = _guided_decoding_from_structured_outputs(structured_outputs)
 
     request_extra = request.model_extra or {}
     # Pick a single legacy guided_* constraint by precedence rather than merging
@@ -323,6 +322,8 @@ def _build_assistant_guided_decoding(
         # behavior), but as a single constraint.
         guided_decoding = legacy_guidance
         whitespace_pattern = request_extra.get("guided_whitespace_pattern")
+        if whitespace_pattern is None and structured_outputs is not None:
+            whitespace_pattern = structured_outputs.whitespace_pattern
         if whitespace_pattern is not None:
             guided_decoding["whitespace_pattern"] = whitespace_pattern
     return guided_decoding
