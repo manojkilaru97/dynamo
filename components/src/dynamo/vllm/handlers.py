@@ -1698,7 +1698,7 @@ def _structured_outputs_from_openai_request(
     if request.get("guided_regex") is not None:
         _validate_structured_regex(request["guided_regex"])
         return StructuredOutputsParams(regex=request["guided_regex"])
-    if request.get("guided_choice") is not None:
+    if request.get("guided_choice"):
         return StructuredOutputsParams(choice=request["guided_choice"])
     if request.get("guided_grammar") is not None:
         _validate_structured_grammar(request["guided_grammar"])
@@ -1824,10 +1824,15 @@ def _text_mode_structured_outputs(
     structured_outputs = _structured_outputs_from_openai_request(without_tools)
     if not forced_tool:
         return structured_outputs
-    if structured_outputs is not None and structured_outputs.structural_tag:
+    # response_format is dropped for a forced tool; explicit guided_* or
+    # structured_outputs constraints are rejected, as on the token path.
+    explicit = _structured_outputs_from_openai_request(
+        {key: value for key, value in without_tools.items() if key != "response_format"}
+    )
+    if explicit is not None:
         raise ValueError(
-            "structured_outputs.structural_tag cannot be combined with a forced "
-            "tool_choice"
+            "tool_choice forces a tool call and cannot be combined with an "
+            "explicit guided_* or structured_outputs constraint."
         )
     return None
 
