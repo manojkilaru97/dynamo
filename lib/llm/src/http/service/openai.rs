@@ -185,6 +185,7 @@ fn backend_error_type_from_response(response: &ErrorResponse) -> ErrorType {
 pub(crate) fn backend_rejection_error_type(code: u16) -> ErrorType {
     match code {
         404 => ErrorType::NotFound,
+        499 => ErrorType::Cancelled,
         429 => ErrorType::Overload,
         _ => ErrorType::Validation,
     }
@@ -217,6 +218,9 @@ fn responses_conversion_error_response(error: anyhow::Error) -> ErrorResponse {
 /// `HttpError` envelope (`{"message": ..., "code": 4xx}`) when present.
 fn rejection_error_response(invalid: &dynamo_runtime::error::DynamoError) -> ErrorResponse {
     let (message, code) = super::disconnect::rejection_message_and_code(invalid.message());
+    if code == 499 {
+        return ErrorMessage::sanitized_with_details(SanitizedError::Cancelled, message);
+    }
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
     (
         status,
@@ -4437,6 +4441,10 @@ mod tests {
         let (status, Json(body)) = rejection_error_response(&rejection("ValueError: bad"));
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.message, "ValueError: bad");
+        let (status, Json(body)) =
+            rejection_error_response(&rejection(r#"{"message":"gone /srv/x.py","code":499}"#));
+        assert_eq!(status.as_u16(), 499);
+        assert!(!body.message.contains("/srv/x.py"));
     }
 
     fn binary_pooling_response() -> NvCreatePoolingResponse {
