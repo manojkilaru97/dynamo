@@ -61,12 +61,26 @@ impl OpenAIPreprocessor {
         let ctx = dynamo_parsers::tool_calling::ToolCallFormatBuildContext {
             tool_choice,
             tools,
-            parallel_tool_calls,
+            parallel_tool_calls: Self::tag_parallel_tool_calls(tool_choice, parallel_tool_calls),
             schema_mode: self.runtime_config.structural_tag_schema,
             starts_in_reasoning: prompt_injected_reasoning && !native_reasoning_owns_prefix,
         };
 
         Self::apply_tool_call_format(parser_name, builder, &ctx, preprocessed_request)
+    }
+
+    /// `parallel_tool_calls` for the tool-call tag. A named `tool_choice` forces
+    /// one call of that tool, as in vLLM; the parser builders allow repeated calls
+    /// unless `parallel_tool_calls` is `false`, which let the forced call repeat
+    /// until `max_tokens`.
+    fn tag_parallel_tool_calls(
+        tool_choice: &ToolChoice,
+        parallel_tool_calls: Option<bool>,
+    ) -> Option<bool> {
+        match tool_choice {
+            ToolChoice::Named(_) => Some(false),
+            _ => parallel_tool_calls,
+        }
     }
 
     /// Find the structural tag builder for a parser, if supported.
@@ -142,5 +156,59 @@ impl OpenAIPreprocessor {
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dynamo_parsers::tool_calling::{StructuralTagSchemaMode, ToolCallFormatBuildContext};
+
+    fn tag(tool_choice: &ToolChoice, parallel_tool_calls: Option<bool>) -> serde_json::Value {
+        let tools = [ToolDefinition {
+            name: "record".to_string(),
+            parameters: Some(serde_json::json!({"type": "object"})),
+            strict: None,
+        }];
+        let builder = OpenAIPreprocessor::structural_tag_builder_for_parser("qwen3_coder")
+            .expect("qwen3_coder has a structural tag builder");
+        let ctx = ToolCallFormatBuildContext {
+            tool_choice,
+            tools: &tools,
+            parallel_tool_calls: OpenAIPreprocessor::tag_parallel_tool_calls(
+                tool_choice,
+                parallel_tool_calls,
+            ),
+            schema_mode: StructuralTagSchemaMode::default(),
+            starts_in_reasoning: false,
+        };
+        builder
+            .build_tool_call_format(&ctx)
+            .expect("tag builds")
+            .expect("tag is needed")
+    }
+
+    #[test]
+    fn named_tool_choice_allows_one_call() {
+        let named = ToolChoice::Named("record".to_string());
+        for parallel_tool_calls in [None, Some(true), Some(false)] {
+            let value = tag(&named, parallel_tool_calls);
+            assert_eq!(
+                value["format"]["stop_after_first"],
+                serde_json::json!(true),
+                "{parallel_tool_calls:?}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_tool_choice_keeps_parallel_tool_calls() {
+        let value = tag(&ToolChoice::Required, None);
+        assert_eq!(
+            value["format"]["stop_after_first"],
+            serde_json::json!(false)
+        );
+        let value = tag(&ToolChoice::Required, Some(false));
+        assert_eq!(value["format"]["stop_after_first"], serde_json::json!(true));
     }
 }
