@@ -181,6 +181,15 @@ fn backend_error_type_from_response(response: &ErrorResponse) -> ErrorType {
     }
 }
 
+/// Metrics ErrorType for a backend rejection's 4xx status (streaming path).
+pub(crate) fn backend_rejection_error_type(code: u16) -> ErrorType {
+    match code {
+        404 => ErrorType::NotFound,
+        429 => ErrorType::Overload,
+        _ => ErrorType::Validation,
+    }
+}
+
 fn responses_conversion_error_type(error: &anyhow::Error) -> ErrorType {
     match error.downcast_ref::<ResponsesConversionError>() {
         Some(ResponsesConversionError::InvalidArgument(_)) => ErrorType::Validation,
@@ -928,14 +937,16 @@ async fn completions_single(
 
         Ok(sse_stream.into_response())
     } else {
-        // Check first event for backend errors before aggregating (non-streaming only)
-        let stream = check_for_backend_error(Box::pin(stream))
-            .await
-            .map_err(|error_response| {
-                tracing::error!(request_id, "Backend error detected: {:?}", error_response);
-                inflight_guard.mark_error(backend_error_type_from_response(&error_response));
-                error_response
-            })?;
+        // Check first event for backend errors before aggregating (non-streaming only).
+        // A rejection after model output is a server error, not a 400.
+        let stream =
+            check_for_backend_error(Box::pin(super::metrics::demote_late_rejections(stream)))
+                .await
+                .map_err(|error_response| {
+                    tracing::error!(request_id, "Backend error detected: {:?}", error_response);
+                    inflight_guard.mark_error(backend_error_type_from_response(&error_response));
+                    error_response
+                })?;
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = stream.inspect(move |response| {
@@ -1147,14 +1158,15 @@ async fn completions_batch(
         // Remap choice indices: choice.index += prompt_idx * n
         let prompt_idx_u32 = prompt_idx as u32;
         let n_u32 = n as u32;
-        let remapped_stream = stream.map(move |mut response| {
-            if let Some(ref mut data) = response.data {
-                for choice in &mut data.inner.choices {
-                    choice.index += prompt_idx_u32 * n_u32;
+        let remapped_stream =
+            super::metrics::demote_late_rejections(stream.map(move |mut response| {
+                if let Some(ref mut data) = response.data {
+                    for choice in &mut data.inner.choices {
+                        choice.index += prompt_idx_u32 * n_u32;
+                    }
                 }
-            }
-            response
-        });
+                response
+            }));
 
         all_streams.push(remapped_stream);
     }
@@ -1189,7 +1201,7 @@ async fn completions_batch(
     if streaming {
         // For streaming, we'll drop the http_queue_guard on the first token
         let mut http_queue_guard = Some(http_queue_guard);
-        let stream = super::metrics::demote_late_rejections(merged_stream)
+        let stream = merged_stream
             .filter(|r| {
                 // Drop empty chunks from multi-byte token assembly
                 futures::future::ready(
@@ -2246,14 +2258,19 @@ const MAX_LEADING_ANNOTATIONS: usize = 16;
 /// Returns Err(ErrorResponse) if error detected, Ok(stream) otherwise — the
 /// returned stream replays any buffered annotation frames in their original
 /// order before yielding the remaining items.
-pub(super) async fn check_for_backend_error<T: Serialize + Send + 'static>(
+pub(super) async fn check_for_backend_error<T: Serialize + ModelOutput + Send + 'static>(
     mut stream: impl futures::Stream<Item = Annotated<T>> + Send + Unpin + 'static,
 ) -> Result<impl futures::Stream<Item = Annotated<T>> + Send, ErrorResponse> {
     use futures::stream::StreamExt;
 
     let mut buffered: Vec<Annotated<T>> = Vec::new();
     while let Some(event) = stream.next().await {
-        if is_annotation_frame(&event) && buffered.len() < MAX_LEADING_ANNOTATIONS {
+        let leading_frame = is_annotation_frame(&event)
+            || event
+                .data
+                .as_ref()
+                .is_some_and(|data| !data.has_model_output());
+        if leading_frame && buffered.len() < MAX_LEADING_ANNOTATIONS {
             buffered.push(event);
             continue;
         }
@@ -2304,6 +2321,24 @@ fn push_dispatch_event(
         Err(e) => {
             tracing::warn!("streaming_{event_name}: failed to serialize: {e}");
         }
+    }
+}
+
+/// Whether a response chunk carries model output. Empty multi-byte assembly
+/// chunks do not, so a rejection after them is still a request rejection.
+pub(crate) trait ModelOutput {
+    fn has_model_output(&self) -> bool;
+}
+
+impl ModelOutput for NvCreateChatCompletionStreamResponse {
+    fn has_model_output(&self) -> bool {
+        !is_empty_stream_response(self)
+    }
+}
+
+impl ModelOutput for NvCreateCompletionResponse {
+    fn has_model_output(&self) -> bool {
+        !is_empty_completion_stream_response(self)
     }
 }
 
@@ -5954,6 +5989,37 @@ mod tests {
             assert!(!error_response.1.message.contains("/srv/model.py"));
             assert!(!error_response.1.message.contains("panic"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_check_for_backend_error_skips_empty_chunks() {
+        use futures::stream;
+
+        #[derive(serde::Serialize)]
+        struct Chunk(&'static str);
+        impl ModelOutput for Chunk {
+            fn has_model_output(&self) -> bool {
+                !self.0.is_empty()
+            }
+        }
+
+        let rejection = Annotated::<Chunk> {
+            data: None,
+            id: None,
+            event: Some("error".to_string()),
+            comment: Some(vec![r#"{"message":"bad schema","code":400}"#.to_string()]),
+            error: None,
+        };
+        let result = check_for_backend_error(stream::iter(vec![
+            Annotated::from_data(Chunk("")),
+            rejection,
+        ]))
+        .await;
+        let Err(error_response) = result else {
+            panic!("a rejection after an empty chunk must be reported");
+        };
+        assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error_response.1.message, "bad schema");
     }
 
     #[tokio::test]
