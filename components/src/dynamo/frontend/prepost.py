@@ -381,14 +381,16 @@ def _materialize_assistant_tool_calls(
     return normalized
 
 
-_STRUCTURED_OUTPUT_CONSTRAINTS = (
-    "json",
-    "regex",
-    "choice",
-    "grammar",
-    "json_object",
-    "structural_tag",
-)
+def _is_unset_structured_output_field(key: str, value: Any) -> bool:
+    """Unset values per field, as in the Rust frontend: `json: false` is a
+    schema (matches nothing) and stays a constraint."""
+    if value is None:
+        return True
+    if key == "json_object":
+        return value is False
+    if key == "choice":
+        return value == []
+    return False
 
 
 def _lift_pattern_only_structured_outputs(request: dict[str, Any]) -> dict[str, Any]:
@@ -403,26 +405,20 @@ def _lift_pattern_only_structured_outputs(request: dict[str, Any]) -> dict[str, 
     if (
         not isinstance(structured_outputs, dict)
         or structured_outputs.get("whitespace_pattern") is None
-        or any(
-            structured_outputs.get(key) not in (None, False)
-            for key in _STRUCTURED_OUTPUT_CONSTRAINTS
-        )
     ):
         return request
-    request = dict(request)
-    # Unset fields (None, and the json_object=False sentinel) are dropped, as in
-    # the Rust frontend, so they do not read as an explicit constraint later.
     rest = {
         key: value
         for key, value in structured_outputs.items()
-        if key != "whitespace_pattern" and value is not None and value is not False
+        if key != "whitespace_pattern"
+        and not _is_unset_structured_output_field(key, value)
     }
+    if rest:
+        return request
+    request = dict(request)
     if request.get("guided_whitespace_pattern") is None:
         request["guided_whitespace_pattern"] = structured_outputs["whitespace_pattern"]
-    if rest:
-        request["structured_outputs"] = rest
-    else:
-        request.pop("structured_outputs")
+    request.pop("structured_outputs")
     return request
 
 

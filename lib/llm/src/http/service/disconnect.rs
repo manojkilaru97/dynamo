@@ -277,14 +277,22 @@ fn monitor_for_disconnects_with_timeout(
                             {
                                 // A request rejection is a client error: forward its
                                 // message with code 400, as the non-streaming path does.
-                                inflight_guard.mark_error(ErrorType::Validation);
-                                stream_handle.disarm();
                                 let (message, code) = rejection_message_and_code(invalid.message());
+                                inflight_guard.mark_error(
+                                    crate::http::service::openai::backend_rejection_error_type(code),
+                                );
+                                stream_handle.disarm();
                                 tracing::warn!("Streaming request rejected ({code}): {message}");
+                                let error_type = match code {
+                                    400 | 422 => "invalid_request_error",
+                                    404 => "not_found_error",
+                                    429 => "rate_limit_error",
+                                    _ => "invalid_request_error",
+                                };
                                 let err_json = serde_json::json!({
                                     "error": {
                                         "message": message,
-                                        "type": "invalid_request_error",
+                                        "type": error_type,
                                         "code": code,
                                     }
                                 });

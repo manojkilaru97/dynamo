@@ -2500,15 +2500,16 @@ fn observe_annotation_metrics<T>(
 /// A rejection (`InvalidArgument`) that arrives after model data has been
 /// streamed is turned into an untyped error comment, so the SSE stream monitor
 /// sends the sanitized internal-error frame instead of a 4xx with its message.
-/// Annotation frames such as `request_id` do not count as output.
-pub fn demote_late_rejections<T>(
+/// Annotation frames such as `request_id` and empty multi-byte assembly chunks
+/// do not count as output.
+pub(crate) fn demote_late_rejections<T: crate::http::service::openai::ModelOutput>(
     stream: impl futures::Stream<Item = crate::types::Annotated<T>>,
 ) -> impl futures::Stream<Item = crate::types::Annotated<T>> {
     use futures::StreamExt;
     let mut data_seen = false;
     stream.map(move |mut annotated| {
-        if annotated.data.is_some() {
-            data_seen = true;
+        if let Some(data) = annotated.data.as_ref() {
+            data_seen |= data.has_model_output();
         } else if data_seen
             && annotated.event.as_deref() == Some("error")
             && annotated.error.as_ref().is_some_and(|error| {
@@ -4432,7 +4433,14 @@ mod tests {
 #[cfg(test)]
 mod demote_late_rejections_tests {
     use super::demote_late_rejections;
+    use crate::http::service::openai::ModelOutput;
     use crate::types::Annotated;
+
+    impl ModelOutput for String {
+        fn has_model_output(&self) -> bool {
+            !self.is_empty()
+        }
+    }
     use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
     use futures::StreamExt;
 
@@ -4461,6 +4469,15 @@ mod demote_late_rejections_tests {
             demote_late_rejections(futures::stream::iter(vec![annotation(), rejection()]))
                 .collect()
                 .await;
+        assert!(out[1].error.is_some());
+    }
+
+    #[tokio::test]
+    async fn rejection_after_empty_chunk_stays_typed() {
+        let empty = Annotated::from_data(String::new());
+        let out: Vec<_> = demote_late_rejections(futures::stream::iter(vec![empty, rejection()]))
+            .collect()
+            .await;
         assert!(out[1].error.is_some());
     }
 
