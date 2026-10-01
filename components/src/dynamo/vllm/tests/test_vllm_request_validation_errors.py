@@ -291,3 +291,16 @@ def test_text_mode_empty_guided_choice_does_not_shadow_response_format():
         default_sampling_params={},
     ).structured_outputs
     assert params is not None and params.json_object is True
+
+
+def test_text_mode_forced_tool_does_not_validate_discarded_constraints():
+    params = build_sampling_params_openai(
+        {
+            "max_tokens": 8,
+            "tools": _TOOLS,
+            "tool_choice": "required",
+            "structured_outputs": {"regex": "(?=a)b"},
+        },
+        default_sampling_params={},
+    )
+    assert params.structured_outputs is None

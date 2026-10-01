@@ -1821,12 +1821,12 @@ def _text_mode_structured_outputs(
         for key, value in request.items()
         if key not in ("tools", "tool_choice")
     }
-    structured_outputs = _structured_outputs_from_openai_request(without_tools)
     if not forced_tool:
-        return structured_outputs
+        return _structured_outputs_from_openai_request(without_tools)
     # As on the token path (preprocessor/tool_choice.rs): legacy guided_*
     # constraints and a client structural tag are rejected; other
-    # structured_outputs constraints and response_format yield to the tool.
+    # structured_outputs constraints and response_format yield to the tool and
+    # are not validated, since they are discarded.
     if (
         request.get("guided_json") is not None
         or request.get("guided_regex") is not None
