@@ -875,7 +875,7 @@ async fn completions_single(
                 .inc_rejection(&model, super::metrics::Endpoint::Completions);
         }
         let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        inflight_guard.mark_error(backend_error_type_from_response(&err_response));
         err_response
     })?;
 
@@ -1146,7 +1146,7 @@ async fn completions_batch(
                     .inc_rejection(&model, super::metrics::Endpoint::Completions);
             }
             let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
-            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+            inflight_guard.mark_error(backend_error_type_from_response(&err_response));
             err_response
         })?;
 
@@ -2650,7 +2650,7 @@ async fn chat_completions(
                 .inc_rejection(&model, super::metrics::Endpoint::ChatCompletions);
         }
         let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        inflight_guard.mark_error(backend_error_type_from_response(&err_response));
         err_response
     })?;
 
@@ -3174,7 +3174,7 @@ async fn responses(
                 .inc_rejection(&model, super::metrics::Endpoint::Responses);
         }
         let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        inflight_guard.mark_error(backend_error_type_from_response(&err_response));
         err_response
     })?;
 

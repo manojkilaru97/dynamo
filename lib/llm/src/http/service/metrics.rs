@@ -4504,6 +4504,24 @@ mod demote_late_rejections_tests {
     }
 
     #[tokio::test]
+    async fn rejection_after_another_prompts_output_is_demoted_when_merged() {
+        // Streaming completions batches demote on the merged stream: prompt A's
+        // output followed by prompt B's rejection must not be sent as a 4xx.
+        let prompt_a = futures::stream::iter(vec![Annotated::from_data("token".to_string())]);
+        let prompt_b = futures::stream::iter(vec![rejection()]);
+        let merged = prompt_a.chain(prompt_b);
+        let out: Vec<_> = demote_late_rejections(merged).collect().await;
+        assert!(out[1].error.is_none());
+        let out: Vec<_> = demote_late_rejections(futures::stream::iter(vec![rejection()]))
+            .collect()
+            .await;
+        assert!(
+            out[0].error.is_some(),
+            "a prompt's own early rejection stays typed"
+        );
+    }
+
+    #[tokio::test]
     async fn rejection_after_model_output_is_demoted() {
         let data = Annotated::from_data("token".to_string());
         let out: Vec<_> = demote_late_rejections(futures::stream::iter(vec![data, rejection()]))
