@@ -282,6 +282,21 @@ fn monitor_for_disconnects_with_timeout(
                                     crate::http::service::openai::backend_rejection_error_type(code),
                                 );
                                 stream_handle.disarm();
+                                if code == 499 {
+                                    // A cancellation keeps the sanitized cancelled frame.
+                                    let cancelled = SanitizedError::Cancelled;
+                                    tracing::warn!("Streaming request cancelled by the backend: {message}");
+                                    let err_json = serde_json::json!({
+                                        "error": {
+                                            "message": cancelled.to_string(),
+                                            "type": cancelled.openai_type_slug(),
+                                            "code": 499,
+                                        }
+                                    });
+                                    yield Event::default().data(err_json.to_string());
+                                    yield Event::default().data("[DONE]");
+                                    break;
+                                }
                                 tracing::warn!("Streaming request rejected ({code}): {message}");
                                 let error_type = match code {
                                     400 | 422 => "invalid_request_error",
@@ -878,6 +893,26 @@ mod tests {
             frame["error"]["message"], "ValueError: Grammar error: Invalid type: foo",
             "{body}"
         );
+        assert!(body.contains("data: [DONE]"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_streamed_499_rejection_is_a_sanitized_cancellation() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as RuntimeErrorType};
+        let (_metrics, guard, ctx, handle) = setup_test("cancel-model", "req-cancel");
+        let stream = async_stream::try_stream! {
+            Err(axum::Error::new(
+                DynamoError::builder()
+                    .error_type(RuntimeErrorType::Backend(BackendError::InvalidArgument))
+                    .message(r#"{"message":"client went away at /srv/x.py","code":499}"#)
+                    .build(),
+            ))?;
+            yield axum::response::sse::Event::default().data("unreachable");
+        };
+        let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+        assert!(body.contains("\"code\":499"), "{body}");
+        assert!(!body.contains("/srv/x.py"), "{body}");
         assert!(body.contains("data: [DONE]"), "{body}");
     }
 
