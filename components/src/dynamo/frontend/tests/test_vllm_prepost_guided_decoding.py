@@ -5,6 +5,7 @@ import pytest
 
 from dynamo.frontend.prepost import (
     _build_assistant_guided_decoding,
+    build_tool_call_guided_decoding,
     _lift_pattern_only_structured_outputs,
     _validate_chat_completion_request,
 )
@@ -70,3 +71,36 @@ def test_empty_choice_with_pattern_is_lifted():
     )
     assert "structured_outputs" not in lifted
     assert lifted["guided_whitespace_pattern"] == "[ ]?"
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    ["required", {"type": "function", "function": {"name": "record"}}],
+    ids=["required", "named"],
+)
+@pytest.mark.parametrize(
+    "pattern_fields",
+    [
+        {"guided_whitespace_pattern": "[ ]?"},
+        {"structured_outputs": {"whitespace_pattern": "[ ]?"}},
+    ],
+    ids=["legacy", "alias"],
+)
+def test_json_tool_fallback_keeps_whitespace_pattern(tool_choice, pattern_fields):
+    request = _validate_chat_completion_request(
+        {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "record", "parameters": {"type": "object"}},
+                }
+            ],
+            "tool_choice": tool_choice,
+            **pattern_fields,
+        }
+    )
+    guided = build_tool_call_guided_decoding(request, None)
+    assert guided is not None and "json" in guided
+    assert guided["whitespace_pattern"] == "[ ]?"

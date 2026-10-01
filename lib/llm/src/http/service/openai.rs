@@ -1201,7 +1201,9 @@ async fn completions_batch(
     if streaming {
         // For streaming, we'll drop the http_queue_guard on the first token
         let mut http_queue_guard = Some(http_queue_guard);
-        let stream = merged_stream
+        // Once any prompt has streamed output, a later rejection from another
+        // prompt is sent as a server error, not a 4xx frame.
+        let stream = super::metrics::demote_late_rejections(merged_stream)
             .filter(|r| {
                 // Drop empty chunks from multi-byte token assembly
                 futures::future::ready(
