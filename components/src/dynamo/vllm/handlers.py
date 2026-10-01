@@ -46,7 +46,13 @@ from vllm.sampling_params import (
     SamplingParams,
     StructuredOutputsParams,
 )
-from vllm.exceptions import VLLMClientError
+try:
+    from vllm.exceptions import VLLMClientError
+except ImportError:  # vLLM releases before VLLMClientError was added
+
+    class VLLMClientError(Exception):  # type: ignore[no-redef]
+        """Never raised by vLLM releases that predate it."""
+
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from dynamo._core import Context
@@ -917,7 +923,9 @@ def _decode_wall_clock_limit_secs() -> float | None:
     return parsed if parsed > 0 else None
 
 
-# vLLM sets this stop_reason when a structured-output grammar fails to compile.
+# stop_reason the super35 vLLM patch (6ae11de098) sets when a structured-output
+# grammar fails to compile. Upstream vLLM sets none, so with it this mapping does
+# not apply and such requests keep their previous error status.
 STRUCTURED_OUTPUT_COMPILE_ERROR = "structured_output_compile_error"
 
 
@@ -929,8 +937,9 @@ async def _map_request_validation_errors(gen, structured_output: bool = False):
     structured-output backend accepts) arrive as EngineGenerateError caused by a
     ValueError. A structured-output grammar that fails to compile (for example an
     outlines regex compile timeout) finishes the request with finish_reason
-    "error", no tokens, and stop_reason STRUCTURED_OUTPUT_COMPILE_ERROR. Only
-    failures before the first output are request rejections.
+    "error", no tokens, and (with the super35 vLLM patch) stop_reason
+    STRUCTURED_OUTPUT_COMPILE_ERROR. Only failures before the first output are
+    request rejections.
     """
     produced = False
     try:
