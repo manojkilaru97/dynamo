@@ -2524,6 +2524,12 @@ fn observe_annotation_metrics<T>(
 /// sends the sanitized internal-error frame instead of a 4xx with its message.
 /// Annotation frames such as `request_id` and empty multi-byte assembly chunks
 /// do not count as output.
+/// A backend `HttpError(499)` is a cancellation, not a rejection; it keeps its
+/// type so the cancellation handling sanitizes it whenever it arrives.
+fn is_cancellation(message: &str) -> bool {
+    crate::http::service::disconnect::rejection_message_and_code(message).1 == 499
+}
+
 pub(crate) fn demote_late_rejections<T: crate::http::service::openai::ModelOutput>(
     stream: impl futures::Stream<Item = crate::types::Annotated<T>>,
 ) -> impl futures::Stream<Item = crate::types::Annotated<T>> {
@@ -2541,7 +2547,7 @@ pub(crate) fn demote_late_rejections<T: crate::http::service::openai::ModelOutpu
                         | dynamo_runtime::error::ErrorType::Backend(
                             dynamo_runtime::error::BackendError::InvalidArgument
                         )
-                )
+                ) && !is_cancellation(error.message())
             })
         {
             let message = annotated
@@ -4491,6 +4497,22 @@ mod demote_late_rejections_tests {
             demote_late_rejections(futures::stream::iter(vec![annotation(), rejection()]))
                 .collect()
                 .await;
+        assert!(out[1].error.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_model_output_stays_typed() {
+        let mut cancelled = rejection();
+        cancelled.error = Some(
+            DynamoError::builder()
+                .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+                .message(r#"{"message":"client went away","code":499}"#)
+                .build(),
+        );
+        let output = Annotated::from_data("token".to_string());
+        let out: Vec<_> = demote_late_rejections(futures::stream::iter(vec![output, cancelled]))
+            .collect()
+            .await;
         assert!(out[1].error.is_some());
     }
 
