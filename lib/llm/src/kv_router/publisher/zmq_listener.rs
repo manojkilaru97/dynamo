@@ -138,6 +138,11 @@ pub(super) async fn start_zmq_listener(
                     {
                         metrics.increment_zmq_suspicious_event(event_type, "empty_store_blocks");
                     }
+                    if normalizer.take_lower_tier_filled() > 0
+                        && let Some(metrics) = &metrics
+                    {
+                        metrics.increment_zmq_event("lower_tier_filled", event_type);
+                    }
                     events.push(event);
                 }
                 if !events.is_empty() {

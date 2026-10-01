@@ -53,6 +53,7 @@ pub struct ZmqEventNormalizer {
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
     cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
     block_identities: BlockIdentityMemo,
+    lower_tier_filled: u64,
 }
 
 /// Router identity of a device-tier block: its chain parent and token hash.
@@ -191,6 +192,7 @@ impl ZmqEventNormalizer {
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
             block_identities: BlockIdentityMemo::new(BLOCK_IDENTITY_MEMO_CAPACITY),
+            lower_tier_filled: 0,
         }
     }
 
@@ -202,6 +204,7 @@ impl ZmqEventNormalizer {
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
             block_identities: BlockIdentityMemo::new(BLOCK_IDENTITY_MEMO_CAPACITY),
+            lower_tier_filled: 0,
         }
     }
 
@@ -265,8 +268,11 @@ impl ZmqEventNormalizer {
         )?;
         match (&mut event.event.data, lower_tier_hashes) {
             (KvCacheEventData::Stored(store), Some(hashes)) => {
-                if store.blocks.is_empty() && !hashes.is_empty() {
-                    self.block_identities.fill(worker, &hashes, store);
+                if store.blocks.is_empty()
+                    && !hashes.is_empty()
+                    && self.block_identities.fill(worker, &hashes, store) > 0
+                {
+                    self.lower_tier_filled += 1;
                 }
             }
             (KvCacheEventData::Stored(store), None) => {
@@ -277,6 +283,12 @@ impl ZmqEventNormalizer {
             _ => {}
         }
         Some(event)
+    }
+
+    /// Number of token-less lower-tier stores completed from device identities
+    /// since the last call.
+    pub fn take_lower_tier_filled(&mut self) -> u64 {
+        std::mem::take(&mut self.lower_tier_filled)
     }
 
     pub fn normalize(

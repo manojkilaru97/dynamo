@@ -983,6 +983,8 @@ fn tokenless_cpu_store_is_completed_from_device_identity() {
     assert_eq!(cpu_both.parent_hash, Some(ExternalSequenceBlockHash(200)));
     assert_eq!(cpu_both.blocks.len(), 2);
     assert_eq!(cpu_both.blocks[0].tokens_hash, gpu.blocks[0].tokens_hash);
+    assert_eq!(normalizer.take_lower_tier_filled(), 2);
+    assert_eq!(normalizer.take_lower_tier_filled(), 0);
 }
 
 #[test]
@@ -1017,4 +1019,5 @@ fn tokenless_cpu_store_stays_empty_for_unknown_or_foreign_blocks() {
     );
     assert_eq!(partial.blocks.len(), 1);
     assert_eq!(partial.parent_hash, None);
+    assert_eq!(normalizer.take_lower_tier_filled(), 1);
 }
