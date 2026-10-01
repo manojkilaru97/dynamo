@@ -159,6 +159,58 @@ mod tests {
     }
 
     #[test]
+    fn parameter_order_and_duplicate_values_are_stable_at_every_boundary() {
+        let raw = "<tool_call><function=get_weather>< parameter =z>雪😊< / parameter ><parameter=a>second</parameter><parameter=z>last</parameter></function></tool_call>";
+        for split in (0..=raw.len()).filter(|index| raw.is_char_boundary(*index)) {
+            let result = parse_chunks(&weather_tools(), &[&raw[..split], &raw[split..]]);
+            assert_eq!(result.calls.len(), 1);
+            assert_eq!(result.calls[0].arguments, r#"{"z":"last","a":"second"}"#);
+        }
+    }
+
+    #[test]
+    fn complete_invocations_keep_nonstructural_markers_inside_arguments() {
+        for marker in [
+            "<tool_call>",
+            "</tool_call>",
+            "<think>",
+            "</think>",
+            "<exec>",
+            "</exec>",
+            "<function=exec>",
+        ] {
+            let value = format!("prefix {marker} suffix");
+            let call = format!(
+                "<tool_call><function=get_weather><parameter=location>\n{value}\n</parameter><parameter=extra>second</parameter></function></tool_call>"
+            );
+            let raw = format!("{call}{call}");
+            let check = |chunks: &[&str]| {
+                let result = parse_chunks(&weather_tools(), chunks);
+                assert_eq!(result.calls.len(), 2, "{marker} {chunks:?}");
+                for call in result.calls {
+                    let arguments: serde_json::Value =
+                        serde_json::from_str(&call.arguments).unwrap();
+                    assert_eq!(
+                        arguments,
+                        serde_json::json!({"location": value, "extra": "second"}),
+                        "{marker} {chunks:?}"
+                    );
+                }
+            };
+            check(&[&raw]);
+            for split in 0..=raw.len() {
+                check(&[&raw[..split], &raw[split..]]);
+            }
+            let characters: Vec<_> = raw
+                .as_bytes()
+                .chunks(1)
+                .map(|bytes| std::str::from_utf8(bytes).unwrap())
+                .collect();
+            check(&characters);
+        }
+    }
+
+    #[test]
     fn emits_complete_call_on_close() {
         let out = parse_chunks(
             &weather_tools(),
@@ -173,8 +225,8 @@ mod tests {
         assert_eq!(out.calls.len(), 1);
         assert_eq!(out.calls[0].tool_index, 0);
         assert_eq!(out.calls[0].name.as_deref(), Some("get_weather"));
-        // Value is schema-typed (string) and trimmed, matching the v1 batch parser.
-        assert_eq!(out.calls[0].arguments, r#"{"location":"NYC"}"#);
+        // Spaces are argument data. Only one framing newline is removed.
+        assert_eq!(out.calls[0].arguments, r#"{"location":" NYC "}"#);
     }
 
     #[test]
