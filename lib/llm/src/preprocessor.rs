@@ -724,7 +724,10 @@ struct TypedJailErrors(std::sync::Mutex<std::collections::VecDeque<DynamoError>>
 impl TypedJailErrors {
     fn stash(&self, error: DynamoError) -> String {
         let text = error.to_string();
-        self.0.lock().expect("jail error buffer poisoned").push_back(error);
+        self.0
+            .lock()
+            .expect("jail error buffer poisoned")
+            .push_back(error);
         text
     }
 
