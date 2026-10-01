@@ -1574,6 +1574,11 @@ mod tests {
                 "messages": [{"role": "user", "content": "hi"}],
                 "guided_whitespace_pattern": "[\\n ]?"
             }),
+            json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "structured_outputs": {"choice": ["yes", ""]}
+            }),
         ] {
             let request: NvCreateChatCompletionRequest =
                 serde_json::from_value(body).expect("Failed to deserialize request");

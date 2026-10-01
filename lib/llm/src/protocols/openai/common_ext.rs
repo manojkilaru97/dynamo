@@ -191,6 +191,13 @@ pub trait CommonExtProvider {
                     "Only one structured_outputs constraint may be set at a time (`json`, `json_object`, `regex`, `choice`, `grammar`, or `structural_tag`)"
                 );
             }
+            if params
+                .choice
+                .as_ref()
+                .is_some_and(|choice| choice.iter().any(|value| value.is_empty()))
+            {
+                anyhow::bail!("structured_outputs.choice cannot contain empty choices");
+            }
         }
         crate::protocols::common::GuidedDecodingOptions::from_optional_with_json_object_and_structural_tag(
             self.get_guided_json(),

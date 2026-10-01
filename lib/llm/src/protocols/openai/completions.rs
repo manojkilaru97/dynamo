@@ -567,6 +567,11 @@ mod tests {
                 "guided_json": {"type": "object"},
                 "guided_regex": "\\d+"
             }),
+            json!({
+                "model": "test-model",
+                "prompt": "x",
+                "structured_outputs": {"choice": ["yes", ""]}
+            }),
         ] {
             let request: NvCreateCompletionRequest =
                 serde_json::from_value(body.clone()).expect("Failed to deserialize request");

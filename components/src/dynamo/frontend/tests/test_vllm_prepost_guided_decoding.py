@@ -57,3 +57,16 @@ def test_lifted_pattern_drops_unset_sentinels():
     )
     assert "structured_outputs" not in lifted
     assert lifted["guided_whitespace_pattern"] == "[ ]?"
+
+
+def test_false_json_schema_with_pattern_is_not_lifted():
+    request = {"structured_outputs": {"json": False, "whitespace_pattern": "[ ]?"}}
+    assert _lift_pattern_only_structured_outputs(request) is request
+
+
+def test_empty_choice_with_pattern_is_lifted():
+    lifted = _lift_pattern_only_structured_outputs(
+        {"structured_outputs": {"choice": [], "whitespace_pattern": "[ ]?"}}
+    )
+    assert "structured_outputs" not in lifted
+    assert lifted["guided_whitespace_pattern"] == "[ ]?"
