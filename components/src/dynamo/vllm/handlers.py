@@ -1539,12 +1539,20 @@ def _structured_outputs_from_fields(fields: Any) -> StructuredOutputsParams | No
         # path so unconstrained strings cannot decode until max_tokens.
         params["json"] = bound_json_schema_for_constrained_decoding(schema)
     for key in ("regex", "choice", "grammar", "json_object"):
-        if fields.get(key) is not None:
-            if key == "regex":
-                _validate_structured_regex(fields[key])
-            elif key == "grammar":
-                _validate_structured_grammar(fields[key])
-            params[key] = fields[key]
+        value = fields.get(key)
+        # Unset values as in the Rust frontend: json_object only when true, and
+        # an empty choice list is no constraint.
+        if (
+            value is None
+            or (key == "json_object" and value is not True)
+            or (key == "choice" and value == [])
+        ):
+            continue
+        if key == "regex":
+            _validate_structured_regex(value)
+        elif key == "grammar":
+            _validate_structured_grammar(value)
+        params[key] = value
     if fields.get("structural_tag") is not None:
         params["structural_tag"] = _normalize_structural_tag(fields["structural_tag"])
     if not params:

@@ -221,3 +221,23 @@ def test_text_mode_auto_tools_keep_output_constraints():
     )
     assert params.structured_outputs is not None
     assert params.structured_outputs.json_object is True
+
+
+@pytest.mark.parametrize(
+    "structured_outputs",
+    [
+        pytest.param({"json": {"type": "object"}, "json_object": False}, id="json"),
+        pytest.param({"json_object": False}, id="json_object_false_only"),
+        pytest.param({"choice": []}, id="empty_choice"),
+    ],
+)
+def test_text_mode_ignores_unset_sentinels(structured_outputs):
+    params = build_sampling_params_openai(
+        {"max_tokens": 8, "structured_outputs": structured_outputs},
+        default_sampling_params={},
+    ).structured_outputs
+    if "json" in structured_outputs:
+        assert params is not None and params.json is not None
+        assert not params.json_object
+    else:
+        assert params is None
