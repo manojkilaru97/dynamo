@@ -170,10 +170,11 @@ fn extract_error_type_from_response(response: &ErrorResponse) -> ErrorType {
     classify_error_for_metrics(response.0, &response.1.message)
 }
 
-/// ErrorType for a response built from a backend error: a forwarded 4xx is a
-/// request rejection, whatever its message prefix.
+/// ErrorType for a response built from a backend error: a forwarded 400 is a
+/// request rejection whatever its message prefix; other statuses keep their
+/// usual classification (404 not found, 429 overload, ...).
 fn backend_error_type_from_response(response: &ErrorResponse) -> ErrorType {
-    if response.0.is_client_error() && response.0.as_u16() != 499 {
+    if response.0 == StatusCode::BAD_REQUEST {
         ErrorType::Validation
     } else {
         extract_error_type_from_response(response)
@@ -4364,6 +4365,11 @@ mod tests {
         assert_eq!(
             backend_error_type_from_response(&rejected),
             ErrorType::Validation
+        );
+        let overloaded = response(StatusCode::TOO_MANY_REQUESTS, "Too many requests");
+        assert_eq!(
+            backend_error_type_from_response(&overloaded),
+            ErrorType::Overload
         );
         let failed = response(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error");
         assert_eq!(
