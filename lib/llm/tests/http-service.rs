@@ -1648,3 +1648,115 @@ async fn test_classify_and_pooling_validation_errors_are_metered() {
     cancel_token.cancel();
     task.await.unwrap().unwrap();
 }
+
+/// Completes prompt "ok" with one token and rejects prompt "reject" (a typed
+/// InvalidArgument) after a delay, so the batch's other prompt streams first.
+struct MixedBatchEngine {}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<NvCreateCompletionRequest>,
+        ManyOut<Annotated<NvCreateCompletionResponse>>,
+        Error,
+    > for MixedBatchEngine
+{
+    async fn generate(
+        &self,
+        request: SingleIn<NvCreateCompletionRequest>,
+    ) -> Result<ManyOut<Annotated<NvCreateCompletionResponse>>, Error> {
+        let (request, context) = request.transfer(());
+        let ctx = context.context();
+        let reject = matches!(
+            &request.inner.prompt,
+            dynamo_protocols::types::Prompt::String(prompt) if prompt == "reject"
+        );
+        let stream = stream! {
+            if reject {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                yield Annotated {
+                    data: None,
+                    id: None,
+                    event: Some("error".to_string()),
+                    comment: None,
+                    error: Some(
+                        DynamoError::builder()
+                            .error_type(dynamo_runtime::error::ErrorType::Backend(
+                                dynamo_runtime::error::BackendError::InvalidArgument,
+                            ))
+                            .message("bad schema")
+                            .build(),
+                    ),
+                };
+            } else {
+                yield Annotated::from_data(NvCreateCompletionResponse {
+                    inner: dynamo_protocols::types::CreateCompletionResponse {
+                        id: "ok".to_string(),
+                        choices: vec![dynamo_protocols::types::Choice {
+                            text: "tok".to_string(),
+                            index: 0,
+                            logprobs: None,
+                            finish_reason: None,
+                        }],
+                        created: 0,
+                        model: "mixed".to_string(),
+                        system_fingerprint: None,
+                        object: "text_completion".to_string(),
+                        usage: None,
+                    },
+                    nvext: None,
+                });
+            }
+        };
+        Ok(ResponseStream::new(Box::pin(stream), ctx))
+    }
+}
+
+#[tokio::test]
+async fn test_streaming_batch_rejection_after_other_prompt_output_is_sanitized() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder()
+        .port(port)
+        .enable_cmpl_endpoints(true)
+        .build()
+        .unwrap();
+    let state = service.state_clone();
+    let manager = state.manager();
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task =
+        tokio::spawn(async move { service.run_with_listener(token.clone(), listener).await });
+    wait_for_service_ready(port).await;
+    let card = ModelDeploymentCard::with_name_only("mixed");
+    manager
+        .add_completions_model("mixed", card.mdcsum(), Arc::new(MixedBatchEngine {}))
+        .expect("register model");
+
+    let response = reqwest::Client::new()
+        .post(format!("http://localhost:{port}/v1/completions"))
+        .json(&serde_json::json!({
+            "model": "mixed",
+            "prompt": ["ok", "reject"],
+            "stream": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = timeout(std::time::Duration::from_secs(10), response.text())
+        .await
+        .expect("stream finished")
+        .unwrap();
+    assert!(body.contains("tok"), "{body}");
+    assert!(
+        !body.contains("bad schema"),
+        "late rejection leaked: {body}"
+    );
+    assert!(
+        body.contains("\"code\":500"),
+        "expected a sanitized 500 frame: {body}"
+    );
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
