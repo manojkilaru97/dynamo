@@ -455,3 +455,41 @@ mod token_provenance_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Splitter;
+
+    #[test]
+    fn literal_reasoning_markers_in_tool_args_survive_all_splits() {
+        for prefix in ["Reason", "Reason</think>"] {
+            for marker in [
+                "<think>",
+                "</think>",
+                "<tool_call>",
+                "</tool_call>",
+                "<exec>",
+                "</exec>",
+            ] {
+                let raw = format!(
+                    "{prefix}<tool_call><function=exec><parameter=command>before {marker} after</parameter></function></tool_call>"
+                );
+                for split in 0..=raw.len() {
+                    let mut parser = Splitter::with_options(false, true, false, true);
+                    let a = parser.push(&raw[..split], false);
+                    let b = parser.push(&raw[split..], true);
+                    assert_eq!(
+                        format!("{}{}", a.0, b.0),
+                        "Reason",
+                        "{marker} split={split}"
+                    );
+                    assert_eq!(
+                        format!("{}{}", a.1, b.1),
+                        raw[prefix.len()..],
+                        "{marker} split={split}"
+                    );
+                }
+            }
+        }
+    }
+}

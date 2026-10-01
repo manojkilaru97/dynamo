@@ -6296,8 +6296,8 @@ mod tests {
             (
                 Some("nemotron_v3"),
                 Some(&force_nonempty_content_true),
-                true,
-                "nemotron_v3 + force_nonempty_content=true → disabled",
+                false,
+                "nemotron_v3 + force_nonempty_content=true → EOF fallback, reasoning remains enabled",
             ),
             // deepseek_v4 — same convention as deepseek_r1; verify all three aliases
             // (deepseek_v4 / deepseek-v4 / deepseekv4) plus both signal keys.
