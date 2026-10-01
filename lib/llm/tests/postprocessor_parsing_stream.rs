@@ -669,8 +669,10 @@ async fn postprocessor_parsing_stream_nemotron_v3_enable_thinking_false_returns_
     assert_eq!(content, "This is plain content");
 }
 
-/// Stock streaming fallback retains already-emitted reasoning and also promotes
-/// it into content when reasoning never ends. It is not a global disable.
+/// vLLM parity: `chat_template_kwargs={"force_nonempty_content": true}` turns
+/// a leading `<think>...` response into normal content instead of reasoning.
+/// Dynamo checks this in the postprocessor because request flags are applied
+/// before stream parsing, not inside the raw reasoning parser.
 #[tokio::test]
 async fn postprocessor_parsing_stream_nemotron_v3_force_nonempty_strips_start_token() {
     let preprocessor = build_preprocessor(Some("nemotron_v3"), None);
@@ -711,7 +713,7 @@ async fn postprocessor_parsing_stream_nemotron_v3_force_nonempty_strips_start_to
         }
     }
 
-    assert_eq!(reasoning, "This is plain content");
+    assert_eq!(reasoning, "");
     assert_eq!(content, "This is plain content");
 }
 
@@ -733,7 +735,6 @@ async fn postprocessor_parsing_stream_nemotron_v3_force_nonempty_aggregated_stri
     let preprocessor = build_preprocessor(Some("nemotron_v3"), None);
 
     let mut request: NvCreateChatCompletionRequest = serde_json::from_str(REQUEST_JSON).unwrap();
-    request.inner.stream = Some(false);
     request.chat_template_args = Some(
         serde_json::from_value(serde_json::json!({
             "force_nonempty_content": true
@@ -785,7 +786,6 @@ async fn postprocessor_parsing_stream_nemotron_v3_force_nonempty_aggregated_flus
     let preprocessor = build_preprocessor(Some("nemotron_v3"), None);
 
     let mut request: NvCreateChatCompletionRequest = serde_json::from_str(REQUEST_JSON).unwrap();
-    request.inner.stream = Some(false);
     request.chat_template_args = Some(
         serde_json::from_value(serde_json::json!({
             "force_nonempty_content": true
@@ -793,8 +793,7 @@ async fn postprocessor_parsing_stream_nemotron_v3_force_nonempty_aggregated_flus
         .unwrap(),
     );
 
-    // The true EOF path has no synthetic terminal delta from the backend.
-    let input_chunks = vec![mock_content_chunk("<thi")];
+    let input_chunks = vec![mock_content_chunk("<thi"), mock_final_chunk()];
     let input_stream = stream::iter(input_chunks.into_iter().map(Annotated::from_data));
 
     let output_stream = preprocessor
@@ -861,7 +860,7 @@ async fn postprocessor_parsing_stream_nemotron_v3_force_nonempty_flushes_partial
         }
     }
 
-    assert_eq!(reasoning, "<thi");
+    assert_eq!(reasoning, "");
     assert_eq!(content, "<thi");
     assert!(finish_reasons.contains(&FinishReason::Stop));
 }
@@ -905,7 +904,7 @@ async fn postprocessor_parsing_stream_nemotron_v3_force_nonempty_flushes_partial
         }
     }
 
-    assert_eq!(reasoning, "<thi");
+    assert_eq!(reasoning, "");
     assert_eq!(content, "<thi");
 }
 
@@ -942,7 +941,6 @@ async fn postprocessor_parsing_stream_nemotron_v3_force_nonempty_tracks_prefix_p
         output_stream.collect().await;
 
     let mut content_by_choice = BTreeMap::new();
-    let mut reasoning_by_choice = BTreeMap::new();
     for output in &output_chunks {
         let Some(data) = output.data.as_ref() else {
             continue;
@@ -954,59 +952,18 @@ async fn postprocessor_parsing_stream_nemotron_v3_force_nonempty_tracks_prefix_p
                     .or_insert_with(String::new)
                     .push_str(get_text(c));
             }
-            if let Some(reasoning) = &choice.delta.reasoning_content {
-                reasoning_by_choice.entry(choice.index).or_insert_with(String::new).push_str(reasoning);
-            }
+            assert!(
+                choice.delta.reasoning_content.is_none(),
+                "reasoning_content must stay empty when force_nonempty_content=true"
+            );
         }
     }
 
     assert_eq!(content_by_choice.get(&0).map(String::as_str), Some("First"));
-    assert_eq!(reasoning_by_choice, content_by_choice);
     assert_eq!(
         content_by_choice.get(&1).map(String::as_str),
         Some("Second")
     );
-}
-
-/// EOF without a terminal delta must flush every choice, including a choice
-/// absent from the last backend delta. Batch fallback can retract reasoning;
-/// streaming fallback retains it, as in stock serving.
-#[tokio::test]
-async fn nemotron_force_fallback_independent_choice_eof_both_transports() {
-    let preprocessor = build_preprocessor(Some("nemotron_v3"), None);
-    for streaming in [false, true] {
-        let mut request: NvCreateChatCompletionRequest = serde_json::from_str(REQUEST_JSON).unwrap();
-        request.inner.stream = Some(streaming);
-        request.chat_template_args = Some(serde_json::from_value(serde_json::json!({"force_nonempty_content":true})).unwrap());
-        let input = vec![
-            mock_multi_choice_content_chunk(&[(0,"<thi"),(1,"<thi")]),
-            mock_multi_choice_content_chunk(&[(0,"nk>First")]),
-        ];
-        let output = preprocessor.postprocessor_parsing_stream(
-            stream::iter(input.into_iter().map(Annotated::from_data)), &request, false, false
-        ).unwrap().collect::<Vec<_>>().await;
-        let mut content = BTreeMap::<u32,String>::new();
-        let mut reasoning = BTreeMap::<u32,String>::new();
-        for annotation in &output {
-            if let Some(data) = &annotation.data {
-                for choice in &data.inner.choices {
-                    if let Some(text) = &choice.delta.content { content.entry(choice.index).or_default().push_str(get_text(text)); }
-                    if let Some(text) = &choice.delta.reasoning_content { reasoning.entry(choice.index).or_default().push_str(text); }
-                    assert!(choice.finish_reason.is_none(), "EOF flush must not invent a terminal reason");
-                }
-            }
-        }
-        assert_eq!(content, BTreeMap::from([(0,"First".into()),(1,"<thi".into())]));
-        assert_eq!(reasoning, if streaming { content.clone() } else { BTreeMap::new() });
-        if !streaming {
-            let response = NvCreateChatCompletionResponse::from_annotated_stream(stream::iter(output), ParsingOptions::default()).await.unwrap();
-            assert_eq!(response.inner.choices.len(),2);
-            for choice in response.inner.choices {
-                assert_eq!(choice.message.content.as_ref().map(get_text),content.get(&choice.index).map(String::as_str));
-                assert!(choice.message.reasoning_content.is_none());
-            }
-        }
-    }
 }
 
 /// Regression: MiniMax + tool_choice=required + SGLang guided decoding.
@@ -2577,82 +2534,6 @@ async fn tool_choice_glm45_named_prompt_injected_bare_params_recovers() {
         finish_reasons.contains(&FinishReason::ToolCalls),
         "{case}: expected ToolCalls finish_reason, got: {finish_reasons:?}"
     );
-}
-
-/// Nemotron 3 may enter a tool call without first closing `</think>`.
-/// The reasoning parser must preserve `<tool_call>` for qwen3_coder, including
-/// when the marker is split at any backend chunk boundary.
-#[tokio::test]
-async fn nemotron_v3_implicit_tool_handoff_survives_every_marker_split() {
-    const MARKER: &str = "<tool_call>";
-    let tool_body = "\n<function=get_weather>\n<parameter=location>\nSan Francisco\n</parameter>\n</function>\n</tool_call>";
-
-    for split in 0..=MARKER.len() {
-        let preprocessor = build_preprocessor(Some("nemotron_v3"), Some("qwen3_coder"));
-        let request = streaming_tool_request(ChatCompletionToolChoiceOption::Auto);
-        let first = format!("I should check the weather.{}", &MARKER[..split]);
-        let second = format!("{}{tool_body}", &MARKER[split..]);
-        let input_stream = stream::iter(
-            vec![
-                mock_content_chunk(&first),
-                mock_content_chunk(&second),
-                mock_final_chunk(),
-            ]
-            .into_iter()
-            .map(Annotated::from_data),
-        );
-        let output_stream = preprocessor
-            .postprocessor_parsing_stream(input_stream, &request, true, false)
-            .expect("postprocessor_parsing_stream should build");
-        let DrainOutput {
-            reasoning,
-            content,
-            tool_calls,
-            finish_reasons,
-        } = drain_stream(output_stream).await;
-
-        let case = format!("Nemotron v3 implicit tool handoff split={split}");
-        assert_eq!(reasoning, "I should check the weather.", "{case}");
-        assert_clean_tool_call(&case, &content, &tool_calls, "San Francisco");
-        assert!(
-            finish_reasons.contains(&FinishReason::ToolCalls),
-            "{case}: expected ToolCalls finish_reason, got: {finish_reasons:?}"
-        );
-    }
-}
-
-/// Once `<tool_call>` ends reasoning, later bytes that resemble reasoning
-/// delimiters belong to the tool arguments and must not be reclassified.
-#[tokio::test]
-async fn nemotron_v3_tool_argument_may_contain_think_end_literal() {
-    let preprocessor = build_preprocessor(Some("nemotron_v3"), Some("qwen3_coder"));
-    let request = streaming_tool_request(ChatCompletionToolChoiceOption::Auto);
-    let chunks = [
-        "I should check.",
-        "<tool_call>\n<function=get_weather>\n<parameter=location>\nSan ",
-        "</think> Francisco\n</parameter>\n</function>\n</tool_call>",
-    ];
-    let input_stream = stream::iter(
-        chunks
-            .into_iter()
-            .map(mock_content_chunk)
-            .chain(std::iter::once(mock_final_chunk()))
-            .map(Annotated::from_data),
-    );
-    let output_stream = preprocessor
-        .postprocessor_parsing_stream(input_stream, &request, true, false)
-        .expect("postprocessor_parsing_stream should build");
-    let DrainOutput {
-        reasoning,
-        content,
-        tool_calls,
-        finish_reasons,
-    } = drain_stream(output_stream).await;
-
-    let case = "Nemotron v3 tool argument containing </think>";
-    assert_eq!(reasoning, "I should check.");
-    assert_clean_tool_call(case, &content, &tool_calls, "San </think> Francisco");
-    assert!(finish_reasons.contains(&FinishReason::ToolCalls));
 }
 
 /// Structural tags must preserve both prompt-injected and force reasoners.

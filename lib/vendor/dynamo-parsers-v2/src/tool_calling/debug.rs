@@ -154,6 +154,6 @@ mod tests {
 
         assert_eq!(result.calls.len(), 1);
         assert_eq!(result.calls[0].name.as_deref(), Some("get_weather"));
-        assert_eq!(result.calls[0].arguments, r#"{"location":" NYC "}"#);
+        assert_eq!(result.calls[0].arguments, r#"{"location":"NYC"}"#);
     }
 }

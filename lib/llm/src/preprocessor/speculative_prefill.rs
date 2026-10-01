@@ -80,6 +80,7 @@ pub fn maybe_wrap_stream(
     >,
     formatter: &Arc<dyn OAIPromptFormatter>,
     tokenizer: &Arc<dyn Tokenizer>,
+    user_data_encoder: Option<&Arc<super::super_user_tokenization::UserDataEncoder>>,
 ) -> Pin<Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>> {
     let enabled = request
         .nvext
@@ -97,12 +98,13 @@ pub fn maybe_wrap_stream(
     let next = next.clone();
     let formatter = formatter.clone();
     let tokenizer = tokenizer.clone();
+    let user_data_encoder = user_data_encoder.cloned();
     let messages = request.inner.messages.clone();
     tokio::spawn(async move {
         let Ok(response_text) = rx.await else {
             return;
         };
-        if let Err(e) = prefill_task(next, formatter, tokenizer, messages, response_text).await {
+        if let Err(e) = prefill_task(next, formatter, tokenizer, user_data_encoder, messages, response_text).await {
             tracing::warn!(error = %e, "Speculative prefill failed");
         }
     });
@@ -137,6 +139,7 @@ async fn prefill_task(
     >,
     formatter: Arc<dyn OAIPromptFormatter>,
     tokenizer: Arc<dyn Tokenizer>,
+    user_data_encoder: Option<Arc<super::super_user_tokenization::UserDataEncoder>>,
     original_messages: Vec<ChatCompletionRequestMessage>,
     response_text: String,
 ) -> Result<()> {
@@ -152,9 +155,11 @@ async fn prefill_task(
     messages.push(assistant_msg);
 
     let prefill_request = SpeculativePrefillRequest::new(messages);
-    let formatted_prompt = formatter.render(&prefill_request)?;
-    let encoding = tokenizer.encode(&formatted_prompt)?;
-    let token_ids = encoding.token_ids().to_vec();
+    let token_ids = if let Some(encoder) = user_data_encoder {
+        encoder.encode(&formatter.render_with_user_spans(&prefill_request)?, tokenizer.as_ref())?
+    } else {
+        tokenizer.encode(&formatter.render(&prefill_request)?)?.token_ids().to_vec()
+    };
 
     tracing::info!(
         num_tokens = token_ids.len(),

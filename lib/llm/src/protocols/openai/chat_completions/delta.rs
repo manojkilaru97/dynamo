@@ -74,6 +74,7 @@ pub struct DeltaGenerator {
     structured_json_completed: HashSet<u32>,
     /// Request tracker for per-request metrics (shared with PreprocessedRequest).
     tracker: Arc<RequestTracker>,
+    nemotron_reasoning: Option<crate::preprocessor::nemotron_reasoning::TokenAwareReasoning>,
 }
 
 impl DeltaGenerator {
@@ -92,12 +93,19 @@ impl DeltaGenerator {
             structured_json_buffers: HashMap::new(),
             structured_json_completed: HashSet::new(),
             tracker,
+            nemotron_reasoning: None,
         }
     }
 
     /// Returns the request tracker. Tracking is enabled. For sharing with PreprocessedRequest.
     pub fn tracker(&self) -> Arc<RequestTracker> {
         self.tracker.clone()
+    }
+
+    pub(crate) fn set_nemotron_reasoning(
+        &mut self, parser: crate::preprocessor::nemotron_reasoning::TokenAwareReasoning,
+    ) {
+        self.nemotron_reasoning = Some(parser);
     }
 
     pub fn set_structured_json_guard(&mut self, enabled: bool) {
@@ -325,8 +333,16 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
     /// * `delta` - The backend response containing generated text and metadata.
     fn choice_from_postprocessor(
         &mut self,
-        delta: crate::protocols::common::llm_backend::BackendOutput,
+        mut delta: crate::protocols::common::llm_backend::BackendOutput,
     ) -> anyhow::Result<NvCreateChatCompletionStreamResponse> {
+        let reasoning = if let Some(parser) = &mut self.nemotron_reasoning {
+            let (reasoning, content) = parser.push(
+                delta.index.unwrap_or(0), &delta.token_ids,
+                delta.text.as_deref().unwrap_or(""), delta.finish_reason.is_some(),
+            )?;
+            delta.text = (!content.is_empty()).then_some(content);
+            (!reasoning.is_empty()).then_some(reasoning)
+        } else { None };
         // Aggregate token usage even if usage tracking is disabled for metrics tracking
         // SAFETY: Casting from `usize` to `u32` could lead to precision loss after `u32::MAX`,
         // but this will not be an issue until context lengths exceed 4_294_967_295.
@@ -389,6 +405,9 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
 
         // Create the streaming response.
         let mut stream_response = self.create_choice(index, text, finish_reason, logprobs);
+        if let Some(choice) = stream_response.inner.choices.first_mut() {
+            choice.delta.reasoning_content = reasoning;
+        }
 
         // Record finish for timing/ITL accounting even when timing is not returned to the client.
         // Kept at call site because it's a side effect on the tracker — not a gating decision.
@@ -439,6 +458,21 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
 
     fn get_isl(&self) -> Option<u32> {
         Some(self.usage.prompt_tokens)
+    }
+
+    fn flush_postprocessor(&mut self) -> anyhow::Result<Option<NvCreateChatCompletionStreamResponse>> {
+        let Some(parser) = &mut self.nemotron_reasoning else { return Ok(None); };
+        let flushed = parser.finish_pending()?;
+        let mut response: Option<NvCreateChatCompletionStreamResponse> = None;
+        for (index, reasoning, content) in flushed {
+            let mut next = self.create_choice(index, (!content.is_empty()).then_some(content), None, None);
+            if let Some(choice) = next.inner.choices.first_mut() {
+                choice.delta.reasoning_content = (!reasoning.is_empty()).then_some(reasoning);
+            }
+            if let Some(response) = &mut response { response.inner.choices.extend(next.inner.choices); }
+            else { response = Some(next); }
+        }
+        Ok(response)
     }
 
     fn create_usage_chunk(&self) -> NvCreateChatCompletionStreamResponse {

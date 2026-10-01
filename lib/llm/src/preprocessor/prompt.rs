@@ -259,6 +259,9 @@ pub fn prompt_formatter_from_mdc(mdc: &ModelDeploymentCard) -> Result<PromptForm
                 }
                 _ => {}
             }
+            if super::super_user_tokenization::enabled(mdc) {
+                dynamo_renderer::provenance::enable_super_user_provenance(&mut config)?;
+            }
             PromptFormatter::from_parts(
                 config,
                 mdc.prompt_context
