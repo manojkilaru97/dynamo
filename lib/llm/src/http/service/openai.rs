@@ -2344,6 +2344,12 @@ impl ModelOutput for NvCreateCompletionResponse {
     }
 }
 
+impl ModelOutput for NvVideosResponse {
+    fn has_model_output(&self) -> bool {
+        true
+    }
+}
+
 /// Empty stream chunk produced by multi-byte token assembly (e.g. emoji).
 /// `role` is excluded; backends set it on every delta.
 fn is_empty_stream_response(resp: &NvCreateChatCompletionStreamResponse) -> bool {
@@ -4008,7 +4014,7 @@ async fn videos(
             },
         )
         .await;
-        let stream = stream.flat_map(move |response| {
+        let stream = super::metrics::demote_late_rejections(stream).flat_map(move |response| {
             let sse_result = process_response_using_event_converter_and_observe_metrics(
                 EventConverter::from(response),
                 &mut response_collector,

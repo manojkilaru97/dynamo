@@ -255,7 +255,6 @@ mod tests {
             Some(legacy_json)
         );
     }
-
 }
 
 fn has_explicit_guided_decoding(request: &NvCreateChatCompletionRequest) -> bool {
