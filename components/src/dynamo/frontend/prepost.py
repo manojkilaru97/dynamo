@@ -381,14 +381,16 @@ def _lift_pattern_only_structured_outputs(request: dict[str, Any]) -> dict[str, 
     ):
         return request
     request = dict(request)
+    # Unset fields (None, and the json_object=False sentinel) are dropped, as in
+    # the Rust frontend, so they do not read as an explicit constraint later.
     rest = {
         key: value
         for key, value in structured_outputs.items()
-        if key != "whitespace_pattern"
+        if key != "whitespace_pattern" and value is not None and value is not False
     }
     if request.get("guided_whitespace_pattern") is None:
         request["guided_whitespace_pattern"] = structured_outputs["whitespace_pattern"]
-    if any(value is not None for value in rest.values()):
+    if rest:
         request["structured_outputs"] = rest
     else:
         request.pop("structured_outputs")

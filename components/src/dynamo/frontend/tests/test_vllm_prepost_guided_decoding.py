@@ -5,6 +5,7 @@ import pytest
 
 from dynamo.frontend.prepost import (
     _build_assistant_guided_decoding,
+    _lift_pattern_only_structured_outputs,
     _validate_chat_completion_request,
 )
 
@@ -45,3 +46,14 @@ def test_top_level_pattern_modifies_structured_outputs_json():
 def test_pattern_does_not_attach_to_non_json_constraints():
     guided = _guided_decoding(guided_regex="a+", guided_whitespace_pattern="[ ]?")
     assert guided == {"regex": "a+"}
+
+
+def test_lifted_pattern_drops_unset_sentinels():
+    lifted = _lift_pattern_only_structured_outputs(
+        {
+            "structured_outputs": {"whitespace_pattern": "[ ]?", "json_object": False},
+            "tool_choice": {"type": "function", "function": {"name": "record"}},
+        }
+    )
+    assert "structured_outputs" not in lifted
+    assert lifted["guided_whitespace_pattern"] == "[ ]?"
