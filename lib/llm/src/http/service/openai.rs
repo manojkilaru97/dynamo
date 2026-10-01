@@ -3877,7 +3877,7 @@ async fn images(
                 .inc_rejection(&model, super::metrics::Endpoint::Images);
         }
         let err_response = ErrorMessage::from_anyhow(e, "Failed to generate images");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        inflight.mark_error(backend_error_type_from_response(&err_response));
         err_response
     })?;
 
@@ -3994,7 +3994,7 @@ async fn videos(
                 .inc_rejection(&model, super::metrics::Endpoint::Videos);
         }
         let err_response = ErrorMessage::from_anyhow(e, "Failed to generate videos");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        inflight.mark_error(backend_error_type_from_response(&err_response));
         err_response
     })?;
 
@@ -4104,7 +4104,7 @@ async fn video_stream(
                 .inc_rejection(&model, super::metrics::Endpoint::Videos);
         }
         let err_response = ErrorMessage::from_anyhow(e, "Failed to start video stream");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        inflight.mark_error(backend_error_type_from_response(&err_response));
         err_response
     })?;
 
@@ -4294,7 +4294,7 @@ async fn audio_speech(
                 .inc_rejection(&model, super::metrics::Endpoint::Audios);
         }
         let err_response = ErrorMessage::from_anyhow(e, "Failed to generate audio");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        inflight.mark_error(backend_error_type_from_response(&err_response));
         err_response
     })?;
 
