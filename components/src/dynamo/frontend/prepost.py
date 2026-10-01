@@ -253,8 +253,22 @@ def build_tool_call_guided_decoding(
             return None
         json_schema = get_json_schema_from_tools(tool_choice, request.tools)
         if json_schema is not None:
-            return {"json": json_schema}
+            guided_decoding: dict[str, Any] = {"json": json_schema}
+            # The JSON tool fallback keeps the whitespace modifier, as in Rust.
+            whitespace_pattern = _request_whitespace_pattern(request)
+            if whitespace_pattern is not None:
+                guided_decoding["whitespace_pattern"] = whitespace_pattern
+            return guided_decoding
     return None
+
+
+def _request_whitespace_pattern(request: ChatCompletionRequest) -> str | None:
+    """`guided_whitespace_pattern`, or the `structured_outputs` alias."""
+    pattern = (request.model_extra or {}).get("guided_whitespace_pattern")
+    structured_outputs = request.extract_structured_outputs()
+    if pattern is None and structured_outputs is not None:
+        pattern = structured_outputs.whitespace_pattern
+    return pattern
 
 
 # Convert vLLM structured-output parameters into Dynamo guided-decoding options.
