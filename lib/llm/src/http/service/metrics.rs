@@ -134,6 +134,24 @@ pub static WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE: LazyLock<GaugeVec> = LazyLock:
     .expect("Failed to create worker_last_inter_token_latency gauge")
 });
 
+/// Worker-set selections made with a conversation affinity key, by chosen namespace and reason.
+pub static WORKER_SET_SELECTION_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "dynamo_frontend_worker_set_selection_total",
+            "Worker-set selections for requests with a conversation affinity key",
+        ),
+        &["model", "namespace", "reason"],
+    )
+    .expect("Failed to create worker_set_selection counter")
+});
+
+pub fn record_worker_set_selection(model: &str, namespace: &str, reason: &str) {
+    WORKER_SET_SELECTION_COUNTER
+        .with_label_values(&[model, namespace, reason])
+        .inc();
+}
+
 /// Register the global per-worker TTFT/ITL/input-tokens Prometheus metrics with the given registry.
 ///
 /// This should be called once during HTTP service setup to expose the metrics
@@ -145,6 +163,7 @@ pub fn register_worker_timing_metrics(registry: &Registry) -> Result<(), prometh
     registry.register(Box::new(WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.clone()))?;
+    registry.register(Box::new(WORKER_SET_SELECTION_COUNTER.clone()))?;
     Ok(())
 }
 

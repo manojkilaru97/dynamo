@@ -2540,9 +2540,19 @@ async fn chat_completions(
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
+    let affinity_key = crate::discovery::set_selection::affinity_enabled()
+        .then(|| {
+            crate::discovery::set_selection::chat_affinity_key(&request.inner.messages, |m| {
+                matches!(
+                    m,
+                    dynamo_protocols::types::ChatCompletionRequestMessage::User(_)
+                )
+            })
+        })
+        .flatten();
     let (engine, parsing_options) = state
         .manager()
-        .get_chat_completions_engine_with_parsing(&model)
+        .get_chat_completions_engine_with_parsing_for(&model, affinity_key)
         .map_err(|e| {
             let err_response = ErrorMessage::from_model_error(&e);
             inflight_guard.mark_error(extract_error_type_from_response(&err_response));

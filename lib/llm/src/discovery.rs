@@ -4,6 +4,8 @@
 mod model;
 pub use model::Model;
 
+pub mod set_selection;
+
 pub mod kv_source_membership;
 pub use kv_source_membership::{
     KvEventSource, KvSourceAdvertisement, KvSourceAmbiguity, KvSourceId, KvSourceKey,

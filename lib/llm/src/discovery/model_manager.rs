@@ -798,6 +798,25 @@ impl ModelManager {
             .get_chat_engine_with_parsing()
     }
 
+    /// Chat engine plus parsing options, selecting the WorkerSet with an optional
+    /// conversation affinity key (see [`super::set_selection`]).
+    pub fn get_chat_completions_engine_with_parsing_for(
+        &self,
+        model: &str,
+        affinity_key: Option<u64>,
+    ) -> Result<
+        (
+            OpenAIChatCompletionsStreamingEngine,
+            crate::protocols::openai::ParsingOptions,
+        ),
+        ModelManagerError,
+    > {
+        self.models
+            .get(model)
+            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .get_chat_engine_with_parsing_for(affinity_key)
+    }
+
     pub fn get_completions_engine_with_parsing(
         &self,
         model: &str,

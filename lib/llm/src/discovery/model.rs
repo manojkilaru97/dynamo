@@ -4,15 +4,16 @@
 //! A Model represents a named model (e.g., "llama-3-70b") that may be served by
 //! one or more WorkerSets. Each WorkerSet corresponds to a namespace.
 //!
-//! Requests are routed to a WorkerSet selected by weighted random (proportional to worker count).
+//! Requests are routed to a WorkerSet selected by weighted random (proportional to worker count),
+//! or by conversation affinity when configured (see [`super::set_selection`]).
 
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use rand::Rng;
 use serde::Serialize;
 
 use super::ModelManagerError;
+use super::set_selection::{SetChoiceReason, SetSelectionConfig, SetSelectionMode, ShareTracker};
 use super::worker_monitor::LoadThresholdConfig;
 use super::worker_set::WorkerSet;
 use crate::protocols::openai::ParsingOptions;
@@ -111,6 +112,7 @@ struct NamespaceReadinessEval {
 pub struct Model {
     name: String,
     worker_sets: DashMap<String, Arc<WorkerSet>>,
+    set_shares: ShareTracker,
 }
 
 impl Model {
@@ -118,6 +120,7 @@ impl Model {
         Self {
             name,
             worker_sets: DashMap::new(),
+            set_shares: ShareTracker::default(),
         }
     }
 
@@ -748,8 +751,19 @@ impl Model {
     pub fn get_chat_engine_with_parsing(
         &self,
     ) -> Result<(OpenAIChatCompletionsStreamingEngine, ParsingOptions), ModelManagerError> {
-        self.select_worker_set_with(|ws| ws.chat_engine.clone().map(|e| (e, ws.parsing_options())))
-            .ok_or_else(|| self.engine_error(self.has_chat_engine()))
+        self.get_chat_engine_with_parsing_for(None)
+    }
+
+    /// Like [`Self::get_chat_engine_with_parsing`], with an optional conversation affinity
+    /// key used when `DYN_WORKER_SET_SELECTION=affinity`.
+    pub fn get_chat_engine_with_parsing_for(
+        &self,
+        affinity_key: Option<u64>,
+    ) -> Result<(OpenAIChatCompletionsStreamingEngine, ParsingOptions), ModelManagerError> {
+        self.select_worker_set_for(affinity_key, |ws| {
+            ws.chat_engine.clone().map(|e| (e, ws.parsing_options()))
+        })
+        .ok_or_else(|| self.engine_error(self.has_chat_engine()))
     }
 
     pub fn get_completions_engine_with_parsing(
@@ -832,6 +846,14 @@ impl Model {
     where
         F: Fn(&WorkerSet) -> Option<T>,
     {
+        self.select_worker_set_for(None, extract)
+    }
+
+    /// [`Self::select_worker_set_with`] with an optional conversation affinity key.
+    fn select_worker_set_for<T, F>(&self, affinity_key: Option<u64>, extract: F) -> Option<T>
+    where
+        F: Fn(&WorkerSet) -> Option<T>,
+    {
         // One snapshot drives both the readiness filter and candidate
         // eligibility, so a concurrent add/remove can't make us treat a
         // namespace as complete while routing to a set that lost a peer. It also
@@ -871,14 +893,14 @@ impl Model {
         // a namespace whose worker set is incomplete.
         // In-process models (no discovery watcher) return count=1, so they always participate.
         // Discovery models with count=0 have no available workers and are skipped.
-        let eligible: Vec<(T, usize)> = snapshot
+        let eligible: Vec<(T, usize, &str)> = snapshot
             .iter()
             .filter_map(|ws| {
                 let count = ws.worker_count();
                 if count == 0 || !ready_namespaces.contains(ws.namespace()) {
                     return None;
                 }
-                extract(ws).map(|val| (val, count))
+                extract(ws).map(|val| (val, count, ws.namespace()))
             })
             .collect();
 
@@ -887,20 +909,34 @@ impl Model {
         }
 
         if eligible.len() == 1 {
-            return eligible.into_iter().next().map(|(val, _)| val);
+            return eligible.into_iter().next().map(|(val, _, _)| val);
         }
 
-        // Weighted random selection proportional to worker count
-        let total_weight: usize = eligible.iter().map(|(_, w)| w).sum();
-        let mut pick = rand::rng().random_range(0..total_weight);
-        for (val, weight) in eligible {
-            if pick < weight {
-                return Some(val);
+        let config = SetSelectionConfig::global();
+        let weighted: Vec<(&str, f64)> = eligible
+            .iter()
+            .map(|(_, count, ns)| (*ns, config.set_weight(ns, *count)))
+            .collect();
+
+        let chosen = match (config.mode, affinity_key) {
+            (SetSelectionMode::Affinity, Some(key)) => {
+                self.set_shares.choose(key, &weighted, config.slack)
             }
-            pick -= weight;
+            _ => {
+                let weights: Vec<f64> = weighted.iter().map(|(_, w)| *w).collect();
+                super::set_selection::weighted_random_pick(&weights)
+                    .map(|idx| (idx, SetChoiceReason::Random))
+            }
+        };
+        let (idx, reason) = chosen?;
+        if affinity_key.is_some() {
+            crate::http::service::metrics::record_worker_set_selection(
+                &self.name,
+                weighted[idx].0,
+                reason.as_label(),
+            );
         }
-        // Should not reach here, but fallback to None
-        None
+        eligible.into_iter().nth(idx).map(|(val, _, _)| val)
     }
 }
 
