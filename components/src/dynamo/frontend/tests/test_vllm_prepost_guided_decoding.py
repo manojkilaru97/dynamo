@@ -104,3 +104,24 @@ def test_json_tool_fallback_keeps_whitespace_pattern(tool_choice, pattern_fields
     guided = build_tool_call_guided_decoding(request, None)
     assert guided is not None and "json" in guided
     assert guided["whitespace_pattern"] == "[ ]?"
+
+
+def test_parser_tool_guidance_keeps_whitespace_pattern():
+    request = _validate_chat_completion_request(
+        {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "record", "parameters": {"type": "object"}},
+                }
+            ],
+            "tool_choice": "required",
+            "structured_outputs": {"whitespace_pattern": "[ ]?"},
+        }
+    )
+    guided = build_tool_call_guided_decoding(
+        request, None, parser_guided_decoding={"json": {"type": "array"}}
+    )
+    assert guided == {"json": {"type": "array"}, "whitespace_pattern": "[ ]?"}

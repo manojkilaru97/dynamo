@@ -238,6 +238,18 @@ def build_tool_call_guided_decoding(
             return {"structural_tag": tag_value}
 
     if parser_guided_decoding is not None:
+        # vLLM's ToolParser.adjust_request replaces structured_outputs with the
+        # tool schema and drops the whitespace modifier; keep it, as in Rust.
+        whitespace_pattern = _request_whitespace_pattern(request)
+        if (
+            whitespace_pattern is not None
+            and "json" in parser_guided_decoding
+            and parser_guided_decoding.get("whitespace_pattern") is None
+        ):
+            parser_guided_decoding = {
+                **parser_guided_decoding,
+                "whitespace_pattern": whitespace_pattern,
+            }
         return parser_guided_decoding
 
     tool_choice = request.tool_choice or "auto"
