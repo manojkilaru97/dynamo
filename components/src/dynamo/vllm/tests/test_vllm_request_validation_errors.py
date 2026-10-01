@@ -122,6 +122,10 @@ async def test_structured_output_compile_failure_is_a_value_error(finished):
         pytest.param([_compile_error()], False, id="not_structured"),
         pytest.param([_output(None, [1], False), _compile_error()], True, id="late"),
         pytest.param([_output("error")], True, id="other_engine_error"),
+        # Upstream vLLM finishes a compile failure without the marker.
+        pytest.param(
+            [_output("error", stop_reason=None)], True, id="upstream_compile_error"
+        ),
         pytest.param([_output("stop", [1])], True, id="normal"),
     ],
 )
