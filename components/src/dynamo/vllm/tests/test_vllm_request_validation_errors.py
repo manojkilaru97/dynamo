@@ -195,7 +195,7 @@ def test_text_mode_forced_tool_takes_precedence_over_output_constraints():
 
 
 def test_text_mode_rejects_structural_tag_with_forced_tool():
-    with pytest.raises(ValueError, match="explicit guided"):
+    with pytest.raises(ValueError, match="structural_tag"):
         build_sampling_params_openai(
             {
                 "max_tokens": 8,
@@ -249,16 +249,36 @@ def test_text_mode_ignores_unset_sentinels(structured_outputs):
         {"guided_json": {"type": "object"}},
         {"guided_regex": "a+"},
         {"guided_choice": ["a", "b"]},
-        {"structured_outputs": {"json": {"type": "object"}}},
     ],
-    ids=["guided_json", "guided_regex", "guided_choice", "structured_outputs"],
+    ids=["guided_json", "guided_regex", "guided_choice"],
 )
-def test_text_mode_rejects_explicit_constraints_with_forced_tool(constraint):
-    with pytest.raises(ValueError, match="explicit guided"):
+def test_text_mode_rejects_legacy_constraints_with_forced_tool(constraint):
+    with pytest.raises(ValueError, match="guided decoding cannot be used"):
         build_sampling_params_openai(
             {"max_tokens": 8, "tools": _TOOLS, "tool_choice": "required", **constraint},
             default_sampling_params={},
         )
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        {"structured_outputs": {"json": {"type": "object"}}},
+        {"structured_outputs": {"json_object": True}},
+        {"response_format": {"type": "json_object"}},
+    ],
+    ids=[
+        "structured_outputs_json",
+        "structured_outputs_json_object",
+        "response_format",
+    ],
+)
+def test_text_mode_forced_tool_wins_over_output_constraints(constraint):
+    params = build_sampling_params_openai(
+        {"max_tokens": 8, "tools": _TOOLS, "tool_choice": "required", **constraint},
+        default_sampling_params={},
+    )
+    assert params.structured_outputs is None
 
 
 def test_text_mode_empty_guided_choice_does_not_shadow_response_format():

@@ -1824,15 +1824,24 @@ def _text_mode_structured_outputs(
     structured_outputs = _structured_outputs_from_openai_request(without_tools)
     if not forced_tool:
         return structured_outputs
-    # response_format is dropped for a forced tool; explicit guided_* or
-    # structured_outputs constraints are rejected, as on the token path.
-    explicit = _structured_outputs_from_openai_request(
-        {key: value for key, value in without_tools.items() if key != "response_format"}
-    )
-    if explicit is not None:
+    # As on the token path (preprocessor/tool_choice.rs): legacy guided_*
+    # constraints and a client structural tag are rejected; other
+    # structured_outputs constraints and response_format yield to the tool.
+    if (
+        request.get("guided_json") is not None
+        or request.get("guided_regex") is not None
+        or request.get("guided_choice")
+        or request.get("guided_grammar") is not None
+    ):
         raise ValueError(
-            "tool_choice forces a tool call and cannot be combined with an "
-            "explicit guided_* or structured_outputs constraint."
+            "guided decoding cannot be used in the same request as "
+            'tool_choice="required" or a named tool_choice.'
+        )
+    client = request.get("structured_outputs")
+    if isinstance(client, dict) and client.get("structural_tag") is not None:
+        raise ValueError(
+            "structured_outputs.structural_tag cannot be used in the same request as "
+            'tool_choice="required" or a named tool_choice.'
         )
     return None
 
