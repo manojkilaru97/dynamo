@@ -874,3 +874,147 @@ fn cpu_event_with_full_payload_is_indexable() {
     }
     assert_eq!(warning_count.load(Ordering::Relaxed), 0);
 }
+
+fn gpu_block_stored(
+    block_hashes: &[u64],
+    token_ids: &[u32],
+    block_size: usize,
+    parent: Option<u64>,
+) -> RawKvEvent {
+    let RawKvEvent::BlockStored {
+        block_hashes,
+        parent_block_hash,
+        token_ids,
+        block_size,
+        lora_name,
+        cache_namespace,
+        block_mm_infos,
+        is_eagle,
+        group_idx,
+        kv_cache_spec_kind,
+        kv_cache_spec_sliding_window,
+        ..
+    } = cpu_block_stored(CpuBlockStoredFixture {
+        block_hashes,
+        token_ids,
+        block_size,
+        parent_block_hash: parent,
+    })
+    else {
+        unreachable!()
+    };
+    RawKvEvent::BlockStored {
+        block_hashes,
+        parent_block_hash,
+        token_ids,
+        block_size,
+        medium: None,
+        lora_name,
+        cache_namespace,
+        block_mm_infos,
+        is_eagle,
+        group_idx,
+        kv_cache_spec_kind,
+        kv_cache_spec_sliding_window,
+    }
+}
+
+fn stored_data(event: PlacementEvent) -> KvCacheStoreData {
+    match event.event.data {
+        KvCacheEventData::Stored(store) => store,
+        other => panic!("expected Stored event, got {other:?}"),
+    }
+}
+
+/// Lazy CPU offload emits stores with only the block hash; the normalizer
+/// completes them from the device-tier store of the same block so the router
+/// can index the CPU tier (and later match its removals).
+#[test]
+fn tokenless_cpu_store_is_completed_from_device_identity() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let mut normalizer = ZmqEventNormalizer::new(4);
+    let gpu = stored_data(
+        normalizer
+            .normalize(
+                gpu_block_stored(&[201, 202], &[10, 11, 12, 13, 14, 15, 16, 17], 4, Some(200)),
+                1,
+                worker,
+            )
+            .unwrap(),
+    );
+    assert_eq!(gpu.blocks.len(), 2);
+
+    let cpu_second = normalizer
+        .normalize(
+            cpu_block_stored(CpuBlockStoredFixture {
+                block_hashes: &[202],
+                token_ids: &[],
+                block_size: 4,
+                parent_block_hash: None,
+            }),
+            2,
+            worker,
+        )
+        .unwrap();
+    assert_eq!(cpu_second.placement.tier, StorageTier::HostPinned);
+    let cpu_second = stored_data(cpu_second);
+    assert_eq!(cpu_second.parent_hash, Some(ExternalSequenceBlockHash(201)));
+    assert_eq!(cpu_second.blocks.len(), 1);
+    assert_eq!(
+        cpu_second.blocks[0].block_hash,
+        ExternalSequenceBlockHash(202)
+    );
+    assert_eq!(cpu_second.blocks[0].tokens_hash, gpu.blocks[1].tokens_hash);
+
+    let cpu_both = stored_data(
+        normalizer
+            .normalize(
+                cpu_block_stored(CpuBlockStoredFixture {
+                    block_hashes: &[201, 202],
+                    token_ids: &[],
+                    block_size: 4,
+                    parent_block_hash: None,
+                }),
+                3,
+                worker,
+            )
+            .unwrap(),
+    );
+    assert_eq!(cpu_both.parent_hash, Some(ExternalSequenceBlockHash(200)));
+    assert_eq!(cpu_both.blocks.len(), 2);
+    assert_eq!(cpu_both.blocks[0].tokens_hash, gpu.blocks[0].tokens_hash);
+}
+
+#[test]
+fn tokenless_cpu_store_stays_empty_for_unknown_or_foreign_blocks() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let other = WorkerWithDpRank::new(8, 0);
+    let mut normalizer = ZmqEventNormalizer::new(4);
+    normalizer
+        .normalize(
+            gpu_block_stored(&[201], &[10, 11, 12, 13], 4, None),
+            1,
+            worker,
+        )
+        .unwrap();
+    let tokenless = |hashes: &'static [u64]| {
+        cpu_block_stored(CpuBlockStoredFixture {
+            block_hashes: hashes,
+            token_ids: &[],
+            block_size: 4,
+            parent_block_hash: None,
+        })
+    };
+    let unknown = stored_data(normalizer.normalize(tokenless(&[999]), 2, worker).unwrap());
+    assert!(unknown.blocks.is_empty());
+    let foreign = stored_data(normalizer.normalize(tokenless(&[201]), 3, other).unwrap());
+    assert!(foreign.blocks.is_empty());
+    // A known head followed by an unknown block keeps only the known prefix.
+    let partial = stored_data(
+        normalizer
+            .normalize(tokenless(&[201, 999]), 4, worker)
+            .unwrap(),
+    );
+    assert_eq!(partial.blocks.len(), 1);
+    assert_eq!(partial.parent_hash, None);
+}

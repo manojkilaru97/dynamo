@@ -7,13 +7,17 @@
 //! engines over ZMQ PUB sockets. They are independent of the dynamo runtime
 //! and can be used by any crate that needs to decode the raw ZMQ payloads.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 use rmp_serde as rmps;
 use rustc_hash::FxHashMap;
 
-use crate::protocols::{DpRank, PlacementEvent, WorkerWithDpRank};
+use crate::protocols::{
+    BlockExtraInfo, DpRank, ExternalSequenceBlockHash, KvCacheEventData, KvCacheStoreData,
+    KvCacheStoredBlockData, LocalBlockHash, PlacementEvent, StorageTier, WorkerWithDpRank,
+};
 
 mod convert;
 mod deserialize;
@@ -48,6 +52,99 @@ pub struct ZmqEventNormalizer {
     warning_count: Arc<AtomicU32>,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
     cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
+    block_identities: BlockIdentityMemo,
+}
+
+/// Router identity of a device-tier block: its chain parent and token hash.
+///
+/// An engine block hash is a pure function of the parent hash and the block's
+/// tokens (plus LoRA / salt / multimodal keys, which also feed the token hash),
+/// so a remembered identity never goes stale and needs no invalidation.
+#[derive(Debug, Clone)]
+struct BlockIdentity {
+    parent: Option<ExternalSequenceBlockHash>,
+    tokens_hash: LocalBlockHash,
+    mm_extra_info: Option<BlockExtraInfo>,
+}
+
+/// Bounded FIFO memo of device-tier block identities, used to complete
+/// lower-tier stores that arrive without token IDs.
+///
+/// vLLM's lazy CPU offload copies blocks that are still cached on the GPU and
+/// emits `BlockStored(medium=CPU)` with only the block hash. Without the
+/// identity the router drops those stores, never indexes the CPU tier, and
+/// later counts its removals as `block_not_found`.
+#[derive(Debug, Clone)]
+struct BlockIdentityMemo {
+    map: FxHashMap<(WorkerWithDpRank, u64), BlockIdentity>,
+    order: VecDeque<(WorkerWithDpRank, u64)>,
+    capacity: usize,
+}
+
+const BLOCK_IDENTITY_MEMO_CAPACITY: usize = 65_536;
+
+impl BlockIdentityMemo {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: FxHashMap::default(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn record(&mut self, worker: WorkerWithDpRank, store: &KvCacheStoreData) {
+        let mut parent = store.parent_hash;
+        for block in &store.blocks {
+            let key = (worker, block.block_hash.0);
+            let identity = BlockIdentity {
+                parent,
+                tokens_hash: block.tokens_hash,
+                mm_extra_info: block.mm_extra_info.clone(),
+            };
+            if self.map.insert(key, identity).is_none() {
+                self.order.push_back(key);
+                while self.order.len() > self.capacity {
+                    if let Some(old) = self.order.pop_front() {
+                        self.map.remove(&old);
+                    }
+                }
+            }
+            parent = Some(block.block_hash);
+        }
+    }
+
+    /// Fill an empty lower-tier store with the longest chain-consistent prefix
+    /// of `hashes` whose identities are known. Returns the number filled.
+    fn fill(
+        &self,
+        worker: WorkerWithDpRank,
+        hashes: &[u64],
+        store: &mut KvCacheStoreData,
+    ) -> usize {
+        let mut blocks = Vec::with_capacity(hashes.len());
+        let mut first_parent = None;
+        for (i, hash) in hashes.iter().enumerate() {
+            let Some(identity) = self.map.get(&(worker, *hash)) else {
+                break;
+            };
+            if i == 0 {
+                first_parent = identity.parent;
+            } else if identity.parent != Some(ExternalSequenceBlockHash(hashes[i - 1])) {
+                break;
+            }
+            blocks.push(KvCacheStoredBlockData {
+                block_hash: ExternalSequenceBlockHash(*hash),
+                tokens_hash: identity.tokens_hash,
+                mm_extra_info: identity.mm_extra_info.clone(),
+            });
+        }
+        let filled = blocks.len();
+        if filled > 0 {
+            store.parent_hash = first_parent;
+            store.blocks = blocks;
+        }
+        filled
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +190,7 @@ impl ZmqEventNormalizer {
             warning_count: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
+            block_identities: BlockIdentityMemo::new(BLOCK_IDENTITY_MEMO_CAPACITY),
         }
     }
 
@@ -103,6 +201,7 @@ impl ZmqEventNormalizer {
             warning_count,
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
+            block_identities: BlockIdentityMemo::new(BLOCK_IDENTITY_MEMO_CAPACITY),
         }
     }
 
@@ -139,19 +238,45 @@ impl ZmqEventNormalizer {
     }
 
     pub fn normalize_preprocessed(
-        &self,
+        &mut self,
         raw: RawKvEvent,
         event_id: u64,
         worker: WorkerWithDpRank,
     ) -> Option<PlacementEvent> {
-        convert_event(
+        let lower_tier_hashes: Option<Vec<u64>> = match &raw {
+            RawKvEvent::BlockStored {
+                block_hashes,
+                medium,
+                ..
+            } if StorageTier::from_kv_medium_or_default(medium.as_deref())
+                != StorageTier::Device =>
+            {
+                Some(block_hashes.iter().map(|h| h.into_u64()).collect())
+            }
+            _ => None,
+        };
+        let mut event = convert_event(
             raw,
             event_id,
             self.kv_block_size,
             worker,
             &self.warning_count,
             self.image_token_id,
-        )
+        )?;
+        match (&mut event.event.data, lower_tier_hashes) {
+            (KvCacheEventData::Stored(store), Some(hashes)) => {
+                if store.blocks.is_empty() && !hashes.is_empty() {
+                    self.block_identities.fill(worker, &hashes, store);
+                }
+            }
+            (KvCacheEventData::Stored(store), None) => {
+                if event.placement.tier == StorageTier::Device {
+                    self.block_identities.record(worker, store);
+                }
+            }
+            _ => {}
+        }
+        Some(event)
     }
 
     pub fn normalize(
