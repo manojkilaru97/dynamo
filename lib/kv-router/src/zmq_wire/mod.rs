@@ -60,7 +60,7 @@ pub struct ZmqEventNormalizer {
 ///
 /// An engine block hash is a pure function of the parent hash and the block's
 /// tokens (plus LoRA / salt / multimodal keys, which also feed the token hash),
-/// so a remembered identity never goes stale and needs no invalidation.
+/// so a remembered identity is never wrong, only possibly no longer needed.
 #[derive(Debug, Clone)]
 struct BlockIdentity {
     parent: Option<ExternalSequenceBlockHash>,
@@ -68,17 +68,27 @@ struct BlockIdentity {
     mm_extra_info: Option<BlockExtraInfo>,
 }
 
-/// Bounded FIFO memo of device-tier block identities, used to complete
+/// Bounded memo of the identities of device-resident blocks, used to complete
 /// lower-tier stores that arrive without token IDs.
 ///
 /// vLLM's lazy CPU offload copies blocks that are still cached on the GPU and
 /// emits `BlockStored(medium=CPU)` with only the block hash. Without the
 /// identity the router drops those stores, never indexes the CPU tier, and
 /// later counts its removals as `block_not_found`.
+///
+/// The memo follows device residency: a device `BlockRemoved` forgets those
+/// blocks and `AllBlocksCleared` forgets the worker, so it holds only blocks
+/// still on the GPU and long-lived hot prefixes are not pushed out by churn.
+/// This is safe for lazy offload because the copy keeps the GPU block in use,
+/// so its CPU store is published before the GPU removal. Past `capacity`, the
+/// least recently stored identity is evicted (a re-store refreshes it).
 #[derive(Debug, Clone)]
 struct BlockIdentityMemo {
-    map: FxHashMap<(WorkerWithDpRank, u64), BlockIdentity>,
-    order: VecDeque<(WorkerWithDpRank, u64)>,
+    /// Identity and the generation of its latest store.
+    map: FxHashMap<(WorkerWithDpRank, u64), (BlockIdentity, u64)>,
+    /// Store order; entries whose generation no longer matches `map` are stale.
+    order: VecDeque<((WorkerWithDpRank, u64), u64)>,
+    next_generation: u64,
     capacity: usize,
 }
 
@@ -89,7 +99,8 @@ impl BlockIdentityMemo {
         Self {
             map: FxHashMap::default(),
             order: VecDeque::new(),
-            capacity,
+            next_generation: 0,
+            capacity: capacity.max(1),
         }
     }
 
@@ -102,15 +113,48 @@ impl BlockIdentityMemo {
                 tokens_hash: block.tokens_hash,
                 mm_extra_info: block.mm_extra_info.clone(),
             };
-            if self.map.insert(key, identity).is_none() {
-                self.order.push_back(key);
-                while self.order.len() > self.capacity {
-                    if let Some(old) = self.order.pop_front() {
-                        self.map.remove(&old);
-                    }
-                }
-            }
+            let generation = self.next_generation;
+            self.next_generation += 1;
+            self.map.insert(key, (identity, generation));
+            self.order.push_back((key, generation));
             parent = Some(block.block_hash);
+        }
+        while self.map.len() > self.capacity {
+            let Some((key, generation)) = self.order.pop_front() else {
+                break;
+            };
+            if self.is_current(&key, generation) {
+                self.map.remove(&key);
+            }
+        }
+        self.compact();
+    }
+
+    /// Forget blocks the worker no longer holds on the device.
+    fn remove(&mut self, worker: WorkerWithDpRank, hashes: &[ExternalSequenceBlockHash]) {
+        for hash in hashes {
+            self.map.remove(&(worker, hash.0));
+        }
+        self.compact();
+    }
+
+    /// Forget every block of a worker (`AllBlocksCleared`).
+    fn clear_worker(&mut self, worker: WorkerWithDpRank) {
+        self.map.retain(|(w, _), _| *w != worker);
+        self.compact();
+    }
+
+    fn is_current(&self, key: &(WorkerWithDpRank, u64), generation: u64) -> bool {
+        self.map.get(key).is_some_and(|(_, g)| *g == generation)
+    }
+
+    /// Drop stale order entries once they outnumber live ones, keeping `order`
+    /// within twice the capacity (amortized O(1) per operation).
+    fn compact(&mut self) {
+        if self.order.len() > 2 * self.capacity.max(self.map.len()) {
+            let map = &self.map;
+            self.order
+                .retain(|(key, generation)| map.get(key).is_some_and(|(_, g)| g == generation));
         }
     }
 
@@ -125,7 +169,7 @@ impl BlockIdentityMemo {
         let mut blocks = Vec::with_capacity(hashes.len());
         let mut first_parent = None;
         for (i, hash) in hashes.iter().enumerate() {
-            let Some(identity) = self.map.get(&(worker, *hash)) else {
+            let Some((identity, _)) = self.map.get(&(worker, *hash)) else {
                 break;
             };
             if i == 0 {
@@ -208,6 +252,14 @@ impl ZmqEventNormalizer {
         }
     }
 
+    /// Normalizer with a custom identity-memo capacity (tests).
+    #[cfg(test)]
+    fn with_identity_capacity(kv_block_size: u32, capacity: usize) -> Self {
+        let mut normalizer = Self::new(kv_block_size);
+        normalizer.block_identities = BlockIdentityMemo::new(capacity);
+        normalizer
+    }
+
     /// Set the model's image placeholder token id so vLLM BlockStored events
     /// get normalized to the canonical pad_value scheme. No-op for text-only
     /// models (leave unset).
@@ -278,6 +330,12 @@ impl ZmqEventNormalizer {
             }
             (KvCacheEventData::Stored(store), None) if is_device => {
                 self.block_identities.record(worker, store);
+            }
+            (KvCacheEventData::Removed(removed), None) if is_device => {
+                self.block_identities.remove(worker, &removed.block_hashes);
+            }
+            (KvCacheEventData::Cleared, None) if is_device => {
+                self.block_identities.clear_worker(worker);
             }
             _ => {}
         }

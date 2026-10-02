@@ -1071,3 +1071,155 @@ fn tokenless_cpu_store_does_not_consume_warning_budget() {
     assert!(stored_data(short_cpu).blocks.is_empty());
     assert_eq!(warning_count.load(Ordering::Relaxed), 2);
 }
+
+fn raw_removed(block_hashes: &[u64], medium: Option<&str>) -> RawKvEvent {
+    RawKvEvent::BlockRemoved {
+        block_hashes: block_hashes
+            .iter()
+            .copied()
+            .map(BlockHashValue::Unsigned)
+            .collect(),
+        medium: medium.map(str::to_string),
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+    }
+}
+
+fn tokenless_cpu(block_hashes: &'static [u64]) -> RawKvEvent {
+    cpu_block_stored(CpuBlockStoredFixture {
+        block_hashes,
+        token_ids: &[],
+        block_size: 4,
+        parent_block_hash: None,
+    })
+}
+
+/// Number of blocks a tokenless CPU store of `hashes` is completed with.
+fn cpu_fill(
+    normalizer: &mut ZmqEventNormalizer,
+    hashes: &'static [u64],
+    worker: WorkerWithDpRank,
+) -> usize {
+    stored_data(
+        normalizer
+            .normalize(tokenless_cpu(hashes), 0, worker)
+            .unwrap(),
+    )
+    .blocks
+    .len()
+}
+
+fn gpu_store(normalizer: &mut ZmqEventNormalizer, hash: u64, worker: WorkerWithDpRank) {
+    let tokens = [hash as u32, 1, 2, 3];
+    normalizer
+        .normalize(gpu_block_stored(&[hash], &tokens, 4, None), 0, worker)
+        .unwrap();
+}
+
+fn gpu_remove(normalizer: &mut ZmqEventNormalizer, hash: u64, worker: WorkerWithDpRank) {
+    normalizer
+        .normalize(raw_removed(&[hash], None), 0, worker)
+        .unwrap();
+}
+
+/// Lazy offload touches the GPU block during the async copy, so the CPU store is
+/// published before the GPU removal; it must fill. A device removal then forgets the
+/// identity.
+#[test]
+fn cpu_store_before_device_removal_fills_then_identity_is_forgotten() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let mut normalizer = ZmqEventNormalizer::new(4);
+    normalizer
+        .normalize(
+            gpu_block_stored(&[201, 202], &[1, 2, 3, 4, 5, 6, 7, 8], 4, None),
+            1,
+            worker,
+        )
+        .unwrap();
+    assert_eq!(cpu_fill(&mut normalizer, &[201], worker), 1);
+    gpu_remove(&mut normalizer, 201, worker);
+    // 202 is still on the GPU; 201 is not.
+    assert_eq!(cpu_fill(&mut normalizer, &[202], worker), 1);
+    assert_eq!(cpu_fill(&mut normalizer, &[201], worker), 0);
+    assert_eq!(normalizer.take_lower_tier_filled(), 2);
+}
+
+/// A device removal that precedes the CPU store leaves the store unfilled, which is the
+/// behavior before the fill existed.
+#[test]
+fn device_removal_before_cpu_store_leaves_it_unfilled() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let mut normalizer = ZmqEventNormalizer::new(4);
+    gpu_store(&mut normalizer, 201, worker);
+    gpu_remove(&mut normalizer, 201, worker);
+    assert_eq!(cpu_fill(&mut normalizer, &[201], worker), 0);
+}
+
+/// Removing the CPU copy says nothing about the GPU copy, so the identity stays.
+#[test]
+fn cpu_removal_keeps_device_identity() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let mut normalizer = ZmqEventNormalizer::new(4);
+    gpu_store(&mut normalizer, 201, worker);
+    assert_eq!(cpu_fill(&mut normalizer, &[201], worker), 1);
+    normalizer
+        .normalize(raw_removed(&[201], Some("CPU")), 0, worker)
+        .unwrap();
+    assert_eq!(cpu_fill(&mut normalizer, &[201], worker), 1);
+}
+
+#[test]
+fn all_blocks_cleared_drops_only_that_workers_identities() {
+    let (a, b) = (WorkerWithDpRank::new(7, 0), WorkerWithDpRank::new(8, 0));
+    let mut normalizer = ZmqEventNormalizer::new(4);
+    gpu_store(&mut normalizer, 201, a);
+    gpu_store(&mut normalizer, 201, b);
+    normalizer
+        .normalize(RawKvEvent::AllBlocksCleared, 0, a)
+        .unwrap();
+    assert_eq!(cpu_fill(&mut normalizer, &[201], a), 0);
+    assert_eq!(cpu_fill(&mut normalizer, &[201], b), 1);
+}
+
+/// Past capacity the least recently stored identity goes; a re-store refreshes it.
+#[test]
+fn re_store_refreshes_identity_position() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let mut normalizer = ZmqEventNormalizer::with_identity_capacity(4, 3);
+    for hash in [201, 202, 203] {
+        gpu_store(&mut normalizer, hash, worker);
+    }
+    gpu_store(&mut normalizer, 201, worker);
+    gpu_store(&mut normalizer, 204, worker);
+    assert_eq!(cpu_fill(&mut normalizer, &[201], worker), 1);
+    assert_eq!(cpu_fill(&mut normalizer, &[202], worker), 0);
+    assert_eq!(cpu_fill(&mut normalizer, &[203], worker), 1);
+    assert_eq!(cpu_fill(&mut normalizer, &[204], worker), 1);
+}
+
+/// A hot prefix stored early and offloaded much later still fills: device churn that is
+/// evicted again does not push it out, and neither do further stores as long as the hot
+/// block is re-stored before it becomes the oldest.
+#[test]
+fn hot_prefix_survives_churn_until_offloaded() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let mut normalizer = ZmqEventNormalizer::with_identity_capacity(4, 8);
+    gpu_store(&mut normalizer, 101, worker);
+    for i in 0..10_000u64 {
+        let hash = 1_000 + i;
+        gpu_store(&mut normalizer, hash, worker);
+        gpu_remove(&mut normalizer, hash, worker);
+    }
+    assert_eq!(cpu_fill(&mut normalizer, &[101], worker), 1);
+    // Resident churn beyond capacity, with the hot block re-stored every few stores.
+    for i in 0..1_000u64 {
+        gpu_store(&mut normalizer, 50_000 + i, worker);
+        if i % 4 == 0 {
+            gpu_store(&mut normalizer, 101, worker);
+        }
+    }
+    assert_eq!(cpu_fill(&mut normalizer, &[101], worker), 1);
+    assert!(normalizer.block_identities.map.len() <= 8);
+    assert!(normalizer.block_identities.order.len() <= 16);
+}

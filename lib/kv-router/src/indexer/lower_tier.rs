@@ -2111,14 +2111,16 @@ mod tests {
     /// `BlockStored(medium=CPU)` with only the block hash. The normalizer completes it from
     /// the device-tier store, so the CPU index learns the block, can match it from the
     /// device continuation, and the later CPU `BlockRemoved` succeeds instead of
-    /// `BlockNotFound`. Also covers the device copy being evicted before the CPU store.
+    /// `BlockNotFound`. Lazy offload keeps the GPU block in use during the copy, so the
+    /// device removal (if any) follows the CPU store; that order is covered too. A device
+    /// removal that precedes the CPU store leaves it unfilled, as before the fill existed.
     #[test]
     fn lazy_cpu_offload_store_then_remove_through_normalizer() {
         use crate::protocols::StorageTier;
         use crate::zmq_wire::ZmqEventNormalizer;
 
         let worker = WorkerWithDpRank::new(7, 0);
-        for device_removed_first in [false, true] {
+        for device_removed_after_cpu_store in [false, true] {
             let mut normalizer = ZmqEventNormalizer::new(4);
             let mut index = TestLowerTierIndex::new();
 
@@ -2137,13 +2139,6 @@ mod tests {
                 device_store.blocks.iter().map(|b| b.tokens_hash).collect();
             assert_eq!(tokens.len(), 2);
 
-            if device_removed_first {
-                let removed = normalizer
-                    .normalize(raw_removed(&[201, 202], None), 2, worker)
-                    .unwrap();
-                assert_eq!(removed.placement.tier, StorageTier::Device);
-            }
-
             for (event_id, hash) in [(3, 201), (4, 202)] {
                 let cpu = normalizer
                     .normalize(
@@ -2158,6 +2153,13 @@ mod tests {
                 index.apply_event(cpu).unwrap();
             }
 
+            if device_removed_after_cpu_store {
+                let removed = normalizer
+                    .normalize(raw_removed(&[201, 202], None), 2, worker)
+                    .unwrap();
+                assert_eq!(removed.placement.tier, StorageTier::Device);
+            }
+
             let mut continuations = FxHashMap::default();
             continuations.insert(
                 worker,
@@ -2167,7 +2169,7 @@ mod tests {
             assert_eq!(
                 hits.get(&worker),
                 Some(&2),
-                "removed first: {device_removed_first}"
+                "device removed after CPU store: {device_removed_after_cpu_store}"
             );
 
             let remove = normalizer
@@ -2182,6 +2184,32 @@ mod tests {
             let after = index.query_contiguous_hits(&tokens, &continuations);
             assert_eq!(after.get(&worker).copied().unwrap_or(0), 0);
         }
+
+        // Device removal before the CPU store: no identity, so the store stays empty and
+        // the CPU removal is BlockNotFound, exactly as without the fill.
+        let mut normalizer = ZmqEventNormalizer::new(4);
+        let mut index = TestLowerTierIndex::new();
+        normalizer
+            .normalize(raw_stored(&[201], &[1, 2, 3, 4], None, None), 1, worker)
+            .unwrap();
+        normalizer
+            .normalize(raw_removed(&[201], None), 2, worker)
+            .unwrap();
+        let cpu = normalizer
+            .normalize(raw_stored(&[201], &[], Some("CPU"), None), 3, worker)
+            .unwrap()
+            .into_router_event()
+            .unwrap();
+        index.apply_event(cpu).unwrap();
+        let remove = normalizer
+            .normalize(raw_removed(&[201], Some("CPU")), 4, worker)
+            .unwrap()
+            .into_router_event()
+            .unwrap();
+        assert!(matches!(
+            index.apply_event(remove),
+            Err(crate::protocols::KvCacheEventError::BlockNotFound)
+        ));
 
         // Without the fill (plain conversion), the same sequence ends in BlockNotFound.
         let warnings = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
