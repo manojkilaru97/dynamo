@@ -266,6 +266,7 @@ impl ZmqEventNormalizer {
             &self.warning_count,
             self.image_token_id,
         )?;
+        let is_device = event.placement.tier == StorageTier::Device;
         match (&mut event.event.data, lower_tier_hashes) {
             (KvCacheEventData::Stored(store), Some(hashes)) => {
                 if store.blocks.is_empty()
@@ -275,10 +276,8 @@ impl ZmqEventNormalizer {
                     self.lower_tier_filled += 1;
                 }
             }
-            (KvCacheEventData::Stored(store), None) => {
-                if event.placement.tier == StorageTier::Device {
-                    self.block_identities.record(worker, store);
-                }
+            (KvCacheEventData::Stored(store), None) if is_device => {
+                self.block_identities.record(worker, store);
             }
             _ => {}
         }

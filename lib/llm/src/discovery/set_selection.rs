@@ -159,7 +159,7 @@ impl SetChoiceReason {
 
 /// Rendezvous score of one candidate: lower wins. `None` for non-positive weights.
 fn rendezvous_score(key: u64, name: &str, weight: f64) -> Option<f64> {
-    if !(weight > 0.0) {
+    if weight.is_nan() || weight <= 0.0 {
         return None;
     }
     let h = xxh3_64_with_seed(name.as_bytes(), key);
@@ -203,7 +203,7 @@ pub fn rendezvous_pick(key: u64, candidates: &[(&str, f64)]) -> Option<usize> {
 pub fn weighted_random_pick(weights: &[f64]) -> Option<usize> {
     let usable = |w: f64| w > 0.0 && w.is_finite();
     let total: f64 = weights.iter().copied().filter(|w| usable(*w)).sum();
-    if !(total > 0.0) || !total.is_finite() {
+    if !total.is_finite() || total <= 0.0 {
         return None;
     }
     let mut pick = rand::rng().random_range(0.0..total);
