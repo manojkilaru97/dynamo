@@ -1821,11 +1821,10 @@ mod tests {
         coincident: usize,
     }
 
-    fn run_recovery(
-        hot: &[u64],
-        charge: f64,
-        phases: &[([(&'static str, f64); 2], u64, u64)],
-    ) -> RecoveryOutcome {
+    /// Candidate weights, decisions, and the hot keys' request period of one phase.
+    type RecoveryPhase = ([(&'static str, f64); 2], u64, u64);
+
+    fn run_recovery(hot: &[u64], charge: f64, phases: &[RecoveryPhase]) -> RecoveryOutcome {
         let d = 1.0 - 1.0 / SHARE_WINDOW;
         let tracker = ShareTracker::default();
         let mut oracle = vec![CreditOracle::default(); hot.len()];
@@ -1896,8 +1895,8 @@ mod tests {
                 if routed {
                     let winner = rendezvous_pick(key, sets).unwrap();
                     oracle[slot].demand[winner] += clamped;
-                    for s in 0..2 {
-                        oracle[slot].expected[s] += clamped * sets[s].1 / total;
+                    for (credit, (_, weight)) in oracle[slot].expected.iter_mut().zip(sets) {
+                        *credit += clamped * weight / total;
                     }
                 } else if phase == 0 {
                     outcome.heavy_in_first_phase += 1;
