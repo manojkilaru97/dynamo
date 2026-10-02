@@ -862,30 +862,13 @@ const AFFINITY_SEED: u64 = 0x5e75_e1ec_7a1f_f1a7;
 /// Domain tags so an explicit key can never collide with a message-prefix hash.
 const PROMPT_CACHE_KEY_TAG: &[u8] = b"prompt_cache_key\0";
 const SESSION_AFFINITY_TAG: &[u8] = b"session_affinity\0";
-const MESSAGES_TAG: &[u8] = b"messages/v3\0";
+const MESSAGES_TAG: &[u8] = b"messages/v4\0";
 
 fn explicit_affinity_key(tag: &[u8], value: &str) -> u64 {
     let mut hasher = Xxh3::with_seed(AFFINITY_SEED);
     hasher.update(tag);
     hasher.update(value.as_bytes());
     hasher.digest()
-}
-
-/// Serialized JSON length of `value`, without allocating the serialization.
-fn json_len<T: serde::Serialize>(value: &T) -> Option<usize> {
-    struct Count(usize);
-    impl io::Write for Count {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut count = Count(0);
-    serde_json::to_writer(&mut count, value).ok()?;
-    Some(count.0)
 }
 
 /// Text pieces of system/developer content (parts are concatenated, as both the chat
@@ -942,12 +925,14 @@ impl OpeningHasher {
         }
     }
 
-    /// A non-text part, identified by its JSON serialization (streamed, not buffered).
+    /// A non-text part, identified by the hash of its JSON serialization: one streaming
+    /// pass into a separate hasher, then a fixed-size record (tag and 8-byte digest).
     fn part<T: serde::Serialize>(&mut self, part: &T) -> Option<()> {
-        let len = json_len(part)?;
+        let mut inner = HashWriter(Xxh3::with_seed(AFFINITY_SEED));
+        serde_json::to_writer(&mut inner, part).ok()?;
         self.tag(b'P');
-        self.update(&(len as u64).to_le_bytes());
-        serde_json::to_writer(&mut self.0, part).ok()
+        self.update(&inner.0.digest().to_le_bytes());
+        Some(())
     }
 
     fn name(&mut self, name: Option<&String>) {
