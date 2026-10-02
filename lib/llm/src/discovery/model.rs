@@ -2162,6 +2162,7 @@ mod tests {
                     "affinity",
                     "share_cap_fallback",
                     "share_cap_overflow",
+                    "share_cap_revert",
                     "random",
                 ]
                 .map(|reason| selection_count(model, ns, reason))

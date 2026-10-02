@@ -134,8 +134,10 @@ pub static WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE: LazyLock<GaugeVec> = LazyLock:
     .expect("Failed to create worker_last_inter_token_latency gauge")
 });
 
-/// Multi-set worker-set selections made in affinity mode, by chosen namespace and reason
-/// (`affinity`, `share_cap_fallback`, or `random` for requests without an affinity key).
+/// Multi-set worker-set selections made in affinity mode, by chosen namespace and reason:
+/// `affinity` (rendezvous winner), `share_cap_fallback` (sticky spill),
+/// `share_cap_overflow` (heavy key moved off its over-band set), `share_cap_revert` (spilled
+/// heavy key sent back to its winner), or `random` (no affinity key).
 pub static WORKER_SET_SELECTION_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
