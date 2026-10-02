@@ -12,39 +12,55 @@
 //! unique storage keys. Every frontend makes the same choice for the same conversation
 //! without shared state, and the long-run split follows the set weights.
 //!
-//! Each frontend also keeps decayed, size-weighted load statistics (charged by
-//! [`request_charge`], a byte-count proxy for prompt size):
+//! Each frontend also keeps decayed load statistics, by size (charged by
+//! [`request_charge`], a byte-count proxy for prompt size) and by request count:
 //!
 //! 1. **Heavy keys bypass affinity.** A key is heavy only when it alone could push its
 //!    set out of band, which whole-key spilling cannot absorb. A Space-Saving table of 128
 //!    counters (with per-counter error bounds; a counter is taken over only when its larger
-//!    share is the smallest) tracks each key's decayed request count and unclamped charge.
-//!    A key becomes heavy when it has at least 8 guaranteed (decayed) requests in the window
-//!    and EITHER its guaranteed request share OR its guaranteed share of unclamped charge,
-//!    less four standard deviations of that share's sampling noise, reaches the narrowest
-//!    share band among the candidate sets (`min_i slack·min(fair_i, 1 − fair_i)`, about
-//!    0.083 for 30/60 workers and slack 0.25). It stays heavy until both shares drop below
-//!    half the band or it has fewer than 4 observations. The request share catches many
-//!    small requests; the unclamped share catches repeated very large ones (the charge clamp
-//!    below applies only to the spill statistics). Heavy keys get the default weighted
-//!    random pick (`heavy_key_random`): a key that hot is cached on every set anyway, and
-//!    random routing balances it by construction. Ordinary conversations never qualify,
-//!    also on a frontend that sees only a few dozen concurrent conversations (with 12 or
-//!    more similar conversations each carries at most about 1/12 of requests and load,
-//!    which does not exceed the band), and neither does a single large request (it has no
+//!    share is the smallest, so a key that is rare but carries much of the load keeps its
+//!    counter between requests) tracks each key's decayed request count and unclamped
+//!    charge. A key becomes heavy when EITHER its guaranteed request share (with at least 8
+//!    guaranteed decayed requests in the window) OR its guaranteed share of unclamped charge
+//!    (with at least 3), less four standard deviations of that share's sampling noise,
+//!    reaches the narrowest share band among the candidate sets
+//!    (`min_i slack·min(fair_i, 1 − fair_i)`, about 0.083 for 30/60 workers and slack 0.25).
+//!    A lopsided key, whose share of one measure is at least four times its share of the
+//!    other, is heavy from half the band: moving it barely changes the other measure, so
+//!    a few of them can push a set out of band on one measure that spilling (it moves both
+//!    measures in proportion) cannot fix without pushing the other out. A heavy key stays
+//!    heavy until both branches fail at half the thresholds and floors. The request share
+//!    catches many small requests; the unclamped share catches very large ones that repeat
+//!    as rarely as once per few hundred requests (the charge clamp below applies only to
+//!    the spill statistics). Heavy keys get the default weighted random pick
+//!    (`heavy_key_random`): a key that hot is cached on every set anyway, and random
+//!    routing balances it by construction. Ordinary conversations do not qualify, also on
+//!    a frontend that sees only a few dozen concurrent conversations (with 12 or more
+//!    similar conversations each carries at most about 1/12 of requests and load, which
+//!    does not exceed the band; at exactly 12, a rare excursion of more than four standard
+//!    deviations can still admit one), and neither does a single large request (it has no
 //!    repetitions). A heavy key that stops qualifying is routed by affinity again and must
 //!    meet the full entry threshold to re-enter.
 //! 2. **Sticky spill** for the remaining (affinity-routed) load keeps every set within
-//!    `fair ± slack·min(fair, 1 − fair)`. When the load whose rendezvous winner is set `P`
-//!    exceeds `P`'s fair share, the frontend derives a spill fraction `p` (zero until demand
-//!    exceeds the middle of the upper band by more than two standard deviations of its
-//!    sampling noise, at most `slack`) and moves exactly the keys whose [`spill_point`] is
-//!    below `p` to their second rendezvous choice (`share_cap_fallback`). Whether a key
-//!    spills, and where to, is a function of the key, the candidate set keys and `p`; `p`
-//!    depends only on the aggregate load mix, so frontends with similar traffic agree and a
-//!    conversation's turns stay on one set while `p` is stable. When a key becomes heavy,
-//!    exactly what it contributed to the current window while affinity-routed leaves the
-//!    spill statistics.
+//!    `fair ± slack·min(fair, 1 − fair)`. When the load or the requests whose rendezvous
+//!    winner is set `P` exceed `P`'s fair share, the frontend derives a spill fraction `p`
+//!    from the larger excess (zero until demand exceeds the middle of the upper band by
+//!    more than two standard deviations of its sampling noise, at most `slack`) and moves
+//!    exactly the keys whose [`spill_point`] is below `p` to their second rendezvous choice
+//!    (`share_cap_fallback`). Whether a key spills, and where to, is a function of the key,
+//!    the candidate set keys and `p`; `p` depends only on the aggregate load mix, so
+//!    frontends with similar traffic agree and a conversation's turns stay on one set while
+//!    `p` is stable. When a key becomes heavy, exactly what it contributed to the current
+//!    window while affinity-routed leaves the spill statistics.
+//! 3. **Routed-share feedback.** The demand-based `p` assumes load is spread evenly over
+//!    keys; a persistent pool of a few conversations whose spill points all exceed `slack`
+//!    defeats it. Each frontend therefore also tracks the load and requests each set
+//!    actually received, and while a set stays above its band on either (beyond sampling
+//!    noise) it raises that set's `p` beyond `slack`, up to 1 (an integral term, about the
+//!    excess per window), moving further keys in spill-point order. The boost holds while
+//!    the set is between its fair share and its band edge, and falls back once the set is
+//!    below fair share on both measures, so whole-key moves settle instead of oscillating.
+//!    A balanced workload never engages it.
 //!
 //! "Fair" is the decayed average of each set's weight share over the same window, so a
 //! worker-count change shifts the targets as gradually as the observed load and only the
@@ -53,9 +69,10 @@
 //! returns at a new size is not judged against a stale fair share.
 //!
 //! Charges in the spill statistics are clamped to 8× a decayed mean charge (seeded with a
-//! 4 KiB prior), and the guard stays idle until it has seen about 200 decisions, so one
-//! huge request or a freshly started frontend cannot swing them. Heavy-key detection uses
-//! the unclamped charge.
+//! 4 KiB prior), and the guard stays idle until it has seen about 200 decisions (heavy-key
+//! detection starts after 100, so a hot key present from the start leaves the statistics
+//! before the guard acts on them), so one huge request or a freshly started frontend
+//! cannot swing them. Heavy-key detection uses the unclamped charge.
 //!
 //! `DYN_WORKER_SET_WEIGHTS=suffix=weight,...` scales the per-worker weight of every set whose
 //! namespace ends with `suffix` (for example `tp4=2,tp2=1` to weight sets by GPUs). Entries
@@ -101,24 +118,49 @@ pub const MIN_PER_WORKER_WEIGHT: f64 = 1e-6;
 const SHARE_WINDOW: f64 = 1000.0;
 /// Decayed decisions required before the share guard may override the hashed set.
 const SHARE_MIN_SAMPLES: f64 = 200.0;
+/// Decayed decisions required before a key may be classified heavy: half the guard's
+/// warm-up, so a hot key present from the start is classified (and its load leaves the
+/// window) before the guard first acts on that load.
+const HEAVY_MIN_SAMPLES: f64 = SHARE_MIN_SAMPLES / 2.0;
 /// A recorded charge is clamped to this multiple of the decayed mean charge.
 const CHARGE_CLAMP_FACTOR: f64 = 8.0;
 /// Standard deviations of sampling noise in the demand share tolerated before spilling.
 const SPILL_NOISE_SIGMAS: f64 = 2.0;
-/// Size of the per-frontend Space-Saving heavy-key table. Any key above `1/HEAVY_KEYS`
-/// (0.8%) of recent load is guaranteed a counter, below the exit threshold.
+/// Size of the per-frontend Space-Saving heavy-key table. A counter is taken over only
+/// when its larger share (requests or unclamped charge) is the smallest in the table, and
+/// those shares sum to at most 2, so any key whose request share or charge share exceeds
+/// `2/HEAVY_KEYS` (1.6%) is guaranteed a counter. That is below the exit thresholds for
+/// bands of at least 6.3% (production: 8.3%); for narrower bands (small slack, or a small
+/// third set) detection of keys between the two is best-effort.
 const HEAVY_KEYS: usize = 128;
-/// Heavy-key thresholds. A key becomes heavy when, with at least
-/// [`HEAVY_MIN_OBSERVATIONS`] guaranteed (decayed) requests in the window, EITHER its
-/// guaranteed request share OR its guaranteed share of unclamped charge, less that
-/// share's sampling noise, reaches the narrowest share band among the candidate sets
-/// (`min_i slack·min(fair_i, 1 − fair_i)`). It stays heavy until both shares drop below
-/// half the band or its observations below half the minimum. The request share catches
-/// many small requests; the unclamped charge share catches repeated very large ones
-/// (the charge clamp applies only to the spill statistics). A single large request cannot
-/// qualify: it has no repetitions.
+/// Heavy-key thresholds (see [`ShareState::heavy_status`]). A key becomes heavy when its
+/// guaranteed request share (with at least [`HEAVY_MIN_OBSERVATIONS`] guaranteed decayed
+/// requests) or its guaranteed share of unclamped charge (with at least
+/// [`HEAVY_MIN_CHARGE_OBSERVATIONS`]), less that share's sampling noise, reaches the
+/// narrowest share band among the candidate sets (`min_i slack·min(fair_i, 1 − fair_i)`),
+/// or reaches [`HEAVY_LOPSIDED_BAND_FRACTION`] of it while its other share is at most
+/// `1/HEAVY_LOPSIDED_RATIO` of this one. It stays heavy until every branch fails at
+/// [`HEAVY_EXIT_LOAD_RATIO`] times the thresholds and observation floors (and half the
+/// lopsidedness ratio). The request share catches many small requests; the unclamped
+/// charge share catches repeated very large ones (the charge clamp applies only to the
+/// spill statistics), and its lower floor admits keys that repeat only once per few
+/// hundred requests (the noise term already rejects a lone outlier, whose charge
+/// collapses the effective sample size). A single large request cannot qualify.
 const HEAVY_MIN_OBSERVATIONS: f64 = 8.0;
+const HEAVY_MIN_CHARGE_OBSERVATIONS: f64 = 3.0;
 const HEAVY_EXIT_LOAD_RATIO: f64 = 0.5;
+/// Lopsided keys: a key that carries far more of one measure than of the other moves
+/// that measure without moving the other, which whole-key spilling (it moves both in
+/// proportion) cannot balance; a few such keys can push a set out of band on one measure
+/// while the other is in band. They are heavy from half the band.
+const HEAVY_LOPSIDED_BAND_FRACTION: f64 = 0.5;
+const HEAVY_LOPSIDED_RATIO: f64 = 4.0;
+/// Integral gain of the routed-share feedback: a set whose routed share stays above its
+/// band (plus noise) raises its spill fraction by this times the excess per decision (so
+/// by about the excess per window).
+const SPILL_BOOST_GAIN: f64 = 1.0 / SHARE_WINDOW;
+/// A shrinking boost below this is dropped (it decays roughly exponentially otherwise).
+const SPILL_BOOST_FLOOR: f64 = 1e-3;
 /// Standard deviations of sampling noise subtracted from a key's request or charge share
 /// before it is compared with the band, so keys sitting right at the band (for example 12
 /// equal conversations against a 1/12 band) do not become heavy on a random excursion.
@@ -359,15 +401,24 @@ fn share_band(fair: f64, slack: f64) -> f64 {
     slack * fair.min(1.0 - fair)
 }
 
-/// [`HEAVY_NOISE_SIGMAS`] standard deviations of a decayed weighted share `share`, from
-/// the effective number of samples `sum² / sq_sum` of the weights behind it.
-fn share_noise(share: f64, sum: f64, sq_sum: f64) -> f64 {
-    let effective = if sq_sum > 0.0 {
+/// Effective number of samples `sum² / sq_sum` of decayed weights (0 without samples).
+fn effective_samples(sum: f64, sq_sum: f64) -> f64 {
+    if sq_sum > 0.0 {
         sum * sum / sq_sum
     } else {
         0.0
-    };
-    HEAVY_NOISE_SIGMAS * (share * (1.0 - share) / effective.max(1.0)).sqrt()
+    }
+}
+
+/// Standard deviation of a share estimated from `samples` effective samples (at least 1).
+fn sampling_sd(share: f64, samples: f64) -> f64 {
+    (share * (1.0 - share) / samples.max(1.0)).sqrt()
+}
+
+/// [`HEAVY_NOISE_SIGMAS`] standard deviations of a decayed weighted share `share`, from
+/// the effective number of samples of the weights behind it.
+fn share_noise(share: f64, sum: f64, sq_sum: f64) -> f64 {
+    HEAVY_NOISE_SIGMAS * sampling_sd(share, effective_samples(sum, sq_sum))
 }
 
 /// The narrowest share band among the candidates in `ranking`: the most load one key may
@@ -393,10 +444,12 @@ fn spill_fraction(demand_share: f64, fair: f64, band: f64, slack: f64, noise: f6
     (1.0 - target / demand_share).clamp(0.0, slack)
 }
 
-/// One Space-Saving counter of the heavy-key table. `raw` (unclamped charge) and `count`
-/// over-estimate the key's decayed charge and request count by at most `raw_err` and
-/// `count_err` (the counter's values when the key took the slot over), so `raw - raw_err`
-/// and `count - count_err` are guaranteed lower bounds.
+/// One Space-Saving counter of the heavy-key table. `raw_err` and `count_err` are the
+/// counter's unclamped charge and request count when the key took the slot over, so
+/// `raw - raw_err` and `count - count_err` (what the key sent since) are guaranteed lower
+/// bounds of its decayed charge and request count. `raw` and `count` are upper bounds only
+/// while the key has held the slot since it first appeared (eviction is by the larger
+/// share, not by the smallest count).
 #[derive(Debug, Clone)]
 struct HeavyCounter {
     key: u64,
@@ -407,15 +460,22 @@ struct HeavyCounter {
     /// Current heavy status (with hysteresis).
     heavy: bool,
     /// What this key contributed to the current fair-share window while affinity-routed,
-    /// decayed with the window: the demand it credited to each set (its winner at the
-    /// time; a winner change keeps the earlier set's credit), the fair load it credited to
-    /// each candidate set (at the weights of the time), both by set-key hash, and its
-    /// squared charges and decisions. Cleared on window reset and once subtracted when the
-    /// key becomes heavy.
+    /// decayed with the window: the clamped charge and the requests it credited to each
+    /// set as demand (its winner at the time; a winner change keeps the earlier set's
+    /// credit), the fair charge and fair requests it credited to each candidate set (at
+    /// the weights of the time), the charge and requests it placed on each set (winner or
+    /// spill target), all by set-key hash, and its squared charges, decisions and squared
+    /// decision weights. Cleared on window reset and once subtracted when the key becomes
+    /// heavy.
     window_demand: Vec<(u64, f64)>,
     window_expected: Vec<(u64, f64)>,
+    window_demand_requests: Vec<(u64, f64)>,
+    window_expected_requests: Vec<(u64, f64)>,
+    window_routed: Vec<(u64, f64)>,
+    window_routed_requests: Vec<(u64, f64)>,
     window_sq: f64,
     window_decisions: f64,
+    window_decisions_sq: f64,
 }
 
 /// Add `amount` to `id`'s entry of a per-set credit list.
@@ -437,16 +497,34 @@ impl HeavyCounter {
             heavy: false,
             window_demand: Vec::new(),
             window_expected: Vec::new(),
+            window_demand_requests: Vec::new(),
+            window_expected_requests: Vec::new(),
+            window_routed: Vec::new(),
+            window_routed_requests: Vec::new(),
             window_sq: 0.0,
             window_decisions: 0.0,
+            window_decisions_sq: 0.0,
         }
     }
 
     fn clear_window_credit(&mut self) {
-        self.window_demand.clear();
-        self.window_expected.clear();
+        for list in self.credit_lists_mut() {
+            list.clear();
+        }
         self.window_sq = 0.0;
         self.window_decisions = 0.0;
+        self.window_decisions_sq = 0.0;
+    }
+
+    fn credit_lists_mut(&mut self) -> [&mut Vec<(u64, f64)>; 6] {
+        [
+            &mut self.window_demand,
+            &mut self.window_expected,
+            &mut self.window_demand_requests,
+            &mut self.window_expected_requests,
+            &mut self.window_routed,
+            &mut self.window_routed_requests,
+        ]
     }
 }
 
@@ -477,10 +555,21 @@ struct ShareState {
     window_decisions: f64,
     window_sum: f64,
     window_sq_sum: f64,
+    /// Decayed sum of squared decision weights of the window (request-share noise).
+    window_decisions_sq: f64,
     /// Load times each set's weight share at decision time: the decayed "fair" load.
     expected: HashMap<String, f64>,
     /// Load whose rendezvous winner was the set.
     demand: HashMap<String, f64>,
+    /// The same two for request counts (each decision weighs 1).
+    expected_requests: HashMap<String, f64>,
+    demand_requests: HashMap<String, f64>,
+    /// Load and requests the set actually received (winner or spill target), for the
+    /// routed-share feedback.
+    routed: HashMap<String, f64>,
+    routed_requests: HashMap<String, f64>,
+    /// Per-set integral term added to the spill fraction (routed-share feedback).
+    boost: HashMap<String, f64>,
     /// Candidate set keys of the last recorded decision.
     candidates: Vec<String>,
     /// Source of the heavy-key weighted random picks (seeded in tests, so they are
@@ -501,8 +590,14 @@ impl Default for ShareState {
             window_decisions: 0.0,
             window_sum: 0.0,
             window_sq_sum: 0.0,
+            window_decisions_sq: 0.0,
             expected: HashMap::new(),
             demand: HashMap::new(),
+            expected_requests: HashMap::new(),
+            demand_requests: HashMap::new(),
+            routed: HashMap::new(),
+            routed_requests: HashMap::new(),
+            boost: HashMap::new(),
             candidates: Vec::new(),
             rng: if cfg!(test) {
                 StdRng::seed_from_u64(0x5eed)
@@ -523,8 +618,14 @@ impl ShareState {
         self.window_decisions = 0.0;
         self.window_sum = 0.0;
         self.window_sq_sum = 0.0;
+        self.window_decisions_sq = 0.0;
         self.expected.clear();
         self.demand.clear();
+        self.expected_requests.clear();
+        self.demand_requests.clear();
+        self.routed.clear();
+        self.routed_requests.clear();
+        self.boost.clear();
         for c in &mut self.heavy {
             c.clear_window_credit();
         }
@@ -543,24 +644,49 @@ impl ShareState {
     }
 
     /// Heavy status of `counter` against the narrowest candidate band `band`, applying
-    /// hysteresis to its previous status. Never heavy before warm-up.
+    /// hysteresis to its previous status. Never heavy before [`HEAVY_MIN_SAMPLES`].
+    ///
+    /// Two branches, one per measure: the request share (observation floor
+    /// [`HEAVY_MIN_OBSERVATIONS`]) and the unclamped charge share (floor
+    /// [`HEAVY_MIN_CHARGE_OBSERVATIONS`]). A branch qualifies when its guaranteed share,
+    /// less [`HEAVY_NOISE_SIGMAS`] of sampling noise, reaches the band, or reaches
+    /// [`HEAVY_LOPSIDED_BAND_FRACTION`] of it while the key's other share (upper bound) is
+    /// at most `1/HEAVY_LOPSIDED_RATIO` of it. A heavy key stays heavy while some branch
+    /// qualifies at [`HEAVY_EXIT_LOAD_RATIO`] times the thresholds and floors, without the
+    /// noise term and with half the ratio.
     fn heavy_status(&self, counter: &HeavyCounter, band: f64) -> bool {
-        if self.decisions < SHARE_MIN_SAMPLES || self.raw_sum <= 0.0 || band <= 0.0 {
+        if self.decisions < HEAVY_MIN_SAMPLES || self.raw_sum <= 0.0 || band <= 0.0 {
             return false;
         }
         let observations = counter.count - counter.count_err;
         let requests = observations / self.decisions;
         let charge = (counter.raw - counter.raw_err) / self.raw_sum;
-        if counter.heavy {
-            observations >= HEAVY_MIN_OBSERVATIONS / 2.0
-                && (requests >= HEAVY_EXIT_LOAD_RATIO * band
-                    || charge >= HEAVY_EXIT_LOAD_RATIO * band)
+        let requests_max = counter.count / self.decisions;
+        let charge_max = counter.raw / self.raw_sum;
+        let (scale, ratio, requests_noise, charge_noise) = if counter.heavy {
+            (HEAVY_EXIT_LOAD_RATIO, HEAVY_LOPSIDED_RATIO / 2.0, 0.0, 0.0)
         } else {
-            let requests_noise = share_noise(requests, self.decisions, self.decisions_sq);
-            let charge_noise = share_noise(charge, self.raw_sum, self.raw_sq_sum);
-            observations >= HEAVY_MIN_OBSERVATIONS
-                && (requests - requests_noise >= band || charge - charge_noise >= band)
-        }
+            (
+                1.0,
+                HEAVY_LOPSIDED_RATIO,
+                share_noise(requests, self.decisions, self.decisions_sq),
+                share_noise(charge, self.raw_sum, self.raw_sq_sum),
+            )
+        };
+        let branch = |share: f64, noise: f64, other_max: f64, floor: f64| {
+            let share = share - noise;
+            observations >= scale * floor
+                && (share >= scale * band
+                    || (share >= scale * HEAVY_LOPSIDED_BAND_FRACTION * band
+                        && other_max * ratio <= share))
+        };
+        branch(requests, requests_noise, charge_max, HEAVY_MIN_OBSERVATIONS)
+            || branch(
+                charge,
+                charge_noise,
+                requests_max,
+                HEAVY_MIN_CHARGE_OBSERVATIONS,
+            )
     }
 
     /// How much a counter is worth keeping in the table: its larger share.
@@ -588,17 +714,52 @@ impl ShareState {
         charge.min(CHARGE_CLAMP_FACTOR * mean)
     }
 
-    /// Sampling standard deviation (times [`SPILL_NOISE_SIGMAS`]) of a charge-weighted
-    /// share of the window. The effective sample size `sum² / sq_sum` is floored at
-    /// `window_decisions / CHARGE_CLAMP_FACTOR`, its bound under the charge clamp.
-    fn share_noise(&self, share: f64) -> f64 {
-        let floor = self.window_decisions / CHARGE_CLAMP_FACTOR;
-        let effective = if self.window_sq_sum > 0.0 {
-            (self.window_sum * self.window_sum / self.window_sq_sum).max(floor)
-        } else {
-            floor
+    /// Spill fraction of the keys whose rendezvous winner is `candidates[preferred]`: the
+    /// larger of the charge-demand and request-demand fractions ([`spill_fraction`], each
+    /// with its own sampling noise, at most `slack`), plus the set's routed-share boost,
+    /// at most 1. Zero before warm-up.
+    fn spill_p(
+        &self,
+        candidates: &[(&str, f64)],
+        ranking: &[usize],
+        preferred: usize,
+        slack: f64,
+    ) -> f64 {
+        if ranking.len() < 2 || self.window_decisions < SHARE_MIN_SAMPLES {
+            return 0.0;
+        }
+        let name = candidates[preferred].0;
+        let total = |map: &HashMap<String, f64>| -> f64 {
+            ranking
+                .iter()
+                .map(|&i| Self::stat(map, candidates[i].0))
+                .sum()
         };
-        SPILL_NOISE_SIGMAS * (share * (1.0 - share) / effective.max(1.0)).sqrt()
+        let mut p: f64 = 0.0;
+        for (expected, demand, samples) in [
+            (&self.expected, &self.demand, self.charge_samples()),
+            (
+                &self.expected_requests,
+                &self.demand_requests,
+                self.request_samples(),
+            ),
+        ] {
+            let (expected_total, demand_total) = (total(expected), total(demand));
+            if expected_total <= 0.0 || demand_total <= 0.0 {
+                continue;
+            }
+            let fair = Self::stat(expected, name) / expected_total;
+            let share = Self::stat(demand, name) / demand_total;
+            let noise = SPILL_NOISE_SIGMAS * sampling_sd(share, samples);
+            p = p.max(spill_fraction(
+                share,
+                fair,
+                share_band(fair, slack),
+                slack,
+                noise,
+            ));
+        }
+        (p + Self::stat(&self.boost, name)).min(1.0)
     }
 
     /// Affinity decision for a non-heavy `key`; pure in the state.
@@ -610,31 +771,91 @@ impl ShareState {
         slack: f64,
     ) -> (usize, SetChoiceReason) {
         let preferred = ranking[0];
-        let affinity = (preferred, SetChoiceReason::Affinity);
-        if ranking.len() < 2 || self.window_decisions < SHARE_MIN_SAMPLES {
-            return affinity;
-        }
-        let name = |i: usize| candidates[i].0;
-        let total =
-            |map: &HashMap<String, f64>| ranking.iter().map(|&i| Self::stat(map, name(i))).sum();
-        let (expected, demand): (f64, f64) = (total(&self.expected), total(&self.demand));
-        if expected <= 0.0 || demand <= 0.0 {
-            return affinity;
-        }
-        let fair = Self::stat(&self.expected, name(preferred)) / expected;
-        let demand_share = Self::stat(&self.demand, name(preferred)) / demand;
-        let p = spill_fraction(
-            demand_share,
-            fair,
-            share_band(fair, slack),
-            slack,
-            self.share_noise(demand_share),
-        );
-        if spill_point(key) < p {
+        if ranking.len() >= 2
+            && spill_point(key) < self.spill_p(candidates, ranking, preferred, slack)
+        {
             (ranking[1], SetChoiceReason::ShareCapFallback)
         } else {
-            affinity
+            (preferred, SetChoiceReason::Affinity)
         }
+    }
+
+    /// Routed-share feedback (integral term of the spill fraction). For each candidate
+    /// set, compare the shares of the window's clamped charge and requests it actually
+    /// received (winner or spill target) with its fair shares: while either exceeds the
+    /// upper band edge by more than two standard deviations of sampling noise, the set's
+    /// boost grows by [`SPILL_BOOST_GAIN`] times the excess; while both are below fair, it
+    /// shrinks by the gain times the larger shortfall; in between it holds, so a set
+    /// brought back into band by whole-key spills stays there instead of oscillating.
+    /// Sticky spill alone moves at most `slack` of a set's keys, which persistent pools
+    /// whose keys have high spill points defeat; the boost moves more, still in spill-point
+    /// order. Acting only outside the band leaves room for the two measures to disagree
+    /// (a set over on charge spilling into one that is near its edge on requests).
+    fn update_boost(&mut self, candidates: &[(&str, f64)], ranking: &[usize], slack: f64) {
+        if ranking.len() < 2 || self.window_decisions < SHARE_MIN_SAMPLES {
+            return;
+        }
+        let total = |map: &HashMap<String, f64>| -> f64 {
+            ranking
+                .iter()
+                .map(|&i| Self::stat(map, candidates[i].0))
+                .sum()
+        };
+        let measures = [
+            (&self.routed, &self.expected, self.charge_samples()),
+            (
+                &self.routed_requests,
+                &self.expected_requests,
+                self.request_samples(),
+            ),
+        ];
+        let totals = measures.map(|(got, fair, _)| (total(got), total(fair)));
+        for &i in ranking {
+            let name = candidates[i].0;
+            let (mut over, mut above_fair) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for ((got, fair, samples), (got_total, fair_total)) in measures.iter().zip(totals) {
+                if got_total <= 0.0 || fair_total <= 0.0 {
+                    continue;
+                }
+                let share = Self::stat(got, name) / got_total;
+                let fair = Self::stat(fair, name) / fair_total;
+                let noise = SPILL_NOISE_SIGMAS * sampling_sd(share, *samples);
+                over = over.max(share - fair - share_band(fair, slack) - noise);
+                above_fair = above_fair.max(share - fair);
+            }
+            let step = if over > 0.0 {
+                over
+            } else if above_fair < 0.0 {
+                above_fair
+            } else {
+                continue;
+            };
+            match self.boost.get_mut(name) {
+                Some(b) => {
+                    *b = (*b + SPILL_BOOST_GAIN * step).min(1.0);
+                    if step < 0.0 && *b < SPILL_BOOST_FLOOR {
+                        self.boost.remove(name);
+                    }
+                }
+                None if step > 0.0 => {
+                    self.boost
+                        .insert(name.to_string(), (SPILL_BOOST_GAIN * step).min(1.0));
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Effective sample size of the window's charge shares, floored at its bound under
+    /// the charge clamp.
+    fn charge_samples(&self) -> f64 {
+        effective_samples(self.window_sum, self.window_sq_sum)
+            .max(self.window_decisions / CHARGE_CLAMP_FACTOR)
+    }
+
+    /// Effective sample size of the window's request shares.
+    fn request_samples(&self) -> f64 {
+        effective_samples(self.window_decisions, self.window_decisions_sq)
     }
 
     fn decay(&mut self) -> f64 {
@@ -648,7 +869,15 @@ impl ShareState {
         self.window_decisions *= decay;
         self.window_sum *= decay;
         self.window_sq_sum *= decay * decay;
-        for map in [&mut self.expected, &mut self.demand] {
+        self.window_decisions_sq *= decay * decay;
+        for map in [
+            &mut self.expected,
+            &mut self.demand,
+            &mut self.expected_requests,
+            &mut self.demand_requests,
+            &mut self.routed,
+            &mut self.routed_requests,
+        ] {
             for v in map.values_mut() {
                 *v *= decay;
             }
@@ -661,23 +890,30 @@ impl ShareState {
             c.count_err *= decay;
             c.window_sq *= decay * decay;
             c.window_decisions *= decay;
-            for (_, credit) in c.window_demand.iter_mut().chain(&mut c.window_expected) {
-                *credit *= decay;
+            c.window_decisions_sq *= decay * decay;
+            for list in c.credit_lists_mut() {
+                for (_, credit) in list.iter_mut() {
+                    *credit *= decay;
+                }
             }
         }
         decay
     }
 
-    /// Record one keyed decision. Affinity-routed requests also feed the fair-share
-    /// window; heavy-key requests (weighted random) do not.
+    /// Record one keyed decision that placed the request on `candidates[chosen]`.
+    /// Affinity-routed requests also feed the fair-share window (demand, fair share and
+    /// placement); heavy-key requests (weighted random) do not.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         key: u64,
         candidates: &[(&str, f64)],
         ranking: &[usize],
+        chosen: usize,
         affinity_routed: bool,
         charge: f64,
         band: f64,
+        slack: f64,
     ) {
         let raw = charge;
         let charge = self.clamp_charge(raw);
@@ -687,36 +923,41 @@ impl ShareState {
         self.charge_sum += charge;
         self.raw_sum += raw;
         self.raw_sq_sum += raw * raw;
+        let total_weight: f64 = ranking.iter().map(|&i| candidates[i].1).sum();
+        let bump = |map: &mut HashMap<String, f64>, name: &str, amount: f64| match map.get_mut(name)
+        {
+            Some(v) => *v += amount,
+            None => {
+                map.insert(name.to_string(), amount);
+            }
+        };
         let slot = self.record_heavy(key, raw);
         if affinity_routed {
+            let (winner, target) = (candidates[ranking[0]].0, candidates[chosen].0);
             let counter = &mut self.heavy[slot];
-            add_credit(
-                &mut counter.window_demand,
-                set_id(candidates[ranking[0]].0),
-                charge,
-            );
+            add_credit(&mut counter.window_demand, set_id(winner), charge);
+            add_credit(&mut counter.window_demand_requests, set_id(winner), 1.0);
+            add_credit(&mut counter.window_routed, set_id(target), charge);
+            add_credit(&mut counter.window_routed_requests, set_id(target), 1.0);
             counter.window_sq += charge * charge;
             counter.window_decisions += 1.0;
+            counter.window_decisions_sq += 1.0;
             self.window_decisions += 1.0;
+            self.window_decisions_sq += 1.0;
             self.window_sum += charge;
             self.window_sq_sum += charge * charge;
-            let total_weight: f64 = ranking.iter().map(|&i| candidates[i].1).sum();
             for &i in ranking {
-                let fair_load = charge * candidates[i].1 / total_weight;
-                *self
-                    .expected
-                    .entry(candidates[i].0.to_string())
-                    .or_insert(0.0) += fair_load;
-                add_credit(
-                    &mut self.heavy[slot].window_expected,
-                    set_id(candidates[i].0),
-                    fair_load,
-                );
+                let (name, share) = (candidates[i].0, candidates[i].1 / total_weight);
+                bump(&mut self.expected, name, charge * share);
+                bump(&mut self.expected_requests, name, share);
+                let counter = &mut self.heavy[slot];
+                add_credit(&mut counter.window_expected, set_id(name), charge * share);
+                add_credit(&mut counter.window_expected_requests, set_id(name), share);
             }
-            *self
-                .demand
-                .entry(candidates[ranking[0]].0.to_string())
-                .or_insert(0.0) += charge;
+            bump(&mut self.demand, winner, charge);
+            bump(&mut self.demand_requests, winner, 1.0);
+            bump(&mut self.routed, target, charge);
+            bump(&mut self.routed_requests, target, 1.0);
         }
         // An affinity-routed key is not heavy (the caller clears a stale flag first), so a
         // flagged counter never holds window credit. On entry its credit leaves.
@@ -727,6 +968,7 @@ impl ShareState {
             self.heavy[slot].clear_window_credit();
         }
         self.heavy[slot].heavy = status;
+        self.update_boost(candidates, ranking, slack);
     }
 
     /// Space-Saving update for `key`; returns its counter's slot.
@@ -758,10 +1000,12 @@ impl ShareState {
     }
 
     /// A key that just became heavy stops counting toward the fair-share window: remove
-    /// exactly what it contributed to the current window (the demand it credited to each
-    /// set, the fair load it credited to each set, its squared charges and its decisions),
-    /// so its past turns do not keep the other keys spilling. Nothing is removed from a
-    /// set that did not receive the credit.
+    /// exactly what it contributed to the current window (the charge and requests it
+    /// credited to each set as demand, the fair charge and fair requests it credited to
+    /// each set, the charge and requests it placed on each set, its squared charges, its
+    /// decisions and their squares), so its past turns neither keep the other keys
+    /// spilling nor drive the routed-share feedback. Nothing is removed from a set that
+    /// did not receive the credit.
     fn forget_window_load(
         &mut self,
         credit: &HeavyCounter,
@@ -770,21 +1014,30 @@ impl ShareState {
     ) {
         let mut load = 0.0;
         for &i in ranking {
-            let id = set_id(candidates[i].0);
+            let (name, id) = (candidates[i].0, set_id(candidates[i].0));
             let find =
                 |list: &[(u64, f64)]| list.iter().find(|(s, _)| *s == id).map_or(0.0, |(_, c)| *c);
-            let (demand, expected) = (find(&credit.window_demand), find(&credit.window_expected));
-            load += demand;
-            if let Some(d) = self.demand.get_mut(candidates[i].0) {
-                *d = (*d - demand).max(0.0);
-            }
-            if let Some(e) = self.expected.get_mut(candidates[i].0) {
-                *e = (*e - expected).max(0.0);
+            load += find(&credit.window_demand);
+            for (map, list) in [
+                (&mut self.demand, &credit.window_demand),
+                (&mut self.expected, &credit.window_expected),
+                (&mut self.demand_requests, &credit.window_demand_requests),
+                (
+                    &mut self.expected_requests,
+                    &credit.window_expected_requests,
+                ),
+                (&mut self.routed, &credit.window_routed),
+                (&mut self.routed_requests, &credit.window_routed_requests),
+            ] {
+                if let Some(v) = map.get_mut(name) {
+                    *v = (*v - find(list)).max(0.0);
+                }
             }
         }
         self.window_sum = (self.window_sum - load).max(0.0);
         self.window_sq_sum = (self.window_sq_sum - credit.window_sq).max(0.0);
         self.window_decisions = (self.window_decisions - credit.window_decisions).max(0.0);
+        self.window_decisions_sq = (self.window_decisions_sq - credit.window_decisions_sq).max(0.0);
     }
 
     /// Clear a stale heavy flag of `key` before an affinity-routed request is recorded.
@@ -850,9 +1103,11 @@ impl ShareTracker {
             affinity.key,
             candidates,
             &ranking,
+            choice.0,
             affinity_routed,
             affinity.charge,
             band,
+            slack,
         );
         Some(choice)
     }
@@ -870,7 +1125,8 @@ impl ShareTracker {
         self.state.lock().decide(key, candidates, &ranking, slack)
     }
 
-    /// Current sticky-spill fraction for set `idx` of `candidates` (test hook).
+    /// Current spill fraction (demand terms plus boost) for set `idx` of `candidates`
+    /// (test hook).
     #[cfg(test)]
     pub(crate) fn spill_fraction_of(
         &self,
@@ -878,22 +1134,8 @@ impl ShareTracker {
         candidates: &[(&str, f64)],
         slack: f64,
     ) -> f64 {
-        let state = self.state.lock();
-        let total = |map: &HashMap<String, f64>| -> f64 {
-            candidates
-                .iter()
-                .map(|(n, _)| ShareState::stat(map, n))
-                .sum()
-        };
-        let fair = ShareState::stat(&state.expected, candidates[idx].0) / total(&state.expected);
-        let demand = ShareState::stat(&state.demand, candidates[idx].0) / total(&state.demand);
-        spill_fraction(
-            demand,
-            fair,
-            share_band(fair, slack),
-            slack,
-            state.share_noise(demand),
-        )
+        let ranking: Vec<usize> = (0..candidates.len()).collect();
+        self.state.lock().spill_p(candidates, &ranking, idx, slack)
     }
 
     /// Share of the window's affinity demand whose rendezvous winner is `name` (test hook).
@@ -1488,6 +1730,8 @@ mod tests {
                 (rendezvous_pick(key, &SETS), SetChoiceReason::Affinity)
             );
         }
+        // The routed-share feedback never engaged.
+        assert!(tracker.state.lock().boost.is_empty());
     }
 
     /// Deterministic splitmix64 stream for the simulation tests.
@@ -1612,9 +1856,14 @@ mod tests {
         counter: Option<HeavyCounter>,
         demand: [f64; 2],
         expected: [f64; 2],
+        demand_requests: [f64; 2],
+        expected_requests: [f64; 2],
+        routed: [f64; 2],
+        routed_requests: [f64; 2],
         sum: f64,
         sq_sum: f64,
         decisions: f64,
+        decisions_sq: f64,
     }
 
     impl WindowSnapshot {
@@ -1634,20 +1883,28 @@ mod tests {
                 counter: state.heavy.iter().find(|c| c.key == hot).cloned(),
                 demand: pair(&state.demand),
                 expected: pair(&state.expected),
+                demand_requests: pair(&state.demand_requests),
+                expected_requests: pair(&state.expected_requests),
+                routed: pair(&state.routed),
+                routed_requests: pair(&state.routed_requests),
                 sum: state.window_sum,
                 sq_sum: state.window_sq_sum,
                 decisions: state.window_decisions,
+                decisions_sq: state.window_decisions_sq,
             }
         }
 
-        /// From `self` (before the hot key's request) to `post`: every window quantity
-        /// decayed, plus this request if affinity-routed, minus exactly the key's window
-        /// credit (also decayed, plus this request if it was credited).
+        /// From `self` (before the hot key's request, placed on `sets[chosen]`) to `post`:
+        /// every window quantity decayed, plus this request if affinity-routed, minus
+        /// exactly the key's window credit (also decayed, plus this request if it was
+        /// credited).
+        #[allow(clippy::too_many_arguments)]
         fn assert_credit_removed(
             &self,
             post: &Self,
             hot: u64,
             sets: &[(&str, f64); 2],
+            chosen: usize,
             routed: bool,
             charge: f64,
         ) {
@@ -1674,21 +1931,62 @@ mod tests {
             // A flagged counter holds no credit; a winner change keeps earlier credit.
             let mut credit_load = 0.0;
             for (s, (name, _)) in sets.iter().enumerate() {
-                let added = if routed && s == winner { charge } else { 0.0 };
-                let credit_demand = credit_of(&counter.window_demand, name) * d + added;
-                credit_load += credit_demand;
-                close(
-                    post.demand[s],
-                    self.demand[s] * d + added - credit_demand,
-                    &format!("demand[{s}]"),
-                );
-                let credit_expected =
-                    credit_of(&counter.window_expected, name) * d + request * fair(s);
-                close(
-                    post.expected[s],
-                    self.expected[s] * d + request * fair(s) - credit_expected,
-                    &format!("expected[{s}]"),
-                );
+                let won = if routed && s == winner { 1.0 } else { 0.0 };
+                let placed = if routed && s == chosen { 1.0 } else { 0.0 };
+                let weight_share = sets[s].1 / total;
+                // (window quantity, its snapshot before, the counter's credit list, what
+                // this request added to both)
+                let quantities = [
+                    (
+                        "demand",
+                        post.demand[s],
+                        self.demand[s],
+                        &counter.window_demand,
+                        won * charge,
+                    ),
+                    (
+                        "expected",
+                        post.expected[s],
+                        self.expected[s],
+                        &counter.window_expected,
+                        request * fair(s),
+                    ),
+                    (
+                        "demand_requests",
+                        post.demand_requests[s],
+                        self.demand_requests[s],
+                        &counter.window_demand_requests,
+                        won,
+                    ),
+                    (
+                        "expected_requests",
+                        post.expected_requests[s],
+                        self.expected_requests[s],
+                        &counter.window_expected_requests,
+                        request * weight_share,
+                    ),
+                    (
+                        "routed",
+                        post.routed[s],
+                        self.routed[s],
+                        &counter.window_routed,
+                        placed * charge,
+                    ),
+                    (
+                        "routed_requests",
+                        post.routed_requests[s],
+                        self.routed_requests[s],
+                        &counter.window_routed_requests,
+                        placed,
+                    ),
+                ];
+                for (what, after, before, list, added) in quantities {
+                    let credit = credit_of(list, name) * d + added;
+                    if what == "demand" {
+                        credit_load += credit;
+                    }
+                    close(after, before * d + added - credit, &format!("{what}[{s}]"));
+                }
             }
             let credit_sq = counter.window_sq * d * d + request * charge * charge;
             let credit_decisions = counter.window_decisions * d + request;
@@ -1706,6 +2004,12 @@ mod tests {
                 post.decisions,
                 self.decisions * d + request - credit_decisions,
                 "window_decisions",
+            );
+            let credit_decisions_sq = counter.window_decisions_sq * d * d + request;
+            close(
+                post.decisions_sq,
+                self.decisions_sq * d * d + request - credit_decisions_sq,
+                "window_decisions_sq",
             );
         }
     }
@@ -1762,7 +2066,7 @@ mod tests {
                 if !forgot || (phase.reset_before && step == 0) {
                     continue;
                 }
-                pre.assert_credit_removed(&post, hot, &phase.sets, routed, clamped);
+                pre.assert_credit_removed(&post, hot, &phase.sets, idx, routed, clamped);
                 outcome.entries_checked += 1;
             }
         }
@@ -1828,11 +2132,14 @@ mod tests {
         );
     }
 
-    /// Per-set credit oracle for one key, maintained independently of the tracker.
+    /// Per-set credit oracle for one key, maintained independently of the tracker: demand
+    /// and fair credit by charge and by request count.
     #[derive(Clone, Copy, Default)]
     struct CreditOracle {
         demand: [f64; 2],
         expected: [f64; 2],
+        demand_requests: [f64; 2],
+        expected_requests: [f64; 2],
     }
 
     /// Hot keys sending one request each per `period` requests at `charge` times the
@@ -1886,29 +2193,46 @@ mod tests {
                                 .find(|(id, _)| *id == set_id(name))
                                 .map_or(0.0, |(_, c)| *c)
                         };
-                        let (dem, exp) = counter.as_ref().map_or((0.0, 0.0), |c| {
-                            (find(&c.window_demand), find(&c.window_expected))
+                        let credits = counter.as_ref().map_or([0.0; 4], |c| {
+                            [
+                                find(&c.window_demand),
+                                find(&c.window_expected),
+                                find(&c.window_demand_requests),
+                                find(&c.window_expected_requests),
+                            ]
                         });
-                        assert!(
-                            (dem - o.demand[s]).abs() < 1e-6,
-                            "demand credit {dem} != {}",
-                            o.demand[s]
-                        );
-                        assert!(
-                            (exp - o.expected[s]).abs() < 1e-6,
-                            "fair credit {exp} != {}",
-                            o.expected[s]
-                        );
+                        let oracle = [
+                            o.demand[s],
+                            o.expected[s],
+                            o.demand_requests[s],
+                            o.expected_requests[s],
+                        ];
+                        for (what, (credit, expected)) in
+                            ["demand", "fair", "demand request", "fair request"]
+                                .iter()
+                                .zip(credits.iter().zip(oracle))
+                        {
+                            assert!(
+                                (credit - expected).abs() < 1e-6,
+                                "{what} credit {credit} != {expected}"
+                            );
+                        }
                     }
                 }
-                let (_, reason) = tracker
+                let (chosen, reason) = tracker
                     .choose(SetAffinity::new(key, request_charge), sets, DEFAULT_SLACK)
                     .unwrap();
                 let routed = reason != SetChoiceReason::HeavyKeyRandom;
                 for o in &mut oracle {
-                    for s in 0..2 {
-                        o.demand[s] *= d;
-                        o.expected[s] *= d;
+                    for list in [
+                        &mut o.demand,
+                        &mut o.expected,
+                        &mut o.demand_requests,
+                        &mut o.expected_requests,
+                    ] {
+                        for credit in list.iter_mut() {
+                            *credit *= d;
+                        }
                     }
                 }
                 if slot >= hot.len() {
@@ -1923,9 +2247,12 @@ mod tests {
                 }
                 if routed {
                     let winner = rendezvous_pick(key, sets).unwrap();
-                    oracle[slot].demand[winner] += clamped;
-                    for (credit, (_, weight)) in oracle[slot].expected.iter_mut().zip(sets) {
-                        *credit += clamped * weight / total;
+                    let o = &mut oracle[slot];
+                    o.demand[winner] += clamped;
+                    o.demand_requests[winner] += 1.0;
+                    for (s, (_, weight)) in sets.iter().enumerate() {
+                        o.expected[s] += clamped * weight / total;
+                        o.expected_requests[s] += weight / total;
                     }
                 } else if phase == 0 {
                     outcome.heavy_in_first_phase += 1;
@@ -1938,7 +2265,7 @@ mod tests {
                     if routed && oracle[slot].demand[1 - winner] > 0.0 {
                         outcome.coincident += 1;
                     }
-                    pre.assert_credit_removed(&post, key, sets, routed, clamped);
+                    pre.assert_credit_removed(&post, key, sets, chosen, routed, clamped);
                     // Independent check: the window dropped by exactly the oracle's credit.
                     for s in 0..2 {
                         let added = if routed && Some(s) == rendezvous_pick(key, sets) {
@@ -1953,17 +2280,32 @@ mod tests {
                             0.0
                         };
                         let expected_drop = pre.expected[s] * d + fair - post.expected[s];
+                        let won = if routed && Some(s) == rendezvous_pick(key, sets) {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        let demand_requests_drop =
+                            pre.demand_requests[s] * d + won - post.demand_requests[s];
+                        let fair_requests = if routed { sets[s].1 / total } else { 0.0 };
+                        let expected_requests_drop = pre.expected_requests[s] * d + fair_requests
+                            - post.expected_requests[s];
                         let o = oracle[slot];
-                        assert!(
-                            (demand_drop - o.demand[s]).abs() < 1e-6,
-                            "demand drop {demand_drop} != {}",
-                            o.demand[s]
-                        );
-                        assert!(
-                            (expected_drop - o.expected[s]).abs() < 1e-6,
-                            "fair drop {expected_drop} != {}",
-                            o.expected[s]
-                        );
+                        for (what, drop, credit) in [
+                            ("demand", demand_drop, o.demand[s]),
+                            ("fair", expected_drop, o.expected[s]),
+                            ("demand request", demand_requests_drop, o.demand_requests[s]),
+                            (
+                                "fair request",
+                                expected_requests_drop,
+                                o.expected_requests[s],
+                            ),
+                        ] {
+                            assert!(
+                                (drop - credit).abs() < 1e-6,
+                                "{what} drop {drop} != {credit}"
+                            );
+                        }
                     }
                     oracle[slot] = CreditOracle::default();
                     outcome.entries.push(i);
@@ -2082,29 +2424,130 @@ mod tests {
             .unwrap()
     }
 
-    /// R8-1 (rare huge requests): a key sending 400 KiB once per 100 requests amid 4 KiB
-    /// requests carries half of all prompt bytes. Its clamped charge is small, but its
-    /// unclamped charge share makes it heavy, so TP4 stays in band by charge.
-    #[test]
-    fn rare_huge_requests_make_a_key_heavy() {
-        let hot = unspillable_tp4_cache_key();
+    /// Feed `n` decisions of background (distinct keys, `background` charges) in which,
+    /// from decision 5000 on, `hot` sends one request per `every` at `hot_charge`. Returns
+    /// the charge tally from decision 20000 on, the decision of the hot key's first
+    /// heavy-key request, and whether every hot request after that was heavy.
+    fn run_periodic_hot_key(
+        hot: u64,
+        every: u64,
+        hot_charge: f64,
+        n: u64,
+        mut background: impl FnMut() -> f64,
+    ) -> (Tally, Option<u64>, bool) {
         let tracker = ShareTracker::default();
         let mut tally = Tally::default();
-        for i in 0..50_000u64 {
-            let (key, charge) = if i >= 5_000 && i.is_multiple_of(100) {
-                (hot, 400.0 * 1024.0)
+        let (mut detected, mut stayed) = (None, true);
+        for i in 0..n {
+            let is_hot = i >= 5_000 && i.is_multiple_of(every);
+            let (key, charge) = if is_hot {
+                (hot, hot_charge)
             } else {
-                (mixed(i + 80_000_000), 4096.0)
+                (mixed(i + 80_000_000), background())
             };
-            let (idx, _) = tracker
+            let (idx, reason) = tracker
                 .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
                 .unwrap();
+            if is_hot {
+                let heavy = reason == SetChoiceReason::HeavyKeyRandom;
+                if heavy && detected.is_none() {
+                    detected = Some(i);
+                } else if detected.is_some() && !heavy {
+                    stayed = false;
+                }
+            }
             if i >= 20_000 {
                 tally.add(idx, charge);
             }
         }
+        (tally, detected, stayed)
+    }
+
+    /// R8-1 / R9-1 (rare huge requests): a key sending one request per 100-300 requests
+    /// at 100-300 times the 4 KiB background carries a third to a half of all prompt
+    /// bytes. Its clamped charge is small and it repeats less often than the request
+    /// branch's 8-observation floor (about 0.8% of requests) allows, but the charge
+    /// branch's floor of 3 admits it, so TP4 stays in band by charge.
+    #[test]
+    fn rare_huge_requests_make_a_key_heavy() {
+        let hot = unspillable_tp4_cache_key();
+        for (every, hot_charge) in [
+            (100u64, 400.0 * 1024.0),
+            (150, 100.0 * 4096.0),
+            (200, 400.0 * 1024.0),
+            (300, 300.0 * 4096.0),
+        ] {
+            let (tally, detected, stayed) =
+                run_periodic_hot_key(hot, every, hot_charge, 50_000, || 4096.0);
+            let context = format!("{hot_charge} bytes once per {every} requests");
+            let latency = detected.map(|d| d - 5_000);
+            // Detected within 8 of its requests (observed: 5-7).
+            assert!(
+                latency.is_some_and(|l| l <= 8 * every),
+                "{context}: detected after {latency:?}"
+            );
+            assert!(stayed, "{context}: left the heavy state");
+            tally.assert_in_band(0.0, &context);
+        }
+    }
+
+    /// R9-5: rare huge requests amid heavy-tailed (lognormal sigma 1.5 and 2) background.
+    /// The charge-share noise grows with the background's spread, which delays detection;
+    /// the delay stays bounded, the key stays heavy once detected, and its set stays in
+    /// band from then on (by unclamped charge, with a tolerance for the background's own
+    /// heavy tail).
+    #[test]
+    fn rare_huge_requests_are_detected_under_lognormal_background() {
+        let hot = unspillable_tp4_cache_key();
+        for sigma in [1.5, 2.0] {
+            let mean = 2000.0 * (sigma * sigma / 2.0f64).exp();
+            // Observed latencies: 1039 / 1402 decisions (1 in 33), 850 / 1000 (1 in 150).
+            for (every, factor, bound) in [(33u64, 10.0, 2_500u64), (150, 100.0, 2_000)] {
+                let mut rng = Rng(0x9e5 + every);
+                let (tally, detected, stayed) =
+                    run_periodic_hot_key(hot, every, factor * mean, 50_000, || rng.charge(sigma));
+                let context = format!("sigma {sigma}: {factor}x mean once per {every}");
+                let latency = detected.map(|d| d - 5_000);
+                assert!(
+                    latency.is_some_and(|l| l <= bound),
+                    "{context}: detected after {latency:?}"
+                );
+                assert!(stayed, "{context}: left the heavy state");
+                tally.assert_in_band(0.03, &context);
+            }
+        }
+    }
+
+    /// R9-4: a counter is taken over by the smallest larger share, not the smallest count.
+    /// Under count-only eviction a key repeating once per 300 requests among distinct
+    /// background keys is evicted between its requests (128 counters turn over every
+    /// ~128 new keys), never accumulates observations, and is never heavy.
+    #[test]
+    fn rare_heavy_key_keeps_its_counter() {
+        let hot = unspillable_tp4_cache_key();
+        let tracker = ShareTracker::default();
+        let (mut kept, mut checks) = (0, 0);
+        for i in 0..20_000u64 {
+            let is_hot = i >= 5_000 && i.is_multiple_of(300);
+            let (key, charge) = if is_hot {
+                (hot, 300.0 * 4096.0)
+            } else {
+                (mixed(i + 81_000_000), 4096.0)
+            };
+            tracker
+                .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
+                .unwrap();
+            if i > 6_000 && i % 300 == 150 {
+                let state = tracker.state.lock();
+                kept += usize::from(state.heavy.iter().any(|c| c.key == hot));
+                checks += 1;
+            }
+        }
+        assert_eq!(
+            kept, checks,
+            "the hot key lost its counter between requests"
+        );
         assert!(tracker.is_heavy(hot, &SETS, DEFAULT_SLACK));
-        tally.assert_in_band(0.0, "400 KiB once per 100 requests");
     }
 
     /// R8-1 (many small requests): a key sending 15% of requests at 0.05x the mean charge
@@ -2130,6 +2573,268 @@ mod tests {
         }
         assert!(tracker.is_heavy(hot, &SETS, DEFAULT_SLACK));
         requests.assert_in_band(0.0, "15% of requests at 0.05x charge");
+    }
+
+    // -- R9-2 / R9-3: balance on requests and bytes, and routed-share feedback --
+
+    /// Production set keys (`worker_set_key` strings) at 30/60 workers.
+    const PROD_TP4: &str = r#"["dynamo_tp4","backend","generate","chat|completions","aggregated"]"#;
+    const PROD_TP2: &str = r#"["dynamo_tp2","backend","generate","chat|completions","aggregated"]"#;
+    const PROD_SETS: [(&str, f64); 2] = [(PROD_TP4, 30.0), (PROD_TP2, 60.0)];
+
+    fn cache_key(name: &str) -> u64 {
+        chat_request_affinity_key(&[], Some(name), None).unwrap()
+    }
+
+    /// Charge and request tallies of one run.
+    #[derive(Default)]
+    struct Tallies {
+        charge: Tally,
+        requests: Tally,
+    }
+
+    impl Tallies {
+        fn add(&mut self, idx: usize, charge: f64) {
+            self.charge.add(idx, charge);
+            self.requests.add(idx, 1.0);
+        }
+
+        fn assert_in_band(&self, tolerance: f64, context: &str) {
+            self.charge
+                .assert_in_band(tolerance, &format!("{context} (charge)"));
+            self.requests
+                .assert_in_band(tolerance, &format!("{context} (requests)"));
+        }
+    }
+
+    /// R9-2 (sol): four `prompt_cache_key`s that all prefer TP4 under the production set
+    /// keys each send 7.5% of requests at 0.05x the background charge. None reaches the
+    /// band alone, and together they would put 53% of requests on TP4. Their spill points
+    /// (0.42-0.93) leave no spill fraction that fixes requests without pushing TP4's
+    /// bytes below band, so they must be classified (lopsided: request share above half
+    /// the band at a 14x smaller charge share) and spread by the weighted random pick.
+    #[test]
+    fn several_small_keys_keep_requests_and_bytes_in_band() {
+        let hot: Vec<u64> = [0, 2, 5, 9]
+            .iter()
+            .map(|n| cache_key(&format!("session-{n}")))
+            .collect();
+        assert!(
+            hot.iter()
+                .all(|k| rendezvous_pick(*k, &PROD_SETS) == Some(0))
+        );
+        for sigma in [0.0, 1.0] {
+            let tracker = ShareTracker::default();
+            let mut rng = Rng(0x92 + sigma as u64);
+            let mut tallies = Tallies::default();
+            for i in 0..40_000u64 {
+                let slot = (i % 40) as usize;
+                let (key, charge) = if slot < 12 {
+                    (hot[slot % 4], 0.05 * 4096.0)
+                } else {
+                    let charge = if sigma > 0.0 {
+                        rng.charge(sigma)
+                    } else {
+                        4096.0
+                    };
+                    (mixed(i + 82_000_000), charge)
+                };
+                let (idx, _) = tracker
+                    .choose(SetAffinity::new(key, charge), &PROD_SETS, DEFAULT_SLACK)
+                    .unwrap();
+                if i >= 20_000 {
+                    tallies.add(idx, charge);
+                }
+            }
+            for k in &hot {
+                assert!(
+                    tracker.is_heavy(*k, &PROD_SETS, DEFAULT_SLACK),
+                    "sigma {sigma}"
+                );
+            }
+            tallies.assert_in_band(0.0, &format!("4 small keys, sigma {sigma}"));
+        }
+    }
+
+    /// R9-2: many TP4-preferring conversations that send small requests often (30% of
+    /// requests from 200 keys at 0.3x charge) overload TP4 on requests (53%) while its
+    /// bytes stay in band (39%). No key is heavy; the request-count demand drives the
+    /// sticky spill, which a charge-only controller would leave idle.
+    #[test]
+    fn request_count_imbalance_drives_the_spill() {
+        let chatty: Vec<u64> = (0..u64::MAX)
+            .map(mixed)
+            .filter(|k| rendezvous_pick(*k, &SETS) == Some(0))
+            .take(200)
+            .collect();
+        let tracker = ShareTracker::default();
+        let mut rng = Rng(0xc4a7);
+        let mut tallies = Tallies::default();
+        let mut spills = 0;
+        for i in 0..40_000u64 {
+            let (key, charge) = if i % 10 < 3 {
+                (chatty[(rng.next_u64() % 200) as usize], 0.3 * 4096.0)
+            } else {
+                (mixed(i + 83_000_000), 4096.0)
+            };
+            let (idx, reason) = tracker
+                .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
+                .unwrap();
+            assert_ne!(reason, SetChoiceReason::HeavyKeyRandom);
+            if i >= 20_000 {
+                tallies.add(idx, charge);
+                spills += usize::from(reason == SetChoiceReason::ShareCapFallback);
+            }
+        }
+        assert!(spills > 0);
+        tallies.assert_in_band(0.0, "chatty TP4 conversations");
+    }
+
+    /// A persistent pool: `keys` conversations of equal expected size (per-request
+    /// lognormal `sigma` noise around 4 KiB, no turnover), each request from a uniformly
+    /// random conversation through one of `frontends` trackers. Returns the tallies of
+    /// the last third, the fraction of requests in the last third whose set differs from
+    /// the conversation's previous request, and the number of heavy-key requests.
+    fn persistent_pool(
+        keys: &[u64],
+        sets: &[(&str, f64); 2],
+        frontends: usize,
+        requests: u64,
+        sigma: f64,
+        seed: u64,
+    ) -> (Tallies, f64, usize) {
+        let mut rng = Rng(seed);
+        let trackers: Vec<ShareTracker> = (0..frontends).map(|_| ShareTracker::default()).collect();
+        let mut last = vec![usize::MAX; keys.len()];
+        let mut tallies = Tallies::default();
+        let (mut changes, mut heavy) = (0usize, 0usize);
+        let tail = requests - requests / 3;
+        for i in 0..requests {
+            let c = (rng.next_u64() % keys.len() as u64) as usize;
+            let charge = 4096.0 * (sigma * rng.normal()).exp();
+            let frontend = (rng.next_u64() % frontends as u64) as usize;
+            let (idx, reason) = trackers[frontend]
+                .choose(SetAffinity::new(keys[c], charge), sets, DEFAULT_SLACK)
+                .unwrap();
+            heavy += usize::from(reason == SetChoiceReason::HeavyKeyRandom);
+            if i >= tail {
+                tallies.add(idx, charge);
+                changes += usize::from(idx != last[c]);
+            }
+            last[c] = idx;
+        }
+        (tallies, changes as f64 / (requests / 3) as f64, heavy)
+    }
+
+    /// R9-3 (sol): 12 persistent equal conversations with `prompt_cache_key`s session-282
+    /// to session-293 under the production set keys. Seven prefer TP4 (58% of load), and
+    /// every one of their spill points exceeds the slack, so the sticky spill alone never
+    /// moves one. The routed-share feedback raises TP4's spill fraction past them until
+    /// TP4 is back in band, then holds: the pool settles (no set changes in the last
+    /// third) and nobody is heavy.
+    #[test]
+    fn persistent_pool_converges_into_band() {
+        let sol: Vec<u64> = (282..294)
+            .map(|n| cache_key(&format!("session-{n}")))
+            .collect();
+        let tp4 = sol
+            .iter()
+            .filter(|k| rendezvous_pick(**k, &PROD_SETS) == Some(0))
+            .count();
+        assert_eq!(tp4, 7);
+        assert!(
+            sol.iter()
+                .filter(|k| rendezvous_pick(**k, &PROD_SETS) == Some(0))
+                .all(|k| spill_point(*k) > DEFAULT_SLACK)
+        );
+        for sigma in [0.0, 0.5] {
+            let (tallies, changes, heavy) =
+                persistent_pool(&sol, &PROD_SETS, 1, 40_000, sigma, 0x282);
+            let context = format!("sol's 12 conversations, sigma {sigma}");
+            assert_eq!(heavy, 0, "{context}");
+            assert!(changes < 0.001, "{context}: {changes} set changes");
+            tallies.assert_in_band(0.01, &context);
+        }
+    }
+
+    /// R9-3: the boost lifts TP4's spill fraction past the slack while sol's persistent
+    /// pool keeps TP4 above its band, and falls back to nothing once the traffic turns
+    /// into many balanced keys (TP4 is then below its fair share), so it leaves no
+    /// residual spill behind.
+    #[test]
+    fn boost_rises_past_slack_and_falls_back() {
+        let sol: Vec<u64> = (282..294)
+            .map(|n| cache_key(&format!("session-{n}")))
+            .collect();
+        let tracker = ShareTracker::default();
+        let mut rng = Rng(0xb0057);
+        for _ in 0..30_000u64 {
+            let key = sol[(rng.next_u64() % 12) as usize];
+            tracker
+                .choose(SetAffinity::new(key, 4096.0), &PROD_SETS, DEFAULT_SLACK)
+                .unwrap();
+        }
+        let p = tracker.spill_fraction_of(0, &PROD_SETS, DEFAULT_SLACK);
+        assert!(p > DEFAULT_SLACK, "p {p}");
+        for i in 0..30_000u64 {
+            tracker
+                .choose(
+                    SetAffinity::new(mixed(i + 84_000_000), 4096.0),
+                    &PROD_SETS,
+                    DEFAULT_SLACK,
+                )
+                .unwrap();
+        }
+        assert!(tracker.state.lock().boost.is_empty());
+        assert_eq!(tracker.spill_fraction_of(0, &PROD_SETS, DEFAULT_SLACK), 0.0);
+    }
+
+    /// R9-3: persistent pools of 12 and 24 conversations over several key sets (each
+    /// drawn so that one set is out of band by rendezvous alone) converge into band.
+    #[test]
+    fn persistent_pools_converge_for_several_key_sets() {
+        for n in [12usize, 24] {
+            let mut tried = 0;
+            for seed in 0..200u64 {
+                let keys: Vec<u64> = (0..n as u64).map(|k| mixed(seed * 1_000 + k + 7)).collect();
+                let tp4 = keys
+                    .iter()
+                    .filter(|k| rendezvous_pick(**k, &SETS) == Some(0))
+                    .count() as f64
+                    / n as f64;
+                let band = share_band(1.0 / 3.0, DEFAULT_SLACK);
+                if (tp4 - 1.0 / 3.0).abs() <= band {
+                    continue;
+                }
+                let (tallies, changes, heavy) = persistent_pool(&keys, &SETS, 1, 40_000, 0.5, seed);
+                let context = format!("{n} conversations, seed {seed}, tp4 by hashing {tp4:.3}");
+                assert_eq!(heavy, 0, "{context}");
+                assert!(changes < 0.005, "{context}: {changes} set changes");
+                tallies.assert_in_band(0.01, &context);
+                tried += 1;
+                if tried == 4 {
+                    break;
+                }
+            }
+            assert_eq!(tried, 4, "{n} conversations: too few unbalanced key sets");
+        }
+    }
+
+    /// R9-3: the same persistent pool behind 30 independent frontends converges too, and
+    /// the frontends agree: a conversation keeps its set from one request to the next
+    /// (whichever frontend serves it) on almost every request of the last third. Twelve
+    /// equal conversations sit exactly at the 1/12 band, so over 30 frontends x 10k
+    /// decisions a rare (about 4.7 sigma) excursion can classify one conversation heavy on
+    /// one frontend, where it then stays (exit is at half the band); that is bounded here.
+    #[test]
+    fn persistent_pool_converges_across_thirty_frontends() {
+        let sol: Vec<u64> = (282..294)
+            .map(|n| cache_key(&format!("session-{n}")))
+            .collect();
+        let (tallies, changes, heavy) = persistent_pool(&sol, &PROD_SETS, 30, 300_000, 0.5, 0x30);
+        assert!(heavy < 300_000 / 200, "{heavy} heavy-key requests");
+        assert!(changes < 0.01, "{changes} set changes");
+        tallies.assert_in_band(0.01, "30 frontends");
     }
 
     /// The subtraction bug moved the hot key's whole history out of its winner's demand,
@@ -2173,9 +2878,10 @@ mod tests {
             hot,
             &[
                 phase(3, 8.0, 8_000),
-                // 1 in 200 requests at 8x: about 3.9% of load, below half the band, so it
-                // exits and is affinity-routed (credited) until it heats up again.
-                phase(200, 8.0, 8_000),
+                // 1 in 400 requests at 8x: about 2% of load, below a quarter of the band
+                // (the lopsided exit), so it exits and is affinity-routed (credited) until
+                // it heats up again.
+                phase(400, 8.0, 8_000),
                 phase(10, 8.0, 6_000),
             ],
         );
@@ -2627,12 +3333,21 @@ mod tests {
         }
     }
 
-    /// The guard stays idle while a fresh frontend has few samples.
+    /// The guard stays idle while a fresh frontend has few samples (even though all of
+    /// its load prefers TP4), and no key is heavy before [`HEAVY_MIN_SAMPLES`].
     #[test]
     fn guard_waits_for_warm_up() {
         let tracker = ShareTracker::default();
+        let tp4_keys = (0..u64::MAX)
+            .map(mixed)
+            .filter(|k| rendezvous_pick(*k, &SETS) == Some(0));
+        for key in tp4_keys.take(SHARE_MIN_SAMPLES as usize) {
+            let (idx, reason) = tracker.choose(unit(key), &SETS, DEFAULT_SLACK).unwrap();
+            assert_eq!((idx, reason), (0, SetChoiceReason::Affinity));
+        }
+        let tracker = ShareTracker::default();
         let hot = key_preferring(TP4, |_| true);
-        for _ in 0..(SHARE_MIN_SAMPLES as usize) {
+        for _ in 0..(HEAVY_MIN_SAMPLES as usize) {
             let (idx, reason) = tracker.choose(unit(hot), &SETS, DEFAULT_SLACK).unwrap();
             assert_eq!((idx, reason), (0, SetChoiceReason::Affinity));
         }
