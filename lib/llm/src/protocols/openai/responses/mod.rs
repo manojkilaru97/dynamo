@@ -69,6 +69,12 @@ pub struct NvCreateResponse {
     #[serde(skip)]
     #[schema(ignore)]
     pub(crate) reasoning_effort_override: Option<ChatReasoningEffort>,
+
+    /// `chat_template_kwargs` (alias `chat_template_args`), passed to the chat
+    /// template as on Chat Completions (for example `enable_thinking`).
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) chat_template_kwargs: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 impl<'de> Deserialize<'de> for NvCreateResponse {
@@ -97,11 +103,19 @@ impl<'de> Deserialize<'de> for NvCreateResponse {
             .map(serde_json::from_value)
             .transpose()
             .map_err(D::Error::custom)?;
+        let chat_template_kwargs = ["chat_template_kwargs", "chat_template_args"]
+            .into_iter()
+            .filter_map(|key| value.as_object_mut().and_then(|object| object.remove(key)))
+            .rfind(|value| !value.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(D::Error::custom)?;
         let inner = serde_json::from_value(value).map_err(D::Error::custom)?;
         Ok(Self {
             inner,
             nvext,
             reasoning_effort_override,
+            chat_template_kwargs,
         })
     }
 }
@@ -901,7 +915,7 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
             },
             common: Default::default(),
             nvext: resp.nvext,
-            chat_template_args: None,
+            chat_template_args: resp.chat_template_kwargs,
             thinking: None,
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
@@ -1324,6 +1338,7 @@ mod tests {
                 ..Default::default()
             }),
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         }
     }
 
@@ -1411,6 +1426,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1456,6 +1472,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1536,6 +1553,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1578,6 +1596,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1622,6 +1641,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1671,6 +1691,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1711,6 +1732,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1746,6 +1768,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1789,6 +1812,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1851,6 +1875,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1924,6 +1949,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1982,6 +2008,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -2038,6 +2065,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -2086,6 +2114,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -2152,6 +2181,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -2232,6 +2262,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -2306,6 +2337,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
         let messages = &chat_req.inner.messages;
@@ -2376,6 +2408,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
         let messages = &chat_req.inner.messages;
@@ -2443,6 +2476,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
         let messages = &chat_req.inner.messages;
@@ -2501,6 +2535,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
         let messages = &chat_req.inner.messages;
@@ -2541,6 +2576,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -2751,6 +2787,26 @@ thinking
                 .and_then(|args| args.get("enable_thinking")),
             Some(&serde_json::json!(true))
         );
+    }
+
+    #[test]
+    fn test_chat_template_kwargs_reach_chat_completion() {
+        for key in ["chat_template_kwargs", "chat_template_args"] {
+            let req: NvCreateResponse = serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "input": "hi",
+                key: {"enable_thinking": false}
+            }))
+            .unwrap();
+            let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+            assert_eq!(
+                chat.chat_template_args
+                    .as_ref()
+                    .and_then(|args| args.get("enable_thinking")),
+                Some(&serde_json::json!(false)),
+                "{key}"
+            );
+        }
     }
 
     #[test]

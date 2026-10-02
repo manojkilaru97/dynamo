@@ -4758,6 +4758,7 @@ mod tests {
             },
             nvext: None,
             reasoning_effort_override: None,
+            chat_template_kwargs: None,
         }
     }
 
