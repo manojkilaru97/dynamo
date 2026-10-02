@@ -134,12 +134,13 @@ pub static WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE: LazyLock<GaugeVec> = LazyLock:
     .expect("Failed to create worker_last_inter_token_latency gauge")
 });
 
-/// Worker-set selections made with a conversation affinity key, by chosen namespace and reason.
+/// Multi-set worker-set selections made in affinity mode, by chosen namespace and reason
+/// (`affinity`, `share_cap_fallback`, or `random` for requests without an affinity key).
 pub static WORKER_SET_SELECTION_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
             "dynamo_frontend_worker_set_selection_total",
-            "Worker-set selections for requests with a conversation affinity key",
+            "Worker-set selections in affinity mode, by chosen namespace and reason",
         ),
         &["model", "namespace", "reason"],
     )

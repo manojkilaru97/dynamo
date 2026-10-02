@@ -849,8 +849,22 @@ impl Model {
         self.select_worker_set_for(None, extract)
     }
 
-    /// [`Self::select_worker_set_with`] with an optional conversation affinity key.
+    /// [`Self::select_worker_set_with`] with an optional conversation affinity key, using
+    /// the process-wide [`SetSelectionConfig::global`].
     fn select_worker_set_for<T, F>(&self, affinity_key: Option<u64>, extract: F) -> Option<T>
+    where
+        F: Fn(&WorkerSet) -> Option<T>,
+    {
+        self.select_worker_set_for_with(SetSelectionConfig::global(), affinity_key, extract)
+    }
+
+    /// [`Self::select_worker_set_for`] with an explicit selection config.
+    fn select_worker_set_for_with<T, F>(
+        &self,
+        config: &SetSelectionConfig,
+        affinity_key: Option<u64>,
+        extract: F,
+    ) -> Option<T>
     where
         F: Fn(&WorkerSet) -> Option<T>,
     {
@@ -858,14 +872,16 @@ impl Model {
         // eligibility, so a concurrent add/remove can't make us treat a
         // namespace as complete while routing to a set that lost a peer. It also
         // avoids re-entering the DashMap mid-iteration, which can deadlock.
-        let snapshot: Vec<Arc<WorkerSet>> = self
+        // The unique storage key identifies a set for affinity hashing and share
+        // tracking; several sets may share one namespace.
+        let snapshot: Vec<(String, Arc<WorkerSet>)> = self
             .worker_sets
             .iter()
-            .map(|entry| entry.value().clone())
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
 
         // Namespaces whose worker set is complete, evaluated against the snapshot.
-        let mut namespaces: Vec<&str> = snapshot.iter().map(|ws| ws.namespace()).collect();
+        let mut namespaces: Vec<&str> = snapshot.iter().map(|(_, ws)| ws.namespace()).collect();
         namespaces.sort_unstable();
         namespaces.dedup();
         let ready_namespaces: std::collections::HashSet<&str> = namespaces
@@ -873,8 +889,8 @@ impl Model {
             .filter(|ns| {
                 let in_ns: Vec<Arc<WorkerSet>> = snapshot
                     .iter()
-                    .filter(|ws| ws.namespace() == *ns)
-                    .cloned()
+                    .filter(|(_, ws)| ws.namespace() == *ns)
+                    .map(|(_, ws)| ws.clone())
                     .collect();
                 self.evaluate_namespace(&in_ns).ready
             })
@@ -882,7 +898,7 @@ impl Model {
 
         // Fast path: single set (same zero-worker filtering as the multi-set path below)
         if snapshot.len() == 1 {
-            let ws = &snapshot[0];
+            let ws = &snapshot[0].1;
             if ws.worker_count() == 0 || !ready_namespaces.contains(ws.namespace()) {
                 return None;
             }
@@ -893,14 +909,15 @@ impl Model {
         // a namespace whose worker set is incomplete.
         // In-process models (no discovery watcher) return count=1, so they always participate.
         // Discovery models with count=0 have no available workers and are skipped.
-        let eligible: Vec<(T, usize, &str)> = snapshot
+        let eligible: Vec<(T, &str, f64, &str)> = snapshot
             .iter()
-            .filter_map(|ws| {
+            .filter_map(|(key, ws)| {
                 let count = ws.worker_count();
                 if count == 0 || !ready_namespaces.contains(ws.namespace()) {
                     return None;
                 }
-                extract(ws).map(|val| (val, count, ws.namespace()))
+                let weight = config.set_weight(ws.namespace(), count);
+                extract(ws).map(|val| (val, key.as_str(), weight, ws.namespace()))
             })
             .collect();
 
@@ -909,15 +926,10 @@ impl Model {
         }
 
         if eligible.len() == 1 {
-            return eligible.into_iter().next().map(|(val, _, _)| val);
+            return eligible.into_iter().next().map(|(val, ..)| val);
         }
 
-        let config = SetSelectionConfig::global();
-        let weighted: Vec<(&str, f64)> = eligible
-            .iter()
-            .map(|(_, count, ns)| (*ns, config.set_weight(ns, *count)))
-            .collect();
-
+        let weighted: Vec<(&str, f64)> = eligible.iter().map(|(_, k, w, _)| (*k, *w)).collect();
         let chosen = match (config.mode, affinity_key) {
             (SetSelectionMode::Affinity, Some(key)) => {
                 self.set_shares.choose(key, &weighted, config.slack)
@@ -929,14 +941,16 @@ impl Model {
             }
         };
         let (idx, reason) = chosen?;
-        if affinity_key.is_some() {
+        // Only affinity mode reports decisions (keyless requests as `random`), so the
+        // default path keeps its historical behavior and emits nothing.
+        if config.mode == SetSelectionMode::Affinity {
             crate::http::service::metrics::record_worker_set_selection(
                 &self.name,
-                weighted[idx].0,
+                eligible[idx].3,
                 reason.as_label(),
             );
         }
-        eligible.into_iter().nth(idx).map(|(val, _, _)| val)
+        eligible.into_iter().nth(idx).map(|(val, ..)| val)
     }
 }
 
@@ -2119,4 +2133,198 @@ mod tests {
             "only an incomplete namespace remains: not ready to serve"
         );
     }
+
+    // -- Worker-set selection policy (DYN_WORKER_SET_SELECTION) --
+
+    use crate::discovery::set_selection::rendezvous_pick;
+
+    fn affinity_config(slack: f64) -> SetSelectionConfig {
+        SetSelectionConfig {
+            mode: SetSelectionMode::Affinity,
+            slack,
+            weights: Vec::new(),
+        }
+    }
+
+    fn selection_count(model: &str, namespace: &str, reason: &str) -> u64 {
+        crate::http::service::metrics::WORKER_SET_SELECTION_COUNTER
+            .with_label_values(&[model, namespace, reason])
+            .get()
+    }
+
+    fn total_selections(model: &str, namespaces: &[&str]) -> u64 {
+        namespaces
+            .iter()
+            .flat_map(|ns| {
+                ["affinity", "share_cap_fallback", "random"]
+                    .map(|reason| selection_count(model, ns, reason))
+            })
+            .sum()
+    }
+
+    fn pick_mdcsum(model: &Model, config: &SetSelectionConfig, key: Option<u64>) -> String {
+        model
+            .select_worker_set_for_with(config, key, |ws| Some(ws.mdcsum().to_string()))
+            .expect("a set must be selected")
+    }
+
+    fn mixed(key: u64) -> u64 {
+        key.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
+
+    #[test]
+    fn affinity_skips_zero_worker_set_without_tracking() {
+        let name = "affinity-zero-worker";
+        let model = Model::new(name.to_string());
+        let (empty, _tx1) = make_worker_set_with_count("ns-tp4", "mdc-tp4", vec![]);
+        let (live, _tx2) = make_worker_set_with_count("ns-tp2", "mdc-tp2", vec![1, 2]);
+        model.add_worker_set("ns-tp4".to_string(), empty);
+        model.add_worker_set("ns-tp2".to_string(), live);
+
+        let config = affinity_config(DEFAULT_TEST_SLACK);
+        for key in 0..200 {
+            assert_eq!(pick_mdcsum(&model, &config, Some(mixed(key))), "mdc-tp2");
+        }
+        assert_eq!(model.set_shares.observed_total(), 0.0);
+        assert_eq!(total_selections(name, &["ns-tp4", "ns-tp2"]), 0);
+    }
+
+    #[test]
+    fn affinity_skips_unready_namespace_without_tracking() {
+        let name = "affinity-unready";
+        let model = Model::new(name.to_string());
+        let (good, _tx1) = make_worker_set_with_count("good", "mdc-good", vec![1]);
+        let (bad, _tx2) = ws_with_type(
+            "bad",
+            "mdc-bad",
+            WorkerType::Decode,
+            vec![vec![WorkerType::Prefill]],
+            vec![2, 3, 4],
+        );
+        model.add_worker_set("good".to_string(), good);
+        model.add_worker_set("bad".to_string(), bad);
+        assert!(!model.is_workers_ready("bad"));
+
+        let config = affinity_config(DEFAULT_TEST_SLACK);
+        for key in 0..200 {
+            assert_eq!(pick_mdcsum(&model, &config, Some(mixed(key))), "mdc-good");
+        }
+        assert_eq!(model.set_shares.observed_total(), 0.0);
+        assert_eq!(total_selections(name, &["good", "bad"]), 0);
+    }
+
+    #[test]
+    fn affinity_key_is_stable_across_calls() {
+        let name = "affinity-stable";
+        let model = Model::new(name.to_string());
+        let (tp4, _tx1) = make_worker_set_with_count("ns-tp4", "mdc-tp4", vec![1]);
+        let (tp2, _tx2) = make_worker_set_with_count("ns-tp2", "mdc-tp2", vec![2, 3]);
+        model.add_worker_set("key-tp4".to_string(), tp4);
+        model.add_worker_set("key-tp2".to_string(), tp2);
+
+        // Generous slack: this test is about determinism, not the share guard.
+        let config = affinity_config(1.0);
+        let sets = [("key-tp4", 1.0), ("key-tp2", 2.0)];
+        let mut calls = 0;
+        for key in 0..200 {
+            let key = mixed(key);
+            let expected = if rendezvous_pick(key, &sets) == Some(0) {
+                "mdc-tp4"
+            } else {
+                "mdc-tp2"
+            };
+            for _ in 0..5 {
+                assert_eq!(pick_mdcsum(&model, &config, Some(key)), expected);
+                calls += 1;
+            }
+        }
+        assert!(model.set_shares.observed_total() > 0.0);
+        let affinity = selection_count(name, "ns-tp4", "affinity")
+            + selection_count(name, "ns-tp2", "affinity");
+        assert_eq!(affinity, calls);
+        assert_eq!(total_selections(name, &["ns-tp4", "ns-tp2"]), calls);
+    }
+
+    #[test]
+    fn affinity_mode_reports_keyless_requests_as_random() {
+        let name = "affinity-keyless";
+        let model = Model::new(name.to_string());
+        let (tp4, _tx1) = make_worker_set_with_count("ns-tp4", "mdc-tp4", vec![1]);
+        let (tp2, _tx2) = make_worker_set_with_count("ns-tp2", "mdc-tp2", vec![2]);
+        model.add_worker_set("ns-tp4".to_string(), tp4);
+        model.add_worker_set("ns-tp2".to_string(), tp2);
+        let config = affinity_config(DEFAULT_TEST_SLACK);
+        for _ in 0..50 {
+            pick_mdcsum(&model, &config, None);
+        }
+        assert_eq!(model.set_shares.observed_total(), 0.0);
+        let random =
+            selection_count(name, "ns-tp4", "random") + selection_count(name, "ns-tp2", "random");
+        assert_eq!(random, 50);
+    }
+
+    /// Default (random) mode ignores the key: weighted by worker count, no share tracking
+    /// and no selection metric, exactly as before affinity existed.
+    #[test]
+    fn default_mode_keeps_weighted_random_behavior() {
+        let name = "default-random";
+        let model = Model::new(name.to_string());
+        let (small, _tx1) = make_worker_set_with_count("ns-small", "mdc-small", vec![1]);
+        let (large, _tx2) = make_worker_set_with_count("ns-large", "mdc-large", vec![2, 3, 4]);
+        model.add_worker_set("ns-small".to_string(), small);
+        model.add_worker_set("ns-large".to_string(), large);
+
+        let config = SetSelectionConfig::default();
+        let n = 8000;
+        let mut large_hits = 0;
+        for i in 0..n {
+            let key = if i % 2 == 0 { Some(7) } else { None };
+            if pick_mdcsum(&model, &config, key) == "mdc-large" {
+                large_hits += 1;
+            }
+        }
+        let share = large_hits as f64 / n as f64;
+        assert!((share - 0.75).abs() < 0.03, "large share {share}");
+        assert_eq!(model.set_shares.observed_total(), 0.0);
+        assert_eq!(total_selections(name, &["ns-small", "ns-large"]), 0);
+    }
+
+    /// D1: two sets in one namespace are distinct candidates (hashed and tracked by their
+    /// storage key), and the choice does not depend on insertion order.
+    #[test]
+    fn affinity_distinguishes_sets_sharing_a_namespace() {
+        let build = |reverse: bool| {
+            let model = Model::new("affinity-same-ns".to_string());
+            let (a, tx_a) = make_worker_set_with_count("dynamo", "mdc-a", vec![1, 2]);
+            let (b, tx_b) = make_worker_set_with_count("dynamo", "mdc-b", vec![3, 4]);
+            let mut sets = vec![("dynamo:set-a", a), ("dynamo:set-b", b)];
+            if reverse {
+                sets.reverse();
+            }
+            for (key, ws) in sets {
+                model.add_worker_set(key.to_string(), ws);
+            }
+            (model, tx_a, tx_b)
+        };
+        let (fwd, _a1, _b1) = build(false);
+        let (rev, _a2, _b2) = build(true);
+        let config = affinity_config(DEFAULT_TEST_SLACK);
+        let n = 2000;
+        let mut a_hits = 0;
+        for key in 0..n {
+            let key = mixed(key);
+            let x = pick_mdcsum(&fwd, &config, Some(key));
+            assert_eq!(x, pick_mdcsum(&rev, &config, Some(key)));
+            a_hits += usize::from(x == "mdc-a");
+        }
+        let share = a_hits as f64 / n as f64;
+        assert!((0.4..0.6).contains(&share), "set-a share {share}");
+        let tracked = fwd.set_shares.share("dynamo:set-a");
+        assert!(
+            (0.4..0.6).contains(&tracked),
+            "tracked set-a share {tracked}"
+        );
+    }
+
+    const DEFAULT_TEST_SLACK: f64 = 0.25;
 }

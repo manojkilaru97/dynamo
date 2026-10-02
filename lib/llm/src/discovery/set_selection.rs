@@ -8,14 +8,20 @@
 //! consecutive turns of one conversation to different sets and discards their prefix cache.
 //!
 //! `DYN_WORKER_SET_SELECTION=affinity` instead maps a request's affinity key (derived from
-//! the conversation's leading messages) to a set with weighted rendezvous hashing. Every
-//! frontend makes the same choice for the same conversation without shared state, and the
-//! long-run traffic split still follows the set weights. A decayed per-frontend share
-//! tracker falls back to the weighted random pick whenever the hashed set already received
-//! more than `(1 + slack)` times its weight share, so one hot key cannot pin a set.
+//! the conversation's leading messages) to a set with weighted rendezvous hashing over the sets'
+//! unique storage keys. Every frontend makes the same choice for the same conversation
+//! without shared state, and the long-run traffic split still follows the set weights.
+//!
+//! A decayed per-frontend share tracker keeps every set inside
+//! `fair ± slack·min(fair, 1 − fair)` of recent affinity decisions. When the hashed set is
+//! above its band (or another set has fallen below its band), the request spills to the
+//! next-ranked rendezvous set that is below its fair share. The spill target depends only on
+//! the key and the candidate sets, so frontends agree and a conversation's spilled turns land
+//! on one set.
 //!
 //! `DYN_WORKER_SET_WEIGHTS=suffix=weight,...` scales the per-worker weight of every set whose
-//! namespace ends with `suffix` (for example `tp4=2,tp2=1` to weight sets by GPUs).
+//! namespace ends with `suffix` (for example `tp4=2,tp2=1` to weight sets by GPUs). Entries
+//! must lie in `(0, 1e6]`; anything else is ignored with a warning.
 
 use std::collections::HashMap;
 use std::io;
@@ -30,6 +36,9 @@ const MODE_ENV: &str = "DYN_WORKER_SET_SELECTION";
 const SLACK_ENV: &str = "DYN_WORKER_SET_AFFINITY_SLACK";
 const WEIGHTS_ENV: &str = "DYN_WORKER_SET_WEIGHTS";
 const DEFAULT_SLACK: f64 = 0.25;
+/// Largest accepted per-worker weight. Keeps `worker_count × weight` and the sums over sets
+/// finite, so weighted picks never see an infinite range.
+pub const MAX_PER_WORKER_WEIGHT: f64 = 1e6;
 /// Decisions over which the share tracker averages (exponential decay horizon).
 const SHARE_WINDOW: f64 = 1000.0;
 /// Decayed decisions required before the share guard may override the hashed set.
@@ -99,7 +108,12 @@ impl SetSelectionConfig {
                 let parsed = item
                     .split_once('=')
                     .and_then(|(suffix, w)| Some((suffix.trim(), w.trim().parse::<f64>().ok()?)))
-                    .filter(|(suffix, w)| !suffix.is_empty() && w.is_finite() && *w > 0.0);
+                    .filter(|(suffix, w)| {
+                        !suffix.is_empty()
+                            && w.is_finite()
+                            && *w > 0.0
+                            && *w <= MAX_PER_WORKER_WEIGHT
+                    });
                 match parsed {
                     Some((suffix, w)) => config.weights.push((suffix.to_string(), w)),
                     None => tracing::warn!(value = item, "Invalid {WEIGHTS_ENV} entry; ignored"),
@@ -139,77 +153,118 @@ impl SetChoiceReason {
     }
 }
 
+/// Rendezvous score of one candidate: lower wins. `None` for non-positive weights.
+fn rendezvous_score(key: u64, name: &str, weight: f64) -> Option<f64> {
+    if !(weight > 0.0) {
+        return None;
+    }
+    let h = xxh3_64_with_seed(name.as_bytes(), key);
+    // Map to (0, 1]: never 0 so ln() stays finite.
+    let u = ((h >> 11) as f64 + 1.0) / (1u64 << 53) as f64;
+    Some(-u.ln() / weight)
+}
+
+/// Candidates with a positive weight, best rendezvous score first. Ties (only possible
+/// with equal names or infinite weights) break by name, so the order never depends on
+/// the order of `candidates`.
+pub fn rendezvous_ranking(key: u64, candidates: &[(&str, f64)]) -> Vec<usize> {
+    let mut scored: Vec<(f64, &str, usize)> = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (name, weight))| {
+            rendezvous_score(key, name, *weight).map(|score| (score, *name, idx))
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    scored.into_iter().map(|(_, _, idx)| idx).collect()
+}
+
 /// Weighted rendezvous hashing: candidate `i` wins with probability `w_i / sum(w)` over
 /// keys, and removing a candidate only moves the keys it owned.
 pub fn rendezvous_pick(key: u64, candidates: &[(&str, f64)]) -> Option<usize> {
-    let mut best: Option<(usize, f64)> = None;
+    let mut best: Option<(usize, f64, &str)> = None;
     for (idx, (name, weight)) in candidates.iter().enumerate() {
-        if !(*weight > 0.0) {
+        let Some(score) = rendezvous_score(key, name, *weight) else {
             continue;
-        }
-        let h = xxh3_64_with_seed(name.as_bytes(), key);
-        // Map to (0, 1]: never 0 so ln() stays finite.
-        let u = ((h >> 11) as f64 + 1.0) / (1u64 << 53) as f64;
-        let score = -u.ln() / weight;
-        if best.is_none_or(|(_, s)| score < s) {
-            best = Some((idx, score));
+        };
+        if best.is_none_or(|(_, s, n)| score < s || (score == s && *name < n)) {
+            best = Some((idx, score, name));
         }
     }
-    best.map(|(idx, _)| idx)
+    best.map(|(idx, _, _)| idx)
 }
 
+/// Pick an index with probability proportional to its weight. Non-positive and non-finite
+/// weights are skipped; returns `None` when no weight is usable.
 pub fn weighted_random_pick(weights: &[f64]) -> Option<usize> {
-    let total: f64 = weights.iter().filter(|w| **w > 0.0).sum();
-    if !(total > 0.0) {
+    let usable = |w: f64| w > 0.0 && w.is_finite();
+    let total: f64 = weights.iter().copied().filter(|w| usable(*w)).sum();
+    if !(total > 0.0) || !total.is_finite() {
         return None;
     }
     let mut pick = rand::rng().random_range(0.0..total);
     let mut last = None;
-    for (idx, w) in weights.iter().enumerate() {
-        if !(*w > 0.0) {
+    for (idx, w) in weights.iter().copied().enumerate() {
+        if !usable(w) {
             continue;
         }
-        if pick < *w {
+        if pick < w {
             return Some(idx);
         }
-        pick -= *w;
+        pick -= w;
         last = Some(idx);
     }
     last
 }
 
-/// Exponentially decayed count of recent decisions per namespace.
+/// Exponentially decayed count of recent affinity decisions per WorkerSet key.
 #[derive(Debug, Default)]
 pub struct ShareTracker {
     counts: Mutex<HashMap<String, f64>>,
 }
 
+/// Half-width of a set's allowed share band around its fair share.
+fn share_band(fair: f64, slack: f64) -> f64 {
+    slack * fair.min(1.0 - fair)
+}
+
 impl ShareTracker {
-    /// Choose among `candidates` for `key`, guarding against one set exceeding
-    /// `(1 + slack)` times its weight share of recent decisions.
+    /// Choose among `candidates` (unique set key, weight) for `key`.
+    ///
+    /// The rendezvous winner is chosen unless it is above `fair + band` of recent
+    /// decisions, or it is above its fair share while another set is below `fair − band`.
+    /// Then the request spills to the best-ranked other set that is below its fair share.
+    /// The result is labelled [`SetChoiceReason::ShareCapFallback`] only when the chosen
+    /// set differs from the rendezvous winner.
     pub fn choose(
         &self,
         key: u64,
         candidates: &[(&str, f64)],
         slack: f64,
     ) -> Option<(usize, SetChoiceReason)> {
-        let preferred = rendezvous_pick(key, candidates)?;
-        let total_weight: f64 = candidates.iter().map(|(_, w)| w.max(0.0)).sum();
+        let ranking = rendezvous_ranking(key, candidates);
+        let preferred = *ranking.first()?;
+        let total_weight: f64 = ranking.iter().map(|&i| candidates[i].1).sum();
         let mut counts = self.counts.lock();
-        let observed: f64 = candidates
+        let observed: f64 = ranking
             .iter()
-            .map(|(name, _)| counts.get(*name).copied().unwrap_or(0.0))
+            .map(|&i| counts.get(candidates[i].0).copied().unwrap_or(0.0))
             .sum();
         let mut choice = (preferred, SetChoiceReason::Affinity);
-        if observed >= SHARE_MIN_SAMPLES && total_weight > 0.0 {
-            let (name, weight) = candidates[preferred];
-            let share = counts.get(name).copied().unwrap_or(0.0) / observed;
-            let cap = (weight / total_weight) * (1.0 + slack);
-            if share > cap {
-                let weights: Vec<f64> = candidates.iter().map(|(_, w)| *w).collect();
-                if let Some(idx) = weighted_random_pick(&weights) {
-                    choice = (idx, SetChoiceReason::ShareCapFallback);
-                }
+        if observed >= SHARE_MIN_SAMPLES && total_weight > 0.0 && total_weight.is_finite() {
+            let share = |i: usize| counts.get(candidates[i].0).copied().unwrap_or(0.0) / observed;
+            let fair = |i: usize| candidates[i].1 / total_weight;
+            let preferred_share = share(preferred);
+            let preferred_fair = fair(preferred);
+            let over_cap = preferred_share > preferred_fair + share_band(preferred_fair, slack);
+            let other_starved = preferred_share > preferred_fair
+                && ranking[1..]
+                    .iter()
+                    .any(|&i| share(i) < fair(i) - share_band(fair(i), slack));
+            if (over_cap || other_starved)
+                && let Some(&spill) = ranking[1..].iter().find(|&&i| share(i) < fair(i))
+            {
+                choice = (spill, SetChoiceReason::ShareCapFallback);
             }
         }
         let decay = 1.0 - 1.0 / SHARE_WINDOW;
@@ -224,10 +279,16 @@ impl ShareTracker {
     }
 
     #[cfg(test)]
-    fn share(&self, name: &str) -> f64 {
+    pub(crate) fn share(&self, name: &str) -> f64 {
         let counts = self.counts.lock();
         let total: f64 = counts.values().sum();
         counts.get(name).copied().unwrap_or(0.0) / total.max(f64::MIN_POSITIVE)
+    }
+
+    /// Decayed number of recorded decisions (test hook).
+    #[cfg(test)]
+    pub(crate) fn observed_total(&self) -> f64 {
+        self.counts.lock().values().sum()
     }
 }
 
@@ -271,6 +332,10 @@ pub fn affinity_enabled() -> bool {
 mod tests {
     use super::*;
 
+    const TP4: &str = "ns-tp4";
+    const TP2: &str = "ns-tp2";
+    const SETS: [(&str, f64); 2] = [(TP4, 30.0), (TP2, 60.0)];
+
     #[test]
     fn parse_defaults_to_random() {
         let c = SetSelectionConfig::parse(None, None, None);
@@ -293,14 +358,42 @@ mod tests {
         assert_eq!(c.set_weight("other", 7), 7.0);
     }
 
+    /// A3: an oversized per-worker weight used to overflow `worker_count × weight` to
+    /// infinity, and `random_range(0.0..inf)` panics on the request path.
+    #[test]
+    fn parse_rejects_weights_that_could_overflow() {
+        let c = SetSelectionConfig::parse(None, None, Some("tp4=1e308,tp2=1e6,x=1e6001"));
+        assert_eq!(c.weights, vec![("tp2".to_string(), MAX_PER_WORKER_WEIGHT)]);
+        assert_eq!(c.set_weight("dynamo-tp4", 30), 30.0);
+        let weights = [
+            c.set_weight("dynamo-tp4", 30),
+            c.set_weight("dynamo-tp2", 60),
+        ];
+        assert!(weights.iter().all(|w| w.is_finite()));
+        for _ in 0..100 {
+            assert!(weighted_random_pick(&weights).is_some());
+        }
+    }
+
+    #[test]
+    fn weighted_random_pick_survives_non_finite_weights() {
+        for _ in 0..1000 {
+            assert_eq!(weighted_random_pick(&[f64::INFINITY, 1.0]), Some(1));
+            assert_eq!(weighted_random_pick(&[f64::NAN, 0.0, 2.0]), Some(2));
+            assert_eq!(weighted_random_pick(&[1e308, 1e308]), None);
+        }
+        assert_eq!(weighted_random_pick(&[f64::INFINITY]), None);
+        assert_eq!(weighted_random_pick(&[]), None);
+    }
+
     #[test]
     fn rendezvous_is_deterministic_and_weighted() {
-        let cands = [("ns-tp4", 30.0), ("ns-tp2", 60.0)];
         let mut tp4 = 0usize;
         let n = 60_000u64;
         for key in 0..n {
-            let a = rendezvous_pick(key, &cands).unwrap();
-            assert_eq!(a, rendezvous_pick(key, &cands).unwrap());
+            let a = rendezvous_pick(key, &SETS).unwrap();
+            assert_eq!(a, rendezvous_pick(key, &SETS).unwrap());
+            assert_eq!(a, rendezvous_ranking(key, &SETS)[0]);
             if a == 0 {
                 tp4 += 1;
             }
@@ -322,40 +415,117 @@ mod tests {
         }
     }
 
+    /// D1: candidates are unique set keys; the winner must not depend on candidate order.
     #[test]
-    fn share_guard_caps_a_hot_key() {
-        let tracker = ShareTracker::default();
-        let cands = [("ns-tp4", 30.0), ("ns-tp2", 60.0)];
-        let hot = (0..u64::MAX)
-            .find(|k| rendezvous_pick(*k, &cands) == Some(0))
-            .unwrap();
+    fn rendezvous_winner_is_independent_of_candidate_order() {
+        let fwd = [("ns:set-a", 1.0), ("ns:set-b", 1.0)];
+        let rev = [("ns:set-b", 1.0), ("ns:set-a", 1.0)];
+        let mut a_wins = 0;
+        for key in 0..4000u64 {
+            let x = fwd[rendezvous_pick(key, &fwd).unwrap()].0;
+            assert_eq!(x, rev[rendezvous_pick(key, &rev).unwrap()].0);
+            let rf: Vec<&str> = rendezvous_ranking(key, &fwd)
+                .into_iter()
+                .map(|i| fwd[i].0)
+                .collect();
+            let rr: Vec<&str> = rendezvous_ranking(key, &rev)
+                .into_iter()
+                .map(|i| rev[i].0)
+                .collect();
+            assert_eq!(rf, rr);
+            a_wins += usize::from(x == "ns:set-a");
+        }
+        assert!((1600..2400).contains(&a_wins), "a_wins {a_wins}");
+        // Exact ties (identical names) still resolve by name, not position.
+        let tie = [("same", f64::INFINITY), ("other", f64::INFINITY)];
+        assert_eq!(rendezvous_pick(1, &tie), Some(1));
+        let tie_rev = [("other", f64::INFINITY), ("same", f64::INFINITY)];
+        assert_eq!(rendezvous_pick(1, &tie_rev), Some(0));
+    }
+
+    fn hot_key_preferring(name: &str) -> u64 {
+        (0..u64::MAX)
+            .find(|k| SETS[rendezvous_pick(*k, &SETS).unwrap()].0 == name)
+            .unwrap()
+    }
+
+    /// Run `n` decisions of one hot key and return (fallbacks, spill targets seen).
+    fn run_hot_key(tracker: &ShareTracker, key: u64, n: usize) -> usize {
+        let preferred = rendezvous_pick(key, &SETS).unwrap();
+        let spill = rendezvous_ranking(key, &SETS)[1];
         let mut fallbacks = 0;
-        for _ in 0..5000 {
-            let (_, reason) = tracker.choose(hot, &cands, 0.25).unwrap();
-            if reason == SetChoiceReason::ShareCapFallback {
-                fallbacks += 1;
+        for _ in 0..n {
+            let (idx, reason) = tracker.choose(key, &SETS, DEFAULT_SLACK).unwrap();
+            match reason {
+                SetChoiceReason::ShareCapFallback => {
+                    assert_ne!(idx, preferred, "a fallback must change the set");
+                    assert_eq!(idx, spill, "spill target must be deterministic");
+                    fallbacks += 1;
+                }
+                SetChoiceReason::Affinity => assert_eq!(idx, preferred),
+                SetChoiceReason::Random => panic!("affinity choice labelled random"),
             }
         }
+        fallbacks
+    }
+
+    /// A1: a hot key that prefers the larger set used to squeeze the smaller set to half
+    /// its fair share (the cap was one-sided and the redraw included the preferred set).
+    #[test]
+    fn share_guard_protects_smaller_set() {
+        let tracker = ShareTracker::default();
+        let fallbacks = run_hot_key(&tracker, hot_key_preferring(TP2), 5000);
         assert!(fallbacks > 0);
-        let share = tracker.share("ns-tp4");
-        assert!(share < 1.0 / 3.0 * 1.25 + 0.03, "share {share}");
+        let floor = (1.0 / 3.0) * (1.0 - DEFAULT_SLACK) - 0.03;
+        let tp4 = tracker.share(TP4);
+        assert!(tp4 >= floor, "tp4 share {tp4} below {floor}");
+    }
+
+    #[test]
+    fn share_guard_caps_a_hot_key_preferring_smaller_set() {
+        let tracker = ShareTracker::default();
+        let fallbacks = run_hot_key(&tracker, hot_key_preferring(TP4), 5000);
+        assert!(fallbacks > 0);
+        let tp4 = tracker.share(TP4);
+        let cap = 1.0 / 3.0 + share_band(1.0 / 3.0, DEFAULT_SLACK) + 0.03;
+        assert!(tp4 <= cap, "tp4 share {tp4} above {cap}");
+        let floor = (2.0 / 3.0) * (1.0 - DEFAULT_SLACK) - 0.03;
+        let tp2 = tracker.share(TP2);
+        assert!(tp2 >= floor, "tp2 share {tp2} below {floor}");
     }
 
     #[test]
     fn share_guard_keeps_affinity_for_balanced_keys() {
         let tracker = ShareTracker::default();
-        let cands = [("ns-tp4", 30.0), ("ns-tp2", 60.0)];
         let mut fallbacks = 0;
         for key in 0..20_000u64 {
             let mixed = key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-            let (idx, reason) = tracker.choose(mixed, &cands, 0.25).unwrap();
+            let (idx, reason) = tracker.choose(mixed, &SETS, DEFAULT_SLACK).unwrap();
             if reason == SetChoiceReason::ShareCapFallback {
+                assert_ne!(Some(idx), rendezvous_pick(mixed, &SETS));
                 fallbacks += 1;
             } else {
-                assert_eq!(Some(idx), rendezvous_pick(mixed, &cands));
+                assert_eq!(Some(idx), rendezvous_pick(mixed, &SETS));
             }
         }
         assert!(fallbacks < 200, "fallbacks {fallbacks}");
+    }
+
+    /// Spilling with three sets goes to the best-ranked set below its fair share.
+    #[test]
+    fn share_guard_spills_to_an_underserved_set() {
+        let sets = [("a", 1.0), ("b", 1.0), ("c", 1.0)];
+        let tracker = ShareTracker::default();
+        let key = 42;
+        let ranking = rendezvous_ranking(key, &sets);
+        for _ in 0..5000 {
+            let (idx, reason) = tracker.choose(key, &sets, DEFAULT_SLACK).unwrap();
+            if reason == SetChoiceReason::ShareCapFallback {
+                assert_ne!(idx, ranking[0]);
+            }
+        }
+        let cap = 1.0 / 3.0 + share_band(1.0 / 3.0, DEFAULT_SLACK) + 0.03;
+        assert!(tracker.share(sets[ranking[0]].0) <= cap);
     }
 
     #[derive(Serialize)]
