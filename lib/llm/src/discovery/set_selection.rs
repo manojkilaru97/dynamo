@@ -21,14 +21,17 @@
 //!    counter) tracks decayed load and request count per key. A key becomes heavy when its
 //!    guaranteed load share, less four standard deviations of sampling noise, reaches the
 //!    narrowest share band among the candidate sets (`min_i slack·min(fair_i, 1 − fair_i)`,
-//!    about 0.083 for 30/60 workers and slack 0.25) and its request share reaches half of
-//!    it; it stays heavy until its load share drops below half the band or its request
-//!    share below a quarter. Heavy keys get the default weighted random pick
-//!    (`heavy_key_random`): a key that hot is cached on every set anyway, and random
-//!    routing balances it by construction. Ordinary conversations never qualify, also on a
-//!    frontend that sees only a few dozen concurrent conversations (with 12 or more similar
-//!    conversations each carries at most about 1/12 of the load, which does not exceed the
-//!    band), and neither do large but infrequent ones.
+//!    about 0.083 for 30/60 workers and slack 0.25) and it has at least 8 guaranteed
+//!    (decayed) requests in the window; it stays heavy until its load share drops below
+//!    half the band or its observations below 4. The load share is size-weighted, so a key
+//!    that carries its load in a few repeated large requests qualifies too. Heavy keys get
+//!    the default weighted random pick (`heavy_key_random`): a key that hot is cached on
+//!    every set anyway, and random routing balances it by construction. Ordinary
+//!    conversations never qualify, also on a frontend that sees only a few dozen concurrent
+//!    conversations (with 12 or more similar conversations each carries at most about 1/12
+//!    of the load, which does not exceed the band), and neither does a single large
+//!    request (it is clamped and has no repetitions). A heavy key that stops qualifying is
+//!    routed by affinity again and must meet the full entry threshold to re-enter.
 //! 2. **Sticky spill** for the remaining (affinity-routed) load keeps every set within
 //!    `fair ± slack·min(fair, 1 − fair)`. When the load whose rendezvous winner is set `P`
 //!    exceeds `P`'s fair share, the frontend derives a spill fraction `p` (zero until demand
@@ -102,14 +105,16 @@ const SPILL_NOISE_SIGMAS: f64 = 2.0;
 /// Size of the per-frontend Space-Saving heavy-key table. Any key above `1/HEAVY_KEYS`
 /// (0.8%) of recent load is guaranteed a counter, below the exit threshold.
 const HEAVY_KEYS: usize = 128;
-/// Heavy-key thresholds, as fractions of the narrowest share band among the candidate
-/// sets (`min_i slack·min(fair_i, 1 − fair_i)`): a key becomes heavy when its guaranteed
-/// load share, less its sampling noise, reaches the band and its request share reaches
-/// half of it; it stays heavy until its load share drops below half the band or its
-/// request share below a quarter.
-const HEAVY_ENTER_COUNT_RATIO: f64 = 0.5;
+/// Heavy-key thresholds. A key becomes heavy when its guaranteed load share, less its
+/// sampling noise, reaches the narrowest share band among the candidate sets
+/// (`min_i slack·min(fair_i, 1 − fair_i)`) and it has at least
+/// [`HEAVY_MIN_OBSERVATIONS`] guaranteed (decayed) requests in the window; it stays heavy
+/// until its load share drops below half the band or its observations below half the
+/// minimum. The observation floor only asks for repeated evidence: a key that carries
+/// its load in a few large requests qualifies as long as it repeats, while a single
+/// large request cannot (it is clamped and alone).
+const HEAVY_MIN_OBSERVATIONS: f64 = 8.0;
 const HEAVY_EXIT_LOAD_RATIO: f64 = 0.5;
-const HEAVY_EXIT_COUNT_RATIO: f64 = 0.25;
 /// Standard deviations of sampling noise subtracted from a key's load share before it
 /// is compared with the band, so keys sitting right at the band (for example 12 equal
 /// conversations against a 1/12 band) do not become heavy on a random excursion.
@@ -386,17 +391,24 @@ struct HeavyCounter {
     count_err: f64,
     /// Current heavy status (with hysteresis).
     heavy: bool,
-    /// What this key contributed to the current fair-share window while affinity-routed
-    /// to `window_winner` (a hash of that set's key), decayed with the window: its charge
-    /// (credited to that set's demand), squared charge, decisions, and the fair load it
-    /// credited to each candidate set (by set-key hash, at the weights of the time).
-    /// Cleared on window reset, on a winner change, and once subtracted when the key
-    /// becomes heavy.
-    window_load: f64,
+    /// What this key contributed to the current fair-share window while affinity-routed,
+    /// decayed with the window: the demand it credited to each set (its winner at the
+    /// time; a winner change keeps the earlier set's credit), the fair load it credited to
+    /// each candidate set (at the weights of the time), both by set-key hash, and its
+    /// squared charges and decisions. Cleared on window reset and once subtracted when the
+    /// key becomes heavy.
+    window_demand: Vec<(u64, f64)>,
+    window_expected: Vec<(u64, f64)>,
     window_sq: f64,
     window_decisions: f64,
-    window_winner: Option<u64>,
-    window_expected: Vec<(u64, f64)>,
+}
+
+/// Add `amount` to `id`'s entry of a per-set credit list.
+fn add_credit(credits: &mut Vec<(u64, f64)>, id: u64, amount: f64) {
+    match credits.iter_mut().find(|(s, _)| *s == id) {
+        Some((_, c)) => *c += amount,
+        None => credits.push((id, amount)),
+    }
 }
 
 impl HeavyCounter {
@@ -408,24 +420,22 @@ impl HeavyCounter {
             count,
             count_err,
             heavy: false,
-            window_load: 0.0,
+            window_demand: Vec::new(),
+            window_expected: Vec::new(),
             window_sq: 0.0,
             window_decisions: 0.0,
-            window_winner: None,
-            window_expected: Vec::new(),
         }
     }
 
     fn clear_window_credit(&mut self) {
-        self.window_load = 0.0;
+        self.window_demand.clear();
+        self.window_expected.clear();
         self.window_sq = 0.0;
         self.window_decisions = 0.0;
-        self.window_winner = None;
-        self.window_expected.clear();
     }
 }
 
-/// Identity of a set key for [`HeavyCounter::window_winner`].
+/// Identity of a set key in a counter's per-set credit lists.
 fn set_id(name: &str) -> u64 {
     xxh3_64_with_seed(name.as_bytes(), 0)
 }
@@ -518,11 +528,11 @@ impl ShareState {
             return false;
         }
         let load = (counter.load - counter.load_err) / self.charge_sum;
-        let count = (counter.count - counter.count_err) / self.decisions;
+        let observations = counter.count - counter.count_err;
         if counter.heavy {
-            load >= HEAVY_EXIT_LOAD_RATIO * band && count >= HEAVY_EXIT_COUNT_RATIO * band
+            load >= HEAVY_EXIT_LOAD_RATIO * band && observations >= HEAVY_MIN_OBSERVATIONS / 2.0
         } else {
-            load - self.load_share_noise(load) >= band && count >= HEAVY_ENTER_COUNT_RATIO * band
+            load - self.load_share_noise(load) >= band && observations >= HEAVY_MIN_OBSERVATIONS
         }
     }
 
@@ -626,11 +636,10 @@ impl ShareState {
             c.load_err *= decay;
             c.count *= decay;
             c.count_err *= decay;
-            c.window_load *= decay;
             c.window_sq *= decay * decay;
             c.window_decisions *= decay;
-            for (_, e) in &mut c.window_expected {
-                *e *= decay;
+            for (_, credit) in c.window_demand.iter_mut().chain(&mut c.window_expected) {
+                *credit *= decay;
             }
         }
         decay
@@ -654,14 +663,12 @@ impl ShareState {
         self.charge_sq_sum += charge * charge;
         let slot = self.record_heavy(key, charge);
         if affinity_routed {
-            let winner = Some(set_id(candidates[ranking[0]].0));
             let counter = &mut self.heavy[slot];
-            if counter.window_winner != winner {
-                // Earlier credit went to another set; it stays there and decays.
-                counter.clear_window_credit();
-                counter.window_winner = winner;
-            }
-            counter.window_load += charge;
+            add_credit(
+                &mut counter.window_demand,
+                set_id(candidates[ranking[0]].0),
+                charge,
+            );
             counter.window_sq += charge * charge;
             counter.window_decisions += 1.0;
             self.window_decisions += 1.0;
@@ -674,24 +681,23 @@ impl ShareState {
                     .expected
                     .entry(candidates[i].0.to_string())
                     .or_insert(0.0) += fair_load;
-                let id = set_id(candidates[i].0);
-                let counter = &mut self.heavy[slot];
-                match counter.window_expected.iter_mut().find(|(s, _)| *s == id) {
-                    Some((_, e)) => *e += fair_load,
-                    None => counter.window_expected.push((id, fair_load)),
-                }
+                add_credit(
+                    &mut self.heavy[slot].window_expected,
+                    set_id(candidates[i].0),
+                    fair_load,
+                );
             }
             *self
                 .demand
                 .entry(candidates[ranking[0]].0.to_string())
                 .or_insert(0.0) += charge;
         }
+        // An affinity-routed key is not heavy (the caller clears a stale flag first), so a
+        // flagged counter never holds window credit. On entry its credit leaves.
         let status = self.heavy_status(&self.heavy[slot], band);
-        // A heavy key's window credit leaves on entry, and also when the key was flagged
-        // heavy but routed by affinity (exit edge) and is heavy again after this request.
-        if status && (!self.heavy[slot].heavy || affinity_routed) {
-            let expected_credit = std::mem::take(&mut self.heavy[slot].window_expected);
-            self.forget_window_load(slot, &expected_credit, candidates, ranking);
+        if status && !self.heavy[slot].heavy {
+            let credit = self.heavy[slot].clone();
+            self.forget_window_load(&credit, candidates, ranking);
             self.heavy[slot].clear_window_credit();
         }
         self.heavy[slot].heavy = status;
@@ -724,42 +730,40 @@ impl ShareState {
     }
 
     /// A key that just became heavy stops counting toward the fair-share window: remove
-    /// exactly what it contributed to the current window (its credited load from its
-    /// credited winner's demand, the fair load it credited to each set, its squared
-    /// charges and its decisions), so its past turns do not keep the other keys spilling.
-    /// Nothing is removed from a set that did not receive the credit.
+    /// exactly what it contributed to the current window (the demand it credited to each
+    /// set, the fair load it credited to each set, its squared charges and its decisions),
+    /// so its past turns do not keep the other keys spilling. Nothing is removed from a
+    /// set that did not receive the credit.
     fn forget_window_load(
         &mut self,
-        slot: usize,
-        window_expected: &[(u64, f64)],
+        credit: &HeavyCounter,
         candidates: &[(&str, f64)],
         ranking: &[usize],
     ) {
-        let counter = &self.heavy[slot];
-        let (load, sq, decisions) = (
-            counter.window_load,
-            counter.window_sq,
-            counter.window_decisions,
-        );
-        let Some(winner) = counter.window_winner else {
-            return;
-        };
-        if let Some(&credited) = ranking.iter().find(|&&i| set_id(candidates[i].0) == winner)
-            && let Some(d) = self.demand.get_mut(candidates[credited].0)
-        {
-            *d = (*d - load).max(0.0);
-        }
+        let mut load = 0.0;
         for &i in ranking {
             let id = set_id(candidates[i].0);
-            if let Some(&(_, credit)) = window_expected.iter().find(|(s, _)| *s == id)
-                && let Some(e) = self.expected.get_mut(candidates[i].0)
-            {
-                *e = (*e - credit).max(0.0);
+            let find =
+                |list: &[(u64, f64)]| list.iter().find(|(s, _)| *s == id).map_or(0.0, |(_, c)| *c);
+            let (demand, expected) = (find(&credit.window_demand), find(&credit.window_expected));
+            load += demand;
+            if let Some(d) = self.demand.get_mut(candidates[i].0) {
+                *d = (*d - demand).max(0.0);
+            }
+            if let Some(e) = self.expected.get_mut(candidates[i].0) {
+                *e = (*e - expected).max(0.0);
             }
         }
         self.window_sum = (self.window_sum - load).max(0.0);
-        self.window_sq_sum = (self.window_sq_sum - sq).max(0.0);
-        self.window_decisions = (self.window_decisions - decisions).max(0.0);
+        self.window_sq_sum = (self.window_sq_sum - credit.window_sq).max(0.0);
+        self.window_decisions = (self.window_decisions - credit.window_decisions).max(0.0);
+    }
+
+    /// Clear a stale heavy flag of `key` before an affinity-routed request is recorded.
+    fn unflag(&mut self, key: u64) {
+        if let Some(counter) = self.heavy.iter_mut().find(|c| c.key == key) {
+            counter.heavy = false;
+        }
     }
 }
 
@@ -807,6 +811,10 @@ impl ShareTracker {
                 SetChoiceReason::HeavyKeyRandom,
             )
         } else {
+            // A key flagged heavy that no longer qualifies is routed by affinity: drop the
+            // flag before recording, so its load stays in the window and re-entry needs
+            // the full entry threshold.
+            state.unflag(affinity.key);
             state.decide(affinity.key, candidates, &ranking, slack)
         };
         let affinity_routed = choice.1 != SetChoiceReason::HeavyKeyRandom;
@@ -1630,41 +1638,32 @@ mod tests {
                 .counter
                 .clone()
                 .unwrap_or_else(|| HeavyCounter::new(hot, 0.0, 0.0, 0.0, 0.0));
-            let previous = (0..2).find(|&s| counter.window_winner == Some(set_id(sets[s].0)));
-            // The credit's set, and whether the counter's earlier credit is part of it.
-            let (credited, keeps_old) = if routed {
-                (Some(winner), previous == Some(winner))
-            } else {
-                (previous, true)
+            let credit_of = |list: &[(u64, f64)], name: &str| {
+                list.iter()
+                    .find(|(id, _)| *id == set_id(name))
+                    .map_or(0.0, |(_, c)| *c)
             };
-            let old = if keeps_old { 1.0 } else { 0.0 };
-            let credit_load = old * counter.window_load * d + request * charge;
-            let credit_sq = old * counter.window_sq * d * d + request * charge * charge;
-            let credit_decisions = old * counter.window_decisions * d + request;
+            // A flagged counter holds no credit; a winner change keeps earlier credit.
+            let mut credit_load = 0.0;
             for (s, (name, _)) in sets.iter().enumerate() {
                 let added = if routed && s == winner { charge } else { 0.0 };
-                let removed = if credited == Some(s) {
-                    credit_load
-                } else {
-                    0.0
-                };
+                let credit_demand = credit_of(&counter.window_demand, name) * d + added;
+                credit_load += credit_demand;
                 close(
                     post.demand[s],
-                    self.demand[s] * d + added - removed,
+                    self.demand[s] * d + added - credit_demand,
                     &format!("demand[{s}]"),
                 );
-                let old_expected = counter
-                    .window_expected
-                    .iter()
-                    .find(|(id, _)| *id == set_id(name))
-                    .map_or(0.0, |(_, e)| *e);
-                let credit_expected = old * old_expected * d + request * fair(s);
+                let credit_expected =
+                    credit_of(&counter.window_expected, name) * d + request * fair(s);
                 close(
                     post.expected[s],
                     self.expected[s] * d + request * fair(s) - credit_expected,
                     &format!("expected[{s}]"),
                 );
             }
+            let credit_sq = counter.window_sq * d * d + request * charge * charge;
+            let credit_decisions = counter.window_decisions * d + request;
             close(
                 post.sum,
                 self.sum * d + request * charge - credit_load,
@@ -1741,56 +1740,216 @@ mod tests {
         outcome
     }
 
-    /// R6-3: a key still flagged heavy whose share sits at the exit threshold is routed by
-    /// affinity (credited to the window) and is heavy again after its own request. Its
-    /// window credit must leave then, or it stays in the winner's demand.
+    /// R7-3: a periodic key cools to the load exit edge. Once it no longer qualifies it is
+    /// routed by affinity with its flag cleared, so every such request stays in its
+    /// winner's demand (nothing is forgotten at the edge) and re-entry needs the full
+    /// entry threshold.
     #[test]
-    fn exit_edge_credit_leaves_the_window() {
+    fn exit_edge_keeps_affinity_load_in_the_window() {
         let key = key_preferring(TP4, |x| x > 0.5);
-        let total = 1000.0;
-        let band = 1.0 / 12.0;
-        let split = |tp4: f64| {
-            HashMap::from([
-                (TP4.to_string(), total * tp4),
-                (TP2.to_string(), total * (1.0 - tp4)),
-            ])
-        };
-        let mut counter = HeavyCounter::new(key, 0.5 * band * total - 0.6, 0.0, 100.0, 0.0);
-        counter.heavy = true;
-        counter.window_load = 30.0;
-        counter.window_sq = 30.0;
-        counter.window_decisions = 30.0;
-        counter.window_winner = Some(set_id(TP4));
-        counter.window_expected = vec![(set_id(TP4), 10.0), (set_id(TP2), 20.0)];
-        let tracker = ShareTracker {
-            state: Mutex::new(ShareState {
-                decisions: total,
-                charge_sum: total,
-                charge_sq_sum: total,
-                window_decisions: total,
-                window_sum: total,
-                window_sq_sum: total,
-                expected: split(1.0 / 3.0),
-                demand: split(1.0 / 3.0),
-                heavy: vec![counter],
-                candidates: vec![TP4.to_string(), TP2.to_string()],
-                ..Default::default()
-            }),
-            stale: AtomicBool::new(false),
-        };
-        let pre = WindowSnapshot::take(&tracker, key);
-        let (idx, reason) = tracker.choose(unit(key), &SETS, DEFAULT_SLACK).unwrap();
-        assert_eq!((idx, reason), (0, SetChoiceReason::Affinity));
-        let post = WindowSnapshot::take(&tracker, key);
-        assert!(post.counter.as_ref().is_some_and(|c| c.heavy));
-        pre.assert_credit_removed(&post, key, &SETS, true, 1.0);
-        let credit = post.counter.unwrap();
-        assert_eq!((credit.window_load, credit.window_winner), (0.0, None));
+        let tracker = ShareTracker::default();
+        let d = 1.0 - 1.0 / SHARE_WINDOW;
+        let mut i = 0u64;
+        let mut edge_routed = 0;
+        // Heavy at one request in 4 (2x charge), then periodic at one in 24 with unit
+        // charge: a 1/24 load share is exactly the exit threshold (half the 1/12 band), so
+        // the share is just below it before each request and just above it after.
+        for (every, charge, decisions) in [(4u64, 2.0, 6_000u64), (24, 1.0, 15_000)] {
+            for _ in 0..decisions {
+                i += 1;
+                if !i.is_multiple_of(every) {
+                    tracker
+                        .choose(unit(mixed(i + 40_000_000)), &SETS, DEFAULT_SLACK)
+                        .unwrap();
+                    continue;
+                }
+                let pre = WindowSnapshot::take(&tracker, key);
+                let clamped = tracker.state.lock().clamp_charge(charge);
+                let (idx, reason) = tracker
+                    .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
+                    .unwrap();
+                let post = WindowSnapshot::take(&tracker, key);
+                if every == 4 || reason == SetChoiceReason::HeavyKeyRandom {
+                    continue;
+                }
+                edge_routed += 1;
+                // Not heavy after its request: the request stays in the winner's demand.
+                assert!(post.counter.as_ref().is_some_and(|c| !c.heavy));
+                assert_eq!(idx, 0);
+                let added = post.demand[0] - pre.demand[0] * d;
+                assert!(
+                    (added - clamped).abs() < 1e-6,
+                    "demand change {added} != {clamped}"
+                );
+            }
+        }
+        assert!(edge_routed > 300, "edge requests {edge_routed}");
+        let credit = tracker
+            .state
+            .lock()
+            .heavy
+            .iter()
+            .find(|c| c.key == key)
+            .cloned()
+            .unwrap();
+        assert!(
+            credit.window_decisions > 30.0,
+            "credit {}",
+            credit.window_decisions
+        );
     }
 
-    /// R6-2: keys credited to the window at 30:30 become heavy after TP2 recovers to 60
-    /// workers. Their fair-load credit is removed at the 1:1 weights it was credited at,
-    /// not the current 1:2, so the residual window stays balanced and nothing spills.
+    /// Per-set credit oracle for one key, maintained independently of the tracker.
+    #[derive(Clone, Copy, Default)]
+    struct CreditOracle {
+        demand: [f64; 2],
+        expected: [f64; 2],
+    }
+
+    /// Hot keys sending one request each per `period` requests at `charge` times the
+    /// background, over `phases` (weights, decisions, period). Checks every heavy entry against
+    /// the window snapshot and against an independent per-set credit oracle. Returns the
+    /// background spills by phase and preferred set, the decision index of each entry, and
+    /// how many hot requests were heavy in the first phase.
+    struct RecoveryOutcome {
+        spills: Vec<[usize; 2]>,
+        spills_after_entries: [usize; 2],
+        entries: Vec<u64>,
+        heavy_in_first_phase: usize,
+        /// Entries on an affinity-routed request that also moved the key's winner (it
+        /// held demand credit on another set).
+        coincident: usize,
+    }
+
+    fn run_recovery(
+        hot: &[u64],
+        charge: f64,
+        phases: &[([(&'static str, f64); 2], u64, u64)],
+    ) -> RecoveryOutcome {
+        let d = 1.0 - 1.0 / SHARE_WINDOW;
+        let tracker = ShareTracker::default();
+        let mut oracle = vec![CreditOracle::default(); hot.len()];
+        let mut outcome = RecoveryOutcome {
+            spills: Vec::new(),
+            spills_after_entries: [0; 2],
+            entries: Vec::new(),
+            heavy_in_first_phase: 0,
+            coincident: 0,
+        };
+        let mut i = 0u64;
+        for (phase, (sets, decisions, period)) in phases.iter().enumerate() {
+            let mut spills = [0usize; 2];
+            let total: f64 = sets.iter().map(|(_, w)| *w).sum();
+            for _ in 0..*decisions {
+                i += 1;
+                let slot = (i % *period) as usize;
+                let (key, request_charge) = match hot.get(slot) {
+                    Some(&k) => (k, charge),
+                    None => (mixed(i + 90_000_000), 1.0),
+                };
+                let pre = WindowSnapshot::take_for(&tracker, key, sets);
+                let clamped = tracker.state.lock().clamp_charge(request_charge);
+                if let Some(o) = hot.get(slot).map(|_| &oracle[slot]) {
+                    // The tracker's credit before the request matches the oracle.
+                    let counter = pre.counter.clone();
+                    for (s, (name, _)) in sets.iter().enumerate() {
+                        let find = |list: &[(u64, f64)]| {
+                            list.iter()
+                                .find(|(id, _)| *id == set_id(name))
+                                .map_or(0.0, |(_, c)| *c)
+                        };
+                        let (dem, exp) = counter.as_ref().map_or((0.0, 0.0), |c| {
+                            (find(&c.window_demand), find(&c.window_expected))
+                        });
+                        assert!(
+                            (dem - o.demand[s]).abs() < 1e-6,
+                            "demand credit {dem} != {}",
+                            o.demand[s]
+                        );
+                        assert!(
+                            (exp - o.expected[s]).abs() < 1e-6,
+                            "fair credit {exp} != {}",
+                            o.expected[s]
+                        );
+                    }
+                }
+                let (_, reason) = tracker
+                    .choose(SetAffinity::new(key, request_charge), sets, DEFAULT_SLACK)
+                    .unwrap();
+                let routed = reason != SetChoiceReason::HeavyKeyRandom;
+                for o in &mut oracle {
+                    for s in 0..2 {
+                        o.demand[s] *= d;
+                        o.expected[s] *= d;
+                    }
+                }
+                if slot >= hot.len() {
+                    if reason == SetChoiceReason::ShareCapFallback {
+                        let preferred = rendezvous_pick(key, sets).unwrap();
+                        spills[preferred] += 1;
+                        if outcome.entries.len() >= hot.len() {
+                            outcome.spills_after_entries[preferred] += 1;
+                        }
+                    }
+                    continue;
+                }
+                if routed {
+                    let winner = rendezvous_pick(key, sets).unwrap();
+                    oracle[slot].demand[winner] += clamped;
+                    for s in 0..2 {
+                        oracle[slot].expected[s] += clamped * sets[s].1 / total;
+                    }
+                } else if phase == 0 {
+                    outcome.heavy_in_first_phase += 1;
+                }
+                let post = WindowSnapshot::take_for(&tracker, key, sets);
+                let was = pre.counter.as_ref().is_some_and(|c| c.heavy);
+                let now = post.counter.as_ref().is_some_and(|c| c.heavy);
+                if now && (!was || routed) {
+                    let winner = rendezvous_pick(key, sets).unwrap();
+                    if routed && oracle[slot].demand[1 - winner] > 0.0 {
+                        outcome.coincident += 1;
+                    }
+                    pre.assert_credit_removed(&post, key, sets, routed, clamped);
+                    // Independent check: the window dropped by exactly the oracle's credit.
+                    for s in 0..2 {
+                        let added = if routed && Some(s) == rendezvous_pick(key, sets) {
+                            clamped
+                        } else {
+                            0.0
+                        };
+                        let demand_drop = pre.demand[s] * d + added - post.demand[s];
+                        let fair = if routed {
+                            clamped * sets[s].1 / total
+                        } else {
+                            0.0
+                        };
+                        let expected_drop = pre.expected[s] * d + fair - post.expected[s];
+                        let o = oracle[slot];
+                        assert!(
+                            (demand_drop - o.demand[s]).abs() < 1e-6,
+                            "demand drop {demand_drop} != {}",
+                            o.demand[s]
+                        );
+                        assert!(
+                            (expected_drop - o.expected[s]).abs() < 1e-6,
+                            "fair drop {expected_drop} != {}",
+                            o.expected[s]
+                        );
+                    }
+                    oracle[slot] = CreditOracle::default();
+                    outcome.entries.push(i);
+                }
+            }
+            outcome.spills.push(spills);
+        }
+        outcome
+    }
+
+    /// R6-2 / R7-4: keys credited to the window at 30:30 become heavy after TP2 recovers
+    /// to 60 workers. Their fair-load credit is removed at the 1:1 weights it was credited
+    /// at, not the current 1:2 (checked against an independent oracle), so the residual
+    /// window stays balanced and nothing spills.
     #[test]
     fn heavy_entry_after_recovery_removes_historical_fair_credit() {
         let even = [(TP4, 30.0), (TP2, 30.0)];
@@ -1801,50 +1960,88 @@ mod tests {
         };
         let mut hot: Vec<u64> = (0..u64::MAX).map(mixed).filter(stable(0)).take(2).collect();
         hot.extend((0..u64::MAX).map(mixed).filter(stable(1)).take(2));
+        // Each hot key sends 5% of requests at 6x the background charge.
+        let outcome = run_recovery(&hot, 6.0, &[(even, 20_000, 20), (SETS, 6_000, 20)]);
+        assert_eq!(
+            outcome.heavy_in_first_phase, 0,
+            "hot keys must not be heavy at 30:30"
+        );
+        assert!(
+            outcome.entries.len() >= hot.len(),
+            "entries {:?}",
+            outcome.entries
+        );
+        assert_eq!(outcome.spills, vec![[0, 0], [0, 0]], "spurious spills");
+    }
+
+    /// R7-2: the winner change and the heavy entry coincide. Six keys preferring TP4 at
+    /// 30:30 and TP2 at 30:60 send one request each per 27 at 16x charge: below the 1/8
+    /// band at 30:30, and right at the 1/12 band at 30:60, so when TP2 recovers a key's
+    /// next request is affinity-routed (moving its winner to TP2) and its own load makes
+    /// it heavy (the rest follow when their rate rises). All of its credit, including the TP4 demand from before the change, leaves
+    /// the window (checked against the independent oracle), so no background key spills
+    /// afterwards.
+    #[test]
+    fn simultaneous_winner_change_and_heavy_entry_remove_all_credit() {
+        let even = [(TP4, 30.0), (TP2, 30.0)];
+        let hot: Vec<u64> = (0..u64::MAX)
+            .map(mixed)
+            .filter(|k| {
+                rendezvous_pick(*k, &even) == Some(0) && rendezvous_pick(*k, &SETS) == Some(1)
+            })
+            .take(6)
+            .collect();
+        // A key that misses the coincident entry becomes heavy once its rate rises.
+        let outcome = run_recovery(
+            &hot,
+            16.0,
+            &[(even, 20_000, 27), (SETS, 4_000, 27), (SETS, 6_000, 18)],
+        );
+        assert_eq!(
+            outcome.heavy_in_first_phase, 0,
+            "hot keys must not be heavy at 30:30"
+        );
+        assert!(
+            outcome.entries.len() >= hot.len(),
+            "entries {:?}",
+            outcome.entries
+        );
+        assert!(
+            outcome.coincident >= 1,
+            "no entry coincided with a winner change"
+        );
+        assert_eq!(
+            outcome.spills_after_entries,
+            [0, 0],
+            "spurious spills after entry"
+        );
+    }
+
+    /// R7-1: a TP4-preferring key that starts after warm-up and sends one request in 25 at
+    /// 8x the background charge carries about a quarter of the load with 4% of requests.
+    /// It must qualify as heavy by load (the request floor only asks for repeated
+    /// observations), so TP4 stays in band even though its spill point keeps it from
+    /// spilling. A request-share floor of half the band (4.2%) would never admit it.
+    #[test]
+    fn load_heavy_infrequent_key_qualifies_and_keeps_band() {
+        let hot = key_preferring(TP4, |x| x > 0.25);
         let tracker = ShareTracker::default();
-        let mut spills_from = [0usize; 2];
-        let mut entries = 0;
-        let mut heavy_before = 0;
-        let mut i = 0u64;
-        for (sets, decisions) in [(even, 20_000u64), (SETS, 6_000)] {
-            for _ in 0..decisions {
-                i += 1;
-                // Each hot key sends 5% of requests at 6x the background charge.
-                let slot = (i % 20) as usize;
-                let (key, charge) = match hot.get(slot) {
-                    Some(&k) => (k, 6.0),
-                    None => (mixed(i + 90_000_000), 1.0),
-                };
-                let pre = WindowSnapshot::take_for(&tracker, key, &sets);
-                let clamped = tracker.state.lock().clamp_charge(charge);
-                let (_, reason) = tracker
-                    .choose(SetAffinity::new(key, charge), &sets, DEFAULT_SLACK)
-                    .unwrap();
-                if slot >= hot.len() {
-                    if reason == SetChoiceReason::ShareCapFallback {
-                        spills_from[rendezvous_pick(key, &sets).unwrap()] += 1;
-                    }
-                    continue;
-                }
-                let routed = reason != SetChoiceReason::HeavyKeyRandom;
-                if sets[1].1 == 30.0 && !routed {
-                    heavy_before += 1;
-                }
-                let post = WindowSnapshot::take_for(&tracker, key, &sets);
-                let was = pre.counter.as_ref().is_some_and(|c| c.heavy);
-                let now = post.counter.as_ref().is_some_and(|c| c.heavy);
-                if now && (!was || routed) {
-                    pre.assert_credit_removed(&post, key, &sets, routed, clamped);
-                    entries += 1;
-                }
+        let mut tally = Tally::default();
+        for i in 0..35_000u64 {
+            let (key, charge) = if i >= 5_000 && i.is_multiple_of(25) {
+                (hot, 8.0)
+            } else {
+                (mixed(i + 60_000_000), 1.0)
+            };
+            let (idx, _) = tracker
+                .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
+                .unwrap();
+            if i >= 20_000 {
+                tally.add(idx, charge);
             }
         }
-        assert_eq!(heavy_before, 0, "hot keys must not be heavy at 30:30");
-        assert!(entries >= hot.len(), "entries {entries}");
-        for &k in &hot {
-            assert!(tracker.is_heavy(k, &SETS, DEFAULT_SLACK));
-        }
-        assert_eq!(spills_from, [0, 0], "spurious spills after recovery");
+        assert!(tracker.is_heavy(hot, &SETS, DEFAULT_SLACK));
+        tally.assert_in_band(0.0, "8x key every 25 requests");
     }
 
     /// The subtraction bug moved the hot key's whole history out of its winner's demand,
@@ -1878,9 +2075,9 @@ mod tests {
         }
     }
 
-    /// Heavy → non-heavy → heavy. The key exits through the request floor while its
-    /// (large-charge) load is still high, then re-enters: only the load credited to the
-    /// window since it left the heavy state is removed, not its random-routed history.
+    /// Heavy → non-heavy → heavy. The key cools below the exit threshold while it keeps
+    /// sending large requests, then re-enters: only the load credited to the window since
+    /// it left the heavy state is removed, not its random-routed history.
     #[test]
     fn heavy_reentry_removes_only_its_window_credit() {
         let hot = key_preferring(TP4, |x| x > 0.5);
@@ -1888,8 +2085,9 @@ mod tests {
             hot,
             &[
                 phase(3, 8.0, 8_000),
-                // 1 in 60 requests: below a quarter of the band in requests, so it exits.
-                phase(60, 8.0, 6_000),
+                // 1 in 200 requests at 8x: about 3.9% of load, below half the band, so it
+                // exits and is affinity-routed (credited) until it heats up again.
+                phase(200, 8.0, 8_000),
                 phase(10, 8.0, 6_000),
             ],
         );
