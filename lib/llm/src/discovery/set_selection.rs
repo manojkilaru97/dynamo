@@ -63,22 +63,28 @@
 //!    that allowance, and leaks away once the set's demand alone (what it would receive
 //!    with no spill) is clearly within band. The deadband is wider than any non-heavy key,
 //!    so whole-key moves settle instead of oscillating, also when one lands exactly on
-//!    fair share. A balanced workload never engages it.
+//!    fair share. A balanced workload never engages it. The boost steps only on decisions
+//!    that update the window, and is dropped whenever the window is cold.
 //!
+//! The window covers the last ~1000 affinity-routed decisions: only those decay it, so
+//! heavy-key traffic in between neither ages its shares nor keeps it from warming up
+//! (with 85% of requests from one heavy key, the guards still see the remaining 15%).
 //! "Fair" is the decayed average of each set's weight share over the same window, so a
 //! small worker-count drift shifts the targets as gradually as the observed load and only
 //! the keys rendezvous hashing itself moves change sets. The window (demand, fair shares,
 //! routed shares and boosts) restarts when the candidate sets change, when any set's
 //! weight share has moved by more than 0.02 since the last restart (a capacity change:
-//! old targets and boosts would keep spilling toward a set that just shrank), or when a
-//! selection found fewer than two eligible sets, so a set that returns at a new size is
-//! not judged against a stale fair share.
+//! old targets and boosts would keep spilling toward a set that just shrank; drifts that
+//! arrive one worker at a time accumulate against that baseline), or when a selection
+//! found fewer than two eligible sets, so a set that returns at a new size is not judged
+//! against a stale fair share. Every restart re-baselines the capacity threshold.
 //!
 //! Charges in the spill statistics are clamped to 8× a decayed mean charge (seeded with a
-//! 4 KiB prior), and the guard stays idle until it has seen about 200 decisions (heavy-key
-//! detection starts after 100, so a hot key present from the start leaves the statistics
-//! before the guard acts on them), so one huge request or a freshly started frontend
-//! cannot swing them. Heavy-key detection uses the unclamped charge.
+//! 4 KiB prior), and the guard stays idle until its window holds about 200 decisions
+//! (heavy-key detection starts after 100 decisions of any kind, so a hot key present from
+//! the start leaves the statistics before the guard acts on them), so one huge request or
+//! a freshly started frontend cannot swing them. Heavy-key detection uses the unclamped
+//! charge.
 //!
 //! `DYN_WORKER_SET_WEIGHTS=suffix=weight,...` scales the per-worker weight of every set whose
 //! namespace ends with `suffix` (for example `tp4=2,tp2=1` to weight sets by GPUs). Entries
@@ -677,38 +683,57 @@ impl ShareState {
         }
     }
 
-    /// Reset the window if the candidate set keys differ from the last decision's, or if
-    /// any candidate's weight share moved by more than [`MATERIAL_SHARE_CHANGE`] since the
-    /// window last restarted (a capacity change: the spill targets, boosts and demand of
-    /// the old weights would otherwise keep spilling toward a set that just shrank).
-    /// Smaller drifts keep the window; fair shares follow them as gradually as the load.
-    fn track_candidates(&mut self, candidates: &[(&str, f64)]) {
+    /// Each candidate's share of the total usable weight (0 for an unusable weight).
+    fn weight_shares(candidates: &[(&str, f64)]) -> Vec<f64> {
+        let usable = |w: f64| w.is_finite() && w > 0.0;
         let total: f64 = candidates
             .iter()
             .map(|(_, w)| *w)
-            .filter(|w| w.is_finite() && *w > 0.0)
+            .filter(|w| usable(*w))
             .sum();
-        let share = |w: f64| {
-            if w.is_finite() && w > 0.0 && total > 0.0 {
-                w / total
-            } else {
-                0.0
-            }
-        };
+        candidates
+            .iter()
+            .map(|(_, w)| {
+                if usable(*w) && total > 0.0 {
+                    *w / total
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
+    /// Restart the window at `candidates`, which become the baseline for detecting the
+    /// next material weight change. Every restart goes through here (membership change,
+    /// material weight change, a selection with fewer than two eligible sets), so the
+    /// capacity-change threshold is always measured from the latest restart.
+    fn restart_window(&mut self, candidates: &[(&str, f64)]) {
+        self.reset_window();
+        self.candidates = candidates.iter().map(|(n, _)| n.to_string()).collect();
+        self.baseline_shares = Self::weight_shares(candidates);
+    }
+
+    /// Restart the window if the candidate set keys differ from the last decision's, or
+    /// if any candidate's weight share moved by more than [`MATERIAL_SHARE_CHANGE`] since
+    /// the window last restarted (a capacity change: the spill targets, boosts and demand
+    /// of the old weights would otherwise keep spilling toward a set that just shrank).
+    /// Drifts accumulate against that baseline, so a capacity change that arrives one
+    /// worker at a time restarts the window too; smaller drifts keep the window, and
+    /// fair shares follow them as gradually as the load.
+    fn track_candidates(&mut self, candidates: &[(&str, f64)]) {
+        let shares = Self::weight_shares(candidates);
         let same = self.candidates.len() == candidates.len()
             && candidates
                 .iter()
                 .all(|(name, _)| self.candidates.iter().any(|c| c == name));
         let material = !same
-            || candidates.iter().any(|(name, w)| {
+            || candidates.iter().zip(&shares).any(|((name, _), share)| {
                 let i = self.candidates.iter().position(|c| c == name);
                 let baseline = i.and_then(|i| self.baseline_shares.get(i)).copied();
-                baseline.is_none_or(|b| (share(*w) - b).abs() > MATERIAL_SHARE_CHANGE)
+                baseline.is_none_or(|b| (share - b).abs() > MATERIAL_SHARE_CHANGE)
             });
         if material {
-            self.reset_window();
-            self.candidates = candidates.iter().map(|(n, _)| n.to_string()).collect();
-            self.baseline_shares = candidates.iter().map(|(_, w)| share(*w)).collect();
+            self.restart_window(candidates);
         }
     }
 
@@ -957,7 +982,9 @@ impl ShareState {
         effective_samples(self.window_decisions, self.window_decisions_sq)
     }
 
-    fn decay(&mut self) -> f64 {
+    /// Decay the statistics every keyed decision feeds: the decision counts and charge
+    /// sums behind the clamp and heavy-key shares, and the heavy-key counters.
+    fn decay_global(&mut self) {
         let decay = 1.0 - 1.0 / SHARE_WINDOW;
         self.decisions *= decay;
         self.charge_sum *= decay;
@@ -965,6 +992,21 @@ impl ShareState {
         self.raw_sq_sum *= decay * decay;
         self.decisions_sq *= decay * decay;
         self.prior_weight *= decay;
+        for c in &mut self.heavy {
+            c.raw *= decay;
+            c.raw_err *= decay;
+            c.count *= decay;
+            c.count_err *= decay;
+        }
+    }
+
+    /// Decay the fair-share window and the counters' window credit (kept in step, so a
+    /// heavy entry removes exactly what is left of the key's contribution). Only
+    /// decisions that add to the window decay it, so its horizon is the last ~1000
+    /// affinity-routed decisions however much heavy-key traffic lies between them: heavy
+    /// traffic neither ages the window's shares nor keeps it from warming up.
+    fn decay_window(&mut self) {
+        let decay = 1.0 - 1.0 / SHARE_WINDOW;
         self.window_decisions *= decay;
         self.window_sum *= decay;
         self.window_sq_sum *= decay * decay;
@@ -983,10 +1025,6 @@ impl ShareState {
             map.retain(|_, v| *v > 1e-6);
         }
         for c in &mut self.heavy {
-            c.raw *= decay;
-            c.raw_err *= decay;
-            c.count *= decay;
-            c.count_err *= decay;
             c.window_sq *= decay * decay;
             c.window_decisions *= decay;
             c.window_decisions_sq *= decay * decay;
@@ -996,12 +1034,14 @@ impl ShareState {
                 }
             }
         }
-        decay
     }
 
     /// Record one keyed decision that placed the request on `candidates[chosen]`.
     /// Affinity-routed requests also feed the fair-share window (demand, fair share and
-    /// placement); heavy-key requests (weighted random) do not.
+    /// placement), decay it and step the routed-share boost; heavy-key requests
+    /// (weighted random) do none of that. Whenever the window is cold (below
+    /// [`SHARE_MIN_SAMPLES`], for example after a heavy entry removed much of it) the boost
+    /// is dropped, as on a restart, so it is never re-applied to a later load mix.
     #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
@@ -1016,7 +1056,10 @@ impl ShareState {
     ) {
         let raw = charge;
         let charge = self.clamp_charge(raw);
-        self.decay();
+        self.decay_global();
+        if affinity_routed {
+            self.decay_window();
+        }
         self.decisions += 1.0;
         self.decisions_sq += 1.0;
         self.charge_sum += charge;
@@ -1067,7 +1110,14 @@ impl ShareState {
             self.heavy[slot].clear_window_credit();
         }
         self.heavy[slot].heavy = status;
-        self.update_boost(candidates, ranking, slack);
+        // A decision that added nothing to the window cannot move the shares the boost
+        // integrates, so it does not step it.
+        if affinity_routed {
+            self.update_boost(candidates, ranking, slack);
+        }
+        if self.window_decisions < SHARE_MIN_SAMPLES {
+            self.boost.clear();
+        }
     }
 
     /// Space-Saving update for `key`; returns its counter's slot.
@@ -1206,7 +1256,7 @@ impl ShareTracker {
         }
         let mut state = self.state.lock();
         if self.stale.swap(false, Ordering::Relaxed) {
-            state.reset_window();
+            state.restart_window(candidates);
         }
         state.track_candidates(candidates);
         let band = narrowest_band(candidates, &ranking, slack);
@@ -2056,7 +2106,13 @@ mod tests {
             routed: bool,
             charge: f64,
         ) {
-            let d = 1.0 - 1.0 / SHARE_WINDOW;
+            // The window (and the counters' window credit) decays only on a decision that
+            // adds to it.
+            let d = if routed {
+                1.0 - 1.0 / SHARE_WINDOW
+            } else {
+                1.0
+            };
             let close = |actual: f64, expected: f64, what: &str| {
                 assert!(
                     (actual - expected).abs() <= 1e-6 * expected.abs().max(1.0),
@@ -2385,7 +2441,8 @@ mod tests {
                 if restarted {
                     oracle.fill(CreditOracle::default());
                 }
-                for o in &mut oracle {
+                // Window credit decays only on decisions that update the window.
+                for o in oracle.iter_mut().filter(|_| routed) {
                     for list in [
                         &mut o.demand,
                         &mut o.expected,
@@ -2434,6 +2491,7 @@ mod tests {
                         pre.assert_credit_removed(&post, key, sets, chosen, routed, clamped);
                     }
                     // Independent check: the window dropped by exactly the oracle's credit.
+                    let d = if routed { d } else { 1.0 };
                     for s in (0..2).filter(|_| checked) {
                         let added = if routed && Some(s) == rendezvous_pick(key, sets) {
                             clamped
@@ -3232,6 +3290,254 @@ mod tests {
                     "{phase}: TP2 {what} share {tp2}"
                 );
             }
+        }
+    }
+
+    // -- R11: heavy traffic and the window, restart baselines, accumulated drift --
+
+    /// R11-1 (sol): one common `prompt_cache_key` sends ~85% of requests at 15k tokens
+    /// (heavy: random routing), and 20 equally active sessions (session-0 to session-19)
+    /// send 126k-token requests, behind 30 trackers with the production set keys. The
+    /// sessions carry ~60% of the bytes and twelve of them prefer TP4. When every decision
+    /// decayed the window but only the sessions' added to it, the window settled near 150
+    /// decisions, below the guards' warm-up, so neither guard ever acted (49% of bytes on
+    /// TP4 against a 41.7% band). The window now ages only with the decisions it holds, so
+    /// the guards balance the sessions and both measures stay in band.
+    #[test]
+    fn heavy_common_key_does_not_disable_balancing() {
+        const BYTES_PER_TOKEN: f64 = 4.0;
+        let common = cache_key("common-system-prompt");
+        let sessions: Vec<u64> = (0..20)
+            .map(|n| cache_key(&format!("session-{n}")))
+            .collect();
+        let on_tp4 = sessions
+            .iter()
+            .filter(|k| rendezvous_pick(**k, &PROD_SETS) == Some(0))
+            .count();
+        assert_eq!(on_tp4, 12, "sessions preferring TP4 by rendezvous");
+        let trackers: Vec<ShareTracker> = (0..30).map(|_| ShareTracker::default()).collect();
+        let mut rng = Rng(0x5011);
+        let mut tallies = Tallies::default();
+        let requests = 30 * 20_000u64;
+        for i in 0..requests {
+            let (key, tokens) = if rng.uniform() < 0.85 {
+                (common, 15_000.0)
+            } else {
+                (sessions[(rng.next_u64() % 20) as usize], 126_000.0)
+            };
+            let charge = tokens * BYTES_PER_TOKEN;
+            let frontend = (rng.next_u64() % 30) as usize;
+            let (idx, _) = trackers[frontend]
+                .choose(SetAffinity::new(key, charge), &PROD_SETS, DEFAULT_SLACK)
+                .unwrap();
+            if i >= requests / 2 {
+                tallies.add(idx, charge);
+            }
+        }
+        for (f, tracker) in trackers.iter().enumerate() {
+            assert!(
+                tracker.is_heavy(common, &PROD_SETS, DEFAULT_SLACK),
+                "frontend {f}"
+            );
+            let state = tracker.state.lock();
+            assert!(
+                state.window_decisions >= SHARE_MIN_SAMPLES,
+                "frontend {f}: window {}",
+                state.window_decisions
+            );
+        }
+        tallies.assert_in_band(0.0, "heavy common key with 20 long sessions");
+    }
+
+    /// Whenever the window is cold, no boost is kept.
+    fn assert_no_cold_boost(tracker: &ShareTracker, context: &str) {
+        let state = tracker.state.lock();
+        assert!(
+            state.window_decisions >= SHARE_MIN_SAMPLES || state.boost.is_empty(),
+            "{context}: boost {:?} with a cold window ({})",
+            state.boost,
+            state.window_decisions
+        );
+    }
+
+    /// R11-1 (grok): sol's 12 persistent conversations drive TP4's boost up; then 2000
+    /// requests come from a single key (heavy after its first ~100 requests), then the
+    /// pool resumes. The heavy run used to keep stepping the boost on frozen shares (+0.3
+    /// over the run) while decaying the window below warm-up, so the grown boost was
+    /// re-applied when affinity resumed. Now the heavy decisions neither step the boost
+    /// nor age the window: the pool resumes against the boost it left, and both measures
+    /// stay in band.
+    #[test]
+    fn heavy_run_neither_grows_nor_strands_the_boost() {
+        let sol: Vec<u64> = (282..294)
+            .map(|n| cache_key(&format!("session-{n}")))
+            .collect();
+        let hot = cache_key("one-heavy-key");
+        let tracker = ShareTracker::default();
+        let mut rng = Rng(0x6e0c);
+        let mut pool = |n: u64, tally: bool| {
+            let mut tallies = Tallies::default();
+            for _ in 0..n {
+                let key = sol[(rng.next_u64() % 12) as usize];
+                let (idx, _) = tracker
+                    .choose(SetAffinity::new(key, 4096.0), &PROD_SETS, DEFAULT_SLACK)
+                    .unwrap();
+                assert_no_cold_boost(&tracker, "pool");
+                if tally {
+                    tallies.add(idx, 4096.0);
+                }
+            }
+            tallies
+        };
+        // Stop while the boost is still climbing (TP4 still above its band).
+        pool(500, false);
+        let climbing = ShareState::stat(&tracker.state.lock().boost, PROD_TP4);
+        pool(100, false);
+        let before = ShareState::stat(&tracker.state.lock().boost, PROD_TP4);
+        assert!(
+            before > climbing && climbing > 0.0,
+            "the boost is not climbing ({climbing} -> {before})"
+        );
+        let mut heavy = 0;
+        for _ in 0..2_000 {
+            let (_, reason) = tracker
+                .choose(SetAffinity::new(hot, 4096.0), &PROD_SETS, DEFAULT_SLACK)
+                .unwrap();
+            heavy += usize::from(reason == SetChoiceReason::HeavyKeyRandom);
+            assert_no_cold_boost(&tracker, "heavy run");
+        }
+        assert!(heavy >= 1_600, "heavy decisions {heavy}");
+        let after = ShareState::stat(&tracker.state.lock().boost, PROD_TP4);
+        // Only the hot key's affinity-routed requests before it became heavy could step
+        // the boost, each by at most the gain (the excess is at most 1).
+        let routed = 2_000 - heavy;
+        assert!(
+            after <= before + routed as f64 * SPILL_BOOST_GAIN,
+            "the boost grew from {before} to {after} over {heavy} heavy decisions"
+        );
+        assert!(tracker.state.lock().window_decisions >= SHARE_MIN_SAMPLES);
+        pool(20_000, false);
+        pool(20_000, true).assert_in_band(0.01, "pool after the heavy run");
+    }
+
+    /// R11-1: a boost never survives a cold window. A heavy entry can remove most of a
+    /// young window; the next decision, of either kind, drops the boost (it is not kept
+    /// frozen for a later load mix), and a heavy decision on a warm window leaves it as
+    /// it is.
+    #[test]
+    fn cold_window_drops_the_boost() {
+        let record = |state: &mut ShareState, affinity_routed: bool| {
+            state.record(
+                mixed(1),
+                &SETS,
+                &[0, 1],
+                0,
+                affinity_routed,
+                1.0,
+                1.0 / 12.0,
+                DEFAULT_SLACK,
+            );
+        };
+        for affinity_routed in [false, true] {
+            let mut state = boost_state(4.0 / 9.0, 1.0 / 3.0);
+            state.window_decisions = 150.0;
+            state.window_decisions_sq = 75.0;
+            record(&mut state, affinity_routed);
+            assert!(
+                state.boost.is_empty(),
+                "routed {affinity_routed}: {:?}",
+                state.boost
+            );
+        }
+        let mut state = boost_state(4.0 / 9.0, 1.0 / 3.0);
+        record(&mut state, false);
+        assert_eq!(ShareState::stat(&state.boost, TP4), 0.4);
+        assert_eq!(
+            state.window_decisions, 1000.0,
+            "a heavy decision aged the window"
+        );
+    }
+
+    /// R11-2 (opus): a "fewer than two eligible sets" restart re-baselines the capacity
+    /// threshold. TP2 goes not-ready (only TP4 eligible), returns at 64 workers (TP4's
+    /// share 0.319, within 0.02 of the old 0.333 baseline), then drops to 56 (0.349: 0.030
+    /// from the restart point, but only 0.016 from the stale baseline). The drop restarts
+    /// the window.
+    #[test]
+    fn stale_restart_rebaselines_the_capacity_threshold() {
+        let tracker = ShareTracker::default();
+        let mut key = 0u64;
+        let mut run = |sets: &[(&str, f64); 2], n: u64| {
+            for _ in 0..n {
+                key += 1;
+                tracker
+                    .choose(unit(mixed(key + 88_000_000)), sets, DEFAULT_SLACK)
+                    .unwrap();
+            }
+        };
+        run(&SETS, 3_000);
+        tracker.mark_single_eligible();
+        run(&[(TP4, 30.0), (TP2, 64.0)], 1);
+        assert!(tracker.state.lock().window_decisions <= 1.0);
+        run(&[(TP4, 30.0), (TP2, 64.0)], 3_000);
+        assert!(tracker.state.lock().window_decisions > 900.0);
+        run(&[(TP4, 30.0), (TP2, 56.0)], 1);
+        assert!(
+            tracker.state.lock().window_decisions <= 1.0,
+            "64 -> 56 after a stale restart did not restart the window"
+        );
+    }
+
+    /// R11-3 (opus): capacity arrives one worker at a time. TP2 drops from 60 to 10
+    /// workers, one worker per 50 decisions, under 20 persistent conversations that hold
+    /// an active boost. No single step moves TP4's share by 0.02 (the largest, 11 → 10, is
+    /// 0.018), but the drift accumulates against the last restart's baseline, so the
+    /// window restarts several times on the way down; once TP2 is at 10 workers it stays at
+    /// or below its new upper band (fair 1/4 + 1/16) on both measures. Comparing with the
+    /// previous call's shares instead never restarts and overloads TP2 with stale state.
+    #[test]
+    fn capacity_drift_accumulates_to_a_restart() {
+        let keys: Vec<u64> = (0..20)
+            .map(|n| cache_key(&format!("session-{n}")))
+            .collect();
+        let tracker = ShareTracker::default();
+        let mut rng = Rng(0xd41f);
+        let restarts = std::cell::Cell::new(0usize);
+        let mut run = |sets: &[(&str, f64); 2], n: u64| {
+            let mut tallies = Tallies::default();
+            for _ in 0..n {
+                let key = keys[(rng.next_u64() % 20) as usize];
+                let baseline = tracker.state.lock().baseline_shares.clone();
+                let (idx, _) = tracker
+                    .choose(SetAffinity::new(key, 4096.0), sets, DEFAULT_SLACK)
+                    .unwrap();
+                let restarted = tracker.state.lock().baseline_shares != baseline;
+                restarts.set(restarts.get() + usize::from(restarted));
+                tallies.add(idx, 4096.0);
+            }
+            tallies
+        };
+        run(&PROD_SETS, 30_000);
+        assert!(
+            !tracker.state.lock().boost.is_empty(),
+            "no active boost before the drift"
+        );
+        let first = restarts.get();
+        for workers in (10..60).rev() {
+            run(&[(PROD_TP4, 30.0), (PROD_TP2, f64::from(workers))], 50);
+        }
+        let during = restarts.get() - first;
+        assert!(
+            during >= 1,
+            "no restart while TP2 drifted from 60 to 10 workers"
+        );
+        let after = run(&[(PROD_TP4, 30.0), (PROD_TP2, 10.0)], 2_000);
+        for (what, tally) in [("charge", &after.charge), ("requests", &after.requests)] {
+            let tp2 = tally.share(1);
+            assert!(
+                tp2 <= 0.25 + 0.0625,
+                "TP2 {what} share {tp2} after {during} restarts"
+            );
         }
     }
 
