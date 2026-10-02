@@ -44,6 +44,7 @@ use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 use rand::Rng;
+use serde_json::Value;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64_with_seed};
 
 use dynamo_protocols::types::{
@@ -513,7 +514,7 @@ const AFFINITY_SEED: u64 = 0x5e75_e1ec_7a1f_f1a7;
 /// Domain tags so an explicit key can never collide with a message-prefix hash.
 const PROMPT_CACHE_KEY_TAG: &[u8] = b"prompt_cache_key\0";
 const SESSION_AFFINITY_TAG: &[u8] = b"session_affinity\0";
-const MESSAGES_TAG: &[u8] = b"messages\0";
+const MESSAGES_TAG: &[u8] = b"messages/v2\0";
 
 fn explicit_affinity_key(tag: &[u8], value: &str) -> u64 {
     let mut hasher = Xxh3::with_seed(AFFINITY_SEED);
@@ -522,19 +523,74 @@ fn explicit_affinity_key(tag: &[u8], value: &str) -> u64 {
     hasher.digest()
 }
 
+/// Canonical form of message content for hashing: a plain string when the content is
+/// only text (text parts concatenated), otherwise an array in which each run of adjacent
+/// text parts becomes one `{"type":"text","text":…}` part and every other part is kept
+/// verbatim.
+fn canonical_content(content: Value) -> Value {
+    let Value::Array(parts) = content else {
+        return content;
+    };
+    let mut out: Vec<Value> = Vec::with_capacity(parts.len());
+    let mut text: Option<String> = None;
+    for part in parts {
+        let part_text = match &part {
+            Value::Object(map) if map.get("type").and_then(Value::as_str) == Some("text") => {
+                map.get("text").and_then(Value::as_str).map(str::to_owned)
+            }
+            _ => None,
+        };
+        match part_text {
+            Some(t) => text.get_or_insert_with(String::new).push_str(&t),
+            None => {
+                if let Some(t) = text.take() {
+                    out.push(serde_json::json!({"type": "text", "text": t}));
+                }
+                out.push(part);
+            }
+        }
+    }
+    match (out.is_empty(), text) {
+        (true, Some(t)) => Value::String(t),
+        (true, None) => Value::String(String::new()),
+        (false, t) => {
+            if let Some(t) = t {
+                out.push(serde_json::json!({"type": "text", "text": t}));
+            }
+            Value::Array(out)
+        }
+    }
+}
+
+/// Canonical JSON of one opening message: text content canonicalized and `developer`
+/// folded into `system` (the Responses conversion maps both to system messages).
+fn canonical_message(message: &ChatCompletionRequestMessage) -> Option<Value> {
+    let mut value = serde_json::to_value(message).ok()?;
+    let map = value.as_object_mut()?;
+    if map.get("role").and_then(Value::as_str) == Some("developer") {
+        map.insert("role".to_string(), Value::String("system".to_string()));
+    }
+    if let Some(content) = map.remove("content") {
+        map.insert("content".to_string(), canonical_content(content));
+    }
+    Some(value)
+}
+
 /// Affinity key for a conversation from its messages: a hash of every message before the
 /// first assistant, tool or function message (the client-authored opening).
 ///
 /// Every later turn of the same conversation repeats that opening, so turns map to the same
 /// key, while two sessions that share boilerplate leading user items (for example Codex's
-/// AGENTS.md and `<environment_context>`) still differ by their task.
+/// AGENTS.md and `<environment_context>`) still differ by their task. Text content is
+/// canonicalized first, so a string and the equivalent text-part array (Chat Completions
+/// vs. a converted Responses request) hash alike.
 ///
 /// Returns `None` when the opening holds no user message (system-only requests, or a
 /// conversation that starts with an assistant message): those carry nothing
 /// conversation-specific, so they take the weighted random pick instead of collapsing
 /// onto one hot key.
 ///
-/// TODO(D6): multimodal parts are hashed verbatim, so a follow-up turn that re-sends an image
+/// TODO(D6): non-text parts are hashed verbatim, so a follow-up turn that re-sends an image
 /// as a UUID-only reference (instead of URL + UUID) changes the key. Canonicalize image
 /// parts to their UUID before enabling affinity for a multimodal model (Super 3.5 is a VLM).
 pub fn messages_affinity_key(messages: &[ChatCompletionRequestMessage]) -> Option<u64> {
@@ -559,7 +615,7 @@ pub fn messages_affinity_key(messages: &[ChatCompletionRequestMessage]) -> Optio
     let mut writer = HashWriter(Xxh3::with_seed(AFFINITY_SEED));
     io::Write::write_all(&mut writer, MESSAGES_TAG).ok()?;
     for message in opening {
-        serde_json::to_writer(&mut writer, message).ok()?;
+        serde_json::to_writer(&mut writer, &canonical_message(message)?).ok()?;
         io::Write::write_all(&mut writer, b"\x1e").ok()?;
     }
     Some(writer.0.digest())
@@ -1421,6 +1477,78 @@ mod tests {
         assert_eq!(chat_request_affinity_key(&[], None, None), None);
         // An explicit key still applies.
         assert!(chat_request_affinity_key(&[], Some("conv"), None).is_some());
+    }
+
+    // -- R2-3: canonical text --
+
+    #[test]
+    fn chat_text_parts_hash_like_a_plain_string() {
+        let plain = chat_key(json!({"model": "m", "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "fix the parser"},
+        ]}));
+        let parts = chat_key(json!({"model": "m", "messages": [
+            {"role": "system", "content": [{"type": "text", "text": "sys"}]},
+            {"role": "user", "content": [
+                {"type": "text", "text": "fix the "},
+                {"type": "text", "text": "parser"},
+            ]},
+        ]}));
+        assert!(plain.is_some());
+        assert_eq!(plain, parts);
+        // Role structure still matters: the same text split across two user messages
+        // is a different opening.
+        let split = chat_key(json!({"model": "m", "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "fix the "},
+            {"role": "user", "content": "parser"},
+        ]}));
+        assert_ne!(plain, split);
+    }
+
+    #[test]
+    fn chat_and_responses_openings_hash_alike() {
+        let responses_single = responses_key(json!({
+            "model": "m", "instructions": "sys", "input": [user_item("fix the parser")],
+        }));
+        let responses_multi = responses_key(json!({
+            "model": "m", "instructions": "sys",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "fix the "},
+                {"type": "input_text", "text": "parser"},
+            ]}],
+        }));
+        let chat_array = chat_key(json!({"model": "m", "messages": [
+            {"role": "developer", "content": "sys"},
+            {"role": "user", "content": [{"type": "text", "text": "fix the parser"}]},
+        ]}));
+        let chat_plain = chat_key(json!({"model": "m", "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "fix the parser"},
+        ]}));
+        assert!(chat_plain.is_some());
+        assert_eq!(responses_single, chat_plain);
+        assert_eq!(responses_multi, chat_plain);
+        assert_eq!(chat_array, chat_plain);
+    }
+
+    #[test]
+    fn non_text_parts_keep_their_identity() {
+        let with_image = |url: &str| {
+            chat_key(
+                json!({"model": "m", "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "what is this"},
+                    {"type": "image_url", "image_url": {"url": url}},
+                ]}]}),
+            )
+        };
+        let a = with_image("https://example.com/a.png");
+        assert!(a.is_some());
+        assert_ne!(a, with_image("https://example.com/b.png"));
+        let text_only = chat_key(json!({"model": "m", "messages": [
+            {"role": "user", "content": "what is this"},
+        ]}));
+        assert_ne!(a, text_only);
     }
 
     // -- R2-2: size proxy --
