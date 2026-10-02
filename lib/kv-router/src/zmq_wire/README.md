@@ -78,3 +78,16 @@ SGLang currently emits a shorter positional `BlockStored` shape ending at
 because the tuple terminates early. If SGLang later adds positional metadata,
 it must either include the vLLM-compatible placeholder fields before the tail
 or use map/object events with named fields.
+
+## Lower-Tier Store Fill
+
+vLLM's lazy CPU offload publishes `BlockStored(medium=CPU)` with only the block
+hash. `ZmqEventNormalizer` completes such stores from the identity (parent hash
+and token hash) of the same block's device store, so the router indexes the CPU
+tier and later matches its `BlockRemoved` events. Identities are kept only while
+the device copy is resident, reference-counted like the publisher's dedup
+filter.
+
+This is an unconditional fix, independent of `DYN_WORKER_SET_SELECTION`. It is
+on by default; set `DYN_KV_ROUTER_FILL_LOWER_TIER=0` (or `false`, `no`, `off`)
+to disable it, which restores the previous behavior of dropping those stores.

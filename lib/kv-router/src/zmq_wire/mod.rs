@@ -6,10 +6,16 @@
 //! These types mirror the Python `msgspec`-defined structures emitted by vLLM
 //! engines over ZMQ PUB sockets. They are independent of the dynamo runtime
 //! and can be used by any crate that needs to decode the raw ZMQ payloads.
+//!
+//! [`ZmqEventNormalizer`] also completes lower-tier (for example CPU) stores
+//! that vLLM's lazy offload publishes without token IDs, from the identities
+//! of the same blocks' device stores. This is an unconditional fix, independent
+//! of `DYN_WORKER_SET_SELECTION`; it is on by default and
+//! `DYN_KV_ROUTER_FILL_LOWER_TIER=0` turns it off.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, LazyLock};
 
 use rmp_serde as rmps;
 use rustc_hash::FxHashMap;
@@ -54,7 +60,30 @@ pub struct ZmqEventNormalizer {
     cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
     block_identities: BlockIdentityMemo,
     lower_tier_filled: u64,
+    /// Complete token-less lower-tier stores from device identities
+    /// (`DYN_KV_ROUTER_FILL_LOWER_TIER`, default on).
+    fill_lower_tier: bool,
 }
+
+const FILL_LOWER_TIER_ENV: &str = "DYN_KV_ROUTER_FILL_LOWER_TIER";
+
+/// Whether the lower-tier fill is enabled for an env value: on unless it is
+/// `0`, `false`, `no` or `off` (case-insensitive).
+fn fill_lower_tier_enabled(value: Option<&str>) -> bool {
+    !value.map(str::trim).is_some_and(|v| {
+        ["0", "false", "no", "off"]
+            .iter()
+            .any(|off| v.eq_ignore_ascii_case(off))
+    })
+}
+
+static FILL_LOWER_TIER: LazyLock<bool> = LazyLock::new(|| {
+    let enabled = fill_lower_tier_enabled(std::env::var(FILL_LOWER_TIER_ENV).ok().as_deref());
+    if !enabled {
+        tracing::info!("{FILL_LOWER_TIER_ENV} disables the lower-tier store fill");
+    }
+    enabled
+});
 
 /// Router identity of a device-tier block: its chain parent and token hash.
 ///
@@ -76,20 +105,31 @@ struct BlockIdentity {
 /// identity the router drops those stores, never indexes the CPU tier, and
 /// later counts its removals as `block_not_found`.
 ///
-/// The memo follows device residency: a device `BlockRemoved` forgets those
-/// blocks and `AllBlocksCleared` forgets the worker, so it holds only blocks
-/// still on the GPU and long-lived hot prefixes are not pushed out by churn.
-/// This is safe for lazy offload because the copy keeps the GPU block in use,
-/// so its CPU store is published before the GPU removal. Past `capacity`, the
-/// least recently stored identity is evicted (a re-store refreshes it).
+/// The memo follows device residency exactly as the publisher's dedup filter
+/// (`EventDedupFilter`) does: each device store of a hash takes a reference, a
+/// device `BlockRemoved` releases one, and the identity is forgotten only when
+/// the last reference goes (the point where the filter forwards the removal);
+/// `AllBlocksCleared` forgets the worker. It therefore holds only blocks still
+/// on the GPU, and long-lived hot prefixes are not pushed out by churn. This is
+/// safe for lazy offload because the copy keeps the GPU block in use, so its
+/// CPU store is published before the GPU removal. Past `capacity`, the least
+/// recently stored identity is evicted (a re-store refreshes it).
 #[derive(Debug, Clone)]
 struct BlockIdentityMemo {
-    /// Identity and the generation of its latest store.
-    map: FxHashMap<(WorkerWithDpRank, u64), (BlockIdentity, u64)>,
+    map: FxHashMap<(WorkerWithDpRank, u64), MemoEntry>,
     /// Store order; entries whose generation no longer matches `map` are stale.
     order: VecDeque<((WorkerWithDpRank, u64), u64)>,
     next_generation: u64,
     capacity: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MemoEntry {
+    identity: BlockIdentity,
+    /// Generation of the latest store (eviction order).
+    generation: u64,
+    /// Device stores not yet matched by a device removal.
+    refs: usize,
 }
 
 const BLOCK_IDENTITY_MEMO_CAPACITY: usize = 65_536;
@@ -115,7 +155,15 @@ impl BlockIdentityMemo {
             };
             let generation = self.next_generation;
             self.next_generation += 1;
-            self.map.insert(key, (identity, generation));
+            let refs = self.map.get(&key).map_or(0, |e| e.refs) + 1;
+            self.map.insert(
+                key,
+                MemoEntry {
+                    identity,
+                    generation,
+                    refs,
+                },
+            );
             self.order.push_back((key, generation));
             parent = Some(block.block_hash);
         }
@@ -130,10 +178,16 @@ impl BlockIdentityMemo {
         self.compact();
     }
 
-    /// Forget blocks the worker no longer holds on the device.
+    /// Release one device reference per hash; forget a hash at its last reference.
     fn remove(&mut self, worker: WorkerWithDpRank, hashes: &[ExternalSequenceBlockHash]) {
         for hash in hashes {
-            self.map.remove(&(worker, hash.0));
+            let key = (worker, hash.0);
+            if let Some(entry) = self.map.get_mut(&key) {
+                entry.refs = entry.refs.saturating_sub(1);
+                if entry.refs == 0 {
+                    self.map.remove(&key);
+                }
+            }
         }
         self.compact();
     }
@@ -145,7 +199,9 @@ impl BlockIdentityMemo {
     }
 
     fn is_current(&self, key: &(WorkerWithDpRank, u64), generation: u64) -> bool {
-        self.map.get(key).is_some_and(|(_, g)| *g == generation)
+        self.map
+            .get(key)
+            .is_some_and(|e| e.generation == generation)
     }
 
     /// Drop stale order entries once they outnumber live ones, keeping `order`
@@ -153,8 +209,9 @@ impl BlockIdentityMemo {
     fn compact(&mut self) {
         if self.order.len() > 2 * self.capacity.max(self.map.len()) {
             let map = &self.map;
-            self.order
-                .retain(|(key, generation)| map.get(key).is_some_and(|(_, g)| g == generation));
+            self.order.retain(|(key, generation)| {
+                map.get(key).is_some_and(|e| e.generation == *generation)
+            });
         }
     }
 
@@ -169,7 +226,7 @@ impl BlockIdentityMemo {
         let mut blocks = Vec::with_capacity(hashes.len());
         let mut first_parent = None;
         for (i, hash) in hashes.iter().enumerate() {
-            let Some((identity, _)) = self.map.get(&(worker, *hash)) else {
+            let Some(MemoEntry { identity, .. }) = self.map.get(&(worker, *hash)) else {
                 break;
             };
             if i == 0 {
@@ -237,6 +294,7 @@ impl ZmqEventNormalizer {
             cache_namespaces: FxHashMap::default(),
             block_identities: BlockIdentityMemo::new(BLOCK_IDENTITY_MEMO_CAPACITY),
             lower_tier_filled: 0,
+            fill_lower_tier: *FILL_LOWER_TIER,
         }
     }
 
@@ -249,6 +307,7 @@ impl ZmqEventNormalizer {
             cache_namespaces: FxHashMap::default(),
             block_identities: BlockIdentityMemo::new(BLOCK_IDENTITY_MEMO_CAPACITY),
             lower_tier_filled: 0,
+            fill_lower_tier: *FILL_LOWER_TIER,
         }
     }
 
@@ -258,6 +317,14 @@ impl ZmqEventNormalizer {
         let mut normalizer = Self::new(kv_block_size);
         normalizer.block_identities = BlockIdentityMemo::new(capacity);
         normalizer
+    }
+
+    /// Enable or disable the lower-tier store fill (overrides
+    /// `DYN_KV_ROUTER_FILL_LOWER_TIER`). Disabled, no identities are kept and
+    /// token-less lower-tier stores stay empty, as before the fill existed.
+    pub fn with_lower_tier_fill(mut self, enabled: bool) -> Self {
+        self.fill_lower_tier = enabled;
+        self
     }
 
     /// Set the model's image placeholder token id so vLLM BlockStored events
@@ -303,8 +370,9 @@ impl ZmqEventNormalizer {
                 block_hashes,
                 medium,
                 ..
-            } if StorageTier::from_kv_medium_or_default(medium.as_deref())
-                != StorageTier::Device =>
+            } if self.fill_lower_tier
+                && StorageTier::from_kv_medium_or_default(medium.as_deref())
+                    != StorageTier::Device =>
             {
                 Some(block_hashes.iter().map(|h| h.into_u64()).collect())
             }
@@ -318,6 +386,9 @@ impl ZmqEventNormalizer {
             &self.warning_count,
             self.image_token_id,
         )?;
+        if !self.fill_lower_tier {
+            return Some(event);
+        }
         let is_device = event.placement.tier == StorageTier::Device;
         match (&mut event.event.data, lower_tier_hashes) {
             (KvCacheEventData::Stored(store), Some(hashes)) => {

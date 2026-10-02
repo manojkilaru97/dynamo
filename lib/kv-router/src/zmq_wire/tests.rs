@@ -1223,3 +1223,52 @@ fn hot_prefix_survives_churn_until_offloaded() {
     assert!(normalizer.block_identities.map.len() <= 8);
     assert!(normalizer.block_identities.order.len() <= 16);
 }
+
+/// R4-2: the publisher's dedup filter forwards a device removal only when the last of
+/// duplicate stores is removed; until then the block is still resident, so the identity
+/// must survive and a lazy CPU store must still fill.
+#[test]
+fn identity_is_reference_counted_like_dedup() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let mut normalizer = ZmqEventNormalizer::new(4);
+    gpu_store(&mut normalizer, 201, worker);
+    gpu_store(&mut normalizer, 201, worker);
+    gpu_remove(&mut normalizer, 201, worker);
+    assert_eq!(cpu_fill(&mut normalizer, &[201], worker), 1);
+    gpu_remove(&mut normalizer, 201, worker);
+    assert_eq!(cpu_fill(&mut normalizer, &[201], worker), 0);
+    // A removal of an unknown hash is ignored.
+    gpu_remove(&mut normalizer, 999, worker);
+}
+
+#[test]
+fn fill_lower_tier_env_values() {
+    for on in [
+        None,
+        Some(""),
+        Some("1"),
+        Some("true"),
+        Some("yes"),
+        Some("on"),
+    ] {
+        assert!(fill_lower_tier_enabled(on), "{on:?}");
+    }
+    for off in ["0", "false", "FALSE", " no ", "off"] {
+        assert!(!fill_lower_tier_enabled(Some(off)), "{off}");
+    }
+}
+
+/// R4-5: with the fill disabled, token-less lower-tier stores stay empty (the behavior
+/// before the fill existed) and no identities are kept.
+#[test]
+fn disabled_fill_leaves_lower_tier_stores_empty() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let mut normalizer = ZmqEventNormalizer::new(4).with_lower_tier_fill(false);
+    gpu_store(&mut normalizer, 201, worker);
+    assert_eq!(cpu_fill(&mut normalizer, &[201], worker), 0);
+    assert_eq!(normalizer.take_lower_tier_filled(), 0);
+    assert!(normalizer.block_identities.map.is_empty());
+    let mut enabled = ZmqEventNormalizer::new(4).with_lower_tier_fill(true);
+    gpu_store(&mut enabled, 201, worker);
+    assert_eq!(cpu_fill(&mut enabled, &[201], worker), 1);
+}
