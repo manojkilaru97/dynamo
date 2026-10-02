@@ -2122,6 +2122,10 @@ mod tests {
         let worker = WorkerWithDpRank::new(7, 0);
         for device_removed_after_cpu_store in [false, true] {
             let mut normalizer = ZmqEventNormalizer::new(4);
+            // The worker's first lower-tier store turns identity recording on.
+            normalizer
+                .normalize(raw_stored(&[0xdead], &[], Some("CPU"), None), 0, worker)
+                .unwrap();
             let mut index = TestLowerTierIndex::new();
 
             let device = normalizer
@@ -2188,6 +2192,10 @@ mod tests {
         // Device removal before the CPU store: no identity, so the store stays empty and
         // the CPU removal is BlockNotFound, exactly as without the fill.
         let mut normalizer = ZmqEventNormalizer::new(4);
+        // The worker's first lower-tier store turns identity recording on.
+        normalizer
+            .normalize(raw_stored(&[0xdead], &[], Some("CPU"), None), 0, worker)
+            .unwrap();
         let mut index = TestLowerTierIndex::new();
         normalizer
             .normalize(raw_stored(&[201], &[1, 2, 3, 4], None, None), 1, worker)

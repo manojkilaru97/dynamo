@@ -933,6 +933,7 @@ fn stored_data(event: PlacementEvent) -> KvCacheStoreData {
 fn tokenless_cpu_store_is_completed_from_device_identity() {
     let worker = WorkerWithDpRank::new(7, 0);
     let mut normalizer = ZmqEventNormalizer::new(4);
+    prime_lower_tier(&mut normalizer, worker);
     let gpu = stored_data(
         normalizer
             .normalize(
@@ -992,6 +993,7 @@ fn tokenless_cpu_store_stays_empty_for_unknown_or_foreign_blocks() {
     let worker = WorkerWithDpRank::new(7, 0);
     let other = WorkerWithDpRank::new(8, 0);
     let mut normalizer = ZmqEventNormalizer::new(4);
+    prime_lower_tier(&mut normalizer, worker);
     normalizer
         .normalize(
             gpu_block_stored(&[201], &[10, 11, 12, 13], 4, None),
@@ -1130,6 +1132,7 @@ fn gpu_remove(normalizer: &mut ZmqEventNormalizer, hash: u64, worker: WorkerWith
 fn cpu_store_before_device_removal_fills_then_identity_is_forgotten() {
     let worker = WorkerWithDpRank::new(7, 0);
     let mut normalizer = ZmqEventNormalizer::new(4);
+    prime_lower_tier(&mut normalizer, worker);
     normalizer
         .normalize(
             gpu_block_stored(&[201, 202], &[1, 2, 3, 4, 5, 6, 7, 8], 4, None),
@@ -1161,6 +1164,7 @@ fn device_removal_before_cpu_store_leaves_it_unfilled() {
 fn cpu_removal_keeps_device_identity() {
     let worker = WorkerWithDpRank::new(7, 0);
     let mut normalizer = ZmqEventNormalizer::new(4);
+    prime_lower_tier(&mut normalizer, worker);
     gpu_store(&mut normalizer, 201, worker);
     assert_eq!(cpu_fill(&mut normalizer, &[201], worker), 1);
     normalizer
@@ -1173,6 +1177,8 @@ fn cpu_removal_keeps_device_identity() {
 fn all_blocks_cleared_drops_only_that_workers_identities() {
     let (a, b) = (WorkerWithDpRank::new(7, 0), WorkerWithDpRank::new(8, 0));
     let mut normalizer = ZmqEventNormalizer::new(4);
+    prime_lower_tier(&mut normalizer, a);
+    prime_lower_tier(&mut normalizer, b);
     gpu_store(&mut normalizer, 201, a);
     gpu_store(&mut normalizer, 201, b);
     normalizer
@@ -1187,6 +1193,7 @@ fn all_blocks_cleared_drops_only_that_workers_identities() {
 fn re_store_refreshes_identity_position() {
     let worker = WorkerWithDpRank::new(7, 0);
     let mut normalizer = ZmqEventNormalizer::with_identity_capacity(4, 3);
+    prime_lower_tier(&mut normalizer, worker);
     for hash in [201, 202, 203] {
         gpu_store(&mut normalizer, hash, worker);
     }
@@ -1205,6 +1212,7 @@ fn re_store_refreshes_identity_position() {
 fn hot_prefix_survives_churn_until_offloaded() {
     let worker = WorkerWithDpRank::new(7, 0);
     let mut normalizer = ZmqEventNormalizer::with_identity_capacity(4, 8);
+    prime_lower_tier(&mut normalizer, worker);
     gpu_store(&mut normalizer, 101, worker);
     for i in 0..10_000u64 {
         let hash = 1_000 + i;
@@ -1231,6 +1239,7 @@ fn hot_prefix_survives_churn_until_offloaded() {
 fn identity_is_reference_counted_like_dedup() {
     let worker = WorkerWithDpRank::new(7, 0);
     let mut normalizer = ZmqEventNormalizer::new(4);
+    prime_lower_tier(&mut normalizer, worker);
     gpu_store(&mut normalizer, 201, worker);
     gpu_store(&mut normalizer, 201, worker);
     gpu_remove(&mut normalizer, 201, worker);
@@ -1264,11 +1273,39 @@ fn fill_lower_tier_env_values() {
 fn disabled_fill_leaves_lower_tier_stores_empty() {
     let worker = WorkerWithDpRank::new(7, 0);
     let mut normalizer = ZmqEventNormalizer::new(4).with_lower_tier_fill(false);
+    prime_lower_tier(&mut normalizer, worker);
     gpu_store(&mut normalizer, 201, worker);
     assert_eq!(cpu_fill(&mut normalizer, &[201], worker), 0);
     assert_eq!(normalizer.take_lower_tier_filled(), 0);
     assert!(normalizer.block_identities.map.is_empty());
     let mut enabled = ZmqEventNormalizer::new(4).with_lower_tier_fill(true);
+    prime_lower_tier(&mut enabled, worker);
     gpu_store(&mut enabled, 201, worker);
     assert_eq!(cpu_fill(&mut enabled, &[201], worker), 1);
+}
+
+/// A worker's first lower-tier store turns identity recording on for it (R5-3). Uses a
+/// hash no test stores on the device.
+fn prime_lower_tier(normalizer: &mut ZmqEventNormalizer, worker: WorkerWithDpRank) {
+    assert_eq!(cpu_fill(normalizer, &[0xdead_beef], worker), 0);
+}
+
+/// Identities are recorded only for workers that have published a lower-tier store, so
+/// workers without CPU offload keep no memo. Blocks stored on the device before the
+/// worker's first lower-tier store are not filled (accepted).
+#[test]
+fn identities_are_recorded_only_after_the_first_lower_tier_store() {
+    let (offloading, plain) = (WorkerWithDpRank::new(7, 0), WorkerWithDpRank::new(8, 0));
+    let mut normalizer = ZmqEventNormalizer::new(4);
+    gpu_store(&mut normalizer, 201, offloading);
+    gpu_store(&mut normalizer, 301, plain);
+    assert!(normalizer.block_identities.map.is_empty());
+    // First lower-tier store: nothing to fill yet, recording starts.
+    assert_eq!(cpu_fill(&mut normalizer, &[201], offloading), 0);
+    gpu_store(&mut normalizer, 202, offloading);
+    assert_eq!(cpu_fill(&mut normalizer, &[202], offloading), 1);
+    // Device events of a worker without lower-tier stores still cost nothing.
+    gpu_store(&mut normalizer, 302, plain);
+    gpu_remove(&mut normalizer, 301, plain);
+    assert_eq!(normalizer.block_identities.map.len(), 1);
 }
