@@ -16,22 +16,24 @@
 //! [`request_charge`], a byte-count proxy for prompt size):
 //!
 //! 1. **Heavy keys bypass affinity.** A key is heavy only when it alone could push its
-//!    set out of band, which whole-key spilling cannot absorb. A Space-Saving table of the
-//!    128 heaviest keys (with per-counter error bounds, so any key above 0.8% of load has a
-//!    counter) tracks decayed load and request count per key. A key becomes heavy when its
-//!    guaranteed load share, less four standard deviations of sampling noise, reaches the
-//!    narrowest share band among the candidate sets (`min_i slack·min(fair_i, 1 − fair_i)`,
-//!    about 0.083 for 30/60 workers and slack 0.25) and it has at least 8 guaranteed
-//!    (decayed) requests in the window; it stays heavy until its load share drops below
-//!    half the band or its observations below 4. The load share is size-weighted, so a key
-//!    that carries its load in a few repeated large requests qualifies too. Heavy keys get
-//!    the default weighted random pick (`heavy_key_random`): a key that hot is cached on
-//!    every set anyway, and random routing balances it by construction. Ordinary
-//!    conversations never qualify, also on a frontend that sees only a few dozen concurrent
-//!    conversations (with 12 or more similar conversations each carries at most about 1/12
-//!    of the load, which does not exceed the band), and neither does a single large
-//!    request (it is clamped and has no repetitions). A heavy key that stops qualifying is
-//!    routed by affinity again and must meet the full entry threshold to re-enter.
+//!    set out of band, which whole-key spilling cannot absorb. A Space-Saving table of 128
+//!    counters (with per-counter error bounds; a counter is taken over only when its larger
+//!    share is the smallest) tracks each key's decayed request count and unclamped charge.
+//!    A key becomes heavy when it has at least 8 guaranteed (decayed) requests in the window
+//!    and EITHER its guaranteed request share OR its guaranteed share of unclamped charge,
+//!    less four standard deviations of that share's sampling noise, reaches the narrowest
+//!    share band among the candidate sets (`min_i slack·min(fair_i, 1 − fair_i)`, about
+//!    0.083 for 30/60 workers and slack 0.25). It stays heavy until both shares drop below
+//!    half the band or it has fewer than 4 observations. The request share catches many
+//!    small requests; the unclamped share catches repeated very large ones (the charge clamp
+//!    below applies only to the spill statistics). Heavy keys get the default weighted
+//!    random pick (`heavy_key_random`): a key that hot is cached on every set anyway, and
+//!    random routing balances it by construction. Ordinary conversations never qualify,
+//!    also on a frontend that sees only a few dozen concurrent conversations (with 12 or
+//!    more similar conversations each carries at most about 1/12 of requests and load,
+//!    which does not exceed the band), and neither does a single large request (it has no
+//!    repetitions). A heavy key that stops qualifying is routed by affinity again and must
+//!    meet the full entry threshold to re-enter.
 //! 2. **Sticky spill** for the remaining (affinity-routed) load keeps every set within
 //!    `fair ± slack·min(fair, 1 − fair)`. When the load whose rendezvous winner is set `P`
 //!    exceeds `P`'s fair share, the frontend derives a spill fraction `p` (zero until demand
@@ -50,9 +52,10 @@
 //! candidate sets change or a selection found fewer than two eligible sets, so a set that
 //! returns at a new size is not judged against a stale fair share.
 //!
-//! Charges are clamped to 8× a decayed mean charge (seeded with a 4 KiB prior), and the
-//! guard stays idle until it has seen about 200 decisions, so one huge request or a
-//! freshly started frontend cannot swing the statistics.
+//! Charges in the spill statistics are clamped to 8× a decayed mean charge (seeded with a
+//! 4 KiB prior), and the guard stays idle until it has seen about 200 decisions, so one
+//! huge request or a freshly started frontend cannot swing them. Heavy-key detection uses
+//! the unclamped charge.
 //!
 //! `DYN_WORKER_SET_WEIGHTS=suffix=weight,...` scales the per-worker weight of every set whose
 //! namespace ends with `suffix` (for example `tp4=2,tp2=1` to weight sets by GPUs). Entries
@@ -105,19 +108,20 @@ const SPILL_NOISE_SIGMAS: f64 = 2.0;
 /// Size of the per-frontend Space-Saving heavy-key table. Any key above `1/HEAVY_KEYS`
 /// (0.8%) of recent load is guaranteed a counter, below the exit threshold.
 const HEAVY_KEYS: usize = 128;
-/// Heavy-key thresholds. A key becomes heavy when its guaranteed load share, less its
-/// sampling noise, reaches the narrowest share band among the candidate sets
-/// (`min_i slack·min(fair_i, 1 − fair_i)`) and it has at least
-/// [`HEAVY_MIN_OBSERVATIONS`] guaranteed (decayed) requests in the window; it stays heavy
-/// until its load share drops below half the band or its observations below half the
-/// minimum. The observation floor only asks for repeated evidence: a key that carries
-/// its load in a few large requests qualifies as long as it repeats, while a single
-/// large request cannot (it is clamped and alone).
+/// Heavy-key thresholds. A key becomes heavy when, with at least
+/// [`HEAVY_MIN_OBSERVATIONS`] guaranteed (decayed) requests in the window, EITHER its
+/// guaranteed request share OR its guaranteed share of unclamped charge, less that
+/// share's sampling noise, reaches the narrowest share band among the candidate sets
+/// (`min_i slack·min(fair_i, 1 − fair_i)`). It stays heavy until both shares drop below
+/// half the band or its observations below half the minimum. The request share catches
+/// many small requests; the unclamped charge share catches repeated very large ones
+/// (the charge clamp applies only to the spill statistics). A single large request cannot
+/// qualify: it has no repetitions.
 const HEAVY_MIN_OBSERVATIONS: f64 = 8.0;
 const HEAVY_EXIT_LOAD_RATIO: f64 = 0.5;
-/// Standard deviations of sampling noise subtracted from a key's load share before it
-/// is compared with the band, so keys sitting right at the band (for example 12 equal
-/// conversations against a 1/12 band) do not become heavy on a random excursion.
+/// Standard deviations of sampling noise subtracted from a key's request or charge share
+/// before it is compared with the band, so keys sitting right at the band (for example 12
+/// equal conversations against a 1/12 band) do not become heavy on a random excursion.
 const HEAVY_NOISE_SIGMAS: f64 = 4.0;
 /// Prior for the mean charge (pseudo-decisions and bytes), so early requests are clamped.
 const PRIOR_DECISIONS: f64 = 10.0;
@@ -355,6 +359,17 @@ fn share_band(fair: f64, slack: f64) -> f64 {
     slack * fair.min(1.0 - fair)
 }
 
+/// [`HEAVY_NOISE_SIGMAS`] standard deviations of a decayed weighted share `share`, from
+/// the effective number of samples `sum² / sq_sum` of the weights behind it.
+fn share_noise(share: f64, sum: f64, sq_sum: f64) -> f64 {
+    let effective = if sq_sum > 0.0 {
+        sum * sum / sq_sum
+    } else {
+        0.0
+    };
+    HEAVY_NOISE_SIGMAS * (share * (1.0 - share) / effective.max(1.0)).sqrt()
+}
+
 /// The narrowest share band among the candidates in `ranking`: the most load one key may
 /// carry before it alone could push its set out of band.
 fn narrowest_band(candidates: &[(&str, f64)], ranking: &[usize], slack: f64) -> f64 {
@@ -378,15 +393,15 @@ fn spill_fraction(demand_share: f64, fair: f64, band: f64, slack: f64, noise: f6
     (1.0 - target / demand_share).clamp(0.0, slack)
 }
 
-/// One Space-Saving counter of the heavy-key table. `load` and `count` over-estimate the
-/// key's decayed charge and request count by at most `load_err` and `count_err` (the
-/// counter's values when the key took the slot over), so `load - load_err` and
-/// `count - count_err` are guaranteed lower bounds.
+/// One Space-Saving counter of the heavy-key table. `raw` (unclamped charge) and `count`
+/// over-estimate the key's decayed charge and request count by at most `raw_err` and
+/// `count_err` (the counter's values when the key took the slot over), so `raw - raw_err`
+/// and `count - count_err` are guaranteed lower bounds.
 #[derive(Debug, Clone)]
 struct HeavyCounter {
     key: u64,
-    load: f64,
-    load_err: f64,
+    raw: f64,
+    raw_err: f64,
     count: f64,
     count_err: f64,
     /// Current heavy status (with hysteresis).
@@ -412,11 +427,11 @@ fn add_credit(credits: &mut Vec<(u64, f64)>, id: u64, amount: f64) {
 }
 
 impl HeavyCounter {
-    fn new(key: u64, load: f64, load_err: f64, count: f64, count_err: f64) -> Self {
+    fn new(key: u64, raw: f64, raw_err: f64, count: f64, count_err: f64) -> Self {
         Self {
             key,
-            load,
-            load_err,
+            raw,
+            raw_err,
             count,
             count_err,
             heavy: false,
@@ -445,10 +460,14 @@ fn set_id(name: &str) -> u64 {
 struct ShareState {
     /// Decayed number of keyed decisions (warm-up gate, heavy-key count shares).
     decisions: f64,
-    /// Decayed sum of recorded (clamped) charges (mean charge, heavy-key load shares).
+    /// Decayed sum of recorded (clamped) charges (mean charge for the clamp).
     charge_sum: f64,
-    /// Decayed sum of squared charges (effective sample size of heavy-key load shares).
-    charge_sq_sum: f64,
+    /// Decayed sum of unclamped charges and of their squares (heavy-key charge shares and
+    /// their effective sample size).
+    raw_sum: f64,
+    raw_sq_sum: f64,
+    /// Decayed sum of squared decision weights (effective sample size of request shares).
+    decisions_sq: f64,
     /// Decayed weight of the mean-charge prior (starts at [`PRIOR_DECISIONS`]).
     prior_weight: f64,
     /// Space-Saving heavy-key table, at most [`HEAVY_KEYS`] counters.
@@ -474,7 +493,9 @@ impl Default for ShareState {
         Self {
             decisions: 0.0,
             charge_sum: 0.0,
-            charge_sq_sum: 0.0,
+            raw_sum: 0.0,
+            raw_sq_sum: 0.0,
+            decisions_sq: 0.0,
             prior_weight: PRIOR_DECISIONS,
             heavy: Vec::new(),
             window_decisions: 0.0,
@@ -524,29 +545,29 @@ impl ShareState {
     /// Heavy status of `counter` against the narrowest candidate band `band`, applying
     /// hysteresis to its previous status. Never heavy before warm-up.
     fn heavy_status(&self, counter: &HeavyCounter, band: f64) -> bool {
-        if self.decisions < SHARE_MIN_SAMPLES || self.charge_sum <= 0.0 || band <= 0.0 {
+        if self.decisions < SHARE_MIN_SAMPLES || self.raw_sum <= 0.0 || band <= 0.0 {
             return false;
         }
-        let load = (counter.load - counter.load_err) / self.charge_sum;
         let observations = counter.count - counter.count_err;
+        let requests = observations / self.decisions;
+        let charge = (counter.raw - counter.raw_err) / self.raw_sum;
         if counter.heavy {
-            load >= HEAVY_EXIT_LOAD_RATIO * band && observations >= HEAVY_MIN_OBSERVATIONS / 2.0
+            observations >= HEAVY_MIN_OBSERVATIONS / 2.0
+                && (requests >= HEAVY_EXIT_LOAD_RATIO * band
+                    || charge >= HEAVY_EXIT_LOAD_RATIO * band)
         } else {
-            load - self.load_share_noise(load) >= band && observations >= HEAVY_MIN_OBSERVATIONS
+            let requests_noise = share_noise(requests, self.decisions, self.decisions_sq);
+            let charge_noise = share_noise(charge, self.raw_sum, self.raw_sq_sum);
+            observations >= HEAVY_MIN_OBSERVATIONS
+                && (requests - requests_noise >= band || charge - charge_noise >= band)
         }
     }
 
-    /// [`HEAVY_NOISE_SIGMAS`] standard deviations of a key's decayed load share `share`,
-    /// from the effective number of samples `charge_sum² / charge_sq_sum` (floored at
-    /// `decisions / CHARGE_CLAMP_FACTOR`, its bound under the charge clamp).
-    fn load_share_noise(&self, share: f64) -> f64 {
-        let floor = self.decisions / CHARGE_CLAMP_FACTOR;
-        let effective = if self.charge_sq_sum > 0.0 {
-            (self.charge_sum * self.charge_sum / self.charge_sq_sum).max(floor)
-        } else {
-            floor
-        };
-        HEAVY_NOISE_SIGMAS * (share * (1.0 - share) / effective.max(1.0)).sqrt()
+    /// How much a counter is worth keeping in the table: its larger share.
+    fn importance(&self, counter: &HeavyCounter) -> f64 {
+        let requests = counter.count / self.decisions.max(f64::MIN_POSITIVE);
+        let charge = counter.raw / self.raw_sum.max(f64::MIN_POSITIVE);
+        requests.max(charge)
     }
 
     /// Whether `key` is currently heavy against the narrowest candidate band `band`.
@@ -620,7 +641,9 @@ impl ShareState {
         let decay = 1.0 - 1.0 / SHARE_WINDOW;
         self.decisions *= decay;
         self.charge_sum *= decay;
-        self.charge_sq_sum *= decay * decay;
+        self.raw_sum *= decay;
+        self.raw_sq_sum *= decay * decay;
+        self.decisions_sq *= decay * decay;
         self.prior_weight *= decay;
         self.window_decisions *= decay;
         self.window_sum *= decay;
@@ -632,8 +655,8 @@ impl ShareState {
             map.retain(|_, v| *v > 1e-6);
         }
         for c in &mut self.heavy {
-            c.load *= decay;
-            c.load_err *= decay;
+            c.raw *= decay;
+            c.raw_err *= decay;
             c.count *= decay;
             c.count_err *= decay;
             c.window_sq *= decay * decay;
@@ -656,12 +679,15 @@ impl ShareState {
         charge: f64,
         band: f64,
     ) {
-        let charge = self.clamp_charge(charge);
+        let raw = charge;
+        let charge = self.clamp_charge(raw);
         self.decay();
         self.decisions += 1.0;
+        self.decisions_sq += 1.0;
         self.charge_sum += charge;
-        self.charge_sq_sum += charge * charge;
-        let slot = self.record_heavy(key, charge);
+        self.raw_sum += raw;
+        self.raw_sq_sum += raw * raw;
+        let slot = self.record_heavy(key, raw);
         if affinity_routed {
             let counter = &mut self.heavy[slot];
             add_credit(
@@ -704,28 +730,30 @@ impl ShareState {
     }
 
     /// Space-Saving update for `key`; returns its counter's slot.
-    fn record_heavy(&mut self, key: u64, charge: f64) -> usize {
+    fn record_heavy(&mut self, key: u64, raw: f64) -> usize {
         if let Some(slot) = self.heavy.iter().position(|c| c.key == key) {
             let c = &mut self.heavy[slot];
-            c.load += charge;
+            c.raw += raw;
             c.count += 1.0;
             return slot;
         }
-        let fresh = |load_err: f64, count_err: f64| {
-            HeavyCounter::new(key, load_err + charge, load_err, count_err + 1.0, count_err)
+        let fresh = |raw_err: f64, count_err: f64| {
+            HeavyCounter::new(key, raw_err + raw, raw_err, count_err + 1.0, count_err)
         };
         if self.heavy.len() < HEAVY_KEYS {
             self.heavy.push(fresh(0.0, 0.0));
             return self.heavy.len() - 1;
         }
+        // Take over the least important counter by its larger share, so keys heavy by
+        // requests and keys heavy by charge both keep their counters.
         let slot = self
             .heavy
             .iter()
             .enumerate()
-            .min_by(|a, b| a.1.load.total_cmp(&b.1.load))
+            .min_by(|a, b| self.importance(a.1).total_cmp(&self.importance(b.1)))
             .map_or(0, |(i, _)| i);
-        let (load, count) = (self.heavy[slot].load, self.heavy[slot].count);
-        self.heavy[slot] = fresh(load, count);
+        let (taken_raw, taken_count) = (self.heavy[slot].raw, self.heavy[slot].count);
+        self.heavy[slot] = fresh(taken_raw, taken_count);
         slot
     }
 
@@ -2041,6 +2069,66 @@ mod tests {
         }
         assert!(tracker.is_heavy(hot, &SETS, DEFAULT_SLACK));
         tally.assert_in_band(0.0, "8x key every 25 requests");
+    }
+
+    /// A `prompt_cache_key` that prefers TP4 and whose spill point is above the slack (so
+    /// the sticky spill can never move it).
+    fn unspillable_tp4_cache_key() -> u64 {
+        (0..)
+            .map(|n| chat_request_affinity_key(&[], Some(&format!("large-session-{n}")), None))
+            .map(Option::unwrap)
+            .find(|k| rendezvous_pick(*k, &SETS) == Some(0) && spill_point(*k) > DEFAULT_SLACK)
+            .unwrap()
+    }
+
+    /// R8-1 (rare huge requests): a key sending 400 KiB once per 100 requests amid 4 KiB
+    /// requests carries half of all prompt bytes. Its clamped charge is small, but its
+    /// unclamped charge share makes it heavy, so TP4 stays in band by charge.
+    #[test]
+    fn rare_huge_requests_make_a_key_heavy() {
+        let hot = unspillable_tp4_cache_key();
+        let tracker = ShareTracker::default();
+        let mut tally = Tally::default();
+        for i in 0..50_000u64 {
+            let (key, charge) = if i >= 5_000 && i.is_multiple_of(100) {
+                (hot, 400.0 * 1024.0)
+            } else {
+                (mixed(i + 80_000_000), 4096.0)
+            };
+            let (idx, _) = tracker
+                .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
+                .unwrap();
+            if i >= 20_000 {
+                tally.add(idx, charge);
+            }
+        }
+        assert!(tracker.is_heavy(hot, &SETS, DEFAULT_SLACK));
+        tally.assert_in_band(0.0, "400 KiB once per 100 requests");
+    }
+
+    /// R8-1 (many small requests): a key sending 15% of requests at 0.05x the mean charge
+    /// has a negligible charge share, but its request share makes it heavy, so per-set
+    /// request counts stay in band.
+    #[test]
+    fn frequent_small_requests_make_a_key_heavy() {
+        let hot = unspillable_tp4_cache_key();
+        let tracker = ShareTracker::default();
+        let mut requests = Tally::default();
+        for i in 0..40_000u64 {
+            let (key, charge) = if i >= 5_000 && i % 20 < 3 {
+                (hot, 0.05 * 4096.0)
+            } else {
+                (mixed(i + 85_000_000), 4096.0)
+            };
+            let (idx, _) = tracker
+                .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
+                .unwrap();
+            if i >= 20_000 {
+                requests.add(idx, 1.0);
+            }
+        }
+        assert!(tracker.is_heavy(hot, &SETS, DEFAULT_SLACK));
+        requests.assert_in_band(0.0, "15% of requests at 0.05x charge");
     }
 
     /// The subtraction bug moved the hot key's whole history out of its winner's demand,
