@@ -898,8 +898,17 @@ impl Model {
             })
             .collect();
 
+        // An affinity selection that finds fewer than two eligible sets restarts the share
+        // tracker's fair-share window, so a set returning at a new size is judged afresh.
+        let mark_single_eligible = || {
+            if config.mode == SetSelectionMode::Affinity && affinity.is_some() {
+                self.set_shares.mark_single_eligible();
+            }
+        };
+
         // Fast path: single set (same zero-worker filtering as the multi-set path below)
         if snapshot.len() == 1 {
+            mark_single_eligible();
             let ws = &snapshot[0].1;
             if ws.worker_count() == 0 || !ready_namespaces.contains(ws.namespace()) {
                 return None;
@@ -923,11 +932,8 @@ impl Model {
             })
             .collect();
 
-        if eligible.is_empty() {
-            return None;
-        }
-
-        if eligible.len() == 1 {
+        if eligible.len() < 2 {
+            mark_single_eligible();
             return eligible.into_iter().next().map(|(val, ..)| val);
         }
 
@@ -2161,8 +2167,7 @@ mod tests {
                 [
                     "affinity",
                     "share_cap_fallback",
-                    "share_cap_overflow",
-                    "share_cap_revert",
+                    "heavy_key_random",
                     "random",
                 ]
                 .map(|reason| selection_count(model, ns, reason))
@@ -2197,6 +2202,39 @@ mod tests {
         }
         assert_eq!(model.set_shares.observed_total(), 0.0);
         assert_eq!(total_selections(name, &["ns-tp4", "ns-tp2"]), 0);
+    }
+
+    /// R4-3 end to end: TP2 goes 60 → 0 → 30 workers. The single-eligible selections in
+    /// between restart the fair-share window, so when TP2 returns at half size no key
+    /// spills because of the old 1:2 fair share.
+    #[test]
+    fn affinity_restarts_window_when_a_set_returns_at_a_new_size() {
+        let name = "affinity-set-returns";
+        let model = Model::new(name.to_string());
+        let (tp4, _tx4) = make_worker_set_with_count("ns-tp4", "mdc-tp4", (0..30).collect());
+        let (tp2, tx2) = make_worker_set_with_count("ns-tp2", "mdc-tp2", (100..160).collect());
+        model.add_worker_set("ns-tp4".to_string(), tp4);
+        model.add_worker_set("ns-tp2".to_string(), tp2);
+        let config = affinity_config(DEFAULT_TEST_SLACK);
+        for key in 0..5000 {
+            pick_mdcsum(&model, &config, Some(mixed(key)));
+        }
+        tx2.send(vec![]).unwrap();
+        for key in 0..300 {
+            assert_eq!(
+                pick_mdcsum(&model, &config, Some(mixed(key + 10_000))),
+                "mdc-tp4"
+            );
+        }
+        tx2.send((100..130).collect()).unwrap();
+        let spills_before = selection_count(name, "ns-tp4", "share_cap_fallback")
+            + selection_count(name, "ns-tp2", "share_cap_fallback");
+        for key in 0..2000 {
+            pick_mdcsum(&model, &config, Some(mixed(key + 20_000)));
+        }
+        let spills_after = selection_count(name, "ns-tp4", "share_cap_fallback")
+            + selection_count(name, "ns-tp2", "share_cap_fallback");
+        assert_eq!(spills_after, spills_before);
     }
 
     #[test]
@@ -2329,7 +2367,7 @@ mod tests {
         }
         let share = a_hits as f64 / n as f64;
         assert!((0.4..0.6).contains(&share), "set-a share {share}");
-        let tracked = fwd.set_shares.share("dynamo:set-a");
+        let tracked = fwd.set_shares.demand_share("dynamo:set-a");
         assert!(
             (0.4..0.6).contains(&tracked),
             "tracked set-a share {tracked}"

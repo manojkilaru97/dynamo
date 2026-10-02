@@ -135,9 +135,9 @@ pub static WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE: LazyLock<GaugeVec> = LazyLock:
 });
 
 /// Multi-set worker-set selections made in affinity mode, by chosen namespace and reason:
-/// `affinity` (rendezvous winner), `share_cap_fallback` (sticky spill),
-/// `share_cap_overflow` (heavy key moved off its over-band set), `share_cap_revert` (spilled
-/// heavy key sent back to its winner), or `random` (no affinity key).
+/// `affinity` (rendezvous winner), `share_cap_fallback` (sticky spill to the second
+/// choice), `heavy_key_random` (a heavy key, weighted random pick), or `random` (no
+/// affinity key).
 pub static WORKER_SET_SELECTION_COUNTER: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(

@@ -13,33 +13,35 @@
 //! without shared state, and the long-run split follows the set weights.
 //!
 //! Each frontend also keeps decayed, size-weighted load statistics (charged by
-//! [`request_charge`], a byte-count proxy for prompt size) to keep every set within
-//! `fair ± slack·min(fair, 1 − fair)` of recent affinity load:
+//! [`request_charge`], a byte-count proxy for prompt size):
 //!
-//! 1. **Sticky spill.** When the load whose rendezvous winner is set `P` exceeds `P`'s fair
-//!    share, the frontend derives a spill fraction `p` (zero until demand exceeds the middle
-//!    of the upper band by more than two standard deviations of its sampling noise, at most
-//!    `slack`) and moves exactly the keys whose [`spill_point`] is below `p`
-//!    to their second rendezvous choice. Whether a key spills, and where to, is a function
-//!    of the key, the candidate set keys and `p`; `p` depends only on the aggregate load
-//!    mix, so frontends with similar traffic agree and a conversation's turns stay on one
-//!    set while `p` is stable.
-//! 2. **Heavy-key overflow.** Load that one key concentrates cannot be spread by moving
-//!    whole keys. Each frontend keeps a small decayed table of its heaviest keys; a key that
-//!    carries at least 1% of recent load is redirected to the best-ranked set below its fair
-//!    share while its chosen set is above its band. A spilled heavy key goes back to its
-//!    rendezvous winner (`share_cap_revert`); a heavy key native to the over-band set moves
-//!    (`share_cap_overflow`) only when the overshoot exceeds the load other sets' keys
-//!    spilled into it. No other key is ever redirected, so ordinary conversations change
-//!    set only through the sticky spill. This is the only frontend-local decision.
-//!
-//! Charges are clamped to 8× the decayed mean charge, and the guard stays idle until it
-//! has seen about 200 decisions, so one huge request or a freshly started frontend cannot
-//! swing the statistics.
+//! 1. **Heavy keys bypass affinity.** A Space-Saving table of the 128 heaviest keys (with
+//!    per-counter error bounds) tracks decayed load and request count per key. A key whose
+//!    guaranteed share reaches 2% of recent load and 1% of recent requests becomes heavy,
+//!    and stays heavy until it drops below 1% of load or 0.5% of requests. Heavy keys get
+//!    the default weighted random pick (`heavy_key_random`): a key that hot is cached on
+//!    every set anyway, and random routing balances it by construction. Large but
+//!    infrequent conversations never qualify.
+//! 2. **Sticky spill** for the remaining (affinity-routed) load keeps every set within
+//!    `fair ± slack·min(fair, 1 − fair)`. When the load whose rendezvous winner is set `P`
+//!    exceeds `P`'s fair share, the frontend derives a spill fraction `p` (zero until demand
+//!    exceeds the middle of the upper band by more than two standard deviations of its
+//!    sampling noise, at most `slack`) and moves exactly the keys whose [`spill_point`] is
+//!    below `p` to their second rendezvous choice (`share_cap_fallback`). Whether a key
+//!    spills, and where to, is a function of the key, the candidate set keys and `p`; `p`
+//!    depends only on the aggregate load mix, so frontends with similar traffic agree and a
+//!    conversation's turns stay on one set while `p` is stable. When a key becomes heavy,
+//!    its past load leaves the spill statistics.
 //!
 //! "Fair" is the decayed average of each set's weight share over the same window, so a
 //! worker-count change shifts the targets as gradually as the observed load and only the
-//! keys rendezvous hashing itself moves change sets.
+//! keys rendezvous hashing itself moves change sets. The window restarts when the
+//! candidate sets change or a selection found fewer than two eligible sets, so a set that
+//! returns at a new size is not judged against a stale fair share.
+//!
+//! Charges are clamped to 8× a decayed mean charge (seeded with a 4 KiB prior), and the
+//! guard stays idle until it has seen about 200 decisions, so one huge request or a
+//! freshly started frontend cannot swing the statistics.
 //!
 //! `DYN_WORKER_SET_WEIGHTS=suffix=weight,...` scales the per-worker weight of every set whose
 //! namespace ends with `suffix` (for example `tp4=2,tp2=1` to weight sets by GPUs). Entries
@@ -49,6 +51,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use rand::Rng;
@@ -87,11 +90,18 @@ const SHARE_MIN_SAMPLES: f64 = 200.0;
 const CHARGE_CLAMP_FACTOR: f64 = 8.0;
 /// Standard deviations of sampling noise in the demand share tolerated before spilling.
 const SPILL_NOISE_SIGMAS: f64 = 2.0;
-/// Size of the per-frontend heavy-key table.
-const HEAVY_KEYS: usize = 8;
-/// Share of recent load at which a key in the table counts as heavy and may be redirected
-/// by the overflow step.
-const HEAVY_MIN_SHARE: f64 = 0.01;
+/// Size of the per-frontend Space-Saving heavy-key table. Any key above `1/HEAVY_KEYS`
+/// (0.8%) of recent load is guaranteed a counter, below the exit threshold.
+const HEAVY_KEYS: usize = 128;
+/// Guaranteed share of recent load and of recent requests at which a key becomes heavy.
+const HEAVY_ENTER_LOAD_SHARE: f64 = 0.02;
+const HEAVY_ENTER_COUNT_SHARE: f64 = 0.01;
+/// A heavy key stays heavy until its load or request share drops below these.
+const HEAVY_EXIT_LOAD_SHARE: f64 = 0.01;
+const HEAVY_EXIT_COUNT_SHARE: f64 = 0.005;
+/// Prior for the mean charge (pseudo-decisions and bytes), so early requests are clamped.
+const PRIOR_DECISIONS: f64 = 10.0;
+const PRIOR_MEAN_CHARGE: f64 = 4096.0;
 /// Upper bound on one request's charge (bytes), so one pathological request cannot
 /// dominate the window.
 pub const MAX_REQUEST_CHARGE: f64 = 64.0 * 1024.0 * 1024.0;
@@ -205,11 +215,8 @@ pub enum SetChoiceReason {
     Affinity,
     /// A key-deterministic sticky spill to the key's second rendezvous choice.
     ShareCapFallback,
-    /// A heavy key redirected away from its native set while that set is above its band.
-    ShareCapOverflow,
-    /// A spilled heavy key sent back to its rendezvous winner because the spill target is
-    /// above its band.
-    ShareCapRevert,
+    /// A heavy key, routed by the weighted random pick instead of affinity.
+    HeavyKeyRandom,
     /// No affinity key (or affinity disabled): weighted random pick.
     Random,
 }
@@ -219,8 +226,7 @@ impl SetChoiceReason {
         match self {
             Self::Affinity => "affinity",
             Self::ShareCapFallback => "share_cap_fallback",
-            Self::ShareCapOverflow => "share_cap_overflow",
-            Self::ShareCapRevert => "share_cap_revert",
+            Self::HeavyKeyRandom => "heavy_key_random",
             Self::Random => "random",
         }
     }
@@ -328,9 +334,7 @@ fn share_band(fair: f64, slack: f64) -> f64 {
 /// share would come down to the middle of its upper band plus `noise` (the sampling
 /// uncertainty of the demand share, so that random fluctuations of a balanced workload do
 /// not spill keys back and forth). Zero until the demand share exceeds that point; never
-/// above `slack` (whole-key moves cannot fix load concentrated in a few keys, and a larger
-/// fraction would only displace unrelated conversations; the heavy-key overflow step
-/// handles that case).
+/// above `slack`.
 fn spill_fraction(demand_share: f64, fair: f64, band: f64, slack: f64, noise: f64) -> f64 {
     let target = fair + band / 2.0 + noise;
     if demand_share <= target {
@@ -339,25 +343,60 @@ fn spill_fraction(demand_share: f64, fair: f64, band: f64, slack: f64, noise: f6
     (1.0 - target / demand_share).clamp(0.0, slack)
 }
 
-/// Decayed, charge-weighted statistics per WorkerSet key.
-#[derive(Debug, Default)]
+/// One Space-Saving counter of the heavy-key table. `load` and `count` over-estimate the
+/// key's decayed charge and request count by at most `load_err` and `count_err` (the
+/// counter's values when the key took the slot over), so `load - load_err` and
+/// `count - count_err` are guaranteed lower bounds.
+#[derive(Debug, Clone, Copy)]
+struct HeavyCounter {
+    key: u64,
+    load: f64,
+    load_err: f64,
+    count: f64,
+    count_err: f64,
+    /// Current heavy status (with hysteresis).
+    heavy: bool,
+}
+
+/// Decayed per-frontend statistics behind affinity decisions.
+#[derive(Debug)]
 struct ShareState {
-    /// Decayed number of decisions (sample gate).
+    /// Decayed number of keyed decisions (warm-up gate, heavy-key count shares).
     decisions: f64,
-    /// Decayed sum of recorded (clamped) charges; `charge_sum / decisions` is the mean.
+    /// Decayed sum of recorded (clamped) charges (mean charge, heavy-key load shares).
     charge_sum: f64,
-    /// Decayed sum of squared charges, for the effective sample size.
-    charge_sq_sum: f64,
+    /// Decayed weight of the mean-charge prior (starts at [`PRIOR_DECISIONS`]).
+    prior_weight: f64,
+    /// Space-Saving heavy-key table, at most [`HEAVY_KEYS`] counters.
+    heavy: Vec<HeavyCounter>,
+    /// Fair-share window over affinity-routed (non-heavy) decisions; reset when the
+    /// candidate sets change. Decayed decision count, charge sum and squared-charge sum.
+    window_decisions: f64,
+    window_sum: f64,
+    window_sq_sum: f64,
     /// Load times each set's weight share at decision time: the decayed "fair" load.
     expected: HashMap<String, f64>,
     /// Load whose rendezvous winner was the set.
     demand: HashMap<String, f64>,
-    /// Load actually sent to the set.
-    placed: HashMap<String, f64>,
-    /// Load sent to the set by keys whose rendezvous winner is another set.
-    spilled_in: HashMap<String, f64>,
-    /// Decayed load of the heaviest recent keys (at most [`HEAVY_KEYS`] entries).
-    heavy: Vec<(u64, f64)>,
+    /// Candidate set keys of the last recorded decision.
+    candidates: Vec<String>,
+}
+
+impl Default for ShareState {
+    fn default() -> Self {
+        Self {
+            decisions: 0.0,
+            charge_sum: 0.0,
+            prior_weight: PRIOR_DECISIONS,
+            heavy: Vec::new(),
+            window_decisions: 0.0,
+            window_sum: 0.0,
+            window_sq_sum: 0.0,
+            expected: HashMap::new(),
+            demand: HashMap::new(),
+            candidates: Vec::new(),
+        }
+    }
 }
 
 impl ShareState {
@@ -365,34 +404,74 @@ impl ShareState {
         map.get(name).copied().unwrap_or(0.0)
     }
 
-    /// Whether `key` carries at least [`HEAVY_MIN_SHARE`] of recent load.
+    /// Forget the fair-share window (candidate sets changed).
+    fn reset_window(&mut self) {
+        self.window_decisions = 0.0;
+        self.window_sum = 0.0;
+        self.window_sq_sum = 0.0;
+        self.expected.clear();
+        self.demand.clear();
+    }
+
+    /// Reset the window if the candidate set keys differ from the last decision's.
+    fn track_candidates(&mut self, candidates: &[(&str, f64)]) {
+        let same = self.candidates.len() == candidates.len()
+            && candidates
+                .iter()
+                .all(|(name, _)| self.candidates.iter().any(|c| c == name));
+        if !same {
+            self.reset_window();
+            self.candidates = candidates.iter().map(|(n, _)| n.to_string()).collect();
+        }
+    }
+
+    /// Heavy status of `counter` given the current totals, applying hysteresis to its
+    /// previous status. Never heavy before warm-up.
+    fn heavy_status(&self, counter: &HeavyCounter) -> bool {
+        if self.decisions < SHARE_MIN_SAMPLES || self.charge_sum <= 0.0 {
+            return false;
+        }
+        let load = (counter.load - counter.load_err) / self.charge_sum;
+        let count = (counter.count - counter.count_err) / self.decisions;
+        if counter.heavy {
+            load >= HEAVY_EXIT_LOAD_SHARE && count >= HEAVY_EXIT_COUNT_SHARE
+        } else {
+            load >= HEAVY_ENTER_LOAD_SHARE && count >= HEAVY_ENTER_COUNT_SHARE
+        }
+    }
+
+    /// Whether `key` is currently heavy.
     fn is_heavy(&self, key: u64) -> bool {
         self.heavy
             .iter()
-            .any(|&(k, load)| k == key && load >= HEAVY_MIN_SHARE * self.charge_sum)
+            .find(|c| c.key == key)
+            .is_some_and(|c| self.heavy_status(c))
     }
 
-    /// Sampling standard deviation of a charge-weighted share `share`, from the effective
-    /// number of samples `charge_sum² / charge_sq_sum` in the window.
+    /// `charge` clamped to [`CHARGE_CLAMP_FACTOR`] times the decayed mean charge, where
+    /// the mean starts from [`PRIOR_DECISIONS`] pseudo-decisions of [`PRIOR_MEAN_CHARGE`]
+    /// (decaying like real decisions), so the first requests of a fresh frontend are
+    /// clamped too.
+    fn clamp_charge(&self, charge: f64) -> f64 {
+        let mean = (self.charge_sum + self.prior_weight * PRIOR_MEAN_CHARGE)
+            / (self.decisions + self.prior_weight);
+        charge.min(CHARGE_CLAMP_FACTOR * mean)
+    }
+
+    /// Sampling standard deviation (times [`SPILL_NOISE_SIGMAS`]) of a charge-weighted
+    /// share of the window. The effective sample size `sum² / sq_sum` is floored at
+    /// `window_decisions / CHARGE_CLAMP_FACTOR`, its bound under the charge clamp.
     fn share_noise(&self, share: f64) -> f64 {
-        if self.charge_sq_sum <= 0.0 {
-            return 0.0;
-        }
-        let effective = self.charge_sum * self.charge_sum / self.charge_sq_sum;
+        let floor = self.window_decisions / CHARGE_CLAMP_FACTOR;
+        let effective = if self.window_sq_sum > 0.0 {
+            (self.window_sum * self.window_sum / self.window_sq_sum).max(floor)
+        } else {
+            floor
+        };
         SPILL_NOISE_SIGMAS * (share * (1.0 - share) / effective.max(1.0)).sqrt()
     }
 
-    /// `charge` clamped to [`CHARGE_CLAMP_FACTOR`] times the decayed mean charge, so one
-    /// very large request cannot swing the statistics.
-    fn clamp_charge(&self, charge: f64) -> f64 {
-        if self.decisions >= 1.0 && self.charge_sum > 0.0 {
-            charge.min(CHARGE_CLAMP_FACTOR * self.charge_sum / self.decisions)
-        } else {
-            charge
-        }
-    }
-
-    /// The decision for `key`; pure in the state.
+    /// Affinity decision for a non-heavy `key`; pure in the state.
     fn decide(
         &self,
         key: u64,
@@ -401,140 +480,173 @@ impl ShareState {
         slack: f64,
     ) -> (usize, SetChoiceReason) {
         let preferred = ranking[0];
-        let mut choice = (preferred, SetChoiceReason::Affinity);
-        if ranking.len() < 2 || self.decisions < SHARE_MIN_SAMPLES {
-            return choice;
+        let affinity = (preferred, SetChoiceReason::Affinity);
+        if ranking.len() < 2 || self.window_decisions < SHARE_MIN_SAMPLES {
+            return affinity;
         }
         let name = |i: usize| candidates[i].0;
         let total =
             |map: &HashMap<String, f64>| ranking.iter().map(|&i| Self::stat(map, name(i))).sum();
-        let (expected, demand, placed): (f64, f64, f64) = (
-            total(&self.expected),
-            total(&self.demand),
-            total(&self.placed),
-        );
-        if expected <= 0.0 || demand <= 0.0 || placed <= 0.0 {
-            return choice;
+        let (expected, demand): (f64, f64) = (total(&self.expected), total(&self.demand));
+        if expected <= 0.0 || demand <= 0.0 {
+            return affinity;
         }
-        let fair = |i: usize| Self::stat(&self.expected, name(i)) / expected;
-        let band = |i: usize| share_band(fair(i), slack);
-
-        // 1. Sticky spill, decided by the key's spill point.
+        let fair = Self::stat(&self.expected, name(preferred)) / expected;
         let demand_share = Self::stat(&self.demand, name(preferred)) / demand;
         let p = spill_fraction(
             demand_share,
-            fair(preferred),
-            band(preferred),
+            fair,
+            share_band(fair, slack),
             slack,
             self.share_noise(demand_share),
         );
         if spill_point(key) < p {
-            choice = (ranking[1], SetChoiceReason::ShareCapFallback);
+            (ranking[1], SetChoiceReason::ShareCapFallback)
+        } else {
+            affinity
         }
-
-        // 2. Heavy-key overflow: only a key carrying a large share of recent load is ever
-        //    redirected, and only while its chosen set is above its band. A key native to
-        //    that set stays unless the overshoot exceeds what other sets' keys spilled in.
-        if !self.is_heavy(key) {
-            return choice;
-        }
-        let share = |i: usize| Self::stat(&self.placed, name(i)) / placed;
-        let chosen = choice.0;
-        let overshoot = share(chosen) - (fair(chosen) + band(chosen));
-        let spilled_in = Self::stat(&self.spilled_in, name(chosen)) / placed;
-        let redirect = overshoot > 0.0 && (chosen != preferred || overshoot > spilled_in);
-        if redirect && let Some(&alt) = ranking.iter().find(|&&i| i != chosen && share(i) < fair(i))
-        {
-            let reason = if alt == preferred {
-                SetChoiceReason::ShareCapRevert
-            } else {
-                SetChoiceReason::ShareCapOverflow
-            };
-            choice = (alt, reason);
-        }
-        choice
     }
 
-    fn record(
-        &mut self,
-        key: u64,
-        candidates: &[(&str, f64)],
-        ranking: &[usize],
-        chosen: usize,
-        charge: f64,
-    ) {
-        let charge = self.clamp_charge(charge);
+    fn decay(&mut self) -> f64 {
         let decay = 1.0 - 1.0 / SHARE_WINDOW;
-        self.decisions = self.decisions * decay + 1.0;
-        self.charge_sum = self.charge_sum * decay + charge;
-        self.charge_sq_sum = self.charge_sq_sum * decay * decay + charge * charge;
-        for map in [
-            &mut self.expected,
-            &mut self.demand,
-            &mut self.placed,
-            &mut self.spilled_in,
-        ] {
+        self.decisions *= decay;
+        self.charge_sum *= decay;
+        self.prior_weight *= decay;
+        self.window_decisions *= decay;
+        self.window_sum *= decay;
+        self.window_sq_sum *= decay * decay;
+        for map in [&mut self.expected, &mut self.demand] {
             for v in map.values_mut() {
                 *v *= decay;
             }
             map.retain(|_, v| *v > 1e-6);
         }
-        let total_weight: f64 = ranking.iter().map(|&i| candidates[i].1).sum();
-        for &i in ranking {
-            *self
-                .expected
-                .entry(candidates[i].0.to_string())
-                .or_insert(0.0) += charge * candidates[i].1 / total_weight;
+        for c in &mut self.heavy {
+            c.load *= decay;
+            c.load_err *= decay;
+            c.count *= decay;
+            c.count_err *= decay;
         }
-        *self
-            .demand
-            .entry(candidates[ranking[0]].0.to_string())
-            .or_insert(0.0) += charge;
-        *self
-            .placed
-            .entry(candidates[chosen].0.to_string())
-            .or_insert(0.0) += charge;
-        if chosen != ranking[0] {
-            *self
-                .spilled_in
-                .entry(candidates[chosen].0.to_string())
-                .or_insert(0.0) += charge;
-        }
-        self.record_heavy(key, charge, decay);
+        decay
     }
 
-    /// Decayed top-K by load: a present key accumulates; otherwise the key replaces the
-    /// lightest entry when its charge exceeds that entry's load.
-    fn record_heavy(&mut self, key: u64, charge: f64, decay: f64) {
-        for entry in &mut self.heavy {
-            entry.1 *= decay;
+    /// Record one keyed decision. Affinity-routed requests also feed the fair-share
+    /// window; heavy-key requests (weighted random) do not.
+    fn record(
+        &mut self,
+        key: u64,
+        candidates: &[(&str, f64)],
+        ranking: &[usize],
+        affinity_routed: bool,
+        charge: f64,
+    ) {
+        let charge = self.clamp_charge(charge);
+        self.decay();
+        self.decisions += 1.0;
+        self.charge_sum += charge;
+        if affinity_routed {
+            self.window_decisions += 1.0;
+            self.window_sum += charge;
+            self.window_sq_sum += charge * charge;
+            let total_weight: f64 = ranking.iter().map(|&i| candidates[i].1).sum();
+            for &i in ranking {
+                *self
+                    .expected
+                    .entry(candidates[i].0.to_string())
+                    .or_insert(0.0) += charge * candidates[i].1 / total_weight;
+            }
+            *self
+                .demand
+                .entry(candidates[ranking[0]].0.to_string())
+                .or_insert(0.0) += charge;
         }
-        if let Some(entry) = self.heavy.iter_mut().find(|(k, _)| *k == key) {
-            entry.1 += charge;
-        } else if self.heavy.len() < HEAVY_KEYS {
-            self.heavy.push((key, charge));
-        } else if let Some(lightest) = self
+        let slot = self.record_heavy(key, charge);
+        let counter = self.heavy[slot];
+        let status = self.heavy_status(&counter);
+        if status && !counter.heavy {
+            self.forget_window_load(&counter, candidates, ranking);
+        }
+        self.heavy[slot].heavy = status;
+    }
+
+    /// Space-Saving update for `key`; returns its counter's slot.
+    fn record_heavy(&mut self, key: u64, charge: f64) -> usize {
+        if let Some(slot) = self.heavy.iter().position(|c| c.key == key) {
+            let c = &mut self.heavy[slot];
+            c.load += charge;
+            c.count += 1.0;
+            return slot;
+        }
+        let fresh = |load_err: f64, count_err: f64| HeavyCounter {
+            key,
+            load: load_err + charge,
+            load_err,
+            count: count_err + 1.0,
+            count_err,
+            heavy: false,
+        };
+        if self.heavy.len() < HEAVY_KEYS {
+            self.heavy.push(fresh(0.0, 0.0));
+            return self.heavy.len() - 1;
+        }
+        let slot = self
             .heavy
-            .iter_mut()
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .filter(|(_, load)| *load < charge)
-        {
-            *lightest = (key, charge);
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.load.total_cmp(&b.1.load))
+            .map_or(0, |(i, _)| i);
+        let lightest = self.heavy[slot];
+        self.heavy[slot] = fresh(lightest.load, lightest.count);
+        slot
+    }
+
+    /// A key that just became heavy stops counting toward the fair-share window: remove
+    /// its guaranteed load from its preferred set's demand and from the fair load, so its
+    /// past turns do not keep the other keys spilling.
+    fn forget_window_load(
+        &mut self,
+        counter: &HeavyCounter,
+        candidates: &[(&str, f64)],
+        ranking: &[usize],
+    ) {
+        // `ranking` belongs to the request being recorded, which is this counter's key.
+        let preferred = ranking[0];
+        let load = (counter.load - counter.load_err)
+            .max(0.0)
+            .min(Self::stat(&self.demand, candidates[preferred].0));
+        if let Some(d) = self.demand.get_mut(candidates[preferred].0) {
+            *d -= load;
         }
+        let total_weight: f64 = ranking.iter().map(|&i| candidates[i].1).sum();
+        for &i in ranking {
+            if let Some(e) = self.expected.get_mut(candidates[i].0) {
+                *e = (*e - load * candidates[i].1 / total_weight).max(0.0);
+            }
+        }
+        self.window_sum = (self.window_sum - load).max(0.0);
     }
 }
 
-/// Per-frontend share guard for affinity decisions (see the module docs).
+/// Per-frontend affinity state for one model (see the module docs).
 #[derive(Debug, Default)]
 pub struct ShareTracker {
     state: Mutex<ShareState>,
+    /// Set when a selection ran with fewer than two eligible sets; the next affinity
+    /// decision starts a fresh fair-share window.
+    stale: AtomicBool,
 }
 
 impl ShareTracker {
+    /// Note that a selection ran with fewer than two eligible sets (lock-free).
+    pub fn mark_single_eligible(&self) {
+        self.stale.store(true, Ordering::Relaxed);
+    }
+
     /// Choose among `candidates` (unique set key, weight) for `affinity` and record the
-    /// decision. Every reason other than [`SetChoiceReason::Affinity`] and
-    /// [`SetChoiceReason::ShareCapRevert`] means the chosen set differs from the
-    /// rendezvous winner.
+    /// decision. Heavy keys get the weighted random pick
+    /// ([`SetChoiceReason::HeavyKeyRandom`]); other keys get their rendezvous winner or,
+    /// when sticky spill applies, their second choice
+    /// ([`SetChoiceReason::ShareCapFallback`]).
     pub fn choose(
         &self,
         affinity: SetAffinity,
@@ -546,18 +658,32 @@ impl ShareTracker {
             return None;
         }
         let mut state = self.state.lock();
-        let choice = state.decide(affinity.key, candidates, &ranking, slack);
+        if self.stale.swap(false, Ordering::Relaxed) {
+            state.reset_window();
+        }
+        state.track_candidates(candidates);
+        let choice = if state.is_heavy(affinity.key) {
+            let weights: Vec<f64> = candidates.iter().map(|(_, w)| *w).collect();
+            (
+                weighted_random_pick(&weights)?,
+                SetChoiceReason::HeavyKeyRandom,
+            )
+        } else {
+            state.decide(affinity.key, candidates, &ranking, slack)
+        };
+        let affinity_routed = choice.1 != SetChoiceReason::HeavyKeyRandom;
         state.record(
             affinity.key,
             candidates,
             &ranking,
-            choice.0,
+            affinity_routed,
             affinity.charge,
         );
         Some(choice)
     }
 
-    /// The decision `choose` would make now, without recording it (test hook).
+    /// The affinity decision `choose` would make now for a non-heavy key, without
+    /// recording it (test hook).
     #[cfg(test)]
     pub(crate) fn peek(
         &self,
@@ -567,14 +693,6 @@ impl ShareTracker {
     ) -> (usize, SetChoiceReason) {
         let ranking = rendezvous_ranking(key, candidates);
         self.state.lock().decide(key, candidates, &ranking, slack)
-    }
-
-    /// Share of charged load placed on `name` (test hook).
-    #[cfg(test)]
-    pub(crate) fn share(&self, name: &str) -> f64 {
-        let state = self.state.lock();
-        let total: f64 = state.placed.values().sum();
-        ShareState::stat(&state.placed, name) / total.max(f64::MIN_POSITIVE)
     }
 
     /// Current sticky-spill fraction for set `idx` of `candidates` (test hook).
@@ -601,6 +719,14 @@ impl ShareTracker {
             slack,
             state.share_noise(demand),
         )
+    }
+
+    /// Share of the window's affinity demand whose rendezvous winner is `name` (test hook).
+    #[cfg(test)]
+    pub(crate) fn demand_share(&self, name: &str) -> f64 {
+        let state = self.state.lock();
+        let total: f64 = state.demand.values().sum();
+        ShareState::stat(&state.demand, name) / total.max(f64::MIN_POSITIVE)
     }
 
     /// Whether `key` currently counts as heavy (test hook).
@@ -1155,126 +1281,6 @@ mod tests {
         assert!(run(&full, 5000) < 50, "30 → 60 transient");
     }
 
-    fn hot_key_preferring(name: &str) -> u64 {
-        (0..u64::MAX)
-            .find(|k| SETS[rendezvous_pick(*k, &SETS).unwrap()].0 == name)
-            .unwrap()
-    }
-
-    /// Run `n` decisions of one hot key and return how many left the preferred set.
-    fn run_hot_key(tracker: &ShareTracker, key: u64, n: usize) -> usize {
-        let ranking = rendezvous_ranking(key, &SETS);
-        let mut moved = 0;
-        for _ in 0..n {
-            let (idx, reason) = tracker.choose(unit(key), &SETS, DEFAULT_SLACK).unwrap();
-            match reason {
-                SetChoiceReason::ShareCapFallback | SetChoiceReason::ShareCapOverflow => {
-                    assert_ne!(idx, ranking[0], "a fallback must change the set");
-                    assert_eq!(
-                        idx, ranking[1],
-                        "spill target is the next rendezvous choice"
-                    );
-                    moved += 1;
-                }
-                SetChoiceReason::Affinity | SetChoiceReason::ShareCapRevert => {
-                    assert_eq!(idx, ranking[0])
-                }
-                SetChoiceReason::Random => panic!("affinity choice labelled random"),
-            }
-        }
-        moved
-    }
-
-    /// A1: a hot key that prefers the larger set must not squeeze the smaller set.
-    #[test]
-    fn share_guard_protects_smaller_set() {
-        let tracker = ShareTracker::default();
-        let moved = run_hot_key(&tracker, hot_key_preferring(TP2), 5000);
-        assert!(moved > 0);
-        let floor = (1.0 / 3.0) * (1.0 - DEFAULT_SLACK) - 0.03;
-        let tp4 = tracker.share(TP4);
-        assert!(tp4 >= floor, "tp4 share {tp4} below {floor}");
-    }
-
-    #[test]
-    fn share_guard_caps_a_hot_key_preferring_smaller_set() {
-        let tracker = ShareTracker::default();
-        let moved = run_hot_key(&tracker, hot_key_preferring(TP4), 5000);
-        assert!(moved > 0);
-        let tp4 = tracker.share(TP4);
-        let cap = 1.0 / 3.0 + share_band(1.0 / 3.0, DEFAULT_SLACK) + 0.03;
-        assert!(tp4 <= cap, "tp4 share {tp4} above {cap}");
-        let floor = (2.0 / 3.0) * (1.0 - DEFAULT_SLACK) - 0.03;
-        let tp2 = tracker.share(TP2);
-        assert!(tp2 >= floor, "tp2 share {tp2} below {floor}");
-    }
-
-    #[test]
-    fn share_guard_keeps_affinity_for_balanced_keys() {
-        let tracker = ShareTracker::default();
-        let mut overrides = 0;
-        for key in 0..20_000u64 {
-            let key = mixed(key);
-            let (idx, reason) = tracker.choose(unit(key), &SETS, DEFAULT_SLACK).unwrap();
-            if reason == SetChoiceReason::Affinity {
-                assert_eq!(Some(idx), rendezvous_pick(key, &SETS));
-            } else {
-                assert_ne!(Some(idx), rendezvous_pick(key, &SETS));
-                overrides += 1;
-            }
-        }
-        assert!(overrides < 200, "overrides {overrides}");
-    }
-
-    /// R2-2: load is charged by request size, so a key whose requests are 10x larger
-    /// cannot push its set past the band by request count alone.
-    #[test]
-    fn share_guard_balances_charged_load() {
-        for heavy_pref in [TP4, TP2] {
-            let tracker = ShareTracker::default();
-            let heavy = hot_key_preferring(heavy_pref);
-            for i in 0..20_000u64 {
-                let affinity = if i % 10 == 0 {
-                    SetAffinity::new(heavy, 10.0)
-                } else {
-                    unit(mixed(i))
-                };
-                tracker.choose(affinity, &SETS, DEFAULT_SLACK).unwrap();
-            }
-            for (name, fair) in [(TP4, 1.0 / 3.0), (TP2, 2.0 / 3.0)] {
-                let band = share_band(fair, DEFAULT_SLACK);
-                let share = tracker.share(name);
-                assert!(
-                    (fair - band - 0.03..=fair + band + 0.03).contains(&share),
-                    "heavy key prefers {heavy_pref}: {name} charged share {share}"
-                );
-            }
-        }
-    }
-
-    /// Spilling with three sets goes to a set other than the rendezvous winner.
-    #[test]
-    fn share_guard_spills_to_an_underserved_set() {
-        let sets = [("a", 1.0), ("b", 1.0), ("c", 1.0)];
-        let tracker = ShareTracker::default();
-        let key = 42;
-        let ranking = rendezvous_ranking(key, &sets);
-        for _ in 0..5000 {
-            let (idx, reason) = tracker.choose(unit(key), &sets, DEFAULT_SLACK).unwrap();
-            match reason {
-                SetChoiceReason::Affinity | SetChoiceReason::ShareCapRevert => {
-                    assert_eq!(idx, ranking[0])
-                }
-                _ => assert_ne!(idx, ranking[0]),
-            }
-        }
-        let cap = 1.0 / 3.0 + share_band(1.0 / 3.0, DEFAULT_SLACK) + 0.03;
-        assert!(tracker.share(sets[ranking[0]].0) <= cap);
-    }
-
-    // -- R3-1 / R3-2 / R3-3: heavy-key-only overflow, charge clamp, honest labels --
-
-    /// A key preferring `name` whose spill point satisfies `pred`.
     fn key_preferring(name: &str, pred: impl Fn(f64) -> bool) -> u64 {
         (0..u64::MAX)
             .map(mixed)
@@ -1282,88 +1288,305 @@ mod tests {
             .unwrap()
     }
 
-    /// Feed `n` decisions where 3 of every 10 requests are `hot` and the rest are distinct
-    /// balanced keys; return the decisions of the non-hot keys.
-    fn run_with_hot_key(
-        tracker: &ShareTracker,
-        hot: u64,
-        n: u64,
-    ) -> Vec<(u64, usize, SetChoiceReason)> {
-        let mut others = Vec::new();
-        for i in 0..n {
-            if i % 10 < 3 {
-                tracker.choose(unit(hot), &SETS, DEFAULT_SLACK).unwrap();
-            } else {
-                let key = mixed(i + 1_000_000);
-                let (idx, reason) = tracker.choose(unit(key), &SETS, DEFAULT_SLACK).unwrap();
-                others.push((key, idx, reason));
-            }
-        }
-        others
-    }
+    /// Charge placed on each of the two sets.
+    #[derive(Default)]
+    struct Tally([f64; 2]);
 
-    /// R3-1: a heavy key that sticky-spills onto TP4 pushes TP4 over its band. Only the
-    /// spilled heavy key is sent back (labelled `share_cap_revert`); TP4's own
-    /// conversations keep their set.
-    #[test]
-    fn spilled_heavy_key_does_not_displace_native_keys() {
-        let tracker = ShareTracker::default();
-        let hot = key_preferring(TP2, |x| x < 0.03);
-        let others = run_with_hot_key(&tracker, hot, 20_000);
-        assert!(tracker.is_heavy(hot));
-        assert!(tracker.spill_fraction_of(1, &SETS, DEFAULT_SLACK) > 0.03);
-        assert_ne!(
-            tracker.peek(hot, &SETS, DEFAULT_SLACK).1,
-            SetChoiceReason::Affinity
-        );
-        for (key, idx, reason) in others {
-            let preferred = rendezvous_pick(key, &SETS).unwrap();
-            assert!(
-                !matches!(
-                    reason,
-                    SetChoiceReason::ShareCapOverflow | SetChoiceReason::ShareCapRevert
-                ),
-                "ordinary key redirected by overflow"
-            );
-            if SETS[preferred].0 == TP4 {
-                assert_eq!((idx, reason), (preferred, SetChoiceReason::Affinity));
-            }
+    impl Tally {
+        fn add(&mut self, idx: usize, charge: f64) {
+            self.0[idx] += charge;
         }
-        let tp4 = tracker.share(TP4);
-        let cap = 1.0 / 3.0 + share_band(1.0 / 3.0, DEFAULT_SLACK) + 0.03;
-        assert!(tp4 <= cap, "tp4 share {tp4}");
-    }
 
-    /// R3-1: a 30% hot key preferring TP4 is the only key redirected, and TP4 stays in band.
-    #[test]
-    fn hot_key_preferring_tp4_keeps_tp4_within_band() {
-        for spilled in [false, true] {
-            let tracker = ShareTracker::default();
-            let hot = if spilled {
-                key_preferring(TP4, |x| x < 0.1)
-            } else {
-                key_preferring(TP4, |x| x > 0.5)
-            };
-            let others = run_with_hot_key(&tracker, hot, 20_000);
-            for (_, _, reason) in others {
-                assert!(!matches!(
-                    reason,
-                    SetChoiceReason::ShareCapOverflow | SetChoiceReason::ShareCapRevert
-                ));
-            }
-            for (name, fair) in [(TP4, 1.0 / 3.0), (TP2, 2.0 / 3.0)] {
+        fn share(&self, idx: usize) -> f64 {
+            self.0[idx] / (self.0[0] + self.0[1])
+        }
+
+        /// Both sets inside `fair ± band`, with `tolerance`.
+        fn assert_in_band(&self, tolerance: f64, context: &str) {
+            for (idx, fair) in [(0, 1.0 / 3.0), (1, 2.0 / 3.0)] {
                 let band = share_band(fair, DEFAULT_SLACK);
-                let share = tracker.share(name);
+                let share = self.share(idx);
                 assert!(
-                    (fair - band - 0.03..=fair + band + 0.03).contains(&share),
-                    "spilled {spilled}: {name} share {share}"
+                    (fair - band - tolerance..=fair + band + tolerance).contains(&share),
+                    "{context}: {} share {share}",
+                    SETS[idx].0
                 );
             }
         }
     }
 
-    /// R3-1 / R3-2: one request near the maximum charge is clamped to 8x the mean, is not
-    /// a heavy key, and changes no other key's set.
+    #[test]
+    fn share_guard_keeps_affinity_for_balanced_keys() {
+        let tracker = ShareTracker::default();
+        for key in 0..20_000u64 {
+            let key = mixed(key);
+            let (idx, reason) = tracker.choose(unit(key), &SETS, DEFAULT_SLACK).unwrap();
+            assert_eq!(
+                (Some(idx), reason),
+                (rendezvous_pick(key, &SETS), SetChoiceReason::Affinity)
+            );
+        }
+    }
+
+    /// Deterministic splitmix64 stream for the simulation tests.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn uniform(&mut self) -> f64 {
+            ((self.next_u64() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        }
+
+        fn normal(&mut self) -> f64 {
+            let (u1, u2) = (self.uniform(), self.uniform());
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        }
+
+        /// A lognormal charge with median 2000 bytes.
+        fn charge(&mut self, sigma: f64) -> f64 {
+            2000.0 * (sigma * self.normal()).exp()
+        }
+    }
+
+    // -- R4-1: heavy keys bypass affinity --
+
+    /// Feed `n` decisions in which 3 of every 10 requests come from `hot` (charge
+    /// `hot_charge`) and the rest from distinct background keys with lognormal(`sigma`)
+    /// charges. Returns the placement tally of the last `n / 2` decisions and every
+    /// non-hot decision.
+    fn run_with_hot_key(
+        tracker: &ShareTracker,
+        hot: u64,
+        hot_charge: f64,
+        sigma: f64,
+        n: u64,
+    ) -> (Tally, Vec<(u64, usize, SetChoiceReason)>) {
+        let mut rng = Rng(hot ^ 0x77);
+        let mut tally = Tally::default();
+        let mut others = Vec::new();
+        for i in 0..n {
+            let (key, charge) = if i % 10 < 3 {
+                (hot, hot_charge)
+            } else {
+                (mixed(i + 1_000_000), rng.charge(sigma))
+            };
+            let (idx, reason) = tracker
+                .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
+                .unwrap();
+            if i >= n / 2 {
+                tally.add(idx, charge);
+            }
+            if key != hot {
+                others.push((key, idx, reason));
+            }
+        }
+        (tally, others)
+    }
+
+    /// A 30% hot key preferring either set (spill point low or high) is detected, routed
+    /// by the weighted random pick, and both sets stay in band.
+    #[test]
+    fn hot_key_keeps_both_sets_within_band() {
+        for (pref, low_spill_point) in [(TP4, false), (TP4, true), (TP2, false), (TP2, true)] {
+            let tracker = ShareTracker::default();
+            let hot = key_preferring(pref, |x| if low_spill_point { x < 0.05 } else { x > 0.5 });
+            let (tally, _) = run_with_hot_key(&tracker, hot, 2000.0, 1.0, 20_000);
+            assert!(tracker.is_heavy(hot));
+            tally.assert_in_band(0.03, &format!("hot key prefers {pref}"));
+        }
+    }
+
+    /// With a hot key present, every other key keeps its rendezvous winner on every
+    /// request: the hot key's load does not make them spill.
+    #[test]
+    fn non_hot_keys_never_change_set() {
+        for pref in [TP4, TP2] {
+            let tracker = ShareTracker::default();
+            let hot = key_preferring(pref, |_| true);
+            let (_, others) = run_with_hot_key(&tracker, hot, 2000.0, 1.0, 20_000);
+            for (key, idx, reason) in others {
+                assert_eq!(
+                    (Some(idx), reason),
+                    (rendezvous_pick(key, &SETS), SetChoiceReason::Affinity),
+                    "hot key prefers {pref}"
+                );
+            }
+        }
+    }
+
+    /// A mean-sized hot key that starts after 20k decisions of lognormal background is
+    /// still admitted to the table (Space-Saving takes over the lightest counter and
+    /// tracks its error), becomes heavy, and keeps the sets in band.
+    #[test]
+    fn late_hot_key_is_detected_under_lognormal_background() {
+        for sigma in [1.0, 1.5] {
+            let tracker = ShareTracker::default();
+            let mut rng = Rng(0x1a7e);
+            for i in 0..20_000u64 {
+                tracker
+                    .choose(
+                        SetAffinity::new(mixed(i), rng.charge(sigma)),
+                        &SETS,
+                        DEFAULT_SLACK,
+                    )
+                    .unwrap();
+            }
+            let hot = key_preferring(TP4, |x| x > 0.5);
+            let mean_charge = 2000.0 * (sigma * sigma / 2.0f64).exp();
+            let (tally, _) = run_with_hot_key(&tracker, hot, mean_charge, sigma, 10_000);
+            assert!(tracker.is_heavy(hot), "sigma {sigma}");
+            tally.assert_in_band(0.03, &format!("late hot key, sigma {sigma}"));
+        }
+    }
+
+    /// Once heavy, a steadily hot key stays heavy on every turn (no flapping).
+    #[test]
+    fn heavy_status_does_not_flap() {
+        let tracker = ShareTracker::default();
+        let hot = key_preferring(TP4, |_| true);
+        let mut rng = Rng(0xf1a9);
+        let mut statuses = Vec::new();
+        for i in 0..30_000u64 {
+            // A 5% hot key: well above the 2% entry threshold, close enough to the 1% exit
+            // threshold that noise would flap a single threshold.
+            let (key, charge) = if i % 20 == 0 {
+                (hot, rng.charge(1.5))
+            } else {
+                (mixed(i + 3_000_000), rng.charge(1.5))
+            };
+            let (_, reason) = tracker
+                .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
+                .unwrap();
+            if key == hot {
+                statuses.push(reason == SetChoiceReason::HeavyKeyRandom);
+            }
+        }
+        let transitions = statuses.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(statuses.last().copied().unwrap_or(false));
+        assert_eq!(transitions, 1, "heavy status changed {transitions} times");
+    }
+
+    /// Fraction of follow-up turns that change set when `frontends` independent trackers
+    /// serve `conversations` conversations of 10 turns, with per-conversation lognormal(σ)
+    /// size, context growing by turn, and TP2-preferring conversations `skew` times larger.
+    /// Panics if any conversation is classified heavy.
+    fn follow_up_set_changes(
+        sigma: f64,
+        frontends: usize,
+        conversations: u64,
+        skew: f64,
+        seed: u64,
+    ) -> f64 {
+        let mut rng = Rng(seed);
+        let trackers: Vec<ShareTracker> = (0..frontends).map(|_| ShareTracker::default()).collect();
+        let conversations: Vec<(u64, f64)> = (0..conversations)
+            .map(|c| {
+                let key = mixed(c + seed);
+                let skew = if rendezvous_pick(key, &SETS) == Some(1) {
+                    skew
+                } else {
+                    1.0
+                };
+                (key, rng.charge(sigma) * skew)
+            })
+            .collect();
+        let mut last = vec![usize::MAX; conversations.len()];
+        let mut order: Vec<usize> = (0..conversations.len()).collect();
+        let (mut changes, mut follow_ups) = (0usize, 0usize);
+        for turn in 0..10u32 {
+            for i in (1..order.len()).rev() {
+                let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+                order.swap(i, j);
+            }
+            for &c in &order {
+                let (key, scale) = conversations[c];
+                let frontend = (rng.next_u64() % frontends as u64) as usize;
+                let charge = scale * f64::from(turn + 1);
+                let (idx, reason) = trackers[frontend]
+                    .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
+                    .unwrap();
+                assert_ne!(
+                    reason,
+                    SetChoiceReason::HeavyKeyRandom,
+                    "ordinary conversation classified heavy (turn {turn})"
+                );
+                if turn > 0 {
+                    follow_ups += 1;
+                    changes += usize::from(idx != last[c]);
+                }
+                last[c] = idx;
+            }
+        }
+        changes as f64 / follow_ups as f64
+    }
+
+    /// R3-2 / R4-1: heavy-tailed request sizes neither make independent frontends bounce
+    /// balanced conversations between sets nor classify long-context conversations heavy.
+    #[test]
+    fn lognormal_charges_keep_conversations_on_their_set() {
+        for (sigma, frontends) in [(1.5, 10), (2.0, 10), (1.5, 30), (2.0, 30)] {
+            let rate = follow_up_set_changes(sigma, frontends, 3000, 1.0, 0x5eed);
+            assert!(
+                rate < 0.005,
+                "sigma {sigma}: {:.3}% of follow-ups changed set",
+                rate * 100.0
+            );
+        }
+    }
+
+    /// Long-context conversations under a real 2x skew (sticky spill active) are never
+    /// classified heavy either.
+    #[test]
+    fn long_context_conversations_are_never_heavy() {
+        for (sigma, frontends) in [(1.5, 30), (2.0, 10)] {
+            follow_up_set_changes(sigma, frontends, 3000, 2.0, 0xc0de);
+        }
+    }
+
+    /// The noise allowance does not disable the guard: a real skew under heavy-tailed sizes
+    /// (TP2-preferring conversations twice as large, demand ≈ 0.8) is still corrected.
+    #[test]
+    fn lognormal_skew_is_still_corrected() {
+        for sigma in [1.5, 2.0] {
+            let mut rng = Rng(0xabc);
+            let tracker = ShareTracker::default();
+            let mut tally = Tally::default();
+            for i in 0..30_000u64 {
+                let key = mixed(i);
+                let skew = if rendezvous_pick(key, &SETS) == Some(1) {
+                    2.0
+                } else {
+                    1.0
+                };
+                let charge = rng.charge(sigma) * skew;
+                let (idx, _) = tracker
+                    .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
+                    .unwrap();
+                if i >= 15_000 {
+                    tally.add(idx, charge);
+                }
+            }
+            assert!(tracker.spill_fraction_of(1, &SETS, DEFAULT_SLACK) > 0.0);
+            let cap = 2.0 / 3.0 + share_band(2.0 / 3.0, DEFAULT_SLACK) + 0.03;
+            assert!(
+                tally.share(1) <= cap,
+                "sigma {sigma}: tp2 share {}",
+                tally.share(1)
+            );
+        }
+    }
+
+    // -- R3-2 / R4-4: charge clamp and warm-up --
+
+    /// One request near the maximum charge is clamped, is not a heavy key, and changes no
+    /// other key's set.
     #[test]
     fn single_huge_request_moves_no_other_key() {
         let tracker = ShareTracker::default();
@@ -1404,129 +1627,136 @@ mod tests {
     #[test]
     fn charges_are_clamped_to_a_multiple_of_the_mean() {
         let tracker = ShareTracker::default();
-        for i in 0..1000u64 {
+        for i in 0..5000u64 {
             tracker
                 .choose(SetAffinity::new(mixed(i), 100.0), &SETS, DEFAULT_SLACK)
                 .unwrap();
         }
         let state = tracker.state.lock();
-        assert!((state.clamp_charge(1e9) - CHARGE_CLAMP_FACTOR * 100.0).abs() < 1.0);
+        assert!((state.clamp_charge(1e9) - CHARGE_CLAMP_FACTOR * 100.0).abs() < 10.0);
         assert_eq!(state.clamp_charge(50.0), 50.0);
-        assert_eq!(ShareState::default().clamp_charge(1e9), 1e9);
+        // A fresh frontend clamps against the prior.
+        let fresh = ShareState::default();
+        assert_eq!(
+            fresh.clamp_charge(1e9),
+            CHARGE_CLAMP_FACTOR * PRIOR_MEAN_CHARGE
+        );
+    }
+
+    /// R4-4: a very large first request must not disable the sticky spill on a fresh
+    /// frontend: it is clamped against the prior, and the effective sample size is floored.
+    #[test]
+    fn large_first_request_does_not_disable_spill() {
+        let skewed = |tracker: &ShareTracker, rng: &mut Rng, n: u64| {
+            for i in 0..n {
+                let key = mixed(i + 11);
+                let skew = if rendezvous_pick(key, &SETS) == Some(1) {
+                    2.0
+                } else {
+                    1.0
+                };
+                tracker
+                    .choose(
+                        SetAffinity::new(key, rng.charge(1.0) * skew),
+                        &SETS,
+                        DEFAULT_SLACK,
+                    )
+                    .unwrap();
+            }
+        };
+        let reference = ShareTracker::default();
+        skewed(&reference, &mut Rng(9), 1500);
+        let p_reference = reference.spill_fraction_of(1, &SETS, DEFAULT_SLACK);
+        assert!(p_reference > 0.0);
+        for first in [1024.0 * 1024.0, MAX_REQUEST_CHARGE] {
+            let tracker = ShareTracker::default();
+            tracker
+                .choose(SetAffinity::new(mixed(1), first), &SETS, DEFAULT_SLACK)
+                .unwrap();
+            skewed(&tracker, &mut Rng(9), 1500);
+            let p = tracker.spill_fraction_of(1, &SETS, DEFAULT_SLACK);
+            assert!(
+                p > 0.0 && (p - p_reference).abs() < 0.05,
+                "first charge {first}: p {p} vs {p_reference}"
+            );
+        }
     }
 
     /// The guard stays idle while a fresh frontend has few samples.
     #[test]
     fn guard_waits_for_warm_up() {
         let tracker = ShareTracker::default();
-        let hot = hot_key_preferring(TP4);
+        let hot = key_preferring(TP4, |_| true);
         for _ in 0..(SHARE_MIN_SAMPLES as usize) {
             let (idx, reason) = tracker.choose(unit(hot), &SETS, DEFAULT_SLACK).unwrap();
             assert_eq!((idx, reason), (0, SetChoiceReason::Affinity));
         }
     }
 
-    /// Deterministic splitmix64 stream for the simulation tests.
-    struct Rng(u64);
+    // -- R4-3: the fair-share window restarts when the candidate sets change --
 
-    impl Rng {
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        }
-
-        fn uniform(&mut self) -> f64 {
-            ((self.next_u64() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
-        }
-
-        fn normal(&mut self) -> f64 {
-            let (u1, u2) = (self.uniform(), self.uniform());
-            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-        }
-    }
-
-    /// Fraction of follow-up turns that change set when `frontends` independent trackers
-    /// serve 3000 balanced conversations of 10 turns, with per-conversation lognormal(σ)
-    /// size and context growing by turn.
-    fn follow_up_set_changes(sigma: f64, frontends: usize, seed: u64) -> f64 {
-        let mut rng = Rng(seed);
-        let trackers: Vec<ShareTracker> = (0..frontends).map(|_| ShareTracker::default()).collect();
-        let conversations: Vec<(u64, f64)> = (0..3000u64)
-            .map(|c| (mixed(c + seed), 2000.0 * (sigma * rng.normal()).exp()))
-            .collect();
-        let mut last = vec![usize::MAX; conversations.len()];
-        let mut order: Vec<usize> = (0..conversations.len()).collect();
-        let (mut changes, mut follow_ups) = (0usize, 0usize);
-        for turn in 0..10u32 {
-            for i in (1..order.len()).rev() {
-                let j = (rng.next_u64() % (i as u64 + 1)) as usize;
-                order.swap(i, j);
-            }
-            for &c in &order {
-                let (key, scale) = conversations[c];
-                let frontend = (rng.next_u64() % frontends as u64) as usize;
-                let charge = scale * f64::from(turn + 1);
-                let (idx, _) = trackers[frontend]
-                    .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
-                    .unwrap();
-                if turn > 0 {
-                    follow_ups += 1;
-                    changes += usize::from(idx != last[c]);
-                }
-                last[c] = idx;
-            }
-        }
-        changes as f64 / follow_ups as f64
-    }
-
-    /// R3-2: heavy-tailed request sizes must not make independent frontends bounce
-    /// balanced conversations between sets.
+    /// TP2 goes 60 → 0 → 30 workers. While only TP4 is eligible the tracker sees no
+    /// decisions (the selection only marks it); when TP2 returns at half its size, the
+    /// window restarts and the new demand is judged against the new weights only, so no
+    /// key spills.
     #[test]
-    fn lognormal_charges_keep_conversations_on_their_set() {
-        for (sigma, frontends) in [(1.5, 10), (2.0, 10), (1.5, 30), (2.0, 30)] {
-            let rate = follow_up_set_changes(sigma, frontends, 0x5eed);
-            assert!(
-                rate < 0.005,
-                "sigma {sigma}: {:.3}% of follow-ups changed set",
-                rate * 100.0
+    fn returning_set_at_a_new_size_is_not_judged_against_a_stale_window() {
+        let full = [(TP4, 30.0), (TP2, 60.0)];
+        let halved = [(TP4, 30.0), (TP2, 30.0)];
+        let tracker = ShareTracker::default();
+        for i in 0..5000u64 {
+            tracker
+                .choose(unit(mixed(i)), &full, DEFAULT_SLACK)
+                .unwrap();
+        }
+        tracker.mark_single_eligible();
+        tracker
+            .choose(unit(mixed(49_999)), &halved, DEFAULT_SLACK)
+            .unwrap();
+        assert!(tracker.state.lock().window_decisions <= 1.0);
+        for i in 0..2000u64 {
+            let key = mixed(i + 50_000);
+            let (idx, reason) = tracker.choose(unit(key), &halved, DEFAULT_SLACK).unwrap();
+            assert_eq!(
+                (Some(idx), reason),
+                (rendezvous_pick(key, &halved), SetChoiceReason::Affinity)
             );
         }
+        let state = tracker.state.lock();
+        let fair_tp4 =
+            ShareState::stat(&state.expected, TP4) / state.expected.values().sum::<f64>();
+        assert!((fair_tp4 - 0.5).abs() < 1e-9, "fair {fair_tp4}");
     }
 
-    /// The noise allowance does not disable the guard: a real skew under heavy-tailed sizes
-    /// (TP2-preferring conversations twice as large, demand ≈ 0.8) is still corrected.
+    /// A change in the candidate set keys also restarts the window.
     #[test]
-    fn lognormal_skew_is_still_corrected() {
-        for sigma in [1.5, 2.0] {
-            let mut rng = Rng(0xabc);
-            let tracker = ShareTracker::default();
-            for i in 0..30_000u64 {
-                let key = mixed(i);
-                let skew = if rendezvous_pick(key, &SETS) == Some(1) {
-                    2.0
-                } else {
-                    1.0
-                };
-                let charge = 2000.0 * (sigma * rng.normal()).exp() * skew;
-                tracker
-                    .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
-                    .unwrap();
-            }
-            assert!(tracker.spill_fraction_of(1, &SETS, DEFAULT_SLACK) > 0.0);
-            let tp2 = tracker.share(TP2);
-            let cap = 2.0 / 3.0 + share_band(2.0 / 3.0, DEFAULT_SLACK) + 0.03;
-            assert!(tp2 <= cap, "sigma {sigma}: tp2 share {tp2}");
+    fn candidate_membership_change_restarts_the_window() {
+        let tracker = ShareTracker::default();
+        for i in 0..5000u64 {
+            tracker
+                .choose(unit(mixed(i)), &SETS, DEFAULT_SLACK)
+                .unwrap();
         }
+        assert!(tracker.state.lock().window_decisions > 900.0);
+        let three = [(TP4, 30.0), (TP2, 60.0), ("ns-tp8", 10.0)];
+        tracker.choose(unit(1), &three, DEFAULT_SLACK).unwrap();
+        assert!(tracker.state.lock().window_decisions <= 1.0);
+        // Same membership, different weights: the window is kept.
+        tracker
+            .choose(
+                unit(2),
+                &[(TP4, 30.0), (TP2, 30.0), ("ns-tp8", 10.0)],
+                DEFAULT_SLACK,
+            )
+            .unwrap();
+        assert!(tracker.state.lock().window_decisions > 1.0);
     }
 
     // -- R2-1: key-deterministic sticky spill --
 
-    /// A tracker whose decayed statistics are given directly: fair weight split, demand
-    /// split, and placed split (fractions of `total` load).
-    fn tracker_with(demand_tp2: f64, placed_tp2: f64) -> ShareTracker {
+    /// A tracker whose decayed window is given directly: fair weight split 1:2, demand
+    /// split as given (fractions of `total` load).
+    fn tracker_with(demand_tp2: f64) -> ShareTracker {
         let total = 1000.0;
         let map = |tp2: f64| {
             HashMap::from([
@@ -1538,21 +1768,22 @@ mod tests {
             state: Mutex::new(ShareState {
                 decisions: total,
                 charge_sum: total,
+                window_decisions: total,
+                window_sum: total,
                 // Effectively noiseless statistics, so `p` is exactly the demand formula.
-                charge_sq_sum: 1.0,
+                window_sq_sum: 1.0,
                 expected: map(2.0 / 3.0),
                 demand: map(demand_tp2),
-                placed: map(placed_tp2),
                 ..Default::default()
             }),
+            stale: AtomicBool::new(false),
         }
     }
 
     #[test]
     fn spill_is_a_pure_function_of_key_at_fixed_fraction() {
-        // Demand 0.8 on TP2 against fair 2/3: p = 1 − (2/3 + band/2) / 0.8 ≈ 0.115, and
-        // the placed split is inside the band, so no overflow.
-        let tracker = tracker_with(0.8, 0.70);
+        // Demand 0.8 on TP2 against fair 2/3: p = 1 − (2/3 + band/2) / 0.8 ≈ 0.115.
+        let tracker = tracker_with(0.8);
         let p = tracker.spill_fraction_of(1, &SETS, DEFAULT_SLACK);
         assert!((0.10..0.13).contains(&p), "p {p}");
         let mut spilled = 0;
@@ -1579,8 +1810,8 @@ mod tests {
 
     #[test]
     fn trackers_with_different_histories_agree_outside_the_spill_gap() {
-        let a = tracker_with(0.80, 0.70);
-        let b = tracker_with(0.78, 0.71);
+        let a = tracker_with(0.80);
+        let b = tracker_with(0.78);
         let pa = a.spill_fraction_of(1, &SETS, DEFAULT_SLACK);
         let pb = b.spill_fraction_of(1, &SETS, DEFAULT_SLACK);
         let (lo, hi) = (pa.min(pb), pa.max(pb));
@@ -1608,6 +1839,7 @@ mod tests {
     #[test]
     fn live_trackers_converge_and_agree() {
         let feed = |tracker: &ShareTracker, salt: u64| {
+            let mut tally = Tally::default();
             for i in 0..30_000u64 {
                 let key = mixed(i ^ salt);
                 // TP2-preferring conversations are twice as large: TP2 demand ≈ 0.8.
@@ -1616,14 +1848,17 @@ mod tests {
                 } else {
                     1.0
                 };
-                tracker
+                let (idx, _) = tracker
                     .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
                     .unwrap();
+                if i >= 20_000 {
+                    tally.add(idx, charge);
+                }
             }
+            tally
         };
         let (a, b) = (ShareTracker::default(), ShareTracker::default());
-        feed(&a, 0x1111);
-        feed(&b, 0x2222_0000);
+        let tallies = [feed(&a, 0x1111), feed(&b, 0x2222_0000)];
         let pa = a.spill_fraction_of(1, &SETS, DEFAULT_SLACK);
         let pb = b.spill_fraction_of(1, &SETS, DEFAULT_SLACK);
         assert!(pa > 0.05 && pb > 0.05, "pa {pa} pb {pb}");
@@ -1636,8 +1871,8 @@ mod tests {
             })
             .count();
         assert!(agree as f64 >= probe as f64 * 0.95, "agree {agree}/{probe}");
-        for t in [&a, &b] {
-            let tp2 = t.share(TP2);
+        for tally in &tallies {
+            let tp2 = tally.share(1);
             assert!(
                 tp2 <= 2.0 / 3.0 + share_band(2.0 / 3.0, DEFAULT_SLACK) + 0.02,
                 "{tp2}"
@@ -1646,7 +1881,8 @@ mod tests {
     }
 
     /// Spills stick per key across turns: with a stable workload, a conversation keeps its
-    /// set on every turn (keys right at the spill boundary excepted).
+    /// set on every turn (keys right at the spill boundary excepted), and an ordinary
+    /// conversation is never treated as heavy.
     #[test]
     fn spills_stick_across_turns() {
         let tracker = ShareTracker::default();
@@ -1669,7 +1905,6 @@ mod tests {
         let mut first: HashMap<u64, usize> = HashMap::new();
         let mut flips = 0;
         let mut spilled = 0;
-        let mut overflows = 0;
         for turn in 0..20u64 {
             for (c, &conv) in conversations.iter().enumerate() {
                 // Background traffic between turns.
@@ -1686,14 +1921,7 @@ mod tests {
                         DEFAULT_SLACK,
                     )
                     .unwrap();
-                // Ordinary conversations are never heavy, so the overflow step never
-                // touches them.
-                if matches!(
-                    reason,
-                    SetChoiceReason::ShareCapOverflow | SetChoiceReason::ShareCapRevert
-                ) {
-                    overflows += 1;
-                }
+                assert_ne!(reason, SetChoiceReason::HeavyKeyRandom);
                 if turn == 0 && reason == SetChoiceReason::ShareCapFallback {
                     spilled += 1;
                 }
@@ -1709,7 +1937,32 @@ mod tests {
         }
         assert!(spilled > 0);
         assert_eq!(flips, 0);
-        assert_eq!(overflows, 0);
+    }
+
+    /// Sticky spill with three sets moves spilled keys to their second choice.
+    #[test]
+    fn three_set_spill_goes_to_the_second_choice() {
+        let sets = [("a", 1.0), ("b", 1.0), ("c", 1.0)];
+        let tracker = ShareTracker::default();
+        let mut spills = 0;
+        for i in 0..20_000u64 {
+            let key = mixed(i);
+            let ranking = rendezvous_ranking(key, &sets);
+            let charge = if sets[ranking[0]].0 == "a" { 3.0 } else { 1.0 };
+            let (idx, reason) = tracker
+                .choose(SetAffinity::new(key, charge), &sets, DEFAULT_SLACK)
+                .unwrap();
+            match reason {
+                SetChoiceReason::Affinity => assert_eq!(idx, ranking[0]),
+                SetChoiceReason::ShareCapFallback => {
+                    assert_eq!(idx, ranking[1]);
+                    assert_eq!(sets[ranking[0]].0, "a");
+                    spills += 1;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(spills > 0);
     }
 
     // -- Affinity keys over the real request types --
