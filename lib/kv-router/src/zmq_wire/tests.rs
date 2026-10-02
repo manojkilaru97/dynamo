@@ -1021,3 +1021,53 @@ fn tokenless_cpu_store_stays_empty_for_unknown_or_foreign_blocks() {
     assert_eq!(partial.parent_hash, None);
     assert_eq!(normalizer.take_lower_tier_filled(), 1);
 }
+
+/// D5: lazy CPU stores without token IDs are expected (the identity fill completes
+/// them), so they must not consume the shared 3-warning budget that surfaces real drops.
+#[test]
+fn tokenless_cpu_store_does_not_consume_warning_budget() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let mut normalizer = ZmqEventNormalizer::with_warning_count(4, warning_count.clone());
+    let tokenless = |hashes: &'static [u64]| {
+        cpu_block_stored(CpuBlockStoredFixture {
+            block_hashes: hashes,
+            token_ids: &[],
+            block_size: 4,
+            parent_block_hash: None,
+        })
+    };
+    // Unknown identity (stays empty) and known identity (filled): neither warns.
+    let unknown = stored_data(normalizer.normalize(tokenless(&[301]), 1, worker).unwrap());
+    assert!(unknown.blocks.is_empty());
+    normalizer
+        .normalize(gpu_block_stored(&[401], &[1, 2, 3, 4], 4, None), 2, worker)
+        .unwrap();
+    let filled = stored_data(normalizer.normalize(tokenless(&[401]), 3, worker).unwrap());
+    assert_eq!(filled.blocks.len(), 1);
+    assert_eq!(warning_count.load(Ordering::Relaxed), 0);
+
+    // Real truncation still warns: a device store, and a CPU store that carries some
+    // (but too few) token IDs.
+    let short_gpu = stored_data(
+        normalizer
+            .normalize(gpu_block_stored(&[501], &[1, 2], 4, None), 4, worker)
+            .unwrap(),
+    );
+    assert!(short_gpu.blocks.is_empty());
+    assert_eq!(warning_count.load(Ordering::Relaxed), 1);
+    let short_cpu = normalizer
+        .normalize(
+            cpu_block_stored(CpuBlockStoredFixture {
+                block_hashes: &[601],
+                token_ids: &[1, 2],
+                block_size: 4,
+                parent_block_hash: None,
+            }),
+            5,
+            worker,
+        )
+        .unwrap();
+    assert!(stored_data(short_cpu).blocks.is_empty());
+    assert_eq!(warning_count.load(Ordering::Relaxed), 2);
+}

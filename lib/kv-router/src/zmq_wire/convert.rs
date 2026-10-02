@@ -73,6 +73,10 @@ pub fn convert_event(
                 }
             }
 
+            // vLLM's lazy CPU offload emits lower-tier stores with only the block hash; the
+            // normalizer completes them from the device-tier identity afterwards. Those are
+            // expected, so they must not spend the shared warning budget meant for real drops.
+            let warn_short_tokens = storage_tier == StorageTier::Device || !token_ids.is_empty();
             let num_block_tokens = vec![block_size as u64; block_hashes.len()];
             let block_hashes_u64: Vec<u64> = block_hashes
                 .into_iter()
@@ -85,7 +89,7 @@ pub fn convert_event(
                         .map(BlockHashValue::into_u64)
                         .map(ExternalSequenceBlockHash::from),
                     start_position: None,
-                    blocks: create_stored_blocks(
+                    blocks: create_stored_blocks_inner(
                         kv_block_size,
                         &token_ids,
                         &num_block_tokens,
@@ -96,6 +100,7 @@ pub fn convert_event(
                         block_mm_infos.as_deref(),
                         is_eagle,
                         image_token_id,
+                        warn_short_tokens,
                     ),
                 }),
                 dp_rank,
@@ -264,6 +269,37 @@ pub fn create_stored_blocks(
     is_eagle: Option<bool>,
     image_token_id: Option<u32>,
 ) -> Vec<KvCacheStoredBlockData> {
+    create_stored_blocks_inner(
+        kv_block_size,
+        token_ids,
+        num_block_tokens,
+        block_hashes,
+        lora_name,
+        cache_namespace,
+        warning_count,
+        block_mm_infos,
+        is_eagle,
+        image_token_id,
+        true,
+    )
+}
+
+/// [`create_stored_blocks`] with control over the "token_ids too short" warning, which the
+/// lazy lower-tier path (empty `token_ids`, completed later) suppresses.
+#[allow(clippy::too_many_arguments)]
+fn create_stored_blocks_inner(
+    kv_block_size: u32,
+    token_ids: &[u32],
+    num_block_tokens: &[u64],
+    block_hashes: &[u64],
+    lora_name: Option<&str>,
+    cache_namespace: Option<&str>,
+    warning_count: &Arc<AtomicU32>,
+    block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
+    is_eagle: Option<bool>,
+    image_token_id: Option<u32>,
+    warn_short_tokens: bool,
+) -> Vec<KvCacheStoredBlockData> {
     let mut blocks: Vec<KvCacheStoredBlockData> = Vec::new();
 
     let mut token_offset: usize = 0;
@@ -285,7 +321,12 @@ pub fn create_stored_blocks(
 
         let end = token_offset + append + *num_tokens_it as usize;
         if end > token_ids.len() {
-            if warning_count.fetch_add(1, Ordering::Relaxed) < 3 {
+            if !warn_short_tokens {
+                tracing::trace!(
+                    block_hash = *block_hash_it,
+                    "Lower-tier store without token_ids; deferring to identity fill"
+                );
+            } else if warning_count.fetch_add(1, Ordering::Relaxed) < 3 {
                 tracing::warn!(
                     "Block not published. token_ids too short: need {}, got {}",
                     end,
