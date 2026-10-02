@@ -1571,10 +1571,6 @@ mod tests {
         entries_checked: usize,
     }
 
-    fn demand_of(tracker: &ShareTracker, name: &str) -> f64 {
-        ShareState::stat(&tracker.state.lock().demand, name)
-    }
-
     /// The window quantities a heavy entry changes, plus the hot key's counter.
     struct WindowSnapshot {
         counter: Option<HeavyCounter>,
@@ -1645,7 +1641,7 @@ mod tests {
             let credit_load = old * counter.window_load * d + request * charge;
             let credit_sq = old * counter.window_sq * d * d + request * charge * charge;
             let credit_decisions = old * counter.window_decisions * d + request;
-            for s in 0..2 {
+            for (s, (name, _)) in sets.iter().enumerate() {
                 let added = if routed && s == winner { charge } else { 0.0 };
                 let removed = if credited == Some(s) {
                     credit_load
@@ -1660,7 +1656,7 @@ mod tests {
                 let old_expected = counter
                     .window_expected
                     .iter()
-                    .find(|(id, _)| *id == set_id(sets[s].0))
+                    .find(|(id, _)| *id == set_id(name))
                     .map_or(0.0, |(_, e)| *e);
                 let credit_expected = old * old_expected * d + request * fair(s);
                 close(
@@ -1688,7 +1684,6 @@ mod tests {
     }
 
     fn run_phases(hot: u64, phases: &[Phase]) -> PhaseOutcome {
-        let decay = 1.0 - 1.0 / SHARE_WINDOW;
         let tracker = ShareTracker::default();
         let mut outcome = PhaseOutcome {
             spills_from: [0; 2],
