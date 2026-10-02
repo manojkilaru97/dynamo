@@ -13,7 +13,9 @@ use dashmap::DashMap;
 use serde::Serialize;
 
 use super::ModelManagerError;
-use super::set_selection::{SetChoiceReason, SetSelectionConfig, SetSelectionMode, ShareTracker};
+use super::set_selection::{
+    SetAffinity, SetChoiceReason, SetSelectionConfig, SetSelectionMode, ShareTracker,
+};
 use super::worker_monitor::LoadThresholdConfig;
 use super::worker_set::WorkerSet;
 use crate::protocols::openai::ParsingOptions;
@@ -755,12 +757,12 @@ impl Model {
     }
 
     /// Like [`Self::get_chat_engine_with_parsing`], with an optional conversation affinity
-    /// key used when `DYN_WORKER_SET_SELECTION=affinity`.
+    /// (key and load charge) used when `DYN_WORKER_SET_SELECTION=affinity`.
     pub fn get_chat_engine_with_parsing_for(
         &self,
-        affinity_key: Option<u64>,
+        affinity: Option<SetAffinity>,
     ) -> Result<(OpenAIChatCompletionsStreamingEngine, ParsingOptions), ModelManagerError> {
-        self.select_worker_set_for(affinity_key, |ws| {
+        self.select_worker_set_for(affinity, |ws| {
             ws.chat_engine.clone().map(|e| (e, ws.parsing_options()))
         })
         .ok_or_else(|| self.engine_error(self.has_chat_engine()))
@@ -849,20 +851,20 @@ impl Model {
         self.select_worker_set_for(None, extract)
     }
 
-    /// [`Self::select_worker_set_with`] with an optional conversation affinity key, using
+    /// [`Self::select_worker_set_with`] with an optional conversation affinity, using
     /// the process-wide [`SetSelectionConfig::global`].
-    fn select_worker_set_for<T, F>(&self, affinity_key: Option<u64>, extract: F) -> Option<T>
+    fn select_worker_set_for<T, F>(&self, affinity: Option<SetAffinity>, extract: F) -> Option<T>
     where
         F: Fn(&WorkerSet) -> Option<T>,
     {
-        self.select_worker_set_for_with(SetSelectionConfig::global(), affinity_key, extract)
+        self.select_worker_set_for_with(SetSelectionConfig::global(), affinity, extract)
     }
 
     /// [`Self::select_worker_set_for`] with an explicit selection config.
     fn select_worker_set_for_with<T, F>(
         &self,
         config: &SetSelectionConfig,
-        affinity_key: Option<u64>,
+        affinity: Option<SetAffinity>,
         extract: F,
     ) -> Option<T>
     where
@@ -930,9 +932,9 @@ impl Model {
         }
 
         let weighted: Vec<(&str, f64)> = eligible.iter().map(|(_, k, w, _)| (*k, *w)).collect();
-        let chosen = match (config.mode, affinity_key) {
-            (SetSelectionMode::Affinity, Some(key)) => {
-                self.set_shares.choose(key, &weighted, config.slack)
+        let chosen = match (config.mode, affinity) {
+            (SetSelectionMode::Affinity, Some(affinity)) => {
+                self.set_shares.choose(affinity, &weighted, config.slack)
             }
             _ => {
                 let weights: Vec<f64> = weighted.iter().map(|(_, w)| *w).collect();
@@ -2156,15 +2158,22 @@ mod tests {
         namespaces
             .iter()
             .flat_map(|ns| {
-                ["affinity", "share_cap_fallback", "random"]
-                    .map(|reason| selection_count(model, ns, reason))
+                [
+                    "affinity",
+                    "share_cap_fallback",
+                    "share_cap_overflow",
+                    "random",
+                ]
+                .map(|reason| selection_count(model, ns, reason))
             })
             .sum()
     }
 
     fn pick_mdcsum(model: &Model, config: &SetSelectionConfig, key: Option<u64>) -> String {
         model
-            .select_worker_set_for_with(config, key, |ws| Some(ws.mdcsum().to_string()))
+            .select_worker_set_for_with(config, key.map(|k| SetAffinity::new(k, 1.0)), |ws| {
+                Some(ws.mdcsum().to_string())
+            })
             .expect("a set must be selected")
     }
 
