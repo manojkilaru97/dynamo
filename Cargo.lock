@@ -2582,6 +2582,7 @@ dependencies = [
  "arc-swap",
  "assert_matches",
  "async-nats 0.49.1",
+ "async-openai",
  "async-stream",
  "async-trait",
  "axum 0.8.4",

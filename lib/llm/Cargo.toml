@@ -74,6 +74,8 @@ dynamo-tokens = { workspace = true }
 anyhow = { workspace = true }
 arc-swap = "1.9.1"
 dynamo-protocols = { workspace = true }
+# Named only for the developer content-part type, which dynamo-protocols does not re-export.
+async-openai = { version = "0.41", default-features = false, features = ["chat-completion-types"] }
 dynamo-parsers = { workspace = true }
 dynamo-parsers-v2 = { workspace = true }
 async-stream = { workspace = true }

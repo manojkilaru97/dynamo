@@ -52,9 +52,9 @@ use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 use rand::Rng;
-use serde_json::Value;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64_with_seed};
 
+use async_openai::types::chat::ChatCompletionRequestDeveloperMessageContentPart;
 use dynamo_protocols::types::{
     ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
     ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestMessage,
@@ -634,7 +634,7 @@ const AFFINITY_SEED: u64 = 0x5e75_e1ec_7a1f_f1a7;
 /// Domain tags so an explicit key can never collide with a message-prefix hash.
 const PROMPT_CACHE_KEY_TAG: &[u8] = b"prompt_cache_key\0";
 const SESSION_AFFINITY_TAG: &[u8] = b"session_affinity\0";
-const MESSAGES_TAG: &[u8] = b"messages/v2\0";
+const MESSAGES_TAG: &[u8] = b"messages/v3\0";
 
 fn explicit_affinity_key(tag: &[u8], value: &str) -> u64 {
     let mut hasher = Xxh3::with_seed(AFFINITY_SEED);
@@ -643,57 +643,116 @@ fn explicit_affinity_key(tag: &[u8], value: &str) -> u64 {
     hasher.digest()
 }
 
-/// Canonical form of message content for hashing: a plain string when the content is
-/// only text (text parts concatenated), otherwise an array in which each run of adjacent
-/// text parts becomes one `{"type":"text","text":…}` part and every other part is kept
-/// verbatim.
-fn canonical_content(content: Value) -> Value {
-    let Value::Array(parts) = content else {
-        return content;
-    };
-    let mut out: Vec<Value> = Vec::with_capacity(parts.len());
-    let mut text: Option<String> = None;
-    for part in parts {
-        let part_text = match &part {
-            Value::Object(map) if map.get("type").and_then(Value::as_str) == Some("text") => {
-                map.get("text").and_then(Value::as_str).map(str::to_owned)
-            }
-            _ => None,
-        };
-        match part_text {
-            Some(t) => text.get_or_insert_with(String::new).push_str(&t),
-            None => {
-                if let Some(t) = text.take() {
-                    out.push(serde_json::json!({"type": "text", "text": t}));
-                }
-                out.push(part);
-            }
+/// Serialized JSON length of `value`, without allocating the serialization.
+fn json_len<T: serde::Serialize>(value: &T) -> Option<usize> {
+    struct Count(usize);
+    impl io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
-    match (out.is_empty(), text) {
-        (true, Some(t)) => Value::String(t),
-        (true, None) => Value::String(String::new()),
-        (false, t) => {
-            if let Some(t) = t {
-                out.push(serde_json::json!({"type": "text", "text": t}));
-            }
-            Value::Array(out)
-        }
-    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).ok()?;
+    Some(count.0)
 }
 
-/// Canonical JSON of one opening message: text content canonicalized and `developer`
-/// folded into `system` (the Responses conversion maps both to system messages).
-fn canonical_message(message: &ChatCompletionRequestMessage) -> Option<Value> {
-    let mut value = serde_json::to_value(message).ok()?;
-    let map = value.as_object_mut()?;
-    if map.get("role").and_then(Value::as_str) == Some("developer") {
-        map.insert("role".to_string(), Value::String("system".to_string()));
+/// Text pieces of system/developer content (parts are concatenated, as both the chat
+/// templates and the Responses conversion do).
+fn system_text(content: &ChatCompletionRequestSystemMessageContent) -> impl Iterator<Item = &str> {
+    let (text, parts) = match content {
+        ChatCompletionRequestSystemMessageContent::Text(t) => (Some(t.as_str()), None),
+        ChatCompletionRequestSystemMessageContent::Array(parts) => (None, Some(parts)),
+    };
+    text.into_iter()
+        .chain(parts.into_iter().flatten().map(|p| match p {
+            ChatCompletionRequestSystemMessageContentPart::Text(t) => t.text.as_str(),
+        }))
+}
+
+fn developer_text(
+    content: &ChatCompletionRequestDeveloperMessageContent,
+) -> impl Iterator<Item = &str> {
+    let (text, parts) = match content {
+        ChatCompletionRequestDeveloperMessageContent::Text(t) => (Some(t.as_str()), None),
+        ChatCompletionRequestDeveloperMessageContent::Array(parts) => (None, Some(parts)),
+    };
+    text.into_iter()
+        .chain(parts.into_iter().flatten().map(|p| match p {
+            ChatCompletionRequestDeveloperMessageContentPart::Text(t) => t.text.as_str(),
+        }))
+}
+
+/// Streams the canonical opening into the hasher. Each record is a one-byte tag followed by
+/// a little-endian `u64` length and that many bytes, so the encoding is unambiguous and
+/// text is never copied.
+struct OpeningHasher(HashWriter);
+
+impl OpeningHasher {
+    fn update(&mut self, bytes: &[u8]) {
+        self.0.0.update(bytes);
     }
-    if let Some(content) = map.remove("content") {
-        map.insert("content".to_string(), canonical_content(content));
+
+    fn tag(&mut self, tag: u8) {
+        self.update(&[tag]);
     }
-    Some(value)
+
+    /// A text record whose bytes are `pieces` joined by `separator`.
+    fn text(&mut self, tag: u8, pieces: &[&str], separator: &str) {
+        let len = pieces.iter().map(|p| p.len()).sum::<usize>()
+            + separator.len() * pieces.len().saturating_sub(1);
+        self.tag(tag);
+        self.update(&(len as u64).to_le_bytes());
+        for (i, piece) in pieces.iter().enumerate() {
+            if i > 0 {
+                self.update(separator.as_bytes());
+            }
+            self.update(piece.as_bytes());
+        }
+    }
+
+    /// A non-text part, identified by its JSON serialization (streamed, not buffered).
+    fn part<T: serde::Serialize>(&mut self, part: &T) -> Option<()> {
+        let len = json_len(part)?;
+        self.tag(b'P');
+        self.update(&(len as u64).to_le_bytes());
+        serde_json::to_writer(&mut self.0, part).ok()
+    }
+
+    fn name(&mut self, name: Option<&String>) {
+        if let Some(name) = name {
+            self.text(b'N', &[name], "");
+        }
+    }
+
+    fn user(&mut self, content: &ChatCompletionRequestUserMessageContent) -> Option<()> {
+        match content {
+            ChatCompletionRequestUserMessageContent::Text(t) => self.text(b'T', &[t], ""),
+            ChatCompletionRequestUserMessageContent::Array(parts) => {
+                let mut run: Vec<&str> = Vec::new();
+                let mut wrote = false;
+                for part in parts {
+                    if let ChatCompletionRequestUserMessageContentPart::Text(t) = part {
+                        run.push(&t.text);
+                        continue;
+                    }
+                    if !run.is_empty() {
+                        self.text(b'T', &run, "");
+                        run.clear();
+                    }
+                    self.part(part)?;
+                    wrote = true;
+                }
+                if !run.is_empty() || !wrote {
+                    self.text(b'T', &run, "");
+                }
+            }
+        }
+        Some(())
+    }
 }
 
 /// Affinity key for a conversation from its messages: a hash of every message before the
@@ -701,9 +760,13 @@ fn canonical_message(message: &ChatCompletionRequestMessage) -> Option<Value> {
 ///
 /// Every later turn of the same conversation repeats that opening, so turns map to the same
 /// key, while two sessions that share boilerplate leading user items (for example Codex's
-/// AGENTS.md and `<environment_context>`) still differ by their task. Text content is
-/// canonicalized first, so a string and the equivalent text-part array (Chat Completions
-/// vs. a converted Responses request) hash alike.
+/// AGENTS.md and `<environment_context>`) still differ by their task.
+///
+/// The opening is canonicalized so that Chat Completions and converted Responses requests
+/// agree: the leading run of system/developer messages is merged into one text joined by
+/// `"\n\n"` (exactly what the Responses conversion does), developer counts as system, and
+/// each run of adjacent text parts is concatenated, so a string and the equivalent text-part
+/// array hash alike. Text is streamed into the hasher without copying the opening.
 ///
 /// Returns `None` when the opening holds no user message (system-only requests, or a
 /// conversation that starts with an assistant message): those carry nothing
@@ -714,31 +777,61 @@ fn canonical_message(message: &ChatCompletionRequestMessage) -> Option<Value> {
 /// as a UUID-only reference (instead of URL + UUID) changes the key. Canonicalize image
 /// parts to their UUID before enabling affinity for a multimodal model (Super 3.5 is a VLM).
 pub fn messages_affinity_key(messages: &[ChatCompletionRequestMessage]) -> Option<u64> {
+    use ChatCompletionRequestMessage as M;
     let end = messages
         .iter()
-        .position(|m| {
-            matches!(
-                m,
-                ChatCompletionRequestMessage::Assistant(_)
-                    | ChatCompletionRequestMessage::Tool(_)
-                    | ChatCompletionRequestMessage::Function(_)
-            )
-        })
+        .position(|m| matches!(m, M::Assistant(_) | M::Tool(_) | M::Function(_)))
         .unwrap_or(messages.len());
     let opening = &messages[..end];
-    if !opening
-        .iter()
-        .any(|m| matches!(m, ChatCompletionRequestMessage::User(_)))
-    {
+    if !opening.iter().any(|m| matches!(m, M::User(_))) {
         return None;
     }
-    let mut writer = HashWriter(Xxh3::with_seed(AFFINITY_SEED));
-    io::Write::write_all(&mut writer, MESSAGES_TAG).ok()?;
-    for message in opening {
-        serde_json::to_writer(&mut writer, &canonical_message(message)?).ok()?;
-        io::Write::write_all(&mut writer, b"\x1e").ok()?;
+    let leading = opening
+        .iter()
+        .take_while(|m| matches!(m, M::System(_) | M::Developer(_)))
+        .count();
+
+    let mut hasher = OpeningHasher(HashWriter(Xxh3::with_seed(AFFINITY_SEED)));
+    hasher.update(MESSAGES_TAG);
+    if leading > 0 {
+        // Same text as the Responses conversion's merged leading system message.
+        let mut pieces: Vec<&str> = Vec::new();
+        for (i, message) in opening[..leading].iter().enumerate() {
+            if i > 0 {
+                pieces.push("\n\n");
+            }
+            match message {
+                M::System(m) => pieces.extend(system_text(&m.content)),
+                M::Developer(m) => pieces.extend(developer_text(&m.content)),
+                _ => {}
+            }
+        }
+        hasher.text(b'S', &pieces, "");
+        hasher.tag(0x1e);
     }
-    Some(writer.0.digest())
+    for message in &opening[leading..] {
+        match message {
+            M::System(m) => {
+                hasher.tag(b's');
+                hasher.name(m.name.as_ref());
+                hasher.text(b'T', &system_text(&m.content).collect::<Vec<_>>(), "");
+            }
+            M::Developer(m) => {
+                hasher.tag(b's');
+                hasher.name(m.name.as_ref());
+                hasher.text(b'T', &developer_text(&m.content).collect::<Vec<_>>(), "");
+            }
+            M::User(m) => {
+                hasher.tag(b'u');
+                hasher.name(m.name.as_ref());
+                hasher.user(&m.content)?;
+            }
+            // The opening ends before the first of these.
+            M::Assistant(_) | M::Tool(_) | M::Function(_) => {}
+        }
+        hasher.tag(0x1e);
+    }
+    Some(hasher.0.0.digest())
 }
 
 /// Affinity key for a chat-shaped request (Chat Completions, or Responses after
@@ -766,25 +859,10 @@ pub fn chat_request_affinity_key(
     messages_affinity_key(messages)
 }
 
-/// Serialized JSON length of `value`, without allocating the serialization.
-fn json_len<T: serde::Serialize>(value: &T) -> usize {
-    struct Count(usize);
-    impl io::Write for Count {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut count = Count(0);
-    serde_json::to_writer(&mut count, value).map_or(0, |()| count.0)
-}
-
 /// Cheap pre-tokenization size proxy for a request: the UTF-8 bytes of all message text
 /// (content, reasoning, refusals, tool-call names and arguments), plus a nominal charge per
-/// non-text part. Linear in the number of messages and parts; no allocation.
+/// non-text part. Linear in the number of messages and parts; no allocation or
+/// serialization.
 pub fn request_charge(messages: &[ChatCompletionRequestMessage]) -> f64 {
     use ChatCompletionRequestMessage as M;
     let user_part = |p: &ChatCompletionRequestUserMessageContentPart| match p {
@@ -798,21 +876,8 @@ pub fn request_charge(messages: &[ChatCompletionRequestMessage]) -> f64 {
     let bytes: usize = messages
         .iter()
         .map(|message| match message {
-            M::System(m) => match &m.content {
-                ChatCompletionRequestSystemMessageContent::Text(t) => t.len(),
-                ChatCompletionRequestSystemMessageContent::Array(parts) => parts
-                    .iter()
-                    .map(|p| match p {
-                        ChatCompletionRequestSystemMessageContentPart::Text(t) => t.text.len(),
-                    })
-                    .sum(),
-            },
-            M::Developer(m) => match &m.content {
-                ChatCompletionRequestDeveloperMessageContent::Text(t) => t.len(),
-                // The part type is not re-exported; these arrays are rare, so measure
-                // their JSON size instead.
-                ChatCompletionRequestDeveloperMessageContent::Array(parts) => json_len(parts),
-            },
+            M::System(m) => system_text(&m.content).map(str::len).sum(),
+            M::Developer(m) => developer_text(&m.content).map(str::len).sum(),
             M::User(m) => match &m.content {
                 ChatCompletionRequestUserMessageContent::Text(t) => t.len(),
                 ChatCompletionRequestUserMessageContent::Array(parts) => {
@@ -1934,6 +1999,42 @@ mod tests {
         assert_ne!(a, text_only);
     }
 
+    /// R3-4: the Responses conversion merges leading system/developer messages with
+    /// "\n\n"; the key applies the same merge to both APIs.
+    #[test]
+    fn leading_instructions_merge_like_the_responses_conversion() {
+        let chat_split = chat_key(json!({"model": "m", "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "developer", "content": [
+                {"type": "text", "text": "de"},
+                {"type": "text", "text": "v"},
+            ]},
+            {"role": "user", "content": "task 0"},
+        ]}));
+        let chat_merged = chat_key(json!({"model": "m", "messages": [
+            {"role": "system", "content": "sys\n\ndev"},
+            {"role": "user", "content": "task 0"},
+        ]}));
+        let responses = responses_key(json!({
+            "model": "m", "instructions": "sys",
+            "input": [
+                {"type": "message", "role": "developer",
+                 "content": [{"type": "input_text", "text": "dev"}]},
+                user_item("task 0"),
+            ],
+        }));
+        assert!(chat_split.is_some());
+        assert_eq!(chat_split, responses);
+        assert_eq!(chat_split, chat_merged);
+        // A system message after the first user message is not merged.
+        let late = chat_key(json!({"model": "m", "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task 0"},
+            {"role": "developer", "content": "dev"},
+        ]}));
+        assert_ne!(late, chat_split);
+    }
+
     // -- R2-2: size proxy --
 
     #[test]
@@ -1958,5 +2059,36 @@ mod tests {
         assert_eq!(request_charge(&big.inner.messages), 10_000.0);
         assert_eq!(SetAffinity::new(1, f64::NAN).charge, 1.0);
         assert_eq!(SetAffinity::new(1, 1e300).charge, MAX_REQUEST_CHARGE);
+    }
+
+    /// R3-5: developer content is charged by its text bytes (no JSON overhead or escaping),
+    /// the same as plain text, part arrays, and the converted Responses request.
+    #[test]
+    fn developer_charge_counts_text_bytes() {
+        let quotes = "\"".repeat(1000);
+        let charge = |body: serde_json::Value| request_charge(&chat(body).inner.messages);
+        let plain = charge(json!({"model": "m", "messages": [
+            {"role": "developer", "content": quotes},
+        ]}));
+        let parts = charge(json!({"model": "m", "messages": [
+            {"role": "developer", "content": [
+                {"type": "text", "text": &quotes[..400]},
+                {"type": "text", "text": &quotes[400..]},
+            ]},
+        ]}));
+        let system = charge(json!({"model": "m", "messages": [
+            {"role": "system", "content": [{"type": "text", "text": quotes}]},
+        ]}));
+        let (converted, _) = responses(json!({
+            "model": "m",
+            "input": [{"type": "message", "role": "developer", "content": [
+                {"type": "input_text", "text": &quotes[..400]},
+                {"type": "input_text", "text": &quotes[400..]},
+            ]}],
+        }));
+        assert_eq!(plain, 1000.0);
+        assert_eq!(parts, 1000.0);
+        assert_eq!(system, 1000.0);
+        assert_eq!(request_charge(&converted.inner.messages), 1000.0);
     }
 }
