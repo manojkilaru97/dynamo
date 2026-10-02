@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, LazyLock};
 
 use rmp_serde as rmps;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::protocols::{
     BlockExtraInfo, DpRank, ExternalSequenceBlockHash, KvCacheEventData, KvCacheStoreData,
@@ -63,10 +63,6 @@ pub struct ZmqEventNormalizer {
     /// Complete token-less lower-tier stores from device identities
     /// (`DYN_KV_ROUTER_FILL_LOWER_TIER`, default on).
     fill_lower_tier: bool,
-    /// Workers that have published a lower-tier store. Device identities are recorded
-    /// only for these, so workers without CPU offload pay nothing; blocks a worker stored
-    /// on the device before its first lower-tier store are not filled.
-    lower_tier_workers: FxHashSet<WorkerWithDpRank>,
 }
 
 const FILL_LOWER_TIER_ENV: &str = "DYN_KV_ROUTER_FILL_LOWER_TIER";
@@ -117,9 +113,7 @@ struct BlockIdentity {
 /// on the GPU, and long-lived hot prefixes are not pushed out by churn. This is
 /// safe for lazy offload because the copy keeps the GPU block in use, so its
 /// CPU store is published before the GPU removal. Past `capacity`, the least
-/// recently stored identity is evicted (a re-store refreshes it). The
-/// normalizer records identities only for workers that have published a
-/// lower-tier store.
+/// recently stored identity is evicted (a re-store refreshes it).
 #[derive(Debug, Clone)]
 struct BlockIdentityMemo {
     map: FxHashMap<(WorkerWithDpRank, u64), MemoEntry>,
@@ -301,7 +295,6 @@ impl ZmqEventNormalizer {
             block_identities: BlockIdentityMemo::new(BLOCK_IDENTITY_MEMO_CAPACITY),
             lower_tier_filled: 0,
             fill_lower_tier: *FILL_LOWER_TIER,
-            lower_tier_workers: FxHashSet::default(),
         }
     }
 
@@ -315,7 +308,6 @@ impl ZmqEventNormalizer {
             block_identities: BlockIdentityMemo::new(BLOCK_IDENTITY_MEMO_CAPACITY),
             lower_tier_filled: 0,
             fill_lower_tier: *FILL_LOWER_TIER,
-            lower_tier_workers: FxHashSet::default(),
         }
     }
 
@@ -398,11 +390,6 @@ impl ZmqEventNormalizer {
             return Some(event);
         }
         let is_device = event.placement.tier == StorageTier::Device;
-        if lower_tier_hashes.is_some() {
-            self.lower_tier_workers.insert(worker);
-        } else if !self.lower_tier_workers.contains(&worker) {
-            return Some(event);
-        }
         match (&mut event.event.data, lower_tier_hashes) {
             (KvCacheEventData::Stored(store), Some(hashes)) => {
                 if store.blocks.is_empty()

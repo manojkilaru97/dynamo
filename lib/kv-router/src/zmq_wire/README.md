@@ -86,8 +86,7 @@ hash. `ZmqEventNormalizer` completes such stores from the identity (parent hash
 and token hash) of the same block's device store, so the router indexes the CPU
 tier and later matches its `BlockRemoved` events. Identities are kept only while
 the device copy is resident, reference-counted like the publisher's dedup
-filter, and only for workers that have published at least one lower-tier store
-(blocks a worker stored on the device before that are not filled).
+filter.
 
 This is an unconditional fix, independent of `DYN_WORKER_SET_SELECTION`. It is
 on by default; set `DYN_KV_ROUTER_FILL_LOWER_TIER=0` (or `false`, `no`, `off`)
