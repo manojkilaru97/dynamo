@@ -3317,7 +3317,7 @@ mod tests {
             evicted |= was_tracked && !tracked;
             was_tracked = tracked;
             entered |= is_hot && reason == SetChoiceReason::HeavyKeyRandom;
-            if i % 97 == 0 || (is_hot && i >= 8_000 && i < 9_000) {
+            if i % 97 == 0 || (is_hot && (8_000..9_000).contains(&i)) {
                 assert_ledger_closed(&tracker, &SETS, &format!("decision {i}"));
             }
         }
