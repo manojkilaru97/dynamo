@@ -110,6 +110,14 @@ struct NamespaceReadinessEval {
     missing: std::collections::HashSet<crate::worker_type::WorkerType>,
 }
 
+/// Whether a worker-set selection serves a request (and is observed: metric, share
+/// tracker) or only probes readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionKind {
+    Request,
+    Probe,
+}
+
 /// A named model backed by one or more WorkerSets.
 pub struct Model {
     name: String,
@@ -665,8 +673,16 @@ impl Model {
     /// chat engine but no prefill peer would report ready while every request
     /// was rejected.
     pub fn is_ready_to_serve(&self) -> bool {
-        self.select_worker_set_with(|ws| ws.has_any_serving_engine().then_some(()))
-            .is_some()
+        self.is_ready_to_serve_with(SetSelectionConfig::global())
+    }
+
+    /// [`Self::is_ready_to_serve`] with an explicit selection config. A readiness probe
+    /// is not a request: it neither records a selection nor touches the share tracker.
+    fn is_ready_to_serve_with(&self, config: &SetSelectionConfig) -> bool {
+        self.select_worker_set_impl(config, None, SelectionKind::Probe, |ws| {
+            ws.has_any_serving_engine().then_some(())
+        })
+        .is_some()
     }
 
     /// Whether this model should be visible in /v1/models.
@@ -870,6 +886,19 @@ impl Model {
     where
         F: Fn(&WorkerSet) -> Option<T>,
     {
+        self.select_worker_set_impl(config, affinity, SelectionKind::Request, extract)
+    }
+
+    fn select_worker_set_impl<T, F>(
+        &self,
+        config: &SetSelectionConfig,
+        affinity: Option<SetAffinity>,
+        kind: SelectionKind,
+        extract: F,
+    ) -> Option<T>
+    where
+        F: Fn(&WorkerSet) -> Option<T>,
+    {
         // One snapshot drives both the readiness filter and candidate
         // eligibility, so a concurrent add/remove can't make us treat a
         // namespace as complete while routing to a set that lost a peer. It also
@@ -951,7 +980,7 @@ impl Model {
         let (idx, reason) = chosen?;
         // Only affinity mode reports decisions (keyless requests as `random`), so the
         // default path keeps its historical behavior and emits nothing.
-        if config.mode == SetSelectionMode::Affinity {
+        if config.mode == SetSelectionMode::Affinity && kind == SelectionKind::Request {
             crate::http::service::metrics::record_worker_set_selection(
                 &self.name,
                 eligible[idx].3,
@@ -2275,6 +2304,36 @@ mod tests {
         assert!((heavy_tp4 + heavy_tp2) as f64 > 0.85 * hot_total as f64);
         let hot_tp4 = hot_on_tp4 as f64 / hot_total as f64;
         assert!(hot_tp4 > 0.2 && hot_tp4 < 0.5, "hot key on tp4 {hot_tp4}");
+    }
+
+    /// R6-4: readiness probes in affinity mode select nothing: no metric, no tracker.
+    #[test]
+    fn readiness_probe_records_no_selection() {
+        let name = "affinity-readiness-probe";
+        let model = Model::new(name.to_string());
+        let (tp4, _tx4) =
+            ws_serving_role("ns-tp4", "mdc-tp4", WorkerType::Aggregated, vec![], vec![1]);
+        let (tp2, _tx2) = ws_serving_role(
+            "ns-tp2",
+            "mdc-tp2",
+            WorkerType::Aggregated,
+            vec![],
+            vec![2, 3],
+        );
+        model.add_worker_set("ns-tp4".to_string(), tp4);
+        model.add_worker_set("ns-tp2".to_string(), tp2);
+        let config = affinity_config(DEFAULT_TEST_SLACK);
+        for _ in 0..100 {
+            assert!(model.is_ready_to_serve_with(&config));
+        }
+        assert_eq!(total_selections(name, &["ns-tp4", "ns-tp2"]), 0);
+        assert_eq!(model.set_shares.observed_total(), 0.0);
+        // A keyless request selection in affinity mode is still reported.
+        pick_mdcsum(&model, &config, None);
+        assert_eq!(
+            selection_count(name, "ns-tp4", "random") + selection_count(name, "ns-tp2", "random"),
+            1
+        );
     }
 
     #[test]
