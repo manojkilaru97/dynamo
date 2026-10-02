@@ -15,13 +15,20 @@
 //! Each frontend also keeps decayed, size-weighted load statistics (charged by
 //! [`request_charge`], a byte-count proxy for prompt size):
 //!
-//! 1. **Heavy keys bypass affinity.** A Space-Saving table of the 128 heaviest keys (with
-//!    per-counter error bounds) tracks decayed load and request count per key. A key whose
-//!    guaranteed share reaches 2% of recent load and 1% of recent requests becomes heavy,
-//!    and stays heavy until it drops below 1% of load or 0.5% of requests. Heavy keys get
-//!    the default weighted random pick (`heavy_key_random`): a key that hot is cached on
-//!    every set anyway, and random routing balances it by construction. Large but
-//!    infrequent conversations never qualify.
+//! 1. **Heavy keys bypass affinity.** A key is heavy only when it alone could push its
+//!    set out of band, which whole-key spilling cannot absorb. A Space-Saving table of the
+//!    128 heaviest keys (with per-counter error bounds, so any key above 0.8% of load has a
+//!    counter) tracks decayed load and request count per key. A key becomes heavy when its
+//!    guaranteed load share, less four standard deviations of sampling noise, reaches the
+//!    narrowest share band among the candidate sets (`min_i slack·min(fair_i, 1 − fair_i)`,
+//!    about 0.083 for 30/60 workers and slack 0.25) and its request share reaches half of
+//!    it; it stays heavy until its load share drops below half the band or its request
+//!    share below a quarter. Heavy keys get the default weighted random pick
+//!    (`heavy_key_random`): a key that hot is cached on every set anyway, and random
+//!    routing balances it by construction. Ordinary conversations never qualify, also on a
+//!    frontend that sees only a few dozen concurrent conversations (with 12 or more similar
+//!    conversations each carries at most about 1/12 of the load, which does not exceed the
+//!    band), and neither do large but infrequent ones.
 //! 2. **Sticky spill** for the remaining (affinity-routed) load keeps every set within
 //!    `fair ± slack·min(fair, 1 − fair)`. When the load whose rendezvous winner is set `P`
 //!    exceeds `P`'s fair share, the frontend derives a spill fraction `p` (zero until demand
@@ -93,12 +100,18 @@ const SPILL_NOISE_SIGMAS: f64 = 2.0;
 /// Size of the per-frontend Space-Saving heavy-key table. Any key above `1/HEAVY_KEYS`
 /// (0.8%) of recent load is guaranteed a counter, below the exit threshold.
 const HEAVY_KEYS: usize = 128;
-/// Guaranteed share of recent load and of recent requests at which a key becomes heavy.
-const HEAVY_ENTER_LOAD_SHARE: f64 = 0.02;
-const HEAVY_ENTER_COUNT_SHARE: f64 = 0.01;
-/// A heavy key stays heavy until its load or request share drops below these.
-const HEAVY_EXIT_LOAD_SHARE: f64 = 0.01;
-const HEAVY_EXIT_COUNT_SHARE: f64 = 0.005;
+/// Heavy-key thresholds, as fractions of the narrowest share band among the candidate
+/// sets (`min_i slack·min(fair_i, 1 − fair_i)`): a key becomes heavy when its guaranteed
+/// load share, less its sampling noise, reaches the band and its request share reaches
+/// half of it; it stays heavy until its load share drops below half the band or its
+/// request share below a quarter.
+const HEAVY_ENTER_COUNT_RATIO: f64 = 0.5;
+const HEAVY_EXIT_LOAD_RATIO: f64 = 0.5;
+const HEAVY_EXIT_COUNT_RATIO: f64 = 0.25;
+/// Standard deviations of sampling noise subtracted from a key's load share before it
+/// is compared with the band, so keys sitting right at the band (for example 12 equal
+/// conversations against a 1/12 band) do not become heavy on a random excursion.
+const HEAVY_NOISE_SIGMAS: f64 = 4.0;
 /// Prior for the mean charge (pseudo-decisions and bytes), so early requests are clamped.
 const PRIOR_DECISIONS: f64 = 10.0;
 const PRIOR_MEAN_CHARGE: f64 = 4096.0;
@@ -330,6 +343,16 @@ fn share_band(fair: f64, slack: f64) -> f64 {
     slack * fair.min(1.0 - fair)
 }
 
+/// The narrowest share band among the candidates in `ranking`: the most load one key may
+/// carry before it alone could push its set out of band.
+fn narrowest_band(candidates: &[(&str, f64)], ranking: &[usize], slack: f64) -> f64 {
+    let total: f64 = ranking.iter().map(|&i| candidates[i].1).sum();
+    ranking
+        .iter()
+        .map(|&i| share_band(candidates[i].1 / total, slack))
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// Fraction of a set's keys to spill so that, if load were spread evenly over keys, its
 /// share would come down to the middle of its upper band plus `noise` (the sampling
 /// uncertainty of the demand share, so that random fluctuations of a balanced workload do
@@ -365,6 +388,8 @@ struct ShareState {
     decisions: f64,
     /// Decayed sum of recorded (clamped) charges (mean charge, heavy-key load shares).
     charge_sum: f64,
+    /// Decayed sum of squared charges (effective sample size of heavy-key load shares).
+    charge_sq_sum: f64,
     /// Decayed weight of the mean-charge prior (starts at [`PRIOR_DECISIONS`]).
     prior_weight: f64,
     /// Space-Saving heavy-key table, at most [`HEAVY_KEYS`] counters.
@@ -387,6 +412,7 @@ impl Default for ShareState {
         Self {
             decisions: 0.0,
             charge_sum: 0.0,
+            charge_sq_sum: 0.0,
             prior_weight: PRIOR_DECISIONS,
             heavy: Vec::new(),
             window_decisions: 0.0,
@@ -425,27 +451,40 @@ impl ShareState {
         }
     }
 
-    /// Heavy status of `counter` given the current totals, applying hysteresis to its
-    /// previous status. Never heavy before warm-up.
-    fn heavy_status(&self, counter: &HeavyCounter) -> bool {
-        if self.decisions < SHARE_MIN_SAMPLES || self.charge_sum <= 0.0 {
+    /// Heavy status of `counter` against the narrowest candidate band `band`, applying
+    /// hysteresis to its previous status. Never heavy before warm-up.
+    fn heavy_status(&self, counter: &HeavyCounter, band: f64) -> bool {
+        if self.decisions < SHARE_MIN_SAMPLES || self.charge_sum <= 0.0 || band <= 0.0 {
             return false;
         }
         let load = (counter.load - counter.load_err) / self.charge_sum;
         let count = (counter.count - counter.count_err) / self.decisions;
         if counter.heavy {
-            load >= HEAVY_EXIT_LOAD_SHARE && count >= HEAVY_EXIT_COUNT_SHARE
+            load >= HEAVY_EXIT_LOAD_RATIO * band && count >= HEAVY_EXIT_COUNT_RATIO * band
         } else {
-            load >= HEAVY_ENTER_LOAD_SHARE && count >= HEAVY_ENTER_COUNT_SHARE
+            load - self.load_share_noise(load) >= band && count >= HEAVY_ENTER_COUNT_RATIO * band
         }
     }
 
-    /// Whether `key` is currently heavy.
-    fn is_heavy(&self, key: u64) -> bool {
+    /// [`HEAVY_NOISE_SIGMAS`] standard deviations of a key's decayed load share `share`,
+    /// from the effective number of samples `charge_sum² / charge_sq_sum` (floored at
+    /// `decisions / CHARGE_CLAMP_FACTOR`, its bound under the charge clamp).
+    fn load_share_noise(&self, share: f64) -> f64 {
+        let floor = self.decisions / CHARGE_CLAMP_FACTOR;
+        let effective = if self.charge_sq_sum > 0.0 {
+            (self.charge_sum * self.charge_sum / self.charge_sq_sum).max(floor)
+        } else {
+            floor
+        };
+        HEAVY_NOISE_SIGMAS * (share * (1.0 - share) / effective.max(1.0)).sqrt()
+    }
+
+    /// Whether `key` is currently heavy against the narrowest candidate band `band`.
+    fn is_heavy(&self, key: u64, band: f64) -> bool {
         self.heavy
             .iter()
             .find(|c| c.key == key)
-            .is_some_and(|c| self.heavy_status(c))
+            .is_some_and(|c| self.heavy_status(c, band))
     }
 
     /// `charge` clamped to [`CHARGE_CLAMP_FACTOR`] times the decayed mean charge, where
@@ -511,6 +550,7 @@ impl ShareState {
         let decay = 1.0 - 1.0 / SHARE_WINDOW;
         self.decisions *= decay;
         self.charge_sum *= decay;
+        self.charge_sq_sum *= decay * decay;
         self.prior_weight *= decay;
         self.window_decisions *= decay;
         self.window_sum *= decay;
@@ -539,11 +579,13 @@ impl ShareState {
         ranking: &[usize],
         affinity_routed: bool,
         charge: f64,
+        band: f64,
     ) {
         let charge = self.clamp_charge(charge);
         self.decay();
         self.decisions += 1.0;
         self.charge_sum += charge;
+        self.charge_sq_sum += charge * charge;
         if affinity_routed {
             self.window_decisions += 1.0;
             self.window_sum += charge;
@@ -562,7 +604,7 @@ impl ShareState {
         }
         let slot = self.record_heavy(key, charge);
         let counter = self.heavy[slot];
-        let status = self.heavy_status(&counter);
+        let status = self.heavy_status(&counter, band);
         if status && !counter.heavy {
             self.forget_window_load(&counter, candidates, ranking);
         }
@@ -662,7 +704,8 @@ impl ShareTracker {
             state.reset_window();
         }
         state.track_candidates(candidates);
-        let choice = if state.is_heavy(affinity.key) {
+        let band = narrowest_band(candidates, &ranking, slack);
+        let choice = if state.is_heavy(affinity.key, band) {
             let weights: Vec<f64> = candidates.iter().map(|(_, w)| *w).collect();
             (
                 weighted_random_pick(&weights)?,
@@ -678,6 +721,7 @@ impl ShareTracker {
             &ranking,
             affinity_routed,
             affinity.charge,
+            band,
         );
         Some(choice)
     }
@@ -729,10 +773,12 @@ impl ShareTracker {
         ShareState::stat(&state.demand, name) / total.max(f64::MIN_POSITIVE)
     }
 
-    /// Whether `key` currently counts as heavy (test hook).
+    /// Whether `key` currently counts as heavy among `candidates` (test hook).
     #[cfg(test)]
-    pub(crate) fn is_heavy(&self, key: u64) -> bool {
-        self.state.lock().is_heavy(key)
+    pub(crate) fn is_heavy(&self, key: u64, candidates: &[(&str, f64)], slack: f64) -> bool {
+        let ranking = rendezvous_ranking(key, candidates);
+        let band = narrowest_band(candidates, &ranking, slack);
+        self.state.lock().is_heavy(key, band)
     }
 
     /// Decayed number of recorded decisions (test hook).
@@ -1398,7 +1444,7 @@ mod tests {
             let tracker = ShareTracker::default();
             let hot = key_preferring(pref, |x| if low_spill_point { x < 0.05 } else { x > 0.5 });
             let (tally, _) = run_with_hot_key(&tracker, hot, 2000.0, 1.0, 20_000);
-            assert!(tracker.is_heavy(hot));
+            assert!(tracker.is_heavy(hot, &SETS, DEFAULT_SLACK));
             tally.assert_in_band(0.03, &format!("hot key prefers {pref}"));
         }
     }
@@ -1441,12 +1487,13 @@ mod tests {
             let hot = key_preferring(TP4, |x| x > 0.5);
             let mean_charge = 2000.0 * (sigma * sigma / 2.0f64).exp();
             let (tally, _) = run_with_hot_key(&tracker, hot, mean_charge, sigma, 10_000);
-            assert!(tracker.is_heavy(hot), "sigma {sigma}");
+            assert!(tracker.is_heavy(hot, &SETS, DEFAULT_SLACK), "sigma {sigma}");
             tally.assert_in_band(0.03, &format!("late hot key, sigma {sigma}"));
         }
     }
 
-    /// Once heavy, a steadily hot key stays heavy on every turn (no flapping).
+    /// Once heavy, a steadily hot key stays heavy on every turn (no flapping), even though
+    /// its share sits close enough to the entry threshold that noise crosses it.
     #[test]
     fn heavy_status_does_not_flap() {
         let tracker = ShareTracker::default();
@@ -1454,12 +1501,12 @@ mod tests {
         let mut rng = Rng(0xf1a9);
         let mut statuses = Vec::new();
         for i in 0..30_000u64 {
-            // A 5% hot key: well above the 2% entry threshold, close enough to the 1% exit
-            // threshold that noise would flap a single threshold.
-            let (key, charge) = if i % 20 == 0 {
-                (hot, rng.charge(1.5))
+            // A 1-in-6 hot key: its load share (~0.17) is above the band plus noise, but
+            // noise brings it near the entry threshold and it never nears the exit.
+            let (key, charge) = if i % 6 == 0 {
+                (hot, rng.charge(1.0))
             } else {
-                (mixed(i + 3_000_000), rng.charge(1.5))
+                (mixed(i + 3_000_000), rng.charge(1.0))
             };
             let (_, reason) = tracker
                 .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
@@ -1471,6 +1518,125 @@ mod tests {
         let transitions = statuses.windows(2).filter(|w| w[0] != w[1]).count();
         assert!(statuses.last().copied().unwrap_or(false));
         assert_eq!(transitions, 1, "heavy status changed {transitions} times");
+    }
+
+    /// The band for production weights (30/60 workers, slack 0.25) is 0.25 · 1/3 = 1/12.
+    #[test]
+    fn heavy_threshold_is_the_narrowest_band() {
+        let ranking = [0, 1];
+        let band = narrowest_band(&SETS, &ranking, DEFAULT_SLACK);
+        assert!((band - 1.0 / 12.0).abs() < 1e-12, "band {band}");
+        let three = [("a", 10.0), ("b", 45.0), ("c", 45.0)];
+        let band = narrowest_band(&three, &[0, 1, 2], DEFAULT_SLACK);
+        assert!((band - 0.025).abs() < 1e-12, "band {band}");
+    }
+
+    /// Steady pool of `concurrent` conversations of similar size (per-request lognormal
+    /// `sigma` noise around a common median, context growing over 10 turns, then replaced
+    /// by a new conversation), spread over `frontends`. Returns the fraction of follow-up
+    /// turns that kept their set, the number of heavy classifications, and the placement
+    /// tally of the second half.
+    fn concurrent_pool(
+        concurrent: usize,
+        frontends: usize,
+        requests: u64,
+        sigma: f64,
+        seed: u64,
+    ) -> (f64, usize, Tally) {
+        let mut rng = Rng(seed);
+        let trackers: Vec<ShareTracker> = (0..frontends).map(|_| ShareTracker::default()).collect();
+        let mut next_key = 0u64;
+        let mut new_conversation = |rng: &mut Rng| {
+            next_key += 1;
+            // (key, turn, last set); start at a random turn so turnover is spread out.
+            (mixed(next_key ^ seed), rng.next_u64() % 10, usize::MAX)
+        };
+        let mut pool: Vec<(u64, u64, usize)> = (0..concurrent)
+            .map(|_| new_conversation(&mut rng))
+            .collect();
+        let (mut kept, mut follow_ups, mut heavy) = (0usize, 0usize, 0usize);
+        let mut tally = Tally::default();
+        for i in 0..requests {
+            let slot = (rng.next_u64() % concurrent as u64) as usize;
+            let (key, turn, last) = pool[slot];
+            let charge = rng.charge(sigma) * (turn + 1) as f64;
+            let frontend = (rng.next_u64() % frontends as u64) as usize;
+            let (idx, reason) = trackers[frontend]
+                .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
+                .unwrap();
+            heavy += usize::from(reason == SetChoiceReason::HeavyKeyRandom);
+            if last != usize::MAX {
+                follow_ups += 1;
+                kept += usize::from(idx == last);
+            }
+            if i >= requests / 2 {
+                tally.add(idx, charge);
+            }
+            pool[slot] = if turn + 1 >= 10 {
+                new_conversation(&mut rng)
+            } else {
+                (key, turn + 1, idx)
+            };
+        }
+        (kept as f64 / follow_ups as f64, heavy, tally)
+    }
+
+    /// Low concurrency: a frontend that sees only 20-100 concurrent conversations keeps
+    /// affinity on (no conversation is heavy), with one frontend or thirty.
+    #[test]
+    fn low_concurrency_keeps_affinity() {
+        for concurrent in [20, 50, 100] {
+            for (frontends, requests) in [(1usize, 20_000u64), (30, 60_000)] {
+                let (kept, heavy, tally) = concurrent_pool(
+                    concurrent,
+                    frontends,
+                    requests,
+                    1.0,
+                    0x10c0 + concurrent as u64,
+                );
+                let context = format!("{concurrent} conversations, {frontends} frontends");
+                assert_eq!(heavy, 0, "{context}: heavy classifications");
+                assert!(
+                    kept > 0.98,
+                    "{context}: {:.2}% kept their set",
+                    kept * 100.0
+                );
+                tally.assert_in_band(0.03, &context);
+            }
+        }
+    }
+
+    /// Pins the boundary: `n` persistent equal conversations each carry 1/n of the load.
+    /// With 12 or more (1/12 against a 1/12 band) none is heavy; with 8 (1/8) all are.
+    #[test]
+    fn equal_conversations_are_heavy_only_above_the_band() {
+        let heavy_keys = |n: u64, sigma: f64| {
+            let tracker = ShareTracker::default();
+            let mut rng = Rng(0xb0 + n);
+            let keys: Vec<u64> = (0..n).map(|k| mixed(k + 77)).collect();
+            let mut ever_heavy = std::collections::HashSet::new();
+            for _ in 0..30_000 {
+                let key = keys[(rng.next_u64() % n) as usize];
+                let charge = if sigma > 0.0 {
+                    rng.charge(sigma)
+                } else {
+                    2000.0
+                };
+                let (_, reason) = tracker
+                    .choose(SetAffinity::new(key, charge), &SETS, DEFAULT_SLACK)
+                    .unwrap();
+                if reason == SetChoiceReason::HeavyKeyRandom {
+                    ever_heavy.insert(key);
+                }
+            }
+            ever_heavy.len() as u64
+        };
+        for sigma in [0.0, 1.0] {
+            for n in [12, 13, 16, 24] {
+                assert_eq!(heavy_keys(n, sigma), 0, "{n} conversations, sigma {sigma}");
+            }
+        }
+        assert_eq!(heavy_keys(8, 0.0), 8);
     }
 
     /// Fraction of follow-up turns that change set when `frontends` independent trackers
@@ -1608,7 +1774,7 @@ mod tests {
                 DEFAULT_SLACK,
             )
             .unwrap();
-        assert!(!tracker.is_heavy(huge));
+        assert!(!tracker.is_heavy(huge, &SETS, DEFAULT_SLACK));
         let after: Vec<_> = probes
             .iter()
             .map(|k| tracker.peek(*k, &SETS, DEFAULT_SLACK))
