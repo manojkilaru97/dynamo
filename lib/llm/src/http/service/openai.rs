@@ -2439,17 +2439,26 @@ fn accumulate_reasoning_dispatch(
 }
 
 /// Conversation affinity key for worker-set selection, computed only when
-/// `DYN_WORKER_SET_SELECTION=affinity` is configured.
-fn worker_set_affinity_key(request: &NvCreateChatCompletionRequest) -> Option<u64> {
-    if !crate::discovery::set_selection::affinity_enabled() {
+/// `DYN_WORKER_SET_SELECTION=affinity` is configured. `prompt_cache_key` is the Responses
+/// field; Chat Completions requests fall back to their extra-body `prompt_cache_key`. See
+/// [`crate::discovery::set_selection::chat_request_affinity_key`] for the key order.
+fn worker_set_affinity_key(
+    request: &Context<NvCreateChatCompletionRequest>,
+    prompt_cache_key: Option<&str>,
+) -> Option<u64> {
+    use crate::discovery::set_selection;
+    if !set_selection::affinity_enabled() {
         return None;
     }
-    crate::discovery::set_selection::chat_affinity_key(&request.inner.messages, |m| {
-        matches!(
-            m,
-            dynamo_protocols::types::ChatCompletionRequestMessage::User(_)
-        )
-    })
+    let session = request
+        .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+        .ok()
+        .flatten();
+    set_selection::chat_request_affinity_key(
+        &request.inner.messages,
+        prompt_cache_key.or_else(|| set_selection::chat_prompt_cache_key(request)),
+        session.as_deref().map(SessionAffinityId::as_str),
+    )
 }
 
 /// OpenAI Chat Completions Request Handler
@@ -2554,7 +2563,7 @@ async fn chat_completions(
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
-    let affinity_key = worker_set_affinity_key(&request);
+    let affinity_key = worker_set_affinity_key(&request, None);
     let (engine, parsing_options) = state
         .manager()
         .get_chat_completions_engine_with_parsing_for(&model, affinity_key)
@@ -3083,7 +3092,8 @@ async fn responses(
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
-    let affinity_key = worker_set_affinity_key(&request);
+    let affinity_key =
+        worker_set_affinity_key(&request, response_params.prompt_cache_key.as_deref());
     let (engine, parsing_options) = state
         .manager()
         .get_chat_completions_engine_with_parsing_for(&model, affinity_key)

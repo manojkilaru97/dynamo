@@ -7,8 +7,8 @@
 //! worker count. Each WorkerSet has its own KV router and indexer, so a random pick sends
 //! consecutive turns of one conversation to different sets and discards their prefix cache.
 //!
-//! `DYN_WORKER_SET_SELECTION=affinity` instead maps a request's affinity key (derived from
-//! the conversation's leading messages) to a set with weighted rendezvous hashing over the sets'
+//! `DYN_WORKER_SET_SELECTION=affinity` instead maps a request's affinity key (see
+//! [`chat_request_affinity_key`]) to a set with weighted rendezvous hashing over the sets'
 //! unique storage keys. Every frontend makes the same choice for the same conversation
 //! without shared state, and the long-run traffic split still follows the set weights.
 //!
@@ -31,6 +31,10 @@ use parking_lot::Mutex;
 use rand::Rng;
 use serde::Serialize;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64_with_seed};
+
+use dynamo_protocols::types::ChatCompletionRequestMessage;
+
+use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
 
 const MODE_ENV: &str = "DYN_WORKER_SET_SELECTION";
 const SLACK_ENV: &str = "DYN_WORKER_SET_AFFINITY_SLACK";
@@ -307,20 +311,99 @@ impl io::Write for HashWriter {
 
 const AFFINITY_SEED: u64 = 0x5e75_e1ec_7a1f_f1a7;
 
-/// Affinity key for a chat conversation: a hash of every message up to and including
-/// the first user message. Later turns of the same conversation repeat that prefix, so
-/// they map to the same key. Returns `None` when there is no user message.
-pub fn chat_affinity_key<M: Serialize>(
+/// Domain tags so an explicit key can never collide with a message-prefix hash.
+const PROMPT_CACHE_KEY_TAG: &[u8] = b"prompt_cache_key\0";
+const SESSION_AFFINITY_TAG: &[u8] = b"session_affinity\0";
+const MESSAGES_TAG: &[u8] = b"messages\0";
+
+fn explicit_affinity_key(tag: &[u8], value: &str) -> u64 {
+    let mut hasher = Xxh3::with_seed(AFFINITY_SEED);
+    hasher.update(tag);
+    hasher.update(value.as_bytes());
+    hasher.digest()
+}
+
+/// Affinity key for a conversation from its messages: a hash of every message before the
+/// first assistant or tool message (the client-authored opening of the conversation).
+///
+/// Every later turn of the same conversation repeats that opening verbatim, so turns map
+/// to the same key, while two sessions that share boilerplate leading user items (for
+/// example Codex's AGENTS.md and `<environment_context>`) still differ by their task.
+///
+/// Returns `None` when the opening holds no user message (system-only requests, or a
+/// conversation that starts with an assistant message): those carry nothing
+/// conversation-specific, so they take the weighted random pick instead of collapsing
+/// onto one hot key.
+pub fn messages_affinity_key<M: Serialize>(
     messages: &[M],
     is_user: impl Fn(&M) -> bool,
+    is_turn_boundary: impl Fn(&M) -> bool,
 ) -> Option<u64> {
-    let end = messages.iter().position(is_user)?;
+    let end = messages
+        .iter()
+        .position(is_turn_boundary)
+        .unwrap_or(messages.len());
+    let opening = &messages[..end];
+    if !opening.iter().any(is_user) {
+        return None;
+    }
     let mut writer = HashWriter(Xxh3::with_seed(AFFINITY_SEED));
-    for message in &messages[..=end] {
+    io::Write::write_all(&mut writer, MESSAGES_TAG).ok()?;
+    for message in opening {
         serde_json::to_writer(&mut writer, message).ok()?;
         io::Write::write_all(&mut writer, b"\x1e").ok()?;
     }
     Some(writer.0.digest())
+}
+
+/// Affinity key for a chat-shaped request (Chat Completions, or Responses after
+/// conversion), in priority order:
+///
+/// 1. `prompt_cache_key` (Responses field, or the Chat Completions extra-body field),
+/// 2. the session affinity header ([`SessionAffinityId`]),
+/// 3. [`messages_affinity_key`] over the messages.
+///
+/// Blank explicit keys are ignored.
+///
+/// TODO(D6): the message hash serializes multimodal parts verbatim, so a follow-up turn
+/// that re-sends an image as a UUID-only reference (instead of URL + UUID) changes the
+/// key. Canonicalize image parts to their UUID before enabling affinity for a multimodal
+/// model (Super 3.5 is a VLM).
+///
+/// [`SessionAffinityId`]: crate::protocols::common::extensions::SessionAffinityId
+pub fn chat_request_affinity_key(
+    messages: &[ChatCompletionRequestMessage],
+    prompt_cache_key: Option<&str>,
+    session_affinity: Option<&str>,
+) -> Option<u64> {
+    let non_blank = |s: &&str| !s.trim().is_empty();
+    if let Some(key) = prompt_cache_key.filter(non_blank) {
+        return Some(explicit_affinity_key(PROMPT_CACHE_KEY_TAG, key));
+    }
+    if let Some(session) = session_affinity.filter(non_blank) {
+        return Some(explicit_affinity_key(SESSION_AFFINITY_TAG, session));
+    }
+    messages_affinity_key(
+        messages,
+        |m| matches!(m, ChatCompletionRequestMessage::User(_)),
+        |m| {
+            matches!(
+                m,
+                ChatCompletionRequestMessage::Assistant(_)
+                    | ChatCompletionRequestMessage::Tool(_)
+                    | ChatCompletionRequestMessage::Function(_)
+            )
+        },
+    )
+}
+
+/// `prompt_cache_key` sent as a Chat Completions extra-body field (the pinned protocol
+/// type predates it, so it lands in `unsupported_fields`).
+pub fn chat_prompt_cache_key(request: &NvCreateChatCompletionRequest) -> Option<&str> {
+    request
+        .unsupported_fields
+        .get("prompt_cache_key")
+        .and_then(serde_json::Value::as_str)
 }
 
 /// Process-global switch read by the HTTP layer: compute keys only when they are used.
@@ -331,6 +414,8 @@ pub fn affinity_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::openai::responses::NvCreateResponse;
+    use serde_json::json;
 
     const TP4: &str = "ns-tp4";
     const TP2: &str = "ns-tp2";
@@ -528,33 +613,218 @@ mod tests {
         assert!(tracker.share(sets[ranking[0]].0) <= cap);
     }
 
-    #[derive(Serialize)]
-    struct Msg {
-        role: &'static str,
-        content: String,
+    // -- Affinity keys over the real request types --
+
+    fn chat(body: serde_json::Value) -> NvCreateChatCompletionRequest {
+        serde_json::from_value(body).expect("chat request")
     }
 
-    fn msg(role: &'static str, content: &str) -> Msg {
-        Msg {
-            role,
-            content: content.to_string(),
-        }
+    fn chat_key(body: serde_json::Value) -> Option<u64> {
+        let req = chat(body);
+        chat_request_affinity_key(&req.inner.messages, chat_prompt_cache_key(&req), None)
+    }
+
+    fn responses(body: serde_json::Value) -> (NvCreateChatCompletionRequest, Option<String>) {
+        let req: NvCreateResponse = serde_json::from_value(body).expect("responses request");
+        let cache_key = req.inner.prompt_cache_key.clone();
+        (req.try_into().expect("responses conversion"), cache_key)
+    }
+
+    fn responses_key(body: serde_json::Value) -> Option<u64> {
+        let (req, cache_key) = responses(body);
+        chat_request_affinity_key(&req.inner.messages, cache_key.as_deref(), None)
+    }
+
+    fn user_item(text: &str) -> serde_json::Value {
+        json!({"type": "message", "role": "user",
+               "content": [{"type": "input_text", "text": text}]})
+    }
+
+    const AGENTS_MD: &str = "# AGENTS.md instructions for /repo\n\nRun the tests.";
+    const ENV_CONTEXT: &str = "<environment_context><cwd>/repo</cwd></environment_context>";
+
+    fn codex_turn1(task: &str) -> serde_json::Value {
+        json!({
+            "model": "m",
+            "instructions": "You are Codex.",
+            "input": [user_item(AGENTS_MD), user_item(ENV_CONTEXT), user_item(task)],
+        })
+    }
+
+    fn codex_turn2(task: &str) -> serde_json::Value {
+        json!({
+            "model": "m",
+            "instructions": "You are Codex.",
+            "input": [
+                user_item(AGENTS_MD),
+                user_item(ENV_CONTEXT),
+                user_item(task),
+                {"type": "reasoning", "id": "rs_1", "summary": []},
+                {"type": "function_call", "call_id": "c1", "name": "shell",
+                 "arguments": "{\"cmd\":[\"ls\"]}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "README.md"},
+                {"type": "message", "role": "assistant", "id": "m1",
+                 "content": [{"type": "output_text", "text": "Done."}]},
+                user_item("now run the tests"),
+            ],
+        })
+    }
+
+    /// A2: sessions from one harness share their leading user items; the key must still
+    /// separate them by task.
+    #[test]
+    fn responses_sessions_with_shared_boilerplate_get_different_keys() {
+        let a = responses_key(codex_turn1("fix the parser")).unwrap();
+        let b = responses_key(codex_turn1("add a CLI flag")).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn responses_key_is_stable_across_turns() {
+        let t1 = responses_key(codex_turn1("fix the parser")).unwrap();
+        let t2 = responses_key(codex_turn2("fix the parser")).unwrap();
+        assert_eq!(t1, t2);
+    }
+
+    /// Turn 1 sent as `input: "text"` and turn 2 as an item list must agree. This relies on
+    /// the converter collapsing a single `input_text` part to plain text.
+    #[test]
+    fn responses_text_input_matches_item_list_follow_up() {
+        let t1 = responses_key(json!({
+            "model": "m", "instructions": "sys", "input": "fix the parser",
+        }))
+        .unwrap();
+        let t2_items = responses_key(json!({
+            "model": "m", "instructions": "sys",
+            "input": [
+                user_item("fix the parser"),
+                {"type": "message", "role": "assistant", "id": "m1",
+                 "content": [{"type": "output_text", "text": "ok"}]},
+                user_item("more"),
+            ],
+        }))
+        .unwrap();
+        let t2_easy = responses_key(json!({
+            "model": "m", "instructions": "sys",
+            "input": [
+                {"role": "user", "content": "fix the parser"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "more"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(t1, t2_items);
+        assert_eq!(t1, t2_easy);
     }
 
     #[test]
     fn chat_key_is_stable_across_turns() {
-        let is_user = |m: &Msg| m.role == "user";
-        let turn1 = vec![msg("system", "sys"), msg("user", "task A")];
-        let turn2 = vec![
-            msg("system", "sys"),
-            msg("user", "task A"),
-            msg("assistant", "ok"),
-            msg("user", "more"),
-        ];
-        let other = vec![msg("system", "sys"), msg("user", "task B")];
-        let k1 = chat_affinity_key(&turn1, is_user).unwrap();
-        assert_eq!(k1, chat_affinity_key(&turn2, is_user).unwrap());
-        assert_ne!(k1, chat_affinity_key(&other, is_user).unwrap());
-        assert!(chat_affinity_key(&[msg("system", "sys")], is_user).is_none());
+        let t1 = chat_key(json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": AGENTS_MD},
+                {"role": "user", "content": "task A"},
+            ],
+        }))
+        .unwrap();
+        let t2 = chat_key(json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": AGENTS_MD},
+                {"role": "user", "content": "task A"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "more"},
+            ],
+        }))
+        .unwrap();
+        let other = chat_key(json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": AGENTS_MD},
+                {"role": "user", "content": "task B"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(t1, t2);
+        assert_ne!(t1, other);
+    }
+
+    #[test]
+    fn prompt_cache_key_overrides_message_hash() {
+        let mut a = codex_turn1("fix the parser");
+        a["prompt_cache_key"] = json!("conv-123");
+        let mut b = codex_turn1("something else entirely");
+        b["prompt_cache_key"] = json!("conv-123");
+        let mut c = codex_turn1("fix the parser");
+        c["prompt_cache_key"] = json!("conv-456");
+        let (ka, kb, kc) = (
+            responses_key(a).unwrap(),
+            responses_key(b).unwrap(),
+            responses_key(c).unwrap(),
+        );
+        assert_eq!(ka, kb);
+        assert_ne!(ka, kc);
+        assert_ne!(ka, responses_key(codex_turn1("fix the parser")).unwrap());
+
+        // The Chat Completions extra-body field is honored the same way.
+        let chat_a = chat_key(json!({"model": "m", "prompt_cache_key": "conv-123",
+            "messages": [{"role": "user", "content": "x"}]}));
+        let chat_b = chat_key(json!({"model": "m", "prompt_cache_key": "conv-123",
+            "messages": [{"role": "user", "content": "y"}]}));
+        assert_eq!(chat_a, chat_b);
+        assert_eq!(chat_a, Some(ka));
+    }
+
+    #[test]
+    fn session_affinity_header_beats_messages_but_not_prompt_cache_key() {
+        let req = chat(json!({"model": "m", "messages": [{"role": "user", "content": "x"}]}));
+        let msgs = &req.inner.messages;
+        let by_messages = chat_request_affinity_key(msgs, None, None).unwrap();
+        let by_session = chat_request_affinity_key(msgs, None, Some("s-1")).unwrap();
+        assert_ne!(by_session, by_messages);
+        assert_eq!(
+            by_session,
+            chat_request_affinity_key(&[], None, Some("s-1")).unwrap()
+        );
+        let by_cache = chat_request_affinity_key(msgs, Some("s-1"), Some("s-1")).unwrap();
+        assert_eq!(
+            by_cache,
+            chat_request_affinity_key(msgs, Some("s-1"), None).unwrap()
+        );
+        // Same string under a different source is a different key.
+        assert_ne!(by_cache, by_session);
+        // Blank explicit keys fall through.
+        assert_eq!(
+            chat_request_affinity_key(msgs, Some(" "), Some("")),
+            Some(by_messages)
+        );
+    }
+
+    /// Requests whose opening has no user message get no key and take the random pick.
+    #[test]
+    fn requests_without_a_user_opening_have_no_key() {
+        assert_eq!(
+            chat_key(json!({"model": "m",
+                "messages": [{"role": "system", "content": "sys"}]})),
+            None
+        );
+        assert_eq!(
+            chat_key(json!({"model": "m", "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "hi"},
+            ]})),
+            None
+        );
+        assert_eq!(chat_request_affinity_key(&[], None, None), None);
+        // An explicit key still applies.
+        assert!(chat_request_affinity_key(&[], Some("conv"), None).is_some());
     }
 }
