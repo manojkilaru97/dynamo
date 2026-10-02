@@ -2065,4 +2065,139 @@ mod tests {
         assert_eq!(original, replayed);
         assert_eq!(replayed.get(&worker), Some(&3));
     }
+
+    fn raw_stored(
+        hashes: &[u64],
+        token_ids: &[u32],
+        medium: Option<&str>,
+        parent: Option<u64>,
+    ) -> crate::zmq_wire::RawKvEvent {
+        use crate::zmq_wire::BlockHashValue;
+        crate::zmq_wire::RawKvEvent::BlockStored {
+            block_hashes: hashes
+                .iter()
+                .copied()
+                .map(BlockHashValue::Unsigned)
+                .collect(),
+            parent_block_hash: parent.map(BlockHashValue::Unsigned),
+            token_ids: token_ids.to_vec(),
+            block_size: 4,
+            medium: medium.map(str::to_string),
+            lora_name: None,
+            cache_namespace: None,
+            block_mm_infos: None,
+            is_eagle: None,
+            group_idx: None,
+            kv_cache_spec_kind: None,
+            kv_cache_spec_sliding_window: None,
+        }
+    }
+
+    fn raw_removed(hashes: &[u64], medium: Option<&str>) -> crate::zmq_wire::RawKvEvent {
+        crate::zmq_wire::RawKvEvent::BlockRemoved {
+            block_hashes: hashes
+                .iter()
+                .copied()
+                .map(crate::zmq_wire::BlockHashValue::Unsigned)
+                .collect(),
+            medium: medium.map(str::to_string),
+            group_idx: None,
+            kv_cache_spec_kind: None,
+            kv_cache_spec_sliding_window: None,
+        }
+    }
+
+    /// End to end through the ZMQ normalizer: vLLM's lazy CPU offload publishes
+    /// `BlockStored(medium=CPU)` with only the block hash. The normalizer completes it from
+    /// the device-tier store, so the CPU index learns the block, can match it from the
+    /// device continuation, and the later CPU `BlockRemoved` succeeds instead of
+    /// `BlockNotFound`. Also covers the device copy being evicted before the CPU store.
+    #[test]
+    fn lazy_cpu_offload_store_then_remove_through_normalizer() {
+        use crate::protocols::StorageTier;
+        use crate::zmq_wire::ZmqEventNormalizer;
+
+        let worker = WorkerWithDpRank::new(7, 0);
+        for device_removed_first in [false, true] {
+            let mut normalizer = ZmqEventNormalizer::new(4);
+            let mut index = TestLowerTierIndex::new();
+
+            let device = normalizer
+                .normalize(
+                    raw_stored(&[201, 202], &[1, 2, 3, 4, 5, 6, 7, 8], None, Some(200)),
+                    1,
+                    worker,
+                )
+                .unwrap();
+            assert_eq!(device.placement.tier, StorageTier::Device);
+            let KvCacheEventData::Stored(device_store) = &device.event.data else {
+                panic!("expected a device store");
+            };
+            let tokens: Vec<LocalBlockHash> =
+                device_store.blocks.iter().map(|b| b.tokens_hash).collect();
+            assert_eq!(tokens.len(), 2);
+
+            if device_removed_first {
+                let removed = normalizer
+                    .normalize(raw_removed(&[201, 202], None), 2, worker)
+                    .unwrap();
+                assert_eq!(removed.placement.tier, StorageTier::Device);
+            }
+
+            for (event_id, hash) in [(3, 201), (4, 202)] {
+                let cpu = normalizer
+                    .normalize(
+                        raw_stored(&[hash], &[], Some("CPU"), None),
+                        event_id,
+                        worker,
+                    )
+                    .unwrap()
+                    .into_router_event()
+                    .unwrap();
+                assert_eq!(cpu.storage_tier, StorageTier::HostPinned);
+                index.apply_event(cpu).unwrap();
+            }
+
+            let mut continuations = FxHashMap::default();
+            continuations.insert(
+                worker,
+                LowerTierContinuation::new(0, ExternalSequenceBlockHash(200)),
+            );
+            let hits = index.query_contiguous_hits(&tokens, &continuations);
+            assert_eq!(
+                hits.get(&worker),
+                Some(&2),
+                "removed first: {device_removed_first}"
+            );
+
+            let remove = normalizer
+                .normalize(raw_removed(&[202, 201], Some("CPU")), 5, worker)
+                .unwrap()
+                .into_router_event()
+                .unwrap();
+            assert_eq!(remove.storage_tier, StorageTier::HostPinned);
+            index
+                .apply_event(remove)
+                .expect("CPU removal of a filled store must not be BlockNotFound");
+            let after = index.query_contiguous_hits(&tokens, &continuations);
+            assert_eq!(after.get(&worker).copied().unwrap_or(0), 0);
+        }
+
+        // Without the fill (plain conversion), the same sequence ends in BlockNotFound.
+        let warnings = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let convert = |raw, event_id| {
+            crate::zmq_wire::convert_event(raw, event_id, 4, worker, &warnings, None)
+                .unwrap()
+                .into_router_event()
+                .unwrap()
+        };
+        let mut index = TestLowerTierIndex::new();
+        index
+            .apply_event(convert(raw_stored(&[201], &[], Some("CPU"), None), 3))
+            .unwrap();
+        assert!(matches!(
+            index.apply_event(convert(raw_removed(&[201], Some("CPU")), 5)),
+            Err(crate::protocols::KvCacheEventError::BlockNotFound)
+        ));
+    }
 }

@@ -2922,4 +2922,53 @@ mod tests {
         );
         assert_eq!(enc_key, r#"["dynamo","workers","generate","","encode"]"#);
     }
+
+    /// Production set keys are ~60-byte JSON tuples, which take a different xxh3 code path
+    /// than the short names in the selection unit tests. The rendezvous split must still
+    /// follow the weights (30 TP4 vs 60 TP2 workers) and not depend on candidate order.
+    #[test]
+    fn worker_set_selection_splits_real_worker_set_keys() {
+        use crate::discovery::set_selection::{rendezvous_pick, rendezvous_ranking};
+
+        let key_for = |namespace: &str| {
+            worker_set_key(
+                &EndpointId {
+                    namespace: namespace.to_string(),
+                    component: "backend".to_string(),
+                    name: "generate".to_string(),
+                },
+                ModelType::Chat | ModelType::Completions,
+                Some(WorkerType::Aggregated),
+            )
+        };
+        let tp4 = key_for("dynamo_tp4");
+        let tp2 = key_for("dynamo_tp2");
+        assert_eq!(
+            tp4,
+            r#"["dynamo_tp4","backend","generate","chat|completions","aggregated"]"#
+        );
+        assert!(tp4.len() > 32, "long-input xxh3 path: {} bytes", tp4.len());
+
+        let fwd = [(tp4.as_str(), 30.0), (tp2.as_str(), 60.0)];
+        let rev = [(tp2.as_str(), 60.0), (tp4.as_str(), 30.0)];
+        let n = 60_000u64;
+        let mut tp4_hits = 0;
+        for i in 0..n {
+            let key = i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let a = fwd[rendezvous_pick(key, &fwd).unwrap()].0;
+            assert_eq!(a, rev[rendezvous_pick(key, &rev).unwrap()].0);
+            let ranked_fwd: Vec<&str> = rendezvous_ranking(key, &fwd)
+                .into_iter()
+                .map(|i| fwd[i].0)
+                .collect();
+            let ranked_rev: Vec<&str> = rendezvous_ranking(key, &rev)
+                .into_iter()
+                .map(|i| rev[i].0)
+                .collect();
+            assert_eq!(ranked_fwd, ranked_rev);
+            tp4_hits += usize::from(a == tp4);
+        }
+        let share = tp4_hits as f64 / n as f64;
+        assert!((share - 1.0 / 3.0).abs() < 0.01, "tp4 share {share}");
+    }
 }

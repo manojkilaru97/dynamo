@@ -4798,6 +4798,56 @@ mod tests {
         assert_eq!(affinity.as_str(), "session-123");
     }
 
+    /// Mirrors `responses()`: headers attach the session affinity to the request context,
+    /// the context survives the Responses → chat conversion, and the affinity key prefers
+    /// `prompt_cache_key`, then the session header, then the message hash.
+    #[test]
+    fn test_request_set_affinity_precedence_through_responses_conversion() {
+        use crate::discovery::set_selection::chat_request_affinity_key;
+
+        let affinity = |session: Option<&str>, prompt_cache_key: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(session) = session {
+                headers.insert("x-dynamo-session-id", session.parse().unwrap());
+            }
+            let body: NvCreateResponse = serde_json::from_value(serde_json::json!({
+                "model": "m", "instructions": "sys", "input": "fix the parser",
+            }))
+            .unwrap();
+            let request = context_from_headers(body, "request-1".to_string(), &headers).unwrap();
+            let (orig, context) = request.into_parts();
+            let chat: NvCreateChatCompletionRequest = orig.try_into().unwrap();
+            let request = context.map(|_| chat);
+            let messages = request.inner.messages.clone();
+            (request_set_affinity(&request, prompt_cache_key), messages)
+        };
+
+        let (by_messages, messages) = affinity(None, None);
+        let by_messages = by_messages.expect("message hash key");
+        assert_eq!(
+            Some(by_messages.key),
+            chat_request_affinity_key(&messages, None, None)
+        );
+        assert_eq!(
+            by_messages.charge,
+            "sys".len() as f64 + "fix the parser".len() as f64
+        );
+
+        let (by_session, _) = affinity(Some("session-9"), None);
+        assert_eq!(
+            by_session.map(|a| a.key),
+            chat_request_affinity_key(&[], None, Some("session-9"))
+        );
+        assert_ne!(by_session.map(|a| a.key), Some(by_messages.key));
+
+        let (by_cache_key, _) = affinity(Some("session-9"), Some("conv-1"));
+        assert_eq!(
+            by_cache_key.map(|a| a.key),
+            chat_request_affinity_key(&[], Some("conv-1"), None)
+        );
+        assert_ne!(by_cache_key.map(|a| a.key), by_session.map(|a| a.key));
+    }
+
     #[test]
     fn test_http_error_response_from_anyhow() {
         let err = http_error_from_engine(400).unwrap_err();
