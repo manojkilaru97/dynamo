@@ -2237,6 +2237,46 @@ mod tests {
         assert_eq!(spills_after, spills_before);
     }
 
+    /// R5-4: a 30% hot key driven through the model is classified heavy and routed by the
+    /// weighted random pick, reported as `heavy_key_random` on both namespaces and split
+    /// roughly by worker count (30 vs 60 workers).
+    #[test]
+    fn affinity_routes_a_hot_key_by_weighted_random() {
+        let name = "affinity-hot-key";
+        let model = Model::new(name.to_string());
+        let (tp4, _tx4) = make_worker_set_with_count("ns-tp4", "mdc-tp4", (0..30).collect());
+        let (tp2, _tx2) = make_worker_set_with_count("ns-tp2", "mdc-tp2", (100..160).collect());
+        model.add_worker_set("ns-tp4".to_string(), tp4);
+        model.add_worker_set("ns-tp2".to_string(), tp2);
+        let config = affinity_config(DEFAULT_TEST_SLACK);
+        let hot = mixed(4242);
+        let mut hot_on_tp4 = 0usize;
+        let mut hot_total = 0usize;
+        for i in 0..4000u64 {
+            if i % 10 < 3 {
+                hot_total += 1;
+                hot_on_tp4 += usize::from(pick_mdcsum(&model, &config, Some(hot)) == "mdc-tp4");
+            } else {
+                pick_mdcsum(&model, &config, Some(mixed(i + 100_000)));
+            }
+        }
+        let heavy_tp4 = selection_count(name, "ns-tp4", "heavy_key_random");
+        let heavy_tp2 = selection_count(name, "ns-tp2", "heavy_key_random");
+        assert!(
+            heavy_tp4 > 0 && heavy_tp2 > 0,
+            "tp4 {heavy_tp4} tp2 {heavy_tp2}"
+        );
+        let tp4_share = heavy_tp4 as f64 / (heavy_tp4 + heavy_tp2) as f64;
+        assert!(
+            (tp4_share - 1.0 / 3.0).abs() < 0.06,
+            "heavy tp4 share {tp4_share}"
+        );
+        // Nearly all hot requests after warm-up are heavy.
+        assert!((heavy_tp4 + heavy_tp2) as f64 > 0.85 * hot_total as f64);
+        let hot_tp4 = hot_on_tp4 as f64 / hot_total as f64;
+        assert!(hot_tp4 > 0.2 && hot_tp4 < 0.5, "hot key on tp4 {hot_tp4}");
+    }
+
     #[test]
     fn affinity_skips_unready_namespace_without_tracking() {
         let name = "affinity-unready";
