@@ -1755,8 +1755,9 @@ mod tests {
                 let post = WindowSnapshot::take(&tracker, hot);
                 let was_flagged = pre.counter.as_ref().is_some_and(|c| c.heavy);
                 let now_flagged = post.counter.as_ref().is_some_and(|c| c.heavy);
-                // The window credit leaves on entry, and on the exit edge (flagged heavy,
-                // routed by affinity, heavy again after the request).
+                // All window credit leaves on a real entry. A flagged key routed by affinity
+                // has its flag cleared first (a flagged counter never holds credit), so an
+                // entry is "flagged after, and not flagged before or routed by affinity".
                 let forgot = now_flagged && (!was_flagged || routed);
                 if !forgot || (phase.reset_before && step == 0) {
                     continue;
@@ -2218,10 +2219,10 @@ mod tests {
     }
 
     /// The hot key's rendezvous winner changes with a worker-count change (TP2 60 → 30
-    /// workers, same membership). Its credit to the old winner stays there; on heavy entry
-    /// only its credit to the new winner is removed.
+    /// workers, same membership). Its credit to the old winner is kept across the change,
+    /// and on heavy entry all of its credit (old and new winner) leaves the window.
     #[test]
-    fn heavy_entry_after_winner_change_removes_only_new_credit() {
+    fn heavy_entry_after_winner_change_removes_all_credit() {
         let halved = [(TP4, 30.0), (TP2, 30.0)];
         let hot = (0..u64::MAX)
             .map(mixed)
