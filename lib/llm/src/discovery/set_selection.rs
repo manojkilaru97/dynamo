@@ -21,8 +21,9 @@
 //!    share is the smallest, so a key that is rare but carries much of the load keeps its
 //!    counter between requests) tracks each key's decayed request count and unclamped
 //!    charge. A key becomes heavy when EITHER its guaranteed request share (with at least 8
-//!    guaranteed decayed requests in the window) OR its guaranteed share of unclamped charge
-//!    (with at least 3), less four standard deviations of that share's sampling noise,
+//!    guaranteed decayed requests over the last ~1000 keyed decisions) OR its guaranteed
+//!    share of unclamped charge (with at least 3), less four standard deviations of that
+//!    share's sampling noise,
 //!    reaches the narrowest share band among the candidate sets
 //!    (`min_i slack·min(fair_i, 1 − fair_i)`, about 0.083 for 30/60 workers and slack 0.25).
 //!    A lopsided key, whose share of one measure is at least four times its share of the
@@ -66,8 +67,9 @@
 //!    settle instead of oscillating, also when one lands exactly on fair share. Heavy
 //!    status is judged against all keyed traffic while the guards see only the
 //!    affinity-routed part, so with a heavy fraction `h` a key that is not heavy can hold
-//!    up to `band / (1 − h)` of the window (about half of it at `h = 0.85`) and one move of
-//!    it can exceed the deadband. Such a hot template may then alternate sets across
+//!    up to `(band + 4σ) / (1 − h)` of the window (σ the sampling noise of its share, 4σ
+//!    the heavy-entry allowance: about 0.7 of the window at `h = 0.85`; more by charge,
+//!    whose effective sample size is smaller) and one move of it can exceed the deadband. Such a hot template may then alternate sets across
 //!    frontends (it ends up cached on both); the balance of both measures still holds. A
 //!    balanced workload never engages the boost. It steps only on decisions that update
 //!    the window, and is dropped whenever the window is cold.
@@ -75,18 +77,21 @@
 //! The window covers the last ~1000 affinity-routed decisions: only those decay it, so
 //! heavy-key traffic in between neither ages its shares nor keeps it from warming up
 //! (with 85% of requests from one heavy key, the guards still see the remaining 15%).
-//! After more than 1000 keyed decisions without an affinity-routed one (a heavy-only
-//! stretch) it has expired: the next affinity decision restarts it, so conversations that
-//! arrive afterwards are not judged by an earlier mix's demand and boosts.
+//! It has expired when fewer than ~2% of the last ~1000 keyed decisions (decayed: below 20)
+//! were affinity-routed, a heavy stretch with at most a trickle of other keys: those few
+//! decisions cannot have replaced the earlier mix, so the next affinity decision restarts
+//! the window and conversations that arrive afterwards are not judged by the earlier
+//! mix's demand and boosts.
 //! "Fair" is the decayed average of each set's weight share over the same window, so a
 //! small worker-count drift shifts the targets as gradually as the observed load and only
 //! the keys rendezvous hashing itself moves change sets. The window (demand, fair shares,
 //! routed shares and boosts) restarts when the candidate sets change, when any set's
 //! weight share has moved by more than 0.02 since the last restart (a capacity change:
 //! old targets and boosts would keep spilling toward a set that just shrank; drifts that
-//! arrive one worker at a time accumulate against that baseline), or when a selection
-//! found fewer than two eligible sets, so a set that returns at a new size is not judged
-//! against a stale fair share. Every restart re-baselines the capacity threshold.
+//! arrive one worker at a time accumulate against that baseline), when a selection found
+//! fewer than two eligible sets (so a set that returns at a new size is not judged
+//! against a stale fair share), or when it has expired. Every restart re-baselines the
+//! capacity threshold.
 //!
 //! Charges in the spill statistics are clamped to 8× a decayed mean charge (seeded with a
 //! 4 KiB prior), and the guard stays idle until its window holds about 200 decisions
@@ -158,8 +163,11 @@ pub const MAX_PER_WORKER_WEIGHT: f64 = 1e6;
 pub const MIN_PER_WORKER_WEIGHT: f64 = 1e-6;
 /// Decisions over which the share tracker averages (exponential decay horizon).
 const SHARE_WINDOW: f64 = 1000.0;
-/// Keyed decisions without an affinity-routed one after which the window has expired.
-const WINDOW_MAX_GAP: u64 = SHARE_WINDOW as u64;
+/// The window has expired when fewer than this many of the last ~[`SHARE_WINDOW`] keyed
+/// decisions (decayed) were affinity-routed: 2% of the horizon. The window then describes
+/// an earlier load mix that the few recent affinity decisions cannot have replaced (the
+/// window ages only with them). An 85%-heavy mix keeps about 150 and is unaffected.
+const AFFINITY_RECENT_FLOOR: f64 = 20.0;
 /// Decayed decisions required before the share guard may override the hashed set.
 const SHARE_MIN_SAMPLES: f64 = 200.0;
 /// Decayed decisions required before a key may be classified heavy: half the guard's
@@ -609,8 +617,11 @@ struct ShareState {
     prior_weight: f64,
     /// Space-Saving heavy-key table, at most [`HEAVY_KEYS`] counters.
     heavy: Vec<HeavyCounter>,
-    /// Fair-share window over affinity-routed (non-heavy) decisions; reset when the
-    /// candidate sets change. Decayed decision count, charge sum and squared-charge sum.
+    /// Fair-share window over affinity-routed (non-heavy) decisions; restarted (see
+    /// [`ShareState::restart_window`]) when the candidate sets change, when a weight share
+    /// moved materially since the last restart, after a selection with fewer than two
+    /// eligible sets, and when it has expired (too few recent affinity-routed decisions).
+    /// Decayed decision count, charge sum and squared-charge sum.
     window_decisions: f64,
     window_sum: f64,
     window_sq_sum: f64,
@@ -634,9 +645,10 @@ struct ShareState {
     /// Each candidate's weight share when the window last restarted (same order as
     /// `candidates`).
     baseline_shares: Vec<f64>,
-    /// Keyed decisions since the window last received an affinity-routed decision (heavy
-    /// decisions do not age the window, so this bounds how stale it can get).
-    window_gap: u64,
+    /// Decayed number of affinity-routed decisions among the recent keyed decisions
+    /// (decays on every keyed decision, +1 per affinity-routed one; not reset with the
+    /// window). Below [`AFFINITY_RECENT_FLOOR`] the window has expired.
+    affinity_recent: f64,
     /// Source of the heavy-key weighted random picks (seeded in tests, so they are
     /// deterministic).
     rng: StdRng,
@@ -665,7 +677,7 @@ impl Default for ShareState {
             boost: HashMap::new(),
             candidates: Vec::new(),
             baseline_shares: Vec::new(),
-            window_gap: 0,
+            affinity_recent: 0.0,
             rng: if cfg!(test) {
                 StdRng::seed_from_u64(0x5eed)
             } else {
@@ -680,7 +692,9 @@ impl ShareState {
         map.get(name).copied().unwrap_or(0.0)
     }
 
-    /// Forget the fair-share window (candidate sets changed).
+    /// Forget the fair-share window: its demand, fair, routed and request statistics,
+    /// boosts and the counters' window credit. Only called by [`Self::restart_window`]
+    /// (candidate change, material weight change, single-eligible selection, expiry).
     fn reset_window(&mut self) {
         self.window_decisions = 0.0;
         self.window_sum = 0.0;
@@ -693,7 +707,6 @@ impl ShareState {
         self.routed.clear();
         self.routed_requests.clear();
         self.boost.clear();
-        self.window_gap = 0;
         for c in &mut self.heavy {
             c.clear_window_credit();
         }
@@ -905,9 +918,13 @@ impl ShareState {
     ///   the gain times the band;
     /// - otherwise it holds.
     ///
-    /// The deadband `[fair − allowance, fair + band + allowance]` is wider than any key
-    /// below the heavy threshold, so a whole-key move that lands anywhere in it (also
-    /// exactly on fair share) stays put instead of being undone by noise and redone.
+    /// When heavy keys are a small part of keyed traffic, the deadband
+    /// `[fair − allowance, fair + band + allowance]` is wider than any key below the heavy
+    /// threshold, so a whole-key move that lands anywhere in it (also exactly on fair
+    /// share) stays put instead of being undone by noise and redone. With a heavy
+    /// fraction `h`, a key below the heavy threshold can hold up to `(band + 4σ) / (1 − h)`
+    /// of the window (about 0.7 at `h = 0.85`), and its moves can exceed the deadband (see
+    /// the module docs).
     /// Sticky spill alone moves at most `slack` of a set's keys, which persistent pools
     /// whose keys have high spill points defeat; the boost moves more, still in spill-point
     /// order. Acting only outside the band leaves room for the two measures to disagree
@@ -1008,6 +1025,7 @@ impl ShareState {
         self.raw_sq_sum *= decay * decay;
         self.decisions_sq *= decay * decay;
         self.prior_weight *= decay;
+        self.affinity_recent *= decay;
         for c in &mut self.heavy {
             c.raw *= decay;
             c.raw_err *= decay;
@@ -1075,9 +1093,7 @@ impl ShareState {
         self.decay_global();
         if affinity_routed {
             self.decay_window();
-            self.window_gap = 0;
-        } else {
-            self.window_gap += 1;
+            self.affinity_recent += 1.0;
         }
         self.decisions += 1.0;
         self.decisions_sq += 1.0;
@@ -1291,10 +1307,13 @@ impl ShareTracker {
             // flag before recording, so its load stays in the window and re-entry needs
             // the full entry threshold.
             state.unflag(affinity.key);
-            // After more than a window's worth of decisions without an affinity-routed one
-            // (a long heavy-only stretch), the window describes an earlier load mix: start
-            // a fresh one rather than judge new conversations by its demand and boosts.
-            if state.window_gap > WINDOW_MAX_GAP {
+            // When affinity-routed decisions have been too rare lately (a heavy stretch,
+            // possibly with a trickle of other keys), the window still describes an
+            // earlier load mix, since only affinity decisions age it: start a fresh one
+            // rather than judge new conversations by its demand and boosts. (A fresh
+            // frontend also stays below the floor for its first ~20 affinity decisions,
+            // which only delays its warm-up by as much.)
+            if state.affinity_recent < AFFINITY_RECENT_FLOOR && state.window_decisions > 0.0 {
                 state.restart_window(candidates);
             }
             state.decide(affinity.key, candidates, &ranking, slack)
@@ -2404,6 +2423,8 @@ mod tests {
         };
         let mut i = 0u64;
         let mut baseline: Option<f64> = None;
+        // Decayed count of recent affinity-routed decisions, as the tracker keeps it.
+        let mut recent = 0.0f64;
         for (phase, (sets, decisions, period)) in phases.iter().enumerate() {
             let mut spills = [0usize; 2];
             let total: f64 = sets.iter().map(|(_, w)| *w).sum();
@@ -2416,7 +2437,7 @@ mod tests {
             }
             for step in 0..*decisions {
                 i += 1;
-                let restarted = material && step == 0;
+                let mut restarted = material && step == 0;
                 let slot = (i % *period) as usize;
                 let (key, request_charge) = match hot.get(slot) {
                     Some(&k) => (k, charge),
@@ -2463,6 +2484,10 @@ mod tests {
                     .choose(SetAffinity::new(key, request_charge), sets, DEFAULT_SLACK)
                     .unwrap();
                 let routed = reason != SetChoiceReason::HeavyKeyRandom;
+                // The window also expires (restarts before this request is credited) while
+                // too few recent decisions were affinity-routed, as on a fresh frontend.
+                restarted |= routed && recent < AFFINITY_RECENT_FLOOR && pre.decisions > 0.0;
+                recent = recent * d + if routed { 1.0 } else { 0.0 };
                 if restarted {
                     oracle.fill(CreditOracle::default());
                 }
@@ -3390,9 +3415,9 @@ mod tests {
     /// pool resumes. The heavy run used to keep stepping the boost on frozen shares (+0.3
     /// over the run) while decaying the window below warm-up, so the grown boost was
     /// re-applied when affinity resumed. Now the heavy decisions neither step the boost
-    /// nor age the window; the heavy stretch outlasts the window's expiry (1000 decisions
-    /// without an affinity-routed one), so the pool resumes on a fresh window, and both
-    /// measures stay in band.
+    /// nor age the window (2000 heavy decisions still leave ~15% of the recent decisions
+    /// affinity-routed, so the window has not expired), the pool resumes against the
+    /// boost it left, and both measures stay in band.
     #[test]
     fn heavy_run_neither_grows_nor_strands_the_boost() {
         let sol: Vec<u64> = (282..294)
@@ -3442,11 +3467,6 @@ mod tests {
             "the boost grew from {before} to {after} over {heavy} heavy decisions"
         );
         assert!(tracker.state.lock().window_decisions >= SHARE_MIN_SAMPLES);
-        pool(1, false);
-        assert!(
-            tracker.state.lock().window_decisions <= 1.0,
-            "the window did not expire"
-        );
         pool(20_000, false);
         pool(20_000, true).assert_in_band(0.01, "pool after the heavy run");
     }
@@ -3489,32 +3509,29 @@ mod tests {
         );
     }
 
-    /// R12-1 (sol): a heavy-only stretch ends and a DIFFERENT pool resumes. 30 trackers
-    /// with the production set keys serve sol's 12 persistent conversations
-    /// (session-282..293, 20k requests per frontend: TP4 holds an active boost), then 6k
-    /// requests per frontend from one heavy key, then 100 new balanced keys, all at 31k
-    /// tokens. The heavy stretch neither aged the window nor kept it from warm-up, so the
-    /// old demand and boost used to judge the new keys (83% of their first 1000 requests
-    /// per frontend on TP2, against a 75% band). The window now expires after 1000 keyed
-    /// decisions without an affinity-routed one, and the new pool's first 1000 requests
-    /// per frontend stay within band.
-    #[test]
-    fn heavy_burst_then_a_new_pool_starts_from_a_fresh_window() {
+    /// 30 trackers with the production set keys serve the persistent pool `old` (20k
+    /// requests per frontend: TP4 holds an active boost on every frontend), then 6k
+    /// requests per frontend from one heavy key, of which every 100th is instead
+    /// `trickle(i)` (if any), then 100 new keys (`fresh-0..99`), all at 31k tokens. Asserts
+    /// that each frontend's first 1000 new requests, and all of them together, are within
+    /// band.
+    fn assert_new_pool_after_heavy_burst(
+        old: &[u64],
+        mut trickle: impl FnMut(u64) -> Option<u64>,
+        context: &str,
+    ) {
         const CHARGE: f64 = 31_000.0 * 4.0;
-        let sol: Vec<u64> = (282..294)
-            .map(|n| cache_key(&format!("session-{n}")))
-            .collect();
         let hot = cache_key("heavy-burst");
         let fresh: Vec<u64> = (0..100).map(|n| cache_key(&format!("fresh-{n}"))).collect();
         let trackers: Vec<ShareTracker> = (0..30).map(|_| ShareTracker::default()).collect();
         let mut rng = Rng(0x12b);
-        // Each frontend serves `per_frontend` requests from `keys` (round-robin over
-        // frontends, a random key each), tallied per frontend.
-        let mut serve = |keys: &[u64], per_frontend: u64| {
+        // Each frontend serves `per_frontend` requests (round-robin over frontends), the
+        // key of its i-th one chosen by `pick`, tallied per frontend.
+        let mut serve = |per_frontend: u64, pick: &mut dyn FnMut(u64, &mut Rng) -> u64| {
             let mut tallies: Vec<Tallies> = (0..30).map(|_| Tallies::default()).collect();
-            for _ in 0..per_frontend {
+            for i in 0..per_frontend {
                 for (f, tracker) in trackers.iter().enumerate() {
-                    let key = keys[(rng.next_u64() % keys.len() as u64) as usize];
+                    let key = pick(i * 30 + f as u64, &mut rng);
                     let (idx, _) = tracker
                         .choose(SetAffinity::new(key, CHARGE), &PROD_SETS, DEFAULT_SLACK)
                         .unwrap();
@@ -3523,25 +3540,95 @@ mod tests {
             }
             tallies
         };
-        serve(&sol, 20_000);
+        let random =
+            |keys: &[u64], rng: &mut Rng| keys[(rng.next_u64() % keys.len() as u64) as usize];
+        serve(20_000, &mut |_, rng| random(old, rng));
         for (f, tracker) in trackers.iter().enumerate() {
             let state = tracker.state.lock();
-            assert!(!state.boost.is_empty(), "frontend {f}: no active boost");
+            assert!(
+                !state.boost.is_empty(),
+                "{context}: frontend {f}: no active boost"
+            );
         }
-        serve(&[hot], 6_000);
-        let first = serve(&fresh, 1_000);
+        let mut trickled = 0;
+        serve(
+            6_000,
+            &mut |i, _| match trickle(i).filter(|_| (i / 30).is_multiple_of(100)) {
+                Some(key) => {
+                    trickled += 1;
+                    key
+                }
+                None => hot,
+            },
+        );
+        if trickle(0).is_some() {
+            assert_eq!(trickled, 30 * 60, "{context}: trickle requests");
+        }
+        let first = serve(1_000, &mut |_, rng| random(&fresh, rng));
         let band = share_band(2.0 / 3.0, DEFAULT_SLACK);
         let mut all = Tally::default();
         for (f, tallies) in first.iter().enumerate() {
-            let tp2 = tallies.requests.share(1);
-            assert!(
-                (2.0 / 3.0 - band..=2.0 / 3.0 + band).contains(&tp2),
-                "frontend {f}: TP2 share {tp2} of its first 1000 new requests"
-            );
+            for (what, tally) in [("requests", &tallies.requests), ("charge", &tallies.charge)] {
+                let tp2 = tally.share(1);
+                assert!(
+                    (2.0 / 3.0 - band..=2.0 / 3.0 + band).contains(&tp2),
+                    "{context}: frontend {f}: TP2 {what} share {tp2} of its first 1000 new requests"
+                );
+            }
             all.add(0, tallies.requests.0[0]);
             all.add(1, tallies.requests.0[1]);
         }
-        all.assert_in_band(0.0, "first 1000 new requests per frontend, all frontends");
+        all.assert_in_band(
+            0.0,
+            &format!("{context}: first 1000 new requests per frontend"),
+        );
+    }
+
+    /// R12-1 (sol): a heavy-only stretch ends and a DIFFERENT pool resumes: sol's 12
+    /// persistent conversations (session-282..293), 6k heavy requests per frontend, then
+    /// 100 new keys. The heavy stretch neither aged the window nor kept it from warm-up,
+    /// so the old demand and boost used to judge the new keys (83% of their first 1000
+    /// requests per frontend on TP2, against a 75% band). The window now expires, and the
+    /// new pool's first 1000 requests per frontend stay within band.
+    #[test]
+    fn heavy_burst_then_a_new_pool_starts_from_a_fresh_window() {
+        let old: Vec<u64> = (282..294)
+            .map(|n| cache_key(&format!("session-{n}")))
+            .collect();
+        assert_new_pool_after_heavy_burst(&old, |_| None, "heavy-only burst");
+    }
+
+    /// R13-1 (sol): the same transition with a trickle of affinity traffic during the
+    /// heavy stretch: one distinct background key every 100 requests (old pool
+    /// session-744..755). Each trickle request reset the consecutive-gap counter, so the
+    /// window never expired (~86% of the new pool's first 1000 requests on TP2). Expiry
+    /// now depends on the share of recent keyed decisions that were affinity-routed (1%
+    /// here, below the 2% floor), so the new pool starts from a fresh window.
+    #[test]
+    fn affinity_trickle_does_not_keep_a_stale_window() {
+        let old: Vec<u64> = (744..756)
+            .map(|n| cache_key(&format!("session-{n}")))
+            .collect();
+        assert_new_pool_after_heavy_burst(
+            &old,
+            |i| Some(mixed(i + 89_000_000)),
+            "distinct-key trickle",
+        );
+    }
+
+    /// R13-1 (opus): the trickle comes from the old pool itself (1% of the heavy stretch's
+    /// requests), which also keeps stepping the old boost on the old window.
+    #[test]
+    fn old_pool_trickle_does_not_keep_a_stale_window() {
+        let old: Vec<u64> = (282..294)
+            .map(|n| cache_key(&format!("session-{n}")))
+            .collect();
+        let trickle = old.clone();
+        assert_new_pool_after_heavy_burst(
+            &old,
+            move |i| Some(trickle[(i % 12) as usize]),
+            "old-pool trickle",
+        );
     }
 
     /// R11-2 (opus): a "fewer than two eligible sets" restart re-baselines the capacity
