@@ -68,6 +68,7 @@ impl SelectionServiceBuilder {
         self.kv_router_config
             .validate_config()
             .map_err(anyhow::Error::msg)?;
+        super::core::reject_worker_selection_policy(&self.kv_router_config)?;
         let tracking_hash = Arc::new(TrackingHashContext::from_config(&self.kv_router_config)?);
         let cancel_token = CancellationToken::new();
         let mut startup_guard = StartupGuard::new(cancel_token.clone());

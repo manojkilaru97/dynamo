@@ -122,6 +122,25 @@ pub struct SelectionCore {
     tracking_hash: Arc<TrackingHashContext>,
 }
 
+/// The selection service runs only the built-in selector. Refuse a configuration that selects a
+/// worker-selection policy before any resource is allocated, instead of silently serving the
+/// default policy (or failing every worker registration later).
+pub(super) fn reject_worker_selection_policy(
+    kv_router_config: &crate::config::KvRouterConfig,
+) -> anyhow::Result<()> {
+    if kv_router_config
+        .selects_worker_selection_policy()
+        .map_err(|error| anyhow::anyhow!("router_policy_config: {error}"))?
+    {
+        anyhow::bail!(
+            "router_policy_config (or a DYN_ROUTER_*_POLICY override) selects a worker_selection \
+             policy, which the selection service does not run; remove worker_selection, set the \
+             override to \"default\", or route through the frontend"
+        );
+    }
+    Ok(())
+}
+
 impl SelectionCore {
     /// Create an intentionally local selector without replica synchronization
     /// or startup recovery.
@@ -155,6 +174,7 @@ impl SelectionCore {
         kv_router_config
             .validate_config()
             .map_err(anyhow::Error::msg)?;
+        reject_worker_selection_policy(&kv_router_config)?;
         let tracking_hash = Arc::new(TrackingHashContext::from_config(&kv_router_config)?);
         Ok(Self::new_inner(
             kv_router_config,
@@ -167,6 +187,7 @@ impl SelectionCore {
         ))
     }
 
+    /// Callers must run [`reject_worker_selection_policy`] first (the builder does).
     pub(super) fn new_managed(
         kv_router_config: crate::config::KvRouterConfig,
         indexer_threads: usize,
@@ -492,19 +513,6 @@ impl SelectionCore {
             self.kv_router_config.clone(),
             block_size,
         ));
-        // The selection service only runs the built-in selector; refuse a document that selects
-        // a worker-selection policy rather than silently measuring the default policy.
-        if self
-            .kv_router_config
-            .selects_worker_selection_policy()
-            .map_err(|error| SelectionError::BadRequest(error.to_string()))?
-        {
-            return Err(SelectionError::BadRequest(
-                "router_policy_config selects a worker_selection policy, which the selection \
-                 service does not run; remove worker_selection or route through the frontend"
-                    .to_string(),
-            ));
-        }
         let selector = DefaultWorkerSelector::new(Some(self.kv_router_config.clone()), WORKER_TYPE);
         let profile = self
             .kv_router_config

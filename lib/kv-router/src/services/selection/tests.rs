@@ -546,8 +546,7 @@ policy_classes:
     assert_eq!(response_json(response).await["lifecycle"], "schedulable");
 }
 
-#[tokio::test]
-async fn worker_selection_policy_document_is_rejected_not_ignored() {
+fn worker_selection_policy_config() -> (tempfile::NamedTempFile, crate::config::KvRouterConfig) {
     let policy_file = tempfile::NamedTempFile::new().expect("create policy file");
     std::fs::write(
         policy_file.path(),
@@ -560,18 +559,40 @@ worker_selection:
 "#,
     )
     .expect("write policy file");
-
     let mut config = test_config();
     config.router_policy_config = Some(policy_file.path().to_string_lossy().into_owned());
-    let service = Arc::new(SelectionService::new_local_for_test(config, 1));
-    let app = create_router(Arc::new(AppState { service }));
+    (policy_file, config)
+}
 
-    let response = register_worker(app, None).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = response_json(response).await;
+#[tokio::test]
+async fn worker_selection_policy_is_rejected_by_local_constructor() {
+    let (_policy_file, config) = worker_selection_policy_config();
+    let error = SelectionCore::try_new_local(
+        config,
+        1,
+        tokio_util::sync::CancellationToken::new(),
+        SelectionCacheConfig::default(),
+    )
+    .err()
+    .expect("a worker_selection policy must fail construction");
     assert!(
-        body.to_string().contains("worker_selection"),
-        "error should name worker_selection: {body}"
+        error.to_string().contains("worker_selection"),
+        "error should name worker_selection: {error}"
+    );
+}
+
+#[tokio::test]
+async fn worker_selection_policy_is_rejected_by_service_builder() {
+    let (_policy_file, config) = worker_selection_policy_config();
+    let error = SelectionServiceBuilder::new(config)
+        .indexer_threads(1)
+        .build()
+        .await
+        .err()
+        .expect("a worker_selection policy must fail the service build");
+    assert!(
+        error.to_string().contains("worker_selection"),
+        "error should name worker_selection: {error}"
     );
 }
 
