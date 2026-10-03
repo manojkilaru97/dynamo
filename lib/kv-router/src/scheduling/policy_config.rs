@@ -8,6 +8,11 @@ use std::path::Path;
 use serde::Deserialize;
 use thiserror::Error;
 
+use super::worker_selection_config::RawWorkerSelectionConfig;
+pub use super::worker_selection_config::{
+    WorkerSelectionConfig, WorkerSelectionInstance, WorkerSelectionPolicyKind,
+    WorkerSelectionStage,
+};
 use super::{config::RouterQueuePolicy, queue_admission::AdmissionPolicyConfig};
 
 const SYNTHETIC_POLICY_CLASS: &str = "default";
@@ -166,6 +171,7 @@ impl PolicyProfile {
 pub struct RouterPolicyConfig {
     root: Option<PolicyProfile>,
     models: HashMap<String, PolicyProfile>,
+    worker_selection: Option<WorkerSelectionConfig>,
 }
 
 impl RouterPolicyConfig {
@@ -208,6 +214,16 @@ impl RouterPolicyConfig {
             .cloned()
             .unwrap_or_else(|| PolicyProfile::synthetic(fallback_threshold, fallback_policy))
     }
+
+    /// Returns the process-wide worker-selection policy configuration, if present.
+    pub fn worker_selection(&self) -> Option<&WorkerSelectionConfig> {
+        self.worker_selection.as_ref()
+    }
+
+    /// Whether this document configures queue policy profiles.
+    pub fn has_routing_profiles(&self) -> bool {
+        self.root.is_some() || !self.models.is_empty()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +237,8 @@ struct RawRouterPolicyConfig {
     uncached_isl_buckets: Option<Vec<RawUncachedIslBucket>>,
     #[serde(default)]
     models: HashMap<String, RawPolicyProfile>,
+    #[serde(default)]
+    worker_selection: Option<RawWorkerSelectionConfig>,
 }
 
 impl RawRouterPolicyConfig {
@@ -259,14 +277,22 @@ impl RawRouterPolicyConfig {
             models.insert(model_name, resolved);
         }
 
-        if root.is_none() && models.is_empty() {
+        let worker_selection = match self.worker_selection {
+            Some(config) => Some(config.resolve()?),
+            None => None,
+        };
+
+        if root.is_none() && models.is_empty() && worker_selection.is_none() {
             return Err(RouterPolicyConfigError::Validation(
-                "router policy config must define a root profile or at least one model profile"
-                    .to_string(),
+                "router policy config must define a root profile, at least one model profile, or worker_selection".to_string(),
             ));
         }
 
-        Ok(RouterPolicyConfig { root, models })
+        Ok(RouterPolicyConfig {
+            root,
+            models,
+            worker_selection,
+        })
     }
 }
 
@@ -558,7 +584,7 @@ fn resolve_uncached_isl_buckets(
     })
 }
 
-fn validate_identifier(
+pub(super) fn validate_identifier(
     name: &str,
     kind: &str,
     location: &str,
@@ -579,6 +605,177 @@ fn validate_identifier(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduling::two_tier_cost_fn::TwoTierCostFnParameters;
+
+    /// The document Kimi K3 ships at `/etc/dynamo/worker-selection-two-tier.yaml`.
+    const TWO_TIER_YAML: &str = r#"
+worker_selection:
+  aggregated: dynamo-two-tier-cost-fn
+  instances:
+    - name: dynamo-two-tier-cost-fn
+      type: dynamo-two-tier-cost-fn
+"#;
+
+    #[test]
+    fn worker_selection_only_config_selects_two_tier_for_aggregated() {
+        let config = RouterPolicyConfig::from_yaml(TWO_TIER_YAML).unwrap();
+        assert!(!config.has_routing_profiles());
+
+        let selection = config.worker_selection().unwrap();
+        assert_eq!(
+            selection.aggregated_instance(),
+            Some("dynamo-two-tier-cost-fn")
+        );
+        let instance = selection.instance("dynamo-two-tier-cost-fn").unwrap();
+        assert_eq!(instance.policy_type(), "dynamo-two-tier-cost-fn");
+        assert!(matches!(
+            instance.parameters(),
+            serde_yaml::Value::Mapping(_)
+        ));
+        assert_eq!(
+            selection.policy_for(WorkerSelectionStage::Aggregated),
+            Some(WorkerSelectionPolicyKind::TwoTierCostFn(
+                TwoTierCostFnParameters::default()
+            ))
+        );
+        for stage in [
+            WorkerSelectionStage::Prefill,
+            WorkerSelectionStage::Decode,
+            WorkerSelectionStage::Encode,
+        ] {
+            assert_eq!(selection.policy_for(stage), None, "{}", stage.as_str());
+        }
+
+        // A worker-selection-only document leaves queue policy on the synthetic profile.
+        assert_eq!(
+            config
+                .resolve_profile(None, Some(2.0), RouterQueuePolicy::Wspt)
+                .default_class()
+                .queue_policy,
+            RouterQueuePolicy::Wspt
+        );
+    }
+
+    #[test]
+    fn worker_selection_parameters_and_default_selection() {
+        let config = RouterPolicyConfig::from_yaml(
+            r#"
+worker_selection:
+  aggregated: default
+  decode: tuned
+  instances:
+    - name: tuned
+      type: dynamo-two-tier-cost-fn
+      parameters:
+        cache_threshold: 0.3
+        balance_abs_threshold: 8
+"#,
+        )
+        .unwrap();
+        let selection = config.worker_selection().unwrap();
+        assert_eq!(selection.policy_for(WorkerSelectionStage::Aggregated), None);
+        let Some(WorkerSelectionPolicyKind::TwoTierCostFn(parameters)) =
+            selection.policy_for(WorkerSelectionStage::Decode)
+        else {
+            panic!("decode should select the tuned instance");
+        };
+        assert_eq!(parameters.cache_threshold, 0.3);
+        assert_eq!(parameters.balance_abs_threshold, 8);
+    }
+
+    #[test]
+    fn rejects_invalid_worker_selection_config() {
+        for yaml in [
+            "worker_selection: {}\n",
+            r#"
+worker_selection:
+  aggregated: missing
+  instances:
+    - name: present
+      type: dynamo-two-tier-cost-fn
+"#,
+            r#"
+worker_selection:
+  instances:
+    - name: default
+      type: dynamo-two-tier-cost-fn
+"#,
+            r#"
+worker_selection:
+  instances:
+    - name: alpha
+      type: dynamo-two-tier-cost-fn
+      parameters: 1
+"#,
+            r#"
+worker_selection:
+  aggregated: alpha
+  instances:
+    - name: alpha
+      type: not-linked-here
+"#,
+            r#"
+worker_selection:
+  aggregated: alpha
+  instances:
+    - name: alpha
+      type: dynamo-two-tier-cost-fn
+      parameters:
+        cache_affinity_threshold: 0.4
+"#,
+            r#"
+worker_selection:
+  aggregated: alpha
+  instances:
+    - name: alpha
+      type: dynamo-two-tier-cost-fn
+      parameters:
+        balance_rel_threshold: 0.5
+"#,
+            r#"
+worker_selection:
+  aggregated: alpha
+  instances:
+    - name: alpha
+      type: dynamo-two-tier-cost-fn
+    - name: alpha
+      type: dynamo-two-tier-cost-fn
+"#,
+        ] {
+            assert!(
+                RouterPolicyConfig::from_yaml(yaml).is_err(),
+                "unexpectedly accepted {yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_selection_coexists_with_queue_profiles() {
+        let config = RouterPolicyConfig::from_yaml(&format!(
+            r#"
+default_policy_family: standard
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: all
+policy_classes:
+  - name: root-default
+    policy_family: standard
+    cache_bucket: all
+    queue_policy: wspt
+    quantum: 8
+    prefill_busy_threshold: 100
+{TWO_TIER_YAML}"#
+        ))
+        .unwrap();
+        assert!(config.has_routing_profiles());
+        assert!(
+            config
+                .worker_selection()
+                .unwrap()
+                .policy_for(WorkerSelectionStage::Aggregated)
+                .is_some()
+        );
+    }
 
     #[test]
     fn model_profile_replaces_root_and_unmatched_model_uses_root() {

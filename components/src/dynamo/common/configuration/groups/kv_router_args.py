@@ -416,7 +416,9 @@ class KvRouterArgGroup(ArgGroup):
             default=None,
             help=(
                 "KV Router: Startup-only YAML policy-family and cache-bucket "
-                "queue configuration. "
+                "queue configuration, and an optional worker_selection section that "
+                "selects a shipped worker-selection policy (dynamo-two-tier-cost-fn) "
+                "per worker pool. "
                 "When omitted, router_queue_threshold and router_queue_policy define "
                 "one synthetic policy class; queueing remains disabled unless "
                 "router_queue_threshold is set."

@@ -1968,8 +1968,10 @@ class KvRouterConfig:
                 Enables priority scheduling via request priority hints.
                 Set a numeric value to enable queueing.
             router_policy_config: Startup-only policy-family and cache-bucket queue
-                YAML path. When omitted, router_queue_threshold and
-                router_queue_policy define one synthetic policy class.
+                YAML path. Its optional worker_selection section selects a shipped
+                worker-selection policy (dynamo-two-tier-cost-fn) per worker pool.
+                When omitted, router_queue_threshold and router_queue_policy define
+                one synthetic policy class.
             router_event_threads: Number of KV indexer worker threads (default: 4).
                 When > 1, uses a concurrent radix tree with a thread pool,
                 including for approximate routing when KV events are disabled.

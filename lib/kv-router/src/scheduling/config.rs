@@ -991,6 +991,21 @@ impl KvRouterConfig {
         Ok(self.policy_config_cache.get())
     }
 
+    /// The worker-selection policy `router_policy_config` selects for one worker pool, or
+    /// `None` for the built-in selector.
+    pub fn worker_selection_policy(
+        &self,
+        stage: super::policy_config::WorkerSelectionStage,
+    ) -> Result<
+        Option<super::policy_config::WorkerSelectionPolicyKind>,
+        super::policy_config::RouterPolicyConfigError,
+    > {
+        Ok(self
+            .loaded_policy_config()?
+            .and_then(super::policy_config::RouterPolicyConfig::worker_selection)
+            .and_then(|selection| selection.policy_for(stage)))
+    }
+
     pub fn policy_profile(
         &self,
         model_name: Option<&str>,
@@ -1087,8 +1102,15 @@ impl KvRouterConfig {
         const DEFAULT_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
         const PREFILL_LOAD_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
 
+        // `validate_config` parses router_policy_config at startup. Preserve the old
+        // conservative behavior if this helper is called before validation, but do
+        // not treat a worker-selection-only document as a queue policy profile.
+        let has_routing_profiles = self.policy_config_cache.get().map_or(
+            self.router_policy_config.is_some(),
+            super::policy_config::RouterPolicyConfig::has_routing_profiles,
+        );
         if self.router_prefill_load_model.is_enabled()
-            && (self.router_policy_config.is_some() || self.router_queue_threshold.is_some())
+            && (has_routing_profiles || self.router_queue_threshold.is_some())
         {
             return PREFILL_LOAD_RECHECK_INTERVAL;
         }

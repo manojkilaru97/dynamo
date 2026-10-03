@@ -13,6 +13,8 @@ pub mod prefill_load;
 pub mod queue;
 mod queue_admission;
 pub mod selector;
+pub mod two_tier_cost_fn;
+mod worker_selection_config;
 
 mod types;
 pub use filter::*;
@@ -26,6 +28,8 @@ pub use overlap_refresh::{
 };
 pub use policy_config::{
     PolicyClassConfig, PolicyProfile, RouterPolicyConfig, RouterPolicyConfigError,
+    WorkerSelectionConfig, WorkerSelectionInstance, WorkerSelectionPolicyKind,
+    WorkerSelectionStage,
 };
 pub use policy_queue::{
     PolicyQueue, PolicyQueueEntry, QueueLimitKind, QueueRejection, QueueSnapshot,

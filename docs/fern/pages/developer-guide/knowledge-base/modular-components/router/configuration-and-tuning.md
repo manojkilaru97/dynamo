@@ -25,7 +25,7 @@ For the routing cost model and worker-selection behavior, see
 - `--router-prefill-load-model`: Selects the router's prompt-side load model. `none` keeps the existing static prompt load accounting. `aic` predicts one expected prefill duration per admitted request and lazily decays only the oldest active prefill request on each worker.
 - `--router-queue-threshold`: Optional queue threshold fraction for prefill token capacity. Queueing is disabled by default; setting a numeric value enables it. The router holds incoming requests in a priority queue while all eligible workers exceed `threshold * max_num_batched_tokens`, releasing them when capacity frees up. This defers dispatch rather than rejecting work, so routing decisions use the freshest load metrics at the moment a request is sent to a worker. `nvext.agent_hints.strict_priority` selects an absolute pending-queue tier, while `nvext.agent_hints.priority` adjusts ordering within the configured policy. Must be greater than or equal to 0; use `0.0` for maximum queueing sensitivity. See the SGLang note under [Tuning Guidelines](#tuning-guidelines) for caveats around how `max_num_batched_tokens` is populated on that backend, and see [Priority Scheduling](../../../../use-cases/agents/priority-scheduling.md) for how router priority differs from backend engine priority.
 - `--router-queue-policy`: Scheduling policy for the router queue: `fcfs` (default) or `wspt`.
-- `--router-policy-config`: Startup-only YAML path for policy-class queues. When omitted, `--router-queue-threshold` and `--router-queue-policy` define one synthetic policy class. The equivalent environment variable is `DYN_ROUTER_POLICY_CONFIG`.
+- `--router-policy-config`: Startup-only YAML path for policy-class queues and worker-selection instances (see [Worker-Selection Policies](#worker-selection-policies)). When omitted, `--router-queue-threshold` and `--router-queue-policy` define one synthetic policy class. The equivalent environment variable is `DYN_ROUTER_POLICY_CONFIG`.
 
 For how queue backpressure differs from candidate filtering and busy-threshold overload handling, see [Router Filtering](worker-filtering.md).
 
@@ -37,6 +37,51 @@ YAML accept only `fcfs` and `wspt`.
 For each policy, the complete pending-queue key is
 `(strict_priority, policy_key)`. Higher strict tiers always win; the selected
 policy orders requests within a tier.
+
+### Worker-Selection Policies
+
+A worker-selection policy replaces the worker-ranking step of the routing pipeline: it decides which
+eligible worker receives a request. Dynamo still owns discovery, eligibility, queueing, reservations,
+and accounting. The built-in selector and its cost model above remain the default.
+
+| Policy type | Behavior |
+|---|---|
+| `default` | Dynamo's built-in selector and cost model. Reserved; always available. |
+| `dynamo-two-tier-cost-fn` | Ranks on two tiers instead of one additive cost: active-request load first, then device-KV prefix overlap. Prefers the worker holding the largest prefix overlap unless load is badly imbalanced. Thresholds and selection order ported from the experimental SGLang router's `cache_aware_zmq` policy; the defaults reproduce it exactly. |
+
+Write the instance into the same YAML file that `--router-policy-config` points at:
+
+```yaml
+worker_selection:
+  aggregated: dynamo-two-tier-cost-fn
+  instances:
+    - name: dynamo-two-tier-cost-fn
+      type: dynamo-two-tier-cost-fn
+```
+
+`aggregated`, `prefill`, `decode`, and `encode` each select a named instance, so prefill and decode
+pools can run different policies. An omitted stage, or `default`, uses the built-in selector. `name`
+is yours to choose; `type` must be one of the policy types above. An unknown type, an unknown
+parameter, or an out-of-range value fails startup instead of falling back to the default selector.
+
+```bash
+python3 -m dynamo.frontend --router-mode kv --router-policy-config worker-selection.yaml
+```
+
+An instance may carry a `parameters` mapping; omitting it keeps every default:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `cache_threshold` | `0.5` | Fraction of the request's blocks that must be device-resident on the best worker before the cache tier applies. Compared strictly. Must be in `[0.0, 1.0]`. |
+| `balance_abs_threshold` | `32` | Minimum active-request spread before the load tier applies. |
+| `balance_rel_threshold` | `1.1` | Minimum ratio of largest to smallest active-request count before the load tier applies. Must be at least `1.0`. |
+
+The policy selects the least-loaded worker once the active-request spread is greater than
+`balance_abs_threshold` and the largest count is more than `balance_rel_threshold` times the
+smallest. Otherwise it selects the least-loaded worker among those holding the largest device-KV
+overlap when that overlap covers more than `cache_threshold` of the request's blocks, and the
+least-loaded worker when it does not. Active-request counts are the counts this router instance
+tracks.
 
 ### Policy-Class Queues
 

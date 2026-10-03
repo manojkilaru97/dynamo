@@ -11,7 +11,7 @@ use std::{
 
 use dashmap::{DashMap, mapref::entry::Entry};
 use dynamo_kv_router::{
-    PrefillLoadEstimator,
+    PrefillLoadEstimator, WorkerSelectionStage,
     config::KvRouterConfig,
     protocols::{KvTransferEnforcement, RoutingConstraints, WorkerId},
 };
@@ -1274,7 +1274,12 @@ impl ModelManager {
         // Get of create runtime config watcher for this endpoint
         let workers_with_configs = self.get_or_create_runtime_config_watcher(endpoint).await?;
 
-        let selector = DefaultWorkerSelector::new(kv_router_config.clone(), metric_worker_type);
+        let selector = DefaultWorkerSelector::for_stage(
+            kv_router_config.clone(),
+            metric_worker_type,
+            worker_selection_stage(worker_role, metric_worker_type),
+        )
+        .map_err(|error| anyhow::anyhow!("router_policy_config: {error}"))?;
 
         // Build shared cache client based on shared_cache_type.
         let shared_cache: Option<Box<dyn dynamo_kv_router::SharedKvCache>> = match kv_router_config
@@ -2182,6 +2187,25 @@ impl ModelManager {
     }
 }
 
+/// The `worker_selection` stage a KV router serves, resolved like upstream
+/// `ModelDeploymentCard::resolve_worker_type`: an explicit role is used verbatim; a card without
+/// one is a prefill pool when routed as prefill, otherwise aggregated.
+fn worker_selection_stage(
+    worker_role: Option<WorkerType>,
+    metric_worker_type: &str,
+) -> WorkerSelectionStage {
+    match worker_role {
+        Some(WorkerType::Prefill) => WorkerSelectionStage::Prefill,
+        Some(WorkerType::Decode) => WorkerSelectionStage::Decode,
+        Some(WorkerType::Encode) => WorkerSelectionStage::Encode,
+        Some(WorkerType::Aggregated) => WorkerSelectionStage::Aggregated,
+        None if metric_worker_type == crate::protocols::common::timing::WORKER_TYPE_PREFILL => {
+            WorkerSelectionStage::Prefill
+        }
+        None => WorkerSelectionStage::Aggregated,
+    }
+}
+
 fn has_required_kv_transfer_policy(configs: &HashMap<WorkerId, ModelRuntimeConfig>) -> bool {
     configs.values().any(|config| {
         matches!(
@@ -2209,6 +2233,30 @@ mod tests {
         discovery::{KvEventSource, KvSourceStatus},
         local_model::runtime_config::ModelRuntimeConfig,
     };
+
+    #[test]
+    fn worker_selection_stage_follows_role_then_router_label() {
+        use crate::protocols::common::timing::{WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL};
+
+        for (role, stage) in [
+            (WorkerType::Prefill, WorkerSelectionStage::Prefill),
+            (WorkerType::Decode, WorkerSelectionStage::Decode),
+            (WorkerType::Encode, WorkerSelectionStage::Encode),
+            (WorkerType::Aggregated, WorkerSelectionStage::Aggregated),
+        ] {
+            assert_eq!(worker_selection_stage(Some(role), WORKER_TYPE_DECODE), stage);
+        }
+        // Aggregated workers route through the "decode" label; a card without a role is
+        // aggregated unless routed as prefill.
+        assert_eq!(
+            worker_selection_stage(None, WORKER_TYPE_DECODE),
+            WorkerSelectionStage::Aggregated
+        );
+        assert_eq!(
+            worker_selection_stage(None, WORKER_TYPE_PREFILL),
+            WorkerSelectionStage::Prefill
+        );
+    }
 
     fn make_worker_set(namespace: &str, mdcsum: &str) -> WorkerSet {
         WorkerSet::new(
