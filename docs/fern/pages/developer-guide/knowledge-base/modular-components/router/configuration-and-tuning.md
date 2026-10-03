@@ -64,6 +64,13 @@ pools can run different policies. An omitted stage, or `default`, uses the built
 is yours to choose; `type` must be one of the policy types above. An unknown type, an unknown
 parameter, or an out-of-range value fails startup instead of falling back to the default selector.
 
+Environment variables override the YAML selection without editing it, with upstream's precedence:
+`DYN_ROUTER_PREFILL_POLICY` / `DYN_ROUTER_DECODE_POLICY` for their pool, then
+`DYN_ROUTER_WORKER_SELECTION_POLICY` for every pool, then the YAML stage. A value names a configured
+instance; `default` selects the built-in selector, so restarting with
+`DYN_ROUTER_WORKER_SELECTION_POLICY=default` rolls back to the built-in selector. A name that is not
+a configured instance fails startup.
+
 ```bash
 python3 -m dynamo.frontend --router-mode kv --router-policy-config worker-selection.yaml
 ```
@@ -96,10 +103,10 @@ Active-request counts are the counts this router instance tracks. With several f
 only its own in-flight requests unless `--router-replica-sync` shares them, so the load tier fires
 late. See [Load Guard With Many Frontends](#load-guard-with-many-frontends).
 
-Session affinity (`--router-session-affinity-ttl-secs`) is advisory under a worker-selection
-policy, as for upstream custom policies: the policy selects without the binding and the session
-follows its choice. Explicit routing pins (`backend_instance_id`, `decode_worker_id`) stay hard.
-The built-in selector keeps enforcing a session binding.
+Session affinity (`--router-session-affinity-ttl-secs`) pins a bound session to its worker under a
+worker-selection policy exactly as under the built-in selector (upstream's default `Hard` mode):
+the binding is applied before the policy runs, so the policy only places a session's first request
+and requests without a session.
 
 The standalone selection service runs only the built-in selector and rejects a document that
 selects a worker-selection policy; offline and online replay log a warning and use the built-in
@@ -116,9 +123,27 @@ the load it can see.
 
 Run the policy with `--router-replica-sync` whenever more than one frontend routes to the same
 workers. Routers then replay each other's admission, prefill-complete, and free events, so the
-counts the load tier compares are fleet-wide. Worker busy thresholds
-(`--active-decode-blocks-threshold`) do not substitute for it: a burst is admitted before the hot
-worker's KV usage rises, so the threshold trips too late.
+counts the load tier compares cover every request admitted more than one propagation delay ago.
+Under a worker-selection policy each router publishes its admissions as soon as they are queued
+(no 1 ms batching linger), and inbound events are applied to the shared tracker as they arrive, so
+the next admission already sees them. Worker busy thresholds (`--active-decode-blocks-threshold`)
+do not substitute for replica sync: a burst is admitted before the hot worker's KV usage rises, so
+the threshold trips too late.
+
+Requests admitted by different routers within the same propagation window still overlap. A hot
+worker therefore takes about `balance_abs_threshold` + λ·Δ requests more than the least-loaded
+worker before routers shed load, where λ is the fleet arrival rate and Δ the propagation delay
+(publish, one TCP hop, apply; on the order of a millisecond in-cluster). At 100 requests per second
+across 60 routers λ·Δ is well under one request; a burst of 2,000 requests in one second adds
+about 2-4. Without replica sync the excess is up to N x (`balance_abs_threshold` + 1), about 1,980
+for 60 routers. `balance_abs_threshold` keeps its upstream default of 32 (a quarter of a 128-slot
+worker); lower it only after measuring the cache-hit cost.
+
+Two limits remain. A frontend that (re)starts sees only requests admitted after it joined until the
+older ones finish, so it undercounts for at most one request lifetime. And the tracker drops a
+request from the counts `DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS` (default 300 s) after admission even
+if it is still streaming; set it above the longest valid request (queueing, prefill, and the maximum
+generation time) wherever generations can run longer than five minutes.
 
 Measured on 4 TP2 workers with 4 frontends, a multi-turn session load, and 192 concurrent requests
 sharing one 72k-token prefix:
@@ -129,7 +154,11 @@ sharing one 72k-token prefix:
 | Two-tier, no guard | 64 / 105-107 | 9.1-9.8 / 24.3-25.3 / 27.6-29.8 | 73.6-73.8% |
 | Two-tier, decode-blocks threshold 0.35 | 64 / 115 | 9.1 / 23.3 / 27.6 | 73.2% |
 | Two-tier, one frontend | 64 / 52 | 9.8 / 12.8 / 16.2 | 72.8% |
-| Two-tier, `--router-replica-sync` | 55-64 / 38-59 | 8.5-8.9 / 11.3-11.6 / 17.4-18.0 | 72.9-73.1% |
+| Two-tier, `--router-replica-sync` (batched publish) | 55-64 / 38-59 | 8.5-8.9 / 11.3-11.6 / 17.4-18.0 | 72.9-73.1% |
+| Two-tier, `--router-replica-sync` (immediate publish) | 55-64 / 39-48 | 8.4-10.4 / 11.4-13.0 / 16.0-16.1 | 72.6-72.7% |
+
+Ranges cover two seeds. With replica sync every worker ran 53-64 requests during the burst: the waiting counts reflect
+the burst plus session load (256 concurrent) filling all four 64-slot workers, not a pile-up on one.
 
 Replica sync cost about one percentage point of a CPU core per frontend at 8 requests per second
 across the fleet. Each router receives about three events per fleet request whatever the number of
