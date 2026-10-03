@@ -3231,6 +3231,7 @@ async fn responses(
         let outcome = super::disconnect::StreamOutcome::default();
         let stream_outcome = outcome.clone();
         let stream_request_id = request_id.clone();
+        let stream_ctx = ctx.clone();
 
         let mut engine_stream = Box::pin(engine_stream);
         let full_stream = async_stream::stream! {
@@ -3240,7 +3241,7 @@ async fn responses(
                 yield event.map_err(axum::Error::new);
             }
 
-            // The first backend error event, whether model output preceded it, and
+            // The backend error event, whether model output preceded it, and
             // whether it is the request plane's response inactivity timeout.
             let mut failure: Option<(String, StatusCode, bool, bool)> = None;
             let mut saw_output = false;
@@ -3259,8 +3260,9 @@ async fn responses(
                             dynamo_runtime::error::ErrorType::ResponseTimeout
                         )
                     });
-                    failure.get_or_insert((message, status, saw_output, timed_out));
-                    continue;
+                    // The first backend error ends the response.
+                    failure = Some((message, status, saw_output, timed_out));
+                    break;
                 }
 
                 let Some(stream_resp) = annotated_chunk.data else {
@@ -3285,6 +3287,22 @@ async fn responses(
                     );
                     let (error, error_type) =
                         responses_stream_failure(message, status, after_output, timed_out);
+                    let _ = stream_outcome.set(error_type);
+                    converter.append_failed_events(Some(error), &mut events);
+                }
+                // A killed context ends the engine stream without an error item
+                // (for example a worker connection failure); it is not a completion.
+                None if stream_ctx.is_killed() => {
+                    tracing::warn!(
+                        request_id = %stream_request_id,
+                        "Streaming responses request ended by a killed context"
+                    );
+                    let (error, error_type) = responses_stream_failure(
+                        String::new(),
+                        StatusCode::from_u16(499).expect("499 is a valid status"),
+                        saw_output,
+                        false,
+                    );
                     let _ = stream_outcome.set(error_type);
                     converter.append_failed_events(Some(error), &mut events);
                 }

@@ -400,9 +400,14 @@ fn monitor_with_outcome(
                             break;
                         }
                         None => {
-                            // Stream ended normally (possibly after an in-band failure)
+                            // Stream ended (possibly after an in-band failure). A
+                            // killed context ends the engine stream without an
+                            // error item; as on the unary paths it is a cancellation.
                             match outcome.as_ref().and_then(|outcome| outcome.get()) {
                                 Some(error_type) => inflight_guard.mark_error(error_type.clone()),
+                                None if context.is_killed() => {
+                                    inflight_guard.mark_error(ErrorType::Cancelled)
+                                }
                                 None => inflight_guard.mark_ok(),
                             }
                             stream_handle.disarm();

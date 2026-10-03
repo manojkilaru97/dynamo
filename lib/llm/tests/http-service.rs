@@ -2243,3 +2243,104 @@ async fn test_videos_stream_late_rejection_is_sanitized() {
     cancel_token.cancel();
     task.await.unwrap().unwrap();
 }
+
+/// Streams one token, then kills its context and ends without an error item,
+/// as the request plane does when the worker connection fails.
+struct KilledContextEngine {}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<NvCreateChatCompletionRequest>,
+        ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
+        Error,
+    > for KilledContextEngine
+{
+    async fn generate(
+        &self,
+        request: SingleIn<NvCreateChatCompletionRequest>,
+    ) -> Result<ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>, Error> {
+        let (request, context) = request.transfer(());
+        let ctx = context.context();
+        let mut generator = request.response_generator(ctx.id().to_string());
+        let killer = ctx.clone();
+        let stream = stream! {
+            yield Annotated::from_data(generator.create_choice(0, Some("tok".to_string()), None, None));
+            killer.kill();
+        };
+        Ok(ResponseStream::new(Box::pin(stream), ctx))
+    }
+}
+
+/// A stream that ends because its context was killed is a cancellation, not a
+/// success; a Responses stream reports it with `response.failed`.
+#[tokio::test]
+async fn test_killed_stream_is_not_a_success() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder()
+        .port(port)
+        .enable_chat_endpoints(true)
+        .build()
+        .unwrap();
+    let state = service.state_clone();
+    let manager = state.manager();
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task =
+        tokio::spawn(async move { service.run_with_listener(token.clone(), listener).await });
+    wait_for_service_ready(port).await;
+    let card = ModelDeploymentCard::with_name_only("killed");
+    manager
+        .add_chat_completions_model("killed", card.mdcsum(), Arc::new(KilledContextEngine {}))
+        .expect("register model");
+    let metrics = state.metrics_clone();
+    let client = reqwest::Client::new();
+
+    for (path, endpoint) in [
+        ("chat/completions", Endpoint::ChatCompletions),
+        ("responses", Endpoint::Responses),
+    ] {
+        let mut body = serde_json::json!({"model": "killed", "stream": true});
+        if path == "responses" {
+            body["input"] = serde_json::json!("hi");
+        } else {
+            body["messages"] = serde_json::json!([{"role": "user", "content": "hi"}]);
+        }
+        let response = client
+            .post(format!("http://localhost:{port}/v1/{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let text = timeout(std::time::Duration::from_secs(10), response.text())
+            .await
+            .expect("stream finished")
+            .unwrap();
+        if path == "responses" {
+            assert!(text.contains("response.failed"), "{text}");
+            assert!(!text.contains("response.completed"), "{text}");
+            assert!(text.contains("Request cancelled"), "{text}");
+        }
+        compare_counter(
+            &metrics,
+            "killed",
+            &endpoint,
+            &RequestType::Stream,
+            &Status::Error,
+            &ErrorType::Cancelled,
+            1,
+        );
+        compare_counter(
+            &metrics,
+            "killed",
+            &endpoint,
+            &RequestType::Stream,
+            &Status::Success,
+            &ErrorType::None,
+            0,
+        );
+    }
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
