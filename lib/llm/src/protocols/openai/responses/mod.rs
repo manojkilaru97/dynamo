@@ -103,10 +103,20 @@ impl<'de> Deserialize<'de> for NvCreateResponse {
             .map(serde_json::from_value)
             .transpose()
             .map_err(D::Error::custom)?;
-        let chat_template_kwargs = ["chat_template_kwargs", "chat_template_args"]
-            .into_iter()
-            .filter_map(|key| value.as_object_mut().and_then(|object| object.remove(key)))
-            .rfind(|value| !value.is_null())
+        // Both spellings present is a duplicate field, as on Chat Completions.
+        let (kwargs, args) = match value.as_object_mut() {
+            Some(object) => (
+                object.remove("chat_template_kwargs"),
+                object.remove("chat_template_args"),
+            ),
+            None => (None, None),
+        };
+        if kwargs.is_some() && args.is_some() {
+            return Err(D::Error::duplicate_field("chat_template_kwargs"));
+        }
+        let chat_template_kwargs = kwargs
+            .or(args)
+            .filter(|value| !value.is_null())
             .map(serde_json::from_value)
             .transpose()
             .map_err(D::Error::custom)?;
@@ -2807,6 +2817,36 @@ thinking
                 "{key}"
             );
         }
+    }
+
+    #[test]
+    fn test_chat_template_kwargs_aliases_are_a_duplicate_field() {
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!(null),
+            serde_json::json!(7),
+        ] {
+            let err = serde_json::from_value::<NvCreateResponse>(serde_json::json!({
+                "model": "test-model",
+                "input": "hi",
+                "reasoning": {"effort": "high"},
+                "chat_template_kwargs": {"enable_thinking": false},
+                "chat_template_args": args
+            }))
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("duplicate field `chat_template_kwargs`"),
+                "{err}"
+            );
+        }
+        let err = serde_json::from_value::<NvCreateResponse>(serde_json::json!({
+            "model": "test-model",
+            "input": "hi",
+            "chat_template_kwargs": 7
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("expected a map"), "{err}");
     }
 
     #[test]
