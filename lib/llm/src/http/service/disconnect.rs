@@ -304,11 +304,23 @@ fn monitor_with_outcome(
         // stopped, drain the stream to its end so the trailing usage chunk + [DONE]
         // aren't lost to the select! race.
         let mut engine_stopped = false;
+        let mut outcome_applied = false;
         loop {
             tokio::select! {
                 event = stream.next() => {
                     match event {
                         Some(Ok(event)) => {
+                            // An in-band failure is terminal: record it before its
+                            // event is delivered, so a client that closes right
+                            // after reading it is not counted as a cancellation.
+                            if !outcome_applied
+                                && let Some(error_type) =
+                                    outcome.as_ref().and_then(|outcome| outcome.get())
+                            {
+                                inflight_guard.mark_error(error_type.clone());
+                                stream_handle.disarm();
+                                outcome_applied = true;
+                            }
                             yield event;
                         }
                         Some(Err(err)) => {
@@ -1060,6 +1072,31 @@ mod tests {
                 u64::from(!expect_error)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_outcome_is_recorded_when_the_client_closes_after_the_failure() {
+        let model = "outcome-drop";
+        let (metrics, guard, ctx, handle) = setup_test(model, "req-outcome-drop");
+        let outcome = StreamOutcome::default();
+        let producer = outcome.clone();
+        let stream = async_stream::stream! {
+            let _ = producer.set(ErrorType::Validation);
+            yield Ok(axum::response::sse::Event::default().data("response.failed"));
+            std::future::pending::<()>().await;
+        };
+        let mut monitored = Box::pin(monitor_with_outcome(
+            stream,
+            ctx,
+            guard,
+            handle,
+            None,
+            Some(outcome),
+        ));
+        assert!(monitored.next().await.is_some());
+        drop(monitored);
+        assert_eq!(stream_counter(&metrics, model, ErrorType::Validation), 1);
+        assert_eq!(stream_counter(&metrics, model, ErrorType::Cancelled), 0);
     }
 
     #[test]

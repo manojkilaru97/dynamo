@@ -233,6 +233,19 @@ fn rejection_error_response(invalid: &dynamo_runtime::error::DynamoError) -> Err
     )
 }
 
+/// Error response for a failed fold of a single-response stream (embeddings,
+/// classify, pooling, images, unary videos): a backend rejection keeps its 4xx
+/// (a 499 is a sanitized cancellation); anything else is a server error.
+fn fold_rejection_or_internal(
+    err: &(dyn std::error::Error + 'static),
+    message: &str,
+) -> ErrorResponse {
+    match find_invalid_argument_in_chain(err) {
+        Some(invalid) => rejection_error_response(invalid),
+        None => ErrorMessage::internal_server_error(message),
+    }
+}
+
 /// Error response for a non-streaming aggregation failure after model output: a
 /// backend 499 stays a sanitized cancellation; anything else is a server error.
 fn late_cancellation_or_internal(
@@ -1406,9 +1419,8 @@ async fn embeddings(
                 request_id,
                 e
             );
-            let err_response =
-                ErrorMessage::internal_server_error("Failed to fold embeddings stream");
-            inflight.mark_error(extract_error_type_from_response(&err_response));
+            let err_response = fold_rejection_or_internal(&e, "Failed to fold embeddings stream");
+            inflight.mark_error(backend_error_type_from_response(&err_response));
             err_response
         })?;
 
@@ -1589,7 +1601,7 @@ async fn classify(
                 anyhow::Error::new(e),
                 "Failed to fold classification stream",
             );
-            inflight.mark_error(extract_error_type_from_response(&err_response));
+            inflight.mark_error(backend_error_type_from_response(&err_response));
             err_response
         })?;
 
@@ -1867,7 +1879,7 @@ async fn pooling(
         .map_err(|e| {
             let err_response =
                 ErrorMessage::from_anyhow(anyhow::Error::new(e), "Failed to fold pooling stream");
-            inflight.mark_error(extract_error_type_from_response(&err_response));
+            inflight.mark_error(backend_error_type_from_response(&err_response));
             err_response
         })?;
 
@@ -3218,6 +3230,7 @@ async fn responses(
         let mut http_queue_guard = Some(http_queue_guard);
         let outcome = super::disconnect::StreamOutcome::default();
         let stream_outcome = outcome.clone();
+        let stream_request_id = request_id.clone();
 
         let mut engine_stream = Box::pin(engine_stream);
         let full_stream = async_stream::stream! {
@@ -3227,8 +3240,9 @@ async fn responses(
                 yield event.map_err(axum::Error::new);
             }
 
-            // The first backend error event, and whether model output preceded it.
-            let mut failure: Option<(String, StatusCode, bool)> = None;
+            // The first backend error event, whether model output preceded it, and
+            // whether it is the request plane's response inactivity timeout.
+            let mut failure: Option<(String, StatusCode, bool, bool)> = None;
             let mut saw_output = false;
 
             while let Some(annotated_chunk) = engine_stream.next().await {
@@ -3239,7 +3253,13 @@ async fn responses(
                 );
 
                 if let Some((message, status)) = extract_backend_error_if_present(&annotated_chunk) {
-                    failure.get_or_insert((message, status, saw_output));
+                    let timed_out = annotated_chunk.error.as_ref().is_some_and(|error| {
+                        matches!(
+                            error.error_type(),
+                            dynamo_runtime::error::ErrorType::ResponseTimeout
+                        )
+                    });
+                    failure.get_or_insert((message, status, saw_output, timed_out));
                     continue;
                 }
 
@@ -3255,9 +3275,16 @@ async fn responses(
             }
 
             match failure {
-                Some((message, status, after_output)) => {
+                Some((message, status, after_output, timed_out)) => {
+                    tracing::warn!(
+                        request_id = %stream_request_id,
+                        %status,
+                        after_output,
+                        timed_out,
+                        "Streaming responses request failed: {message}"
+                    );
                     let (error, error_type) =
-                        responses_stream_failure(message, status, after_output);
+                        responses_stream_failure(message, status, after_output, timed_out);
                     let _ = stream_outcome.set(error_type);
                     converter.append_failed_events(Some(error), &mut events);
                 }
@@ -3345,45 +3372,57 @@ async fn responses(
 }
 
 /// `response.failed` error object and metrics type for a backend error in a
-/// streaming Responses request. A 4xx rejection before model output is forwarded
-/// (499 as a sanitized cancellation, at any point); anything else is sanitized.
+/// streaming Responses request. A 4xx rejection before model output keeps its
+/// message (499 is a sanitized cancellation at any point); anything else is
+/// sanitized. `code` uses the Responses API's error codes.
 fn responses_stream_failure(
     message: String,
     status: StatusCode,
     after_output: bool,
+    timed_out: bool,
 ) -> (dynamo_protocols::types::responses::ErrorObject, ErrorType) {
     use dynamo_protocols::types::responses::ErrorObject;
-    let sanitized = |error: SanitizedError, error_type: ErrorType| {
-        (
-            ErrorObject {
-                code: error.openai_type_slug().to_string(),
-                message: error.to_string(),
-            },
-            error_type,
-        )
+    let error = |code: &str, message: String| ErrorObject {
+        code: code.to_string(),
+        message,
     };
+    if timed_out {
+        return (
+            error("server_error", SanitizedError::Internal.to_string()),
+            ErrorType::ResponseTimeout,
+        );
+    }
     if status.as_u16() == 499 {
-        return sanitized(SanitizedError::Cancelled, ErrorType::Cancelled);
+        return (
+            error("server_error", SanitizedError::Cancelled.to_string()),
+            ErrorType::Cancelled,
+        );
     }
     if status.is_client_error() && !after_output {
-        let code = match status.as_u16() {
-            404 => "not_found_error",
-            429 => "rate_limit_error",
-            _ => "invalid_request_error",
+        let code = if status == StatusCode::TOO_MANY_REQUESTS {
+            "rate_limit_exceeded"
+        } else {
+            "invalid_prompt"
         };
         return (
-            ErrorObject {
-                code: code.to_string(),
-                message,
-            },
+            error(code, message),
             backend_rejection_error_type(status.as_u16()),
         );
     }
     match SanitizedError::for_backend_status(status) {
-        Some(error) if status.is_server_error() => {
-            sanitized(error, classify_error_for_metrics(status, ""))
+        Some(sanitized) if status.is_server_error() => {
+            let error_type = classify_error_for_metrics(status, "");
+            let code = if error_type == ErrorType::Overload {
+                "rate_limit_exceeded"
+            } else {
+                "server_error"
+            };
+            (error(code, sanitized.to_string()), error_type)
         }
-        _ => sanitized(SanitizedError::Internal, ErrorType::Internal),
+        _ => (
+            error("server_error", SanitizedError::Internal.to_string()),
+            ErrorType::Internal,
+        ),
     }
 }
 
@@ -3968,8 +4007,8 @@ async fn images(
         .await
         .map_err(|e| {
             tracing::error!("Failed to fold images stream for {}: {:?}", request_id, e);
-            let err_response = ErrorMessage::internal_server_error("Failed to fold images stream");
-            inflight.mark_error(extract_error_type_from_response(&err_response));
+            let err_response = fold_rejection_or_internal(&e, "Failed to fold images stream");
+            inflight.mark_error(backend_error_type_from_response(&err_response));
             err_response
         })?;
 
@@ -4110,7 +4149,8 @@ async fn videos(
         connection_handle.disarm();
         Ok(sse_stream.into_response())
     } else {
-        let stream = stream.inspect(move |response| {
+        // A rejection after video output is a server error, not a 4xx.
+        let stream = super::metrics::demote_late_rejections(stream).inspect(move |response| {
             process_response_and_observe_metrics(
                 response,
                 &mut response_collector,
@@ -4122,9 +4162,8 @@ async fn videos(
             .await
             .map_err(|e| {
                 tracing::error!("Failed to fold videos stream for {}: {:?}", request_id, e);
-                let err_response =
-                    ErrorMessage::internal_server_error("Failed to fold videos stream");
-                inflight.mark_error(extract_error_type_from_response(&err_response));
+                let err_response = fold_rejection_or_internal(&e, "Failed to fold videos stream");
+                inflight.mark_error(backend_error_type_from_response(&err_response));
                 err_response
             })?;
 
@@ -4562,41 +4601,100 @@ mod tests {
 
     #[test]
     fn test_responses_stream_failure_classification() {
+        // (status, after output, timed out, code, metrics type, message forwarded)
         let cases = [
-            (499, false, "request_cancelled", ErrorType::Cancelled, false),
-            (499, true, "request_cancelled", ErrorType::Cancelled, false),
+            (
+                499,
+                false,
+                false,
+                "server_error",
+                ErrorType::Cancelled,
+                false,
+            ),
+            (
+                499,
+                true,
+                false,
+                "server_error",
+                ErrorType::Cancelled,
+                false,
+            ),
             (
                 400,
                 false,
-                "invalid_request_error",
+                false,
+                "invalid_prompt",
                 ErrorType::Validation,
                 true,
             ),
-            (404, false, "not_found_error", ErrorType::NotFound, true),
-            (429, false, "rate_limit_error", ErrorType::Overload, true),
-            (400, true, "internal_error", ErrorType::Internal, false),
-            (500, false, "internal_error", ErrorType::Internal, false),
+            (
+                404,
+                false,
+                false,
+                "invalid_prompt",
+                ErrorType::NotFound,
+                true,
+            ),
+            (
+                429,
+                false,
+                false,
+                "rate_limit_exceeded",
+                ErrorType::Overload,
+                true,
+            ),
+            (400, true, false, "server_error", ErrorType::Internal, false),
+            (
+                500,
+                false,
+                false,
+                "server_error",
+                ErrorType::Internal,
+                false,
+            ),
             (
                 503,
                 false,
-                "service_unavailable",
+                false,
+                "server_error",
                 ErrorType::Unavailable,
                 false,
             ),
+            (
+                529,
+                false,
+                false,
+                "rate_limit_exceeded",
+                ErrorType::Overload,
+                false,
+            ),
+            (
+                500,
+                true,
+                true,
+                "server_error",
+                ErrorType::ResponseTimeout,
+                false,
+            ),
         ];
-        for (code, after_output, slug, error_type, forwarded) in cases {
+        for (code, after_output, timed_out, slug, error_type, forwarded) in cases {
             let status = StatusCode::from_u16(code).unwrap();
-            let (error, got_type) =
-                responses_stream_failure("secret /srv/x.py".to_string(), status, after_output);
+            let (error, got_type) = responses_stream_failure(
+                "secret /srv/x.py".to_string(),
+                status,
+                after_output,
+                timed_out,
+            );
             assert_eq!(got_type, error_type, "{code} {after_output}");
+            assert_eq!(error.code, slug, "{code} {after_output}");
             assert_eq!(
                 error.message.contains("/srv/x.py"),
                 forwarded,
                 "{code} {after_output}: {}",
                 error.message
             );
-            if forwarded || code == 499 {
-                assert_eq!(error.code, slug, "{code} {after_output}");
+            if code == 499 {
+                assert_eq!(error.message, "Request cancelled");
             }
         }
     }

@@ -1929,7 +1929,7 @@ async fn test_backend_rejections_on_chat_and_responses() {
             }
             if mode <= 2 {
                 assert!(
-                    text.contains("request_cancelled"),
+                    text.contains("request_cancelled") || text.contains("Request cancelled"),
                     "{path} mode={mode} stream: {text}"
                 );
             }
@@ -2005,6 +2005,46 @@ macro_rules! immediate_rejection_engine {
     };
 }
 
+/// Pooling-family engine whose stream yields a typed backend rejection.
+struct StreamRejectionEngine {
+    message: &'static str,
+}
+
+macro_rules! stream_rejection_engine {
+    ($req:ty, $resp:ty) => {
+        #[async_trait]
+        impl AsyncEngine<SingleIn<$req>, ManyOut<Annotated<$resp>>, Error>
+            for StreamRejectionEngine
+        {
+            async fn generate(
+                &self,
+                request: SingleIn<$req>,
+            ) -> Result<ManyOut<Annotated<$resp>>, Error> {
+                let (_request, context) = request.transfer(());
+                let ctx = context.context();
+                let message = self.message;
+                let stream = stream! {
+                    yield backend_rejection_event::<$resp>(message);
+                };
+                Ok(ResponseStream::new(Box::pin(stream), ctx))
+            }
+        }
+    };
+}
+
+stream_rejection_engine!(
+    dynamo_llm::protocols::openai::embeddings::NvCreateEmbeddingRequest,
+    dynamo_llm::protocols::openai::embeddings::NvCreateEmbeddingResponse
+);
+stream_rejection_engine!(
+    dynamo_llm::protocols::openai::classify::NvCreateClassifyRequest,
+    dynamo_llm::protocols::openai::classify::NvCreateClassifyResponse
+);
+stream_rejection_engine!(
+    dynamo_llm::protocols::openai::pooling::NvCreatePoolingRequest,
+    dynamo_llm::protocols::openai::pooling::NvCreatePoolingResponse
+);
+
 immediate_rejection_engine!(
     dynamo_llm::protocols::openai::embeddings::NvCreateEmbeddingRequest,
     dynamo_llm::protocols::openai::embeddings::NvCreateEmbeddingResponse
@@ -2018,8 +2058,9 @@ immediate_rejection_engine!(
     dynamo_llm::protocols::openai::pooling::NvCreatePoolingResponse
 );
 
-/// An immediate backend rejection from embeddings, classify, or pooling is
-/// metered as validation (400) or cancellation (sanitized 499), not internal.
+/// A backend rejection from embeddings, classify, or pooling, from generate()
+/// or in its stream, is a 400 metered as validation or a sanitized 499 metered
+/// as cancellation, not internal.
 #[tokio::test]
 async fn test_pooling_family_immediate_rejections_are_metered() {
     let (listener, port) = bind_random_port().await;
@@ -2051,11 +2092,29 @@ async fn test_pooling_family_immediate_rejections_are_metered() {
             .add_pooling_model(model, card.mdcsum(), engine)
             .unwrap();
     }
+    for (model, message) in [
+        ("stream-rejects", SECRET_400),
+        ("stream-cancels", SECRET_499),
+    ] {
+        let card = ModelDeploymentCard::with_name_only(model);
+        let engine = Arc::new(StreamRejectionEngine { message });
+        manager
+            .add_embeddings_model(model, card.mdcsum(), engine.clone())
+            .unwrap();
+        manager
+            .add_classify_model(model, card.mdcsum(), engine.clone())
+            .unwrap();
+        manager
+            .add_pooling_model(model, card.mdcsum(), engine)
+            .unwrap();
+    }
     let metrics = state.metrics_clone();
     let client = reqwest::Client::new();
     for (model, status, error_type) in [
         ("rejects", 400u16, ErrorType::Validation),
         ("cancels", 499, ErrorType::Cancelled),
+        ("stream-rejects", 400, ErrorType::Validation),
+        ("stream-cancels", 499, ErrorType::Cancelled),
     ] {
         for (path, endpoint) in [
             ("embeddings", Endpoint::Embeddings),
