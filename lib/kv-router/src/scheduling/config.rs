@@ -1108,6 +1108,9 @@ impl KvRouterConfig {
         ] {
             match self.worker_selection_policy_with_env(stage, &get_env) {
                 Ok(policy) => selects |= policy.is_some(),
+                Err(RouterPolicyConfigError::Validation(message)) => {
+                    errors.push(format!("{} stage: {message}", stage.as_str()))
+                }
                 Err(error) => errors.push(format!("{} stage: {error}", stage.as_str())),
             }
         }
