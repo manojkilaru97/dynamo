@@ -281,9 +281,6 @@ where
     lora_filter: Option<Arc<crate::lora::LoraFilter>>,
     endpoint_registration: Option<dynamo_runtime::discovery::EndpointRegistrationLease>,
     teardown_task_guard: Option<dynamo_runtime::engine::EngineContextGuard>,
-    /// Whether the selector enforces session-affinity bindings as hard pins
-    /// (`WorkerSelector::uses_exclusive_affinity_target`).
-    exclusive_affinity_target: bool,
 }
 
 fn resolve_tracking_model_name(
@@ -399,7 +396,6 @@ where
                 block_size,
             ))
         });
-        let exclusive_affinity_target = selector.uses_exclusive_affinity_target();
         let client_for_overload = client.clone();
         let overloaded_worker_provider: OverloadedWorkerProvider =
             Arc::new(move || client_for_overload.overloaded_instance_ids());
@@ -490,7 +486,6 @@ where
             lora_filter,
             endpoint_registration: None,
             teardown_task_guard: None,
-            exclusive_affinity_target,
         })
     }
 
@@ -534,12 +529,6 @@ where
 
     pub fn is_eagle(&self) -> bool {
         self.is_eagle
-    }
-
-    /// Whether session-affinity bindings pin requests (built-in selector) or only advise a
-    /// worker-selection policy, which may move the session.
-    pub fn uses_exclusive_affinity_target(&self) -> bool {
-        self.exclusive_affinity_target
     }
 
     fn tracking_hash_scope(&self) -> TrackingHashScope<'_> {

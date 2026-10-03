@@ -21,7 +21,6 @@ use crate::{
     preprocessor::PreprocessedRequest,
     protocols::common::{
         FinishReason,
-        extensions::SessionAffinityId,
         llm_backend::LLMEngineOutput,
         timing::{RequestPhase, RoutingData},
     },
@@ -197,13 +196,9 @@ impl KvPushRouter {
             ));
         };
         let explicit = explicit_target(request, phase)?;
-        // A worker-selection policy treats the session binding as advisory (upstream
-        // `uses_exclusive_affinity_target() == false`): it selects without the pin and the binding
-        // follows its choice. Explicit routing pins stay hard either way.
-        let advisory = explicit.is_none() && !self.chooser.uses_exclusive_affinity_target();
         if is_query_only {
             let target = affinity.query_target(&session_id, explicit)?;
-            let worker = target.and_then(affinity_worker).filter(|_| !advisory);
+            let worker = target.and_then(affinity_worker);
             return Ok((
                 self.select_request(request, phase, true, worker).await?,
                 None,
@@ -214,18 +209,6 @@ impl KvPushRouter {
         let operation = affinity
             .acquire_with_context(&session_id, explicit, request_context.as_ref())
             .await?;
-        if advisory {
-            let selection = self.select_request(request, phase, false, None).await?;
-            let operation = rebind_if_moved(
-                affinity,
-                &session_id,
-                operation,
-                &selection,
-                request_context.as_ref(),
-            )
-            .await?;
-            return Ok((selection, operation));
-        }
         let worker = operation.target().and_then(affinity_worker);
         match self.select_request(request, phase, false, worker).await {
             Ok(selection) => Ok((selection, Some(operation))),
@@ -606,47 +589,6 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
     }
 }
 
-/// Whether a selection lands on an affinity target (a worker-only target matches any rank).
-fn selection_matches_target(selection: &WorkerSelection, target: AffinityTarget) -> bool {
-    selection.instance_id == target.worker_id
-        && target.dp_rank.is_none_or(|rank| rank == selection.dp_rank)
-}
-
-/// Keep an advisory session binding consistent with the policy's choice.
-///
-/// A new session (or one already bound to the selected worker) keeps its operation. A session
-/// bound elsewhere is invalidated and re-initialized so the stream commits the selected worker. If a
-/// concurrent request rebinds the session first, this request is served without touching the
-/// binding.
-async fn rebind_if_moved(
-    affinity: &AffinityCoordinator,
-    session_id: &SessionAffinityId,
-    operation: AffinityAcquire,
-    selection: &WorkerSelection,
-    request_context: &dyn AsyncEngineContext,
-) -> Result<Option<AffinityAcquire>, Error> {
-    let Some(target) = operation.target() else {
-        return Ok(Some(operation));
-    };
-    if selection_matches_target(selection, target) {
-        return Ok(Some(operation));
-    }
-    tracing::debug!(
-        session_id = session_id.as_str(),
-        bound_worker_id = target.worker_id,
-        selected_worker_id = selection.instance_id,
-        "session affinity is advisory under the worker-selection policy; rebinding"
-    );
-    operation.invalidate();
-    let retry = affinity
-        .acquire_with_context(session_id, None, request_context)
-        .await?;
-    match retry.target() {
-        Some(target) if !selection_matches_target(selection, target) => Ok(None),
-        _ => Ok(Some(retry)),
-    }
-}
-
 fn affinity_worker(target: AffinityTarget) -> Option<WorkerWithDpRank> {
     target
         .dp_rank
@@ -1011,9 +953,9 @@ mod tests {
         (router, runtime)
     }
 
-    /// Two-worker router (ids 7 and 8) with active-request tracking and session affinity, using
-    /// the built-in selector or, with `policy_yaml`, the policy it selects for aggregated workers.
-    async fn affinity_router(policy_yaml: Option<&str>) -> (KvPushRouter, Runtime) {
+    /// Two-worker router (ids 7 and 8) with active-request tracking, session affinity, and the
+    /// two-tier policy selected for aggregated workers.
+    async fn two_tier_affinity_router() -> (KvPushRouter, Runtime, tempfile::NamedTempFile) {
         use std::io::Write;
 
         let runtime = Runtime::from_current().unwrap();
@@ -1022,7 +964,7 @@ mod tests {
                 .await
                 .unwrap();
         let component = distributed
-            .namespace("affinity-advisory".to_string())
+            .namespace("affinity-hard-two-tier".to_string())
             .unwrap()
             .component("workers".to_string())
             .unwrap();
@@ -1033,18 +975,17 @@ mod tests {
             (8, ModelRuntimeConfig::default()),
         ]);
         let (_tx, workers) = watch::channel(workers);
-        let policy_file = policy_yaml.map(|yaml| {
-            let mut file = tempfile::NamedTempFile::new().unwrap();
-            file.write_all(yaml.as_bytes()).unwrap();
-            file
-        });
+        let mut policy_file = tempfile::NamedTempFile::new().unwrap();
+        policy_file
+            .write_all(
+                b"worker_selection:\n  aggregated: two-tier\n  instances:\n    - name: two-tier\n      type: dynamo-two-tier-cost-fn\n",
+            )
+            .unwrap();
         let config = KvRouterConfig {
             skip_initial_worker_wait: true,
             use_kv_events: false,
             router_track_active_blocks: true,
-            router_policy_config: policy_file
-                .as_ref()
-                .map(|file| file.path().display().to_string()),
+            router_policy_config: Some(policy_file.path().display().to_string()),
             ..Default::default()
         };
         let selector = DefaultWorkerSelector::for_stage(
@@ -1054,6 +995,7 @@ mod tests {
             false,
         )
         .unwrap();
+        assert!(selector.worker_selection_policy_type().is_some());
         let chooser = KvRouter::new(
             endpoint,
             client.clone(),
@@ -1076,13 +1018,15 @@ mod tests {
             .unwrap();
         let router =
             KvPushRouter::new(inner, Arc::new(chooser), Some(Duration::from_secs(60))).unwrap();
-        (router, runtime)
+        (router, runtime, policy_file)
     }
 
-    /// Book 40 requests on worker 7, bind a session to it, then route a session request.
-    async fn route_session_bound_to_loaded_worker(
-        router: &KvPushRouter,
-    ) -> (WorkerSelection, Option<AffinityAcquire>) {
+    /// Upstream's default `Hard` session affinity pins under a worker-selection policy too: a
+    /// session bound to a worker with 40 active requests stays there although the two-tier load
+    /// tier would pick the idle worker for an unbound request.
+    #[tokio::test]
+    async fn session_affinity_stays_hard_under_two_tier_policy() {
+        let (router, runtime, _policy_file) = two_tier_affinity_router().await;
         let mut guards = Vec::new();
         for _ in 0..40 {
             let mut pinned = request();
@@ -1105,10 +1049,21 @@ mod tests {
             );
         }
 
+        // Without a session the load tier (40 vs 0) sends the request to worker 8.
+        let (unbound, _) = router
+            .select_with_affinity(&Context::new(request()), RequestPhase::Aggregated, true)
+            .await
+            .unwrap();
+        assert_eq!(unbound.instance_id, 8);
+
         let session_id = SessionAffinityId::new("bound-to-loaded-worker");
-        let affinity = router.affinity.as_ref().unwrap();
-        let AffinityAcquire::Initialize(initializer) =
-            affinity.acquire(&session_id, None).await.unwrap()
+        let AffinityAcquire::Initialize(initializer) = router
+            .affinity
+            .as_ref()
+            .unwrap()
+            .acquire(&session_id, None)
+            .await
+            .unwrap()
         else {
             panic!("first request must initialize");
         };
@@ -1120,76 +1075,16 @@ mod tests {
                 })
                 .unwrap(),
         );
-
         let mut session_request = Context::new(request());
         session_request.insert(SESSION_AFFINITY_CONTEXT_KEY, session_id);
-        let result = router
+        let (selection, operation) = router
             .select_with_affinity(&session_request, RequestPhase::Aggregated, false)
             .await
             .unwrap();
-        drop(guards);
-        result
-    }
-
-    #[tokio::test]
-    async fn session_affinity_is_exclusive_under_builtin_selector() {
-        let (router, runtime) = affinity_router(None).await;
-        assert!(router.chooser.uses_exclusive_affinity_target());
-        let (selection, operation) = route_session_bound_to_loaded_worker(&router).await;
         assert_eq!(selection.instance_id, 7);
         assert!(matches!(operation, Some(AffinityAcquire::Bound { .. })));
 
-        drop(router);
-        runtime.shutdown();
-    }
-
-    #[tokio::test]
-    async fn session_affinity_is_advisory_under_two_tier_policy() {
-        let (router, runtime) = affinity_router(Some(
-            "worker_selection:\n  aggregated: two-tier\n  instances:\n    - name: two-tier\n      type: dynamo-two-tier-cost-fn\n",
-        ))
-        .await;
-        assert!(!router.chooser.uses_exclusive_affinity_target());
-        // 40 active on the bound worker vs 0: the load tier moves the session to worker 8 and
-        // the binding is re-initialized so the stream commits worker 8.
-        let (selection, operation) = route_session_bound_to_loaded_worker(&router).await;
-        assert_eq!(selection.instance_id, 8);
-        let Some(AffinityAcquire::Initialize(initializer)) = operation else {
-            panic!("a moved session must re-initialize its binding");
-        };
-        drop(
-            initializer
-                .commit(AffinityTarget {
-                    worker_id: 8,
-                    dp_rank: Some(0),
-                })
-                .unwrap(),
-        );
-        let session_id = SessionAffinityId::new("bound-to-loaded-worker");
-        assert_eq!(
-            router
-                .affinity
-                .as_ref()
-                .unwrap()
-                .query_target(&session_id, None)
-                .unwrap()
-                .map(|target| target.worker_id),
-            Some(8)
-        );
-
-        // Explicit pins stay hard under the policy.
-        let mut pinned = request();
-        pinned.routing = Some(crate::protocols::common::preprocessor::RoutingHints {
-            backend_instance_id: Some(7),
-            dp_rank: Some(0),
-            ..Default::default()
-        });
-        let (selection, _) = router
-            .select_with_affinity(&Context::new(pinned), RequestPhase::Aggregated, true)
-            .await
-            .unwrap();
-        assert_eq!(selection.instance_id, 7);
-
+        drop(guards);
         drop(router);
         runtime.shutdown();
     }

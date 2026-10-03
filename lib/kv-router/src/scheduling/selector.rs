@@ -23,16 +23,6 @@ use crate::protocols::{WorkerConfigLike, WorkerId, WorkerSelectionResult, Worker
 ///
 /// Generic over `C` so that the scheduling layer does not depend on a concrete config type.
 pub trait WorkerSelector<C: WorkerConfigLike> {
-    /// Whether a session-affinity binding should be enforced as a hard pin.
-    ///
-    /// The built-in selector treats an affinity target as exclusive. A worker-selection policy
-    /// (e.g. `dynamo-two-tier-cost-fn`) receives it as advisory, as upstream custom policies do, so
-    /// its load tier can move a session off an overloaded worker. Explicit routing pins are always
-    /// enforced.
-    fn uses_exclusive_affinity_target(&self) -> bool {
-        true
-    }
-
     fn select_worker(
         &self,
         workers: &HashMap<WorkerId, C>,
@@ -457,10 +447,6 @@ impl DefaultWorkerSelector {
 }
 
 impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
-    fn uses_exclusive_affinity_target(&self) -> bool {
-        self.worker_selection_policy.is_none()
-    }
-
     fn select_worker(
         &self,
         workers: &HashMap<WorkerId, C>,
@@ -2028,9 +2014,6 @@ worker_selection:
             false,
         )
         .unwrap();
-        assert!(<DefaultWorkerSelector as WorkerSelector<
-            TaintedWorkerConfig,
-        >>::uses_exclusive_affinity_target(&selector));
         assert_eq!(selector.worker_selection_policy_type(), None);
 
         // A document that selects the policy only for prefill leaves aggregated on the built-in.
@@ -2079,14 +2062,6 @@ worker_selection:
         assert_eq!(result.worker.worker_id, 2);
         assert_eq!(result.required_blocks, 10);
         assert_eq!(result.effective_overlap_blocks, 6.0);
-    }
-
-    #[test]
-    fn two_tier_policy_treats_affinity_as_advisory() {
-        let selector = two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default());
-        assert!(!<DefaultWorkerSelector as WorkerSelector<
-            TaintedWorkerConfig,
-        >>::uses_exclusive_affinity_target(&selector));
     }
 
     #[test]
