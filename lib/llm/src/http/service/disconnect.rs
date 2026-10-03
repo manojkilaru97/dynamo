@@ -307,6 +307,9 @@ fn monitor_with_outcome(
         let mut outcome_applied = false;
         loop {
             tokio::select! {
+                // A ready event wins over the stop and inactivity arms, so an event
+                // already produced (such as an in-band failure) is never dropped.
+                biased;
                 event = stream.next() => {
                     match event {
                         Some(Ok(event)) => {
@@ -406,7 +409,20 @@ fn monitor_with_outcome(
                             match outcome.as_ref().and_then(|outcome| outcome.get()) {
                                 Some(error_type) => inflight_guard.mark_error(error_type.clone()),
                                 None if context.is_killed() => {
-                                    inflight_guard.mark_error(ErrorType::Cancelled)
+                                    inflight_guard.mark_error(ErrorType::Cancelled);
+                                    stream_handle.disarm();
+                                    // Tell the client the stream was cut short.
+                                    let cancelled = SanitizedError::Cancelled;
+                                    let err_json = serde_json::json!({
+                                        "error": {
+                                            "message": cancelled.to_string(),
+                                            "type": cancelled.openai_type_slug(),
+                                            "code": cancelled.status().as_u16(),
+                                        }
+                                    });
+                                    yield Event::default().data(err_json.to_string());
+                                    yield Event::default().data("[DONE]");
+                                    break;
                                 }
                                 None => inflight_guard.mark_ok(),
                             }
@@ -437,7 +453,11 @@ fn monitor_with_outcome(
                         None => std::future::pending::<()>().await,
                     }
                 } => {
-                    inflight_guard.mark_error(ErrorType::ResponseTimeout);
+                    // An in-band failure already delivered keeps its error type.
+                    match outcome.as_ref().and_then(|outcome| outcome.get()) {
+                        Some(error_type) => inflight_guard.mark_error(error_type.clone()),
+                        None => inflight_guard.mark_error(ErrorType::ResponseTimeout),
+                    }
                     stream_handle.disarm();
                     tracing::warn!(
                         request_id = %inflight_guard.request_id(),
@@ -1102,6 +1122,31 @@ mod tests {
         drop(monitored);
         assert_eq!(stream_counter(&metrics, model, ErrorType::Validation), 1);
         assert_eq!(stream_counter(&metrics, model, ErrorType::Cancelled), 0);
+    }
+
+    #[tokio::test]
+    async fn test_killed_stream_end_is_a_cancellation_frame() {
+        let model = "killed-end";
+        let metrics = Arc::new(Metrics::new());
+        let guard = metrics.clone().create_inflight_guard(
+            model,
+            Endpoint::ChatCompletions,
+            true,
+            "req-killed",
+        );
+        let context: Arc<dyn AsyncEngineContext> = Arc::new(MockContext::with_kill_tracking());
+        let killer = context.clone();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let handle = ConnectionHandle::create_disabled(tx);
+        let stream = async_stream::stream! {
+            yield Ok(axum::response::sse::Event::default().data("token"));
+            killer.kill();
+        };
+        let monitored = monitor_for_disconnects_with_timeout(stream, context, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+        assert!(body.contains("\"code\":499"), "{body}");
+        assert!(body.contains("data: [DONE]"), "{body}");
+        assert_eq!(stream_counter(&metrics, model, ErrorType::Cancelled), 1);
     }
 
     #[test]

@@ -3311,6 +3311,10 @@ async fn responses(
                 }
             }
 
+            // Release the engine stream before writing the terminal events, so a
+            // failed or finished request frees the worker without waiting on
+            // the client to read them.
+            drop(engine_stream);
             match failure {
                 Some((message, status, after_output)) => {
                     tracing::warn!(

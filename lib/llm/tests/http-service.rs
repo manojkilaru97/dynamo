@@ -2531,10 +2531,10 @@ async fn test_killed_stream_is_not_a_success() {
             .await
             .expect("stream finished")
             .unwrap();
+        assert!(text.contains("Request cancelled"), "{path}: {text}");
         if path == "responses" {
             assert!(text.contains("response.failed"), "{text}");
             assert!(!text.contains("response.completed"), "{text}");
-            assert!(text.contains("Request cancelled"), "{text}");
         }
         compare_counter(
             &metrics,
