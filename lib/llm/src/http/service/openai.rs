@@ -173,7 +173,7 @@ fn extract_error_type_from_response(response: &ErrorResponse) -> ErrorType {
 /// ErrorType for a response built from a backend error: a forwarded 400 is a
 /// request rejection whatever its message prefix; other statuses keep their
 /// usual classification (404 not found, 429 overload, ...).
-fn backend_error_type_from_response(response: &ErrorResponse) -> ErrorType {
+pub(super) fn backend_error_type_from_response(response: &ErrorResponse) -> ErrorType {
     if response.0 == StatusCode::BAD_REQUEST {
         ErrorType::Validation
     } else {
@@ -233,9 +233,10 @@ fn rejection_error_response(invalid: &dynamo_runtime::error::DynamoError) -> Err
     )
 }
 
-/// Error response for a failed fold of a single-response stream (embeddings,
-/// classify, pooling, images, unary videos): a backend rejection keeps its 4xx
-/// (a 499 is a sanitized cancellation); anything else is a server error.
+/// Error response for a failed fold (completions after late-rejection demotion,
+/// embeddings, classify, pooling, images, unary videos): a backend rejection
+/// keeps its 4xx, a cancellation is a sanitized 499, anything else is a server
+/// error.
 fn fold_rejection_or_internal(
     err: &(dyn std::error::Error + 'static),
     message: &str,
@@ -1016,19 +1017,11 @@ async fn completions_single(
                     request_id,
                     e
                 );
-                let err_response = if let Some(invalid) = find_invalid_argument_in_chain(&e) {
-                    // A rejection from any prompt of a batch is a client error.
-                    rejection_error_response(invalid)
-                } else if is_typed_cancellation(&e) {
-                    ErrorMessage::sanitized_with_details(
-                        SanitizedError::Cancelled,
-                        format!("{e:#}"),
-                    )
-                } else {
-                    ErrorMessage::internal_server_error(&format!(
-                        "Failed to fold completions stream for {request_id}"
-                    ))
-                };
+                // A rejection from any prompt of a batch is a client error.
+                let err_response = fold_rejection_or_internal(
+                    &e,
+                    &format!("Failed to fold completions stream for {request_id}"),
+                );
                 inflight_guard.mark_error(backend_error_type_from_response(&err_response));
                 err_response
             })?;
@@ -1317,19 +1310,11 @@ async fn completions_batch(
                     request_id,
                     e
                 );
-                let err_response = if let Some(invalid) = find_invalid_argument_in_chain(&e) {
-                    // A rejection from any prompt of a batch is a client error.
-                    rejection_error_response(invalid)
-                } else if is_typed_cancellation(&e) {
-                    ErrorMessage::sanitized_with_details(
-                        SanitizedError::Cancelled,
-                        format!("{e:#}"),
-                    )
-                } else {
-                    ErrorMessage::internal_server_error(&format!(
-                        "Failed to fold completions stream for {request_id}"
-                    ))
-                };
+                // A rejection from any prompt of a batch is a client error.
+                let err_response = fold_rejection_or_internal(
+                    &e,
+                    &format!("Failed to fold completions stream for {request_id}"),
+                );
                 inflight_guard.mark_error(backend_error_type_from_response(&err_response));
                 err_response
             })?;
@@ -3332,8 +3317,10 @@ async fn responses(
                     let _ = stream_outcome.set(error_type);
                     converter.append_failed_events(Some(error), &mut events);
                 }
-                // A killed context ends the engine stream without an error item
-                // (for example a worker connection failure); it is not a completion.
+                // Defensive: a context killed by something other than this
+                // request's own disconnect handling ends the engine stream
+                // without an error item; that is not a completion. (A lost
+                // worker connection arrives as a typed Disconnected item.)
                 None if stream_ctx.is_killed() => {
                     tracing::warn!(
                         request_id = %stream_request_id,

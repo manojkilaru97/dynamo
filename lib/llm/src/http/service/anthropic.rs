@@ -633,7 +633,11 @@ async fn anthropic_messages(
         // Check first event for backend errors using the openai helper
         let stream_with_check = super::openai::check_for_backend_error(engine_stream)
             .await
-            .map_err(|(status, _json_err)| {
+            .map_err(|error_response| {
+                inflight_guard.mark_error(super::openai::backend_error_type_from_response(
+                    &error_response,
+                ));
+                let (status, _json_err) = error_response;
                 // check_for_backend_error has already sanitized the body and
                 // logged the backend detail; preserve its status when
                 // re-wrapping in Anthropic format. Status classification is
