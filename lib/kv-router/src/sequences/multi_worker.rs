@@ -1344,10 +1344,11 @@ mod tests {
         );
     }
 
-    /// A request that is still running past the default five-minute expiry stays in the active
-    /// counts the two-tier load tier reads once `DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS` is raised
-    /// above the longest valid request (the Super rollout sets 4000 s for 3600 s generations);
-    /// with the default it is dropped while the worker is still busy.
+    /// A request still running past the five-minute default expiry is dropped from the active
+    /// counts while the worker is busy (an undercount); raising
+    /// `DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS` keeps it counted. Raising it also lengthens how
+    /// long a replica copy whose `Free` was lost stays as phantom load (see
+    /// `replica_copy_with_dropped_free_is_phantom_until_expiry`), so production keeps the default.
     #[tokio::test(start_paused = true)]
     async fn raised_expiry_keeps_long_streams_in_active_counts() {
         let raised = active_request_expiry_duration_from_lookup(|key| {
@@ -1405,6 +1406,60 @@ mod tests {
             raised_tracker.active_request_counts().get(&worker).copied(),
             Some(0)
         );
+    }
+
+    /// Known limit of replica sync: if a peer's `Free` never arrives (its router died or restarted,
+    /// a publish failed for good, or a sequence gap), the replica copy stays counted as phantom
+    /// load. The peer's own active-request expiry bounds it: it is gone one expiry interval after
+    /// the copy was applied (default 300 s), while the origin already freed it.
+    #[tokio::test(start_paused = true)]
+    async fn replica_copy_with_dropped_free_is_phantom_until_expiry() {
+        let worker = WorkerWithDpRank::new(7, 0);
+        let peer = ActiveSequencesMultiWorker::new_with_expiry_duration(
+            NoopSequencePublisher,
+            4,
+            HashMap::from([(7, (0, 1))]),
+            true,
+            1,
+            "test",
+            DEFAULT_ACTIVE_REQUEST_EXPIRY_DURATION,
+        );
+
+        // Router 99 admits a request; the peer applies the replica Add.
+        peer.apply_replica_batch(vec![replica_add("lost-free", worker, vec![1, 2, 3])]);
+        assert_eq!(peer.active_request_counts().get(&worker).copied(), Some(1));
+
+        // Router 99's Free is dropped. Until the expiry the peer keeps counting the request.
+        tokio::time::advance(Duration::from_secs(240)).await;
+        peer.force_expire_requests_across_all_workers();
+        assert_eq!(
+            peer.active_request_counts().get(&worker).copied(),
+            Some(1),
+            "a dropped Free leaves phantom load"
+        );
+        assert_eq!(
+            peer.project_worker_loads(None, Instant::now())[&worker].active_requests,
+            1
+        );
+
+        // One expiry interval after the copy was applied, the phantom is gone.
+        tokio::time::advance(
+            DEFAULT_ACTIVE_REQUEST_EXPIRY_DURATION - Duration::from_secs(240)
+                + Duration::from_secs(31),
+        )
+        .await;
+        peer.force_expire_requests_across_all_workers();
+        assert_eq!(
+            peer.active_request_counts().get(&worker).copied(),
+            Some(0),
+            "expiry bounds the phantom"
+        );
+
+        // A Free that does arrive removes the copy immediately.
+        peer.apply_replica_batch(vec![replica_add("freed", worker, vec![4, 5, 6])]);
+        assert_eq!(peer.active_request_counts().get(&worker).copied(), Some(1));
+        peer.apply_replica_batch(vec![replica_free("freed", worker)]);
+        assert_eq!(peer.active_request_counts().get(&worker).copied(), Some(0));
     }
 
     /// Verifies that absent and invalid expiry overrides use the default.

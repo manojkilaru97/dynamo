@@ -222,27 +222,88 @@ async fn run_replica_singleton_publisher<P: SingletonEventPublisher>(
     }
 }
 
-async fn publish_replica_batch(publisher: &EventPublisher, events: Vec<ActiveSequenceEvent>) {
-    let batch = ActiveSequenceEventBatch { events };
-    let first_request_id = &batch
-        .events
-        .first()
-        .expect("replica batch must contain an event")
-        .request_id;
-    let last_request_id = &batch
-        .events
-        .last()
-        .expect("replica batch must contain an event")
-        .request_id;
+trait BatchEventPublisher: Send + Sync {
+    fn publish_batch(
+        &self,
+        batch: &ActiveSequenceEventBatch,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
 
-    if let Err(error) = publisher.publish(&batch).await {
-        tracing::error!(
-            event_count = batch.events.len(),
-            first_request_id = %first_request_id,
-            last_request_id = %last_request_id,
-            error = %error,
-            "Failed to publish active-sequence replica batch"
-        );
+impl BatchEventPublisher for EventPublisher {
+    async fn publish_batch(&self, batch: &ActiveSequenceEventBatch) -> anyhow::Result<()> {
+        self.publish(batch).await
+    }
+}
+
+/// First retry delay for a replica batch whose publish failed; doubles up to
+/// [`REPLICA_PUBLISH_RETRY_MAX`].
+const REPLICA_PUBLISH_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(10);
+const REPLICA_PUBLISH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Publish one replica batch, re-queueing it on failure instead of dropping it.
+///
+/// A dropped batch can carry a `Free`, which would leave the request counted on every peer until
+/// its active-request expiry. The batch is retried in order, with capped exponential backoff, until
+/// it is published or the publisher is cancelled; later events wait in the bounded channel behind
+/// it (whose overflow policy is unchanged). Returns `false` if cancellation abandoned the batch.
+async fn publish_replica_batch<P: BatchEventPublisher>(
+    publisher: &P,
+    events: Vec<ActiveSequenceEvent>,
+    cancellation_token: &CancellationToken,
+) -> bool {
+    let batch = ActiveSequenceEventBatch { events };
+    let mut delay = REPLICA_PUBLISH_RETRY_INITIAL;
+    let mut attempt = 1u32;
+    loop {
+        let error = match publisher.publish_batch(&batch).await {
+            Ok(()) => {
+                if attempt > 1 {
+                    tracing::info!(
+                        event_count = batch.events.len(),
+                        attempt,
+                        "Published active-sequence replica batch after retrying"
+                    );
+                }
+                return true;
+            }
+            Err(error) => error,
+        };
+        let first_request_id = &batch
+            .events
+            .first()
+            .expect("replica batch must contain an event")
+            .request_id;
+        let last_request_id = &batch
+            .events
+            .last()
+            .expect("replica batch must contain an event")
+            .request_id;
+        // Log the first failure and then every 16th, so a persistent outage stays visible
+        // without one line per retry.
+        if attempt == 1 || attempt.is_multiple_of(16) {
+            tracing::error!(
+                event_count = batch.events.len(),
+                first_request_id = %first_request_id,
+                last_request_id = %last_request_id,
+                attempt,
+                retry_in_ms = delay.as_millis() as u64,
+                error = %error,
+                "Failed to publish active-sequence replica batch; re-queued for retry"
+            );
+        }
+        tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                tracing::warn!(
+                    event_count = batch.events.len(),
+                    attempt,
+                    "Dropping unpublished active-sequence replica batch on shutdown"
+                );
+                return false;
+            }
+            _ = tokio::time::sleep(delay) => {}
+        }
+        delay = (delay * 2).min(REPLICA_PUBLISH_RETRY_MAX);
+        attempt = attempt.saturating_add(1);
     }
 }
 
@@ -294,8 +355,8 @@ async fn collect_replica_batch(
     (events, false)
 }
 
-async fn run_replica_batch_publisher(
-    publisher: EventPublisher,
+async fn run_replica_batch_publisher<P: BatchEventPublisher>(
+    publisher: P,
     mut event_rx: mpsc::Receiver<ActiveSequenceEvent>,
     cancellation_token: CancellationToken,
     flush: ReplicaFlush,
@@ -310,7 +371,9 @@ async fn run_replica_batch_publisher(
         };
         let (events, stop_after_flush) =
             collect_replica_batch(first_event, &mut event_rx, &cancellation_token, flush).await;
-        publish_replica_batch(&publisher, events).await;
+        if !publish_replica_batch(&publisher, events, &cancellation_token).await {
+            break;
+        }
         if stop_after_flush {
             break;
         }
@@ -804,6 +867,92 @@ mod tests {
         assert!(!stop);
         assert_eq!(remaining.len(), 1);
         assert_eq!(Instant::now() - start, MAX_REPLICA_BATCH_DURATION);
+    }
+
+    /// Fails the first `fail_first` publishes, then records every published batch.
+    struct FlakyBatchPublisher {
+        fail_first: usize,
+        attempts: std::sync::atomic::AtomicUsize,
+        published: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl BatchEventPublisher for Arc<FlakyBatchPublisher> {
+        async fn publish_batch(&self, batch: &ActiveSequenceEventBatch) -> anyhow::Result<()> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt < self.fail_first {
+                anyhow::bail!("transport unavailable (attempt {attempt})");
+            }
+            self.published.lock().unwrap().push(
+                batch
+                    .events
+                    .iter()
+                    .map(|event| event.request_id.clone())
+                    .collect(),
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_replica_publish_is_requeued_not_dropped() {
+        let publisher = Arc::new(FlakyBatchPublisher {
+            fail_first: 3,
+            attempts: Default::default(),
+            published: Default::default(),
+        });
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let cancellation_token = CancellationToken::new();
+        let task = tokio::spawn(run_replica_batch_publisher(
+            publisher.clone(),
+            event_rx,
+            cancellation_token.clone(),
+            ReplicaFlush::Immediate,
+        ));
+
+        // The Free for request "r1" must reach peers even though the first three publishes fail.
+        event_tx.send(add_event("r1")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        event_tx.send(free_event("r1")).await.unwrap();
+        event_tx.send(add_event("r2")).await.unwrap();
+        // Backoff 10 + 20 + 40 ms, then the queued events follow in order.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let published = publisher.published.lock().unwrap().clone();
+        let flattened: Vec<String> = published.into_iter().flatten().collect();
+        assert_eq!(flattened, ["r1", "r1", "r2"]);
+        assert_eq!(
+            publisher.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "three failed attempts, then the retried batch and the queued batch"
+        );
+
+        cancellation_token.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replica_publish_retry_stops_on_cancellation() {
+        let publisher = Arc::new(FlakyBatchPublisher {
+            fail_first: usize::MAX,
+            attempts: Default::default(),
+            published: Default::default(),
+        });
+        let cancellation_token = CancellationToken::new();
+        let retry = tokio::spawn({
+            let publisher = publisher.clone();
+            let cancellation_token = cancellation_token.clone();
+            async move {
+                publish_replica_batch(&publisher, vec![free_event("r1")], &cancellation_token).await
+            }
+        });
+        // Retries keep going (capped at 1 s) while the transport stays down.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert!(publisher.attempts.load(std::sync::atomic::Ordering::SeqCst) > 5);
+        cancellation_token.cancel();
+        assert!(!retry.await.unwrap(), "cancellation abandons the batch");
+        assert!(publisher.published.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
