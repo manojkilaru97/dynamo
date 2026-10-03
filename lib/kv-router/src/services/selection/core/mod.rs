@@ -492,6 +492,19 @@ impl SelectionCore {
             self.kv_router_config.clone(),
             block_size,
         ));
+        // The selection service only runs the built-in selector; refuse a document that selects
+        // a worker-selection policy rather than silently measuring the default policy.
+        if self
+            .kv_router_config
+            .selects_worker_selection_policy()
+            .map_err(|error| SelectionError::BadRequest(error.to_string()))?
+        {
+            return Err(SelectionError::BadRequest(
+                "router_policy_config selects a worker_selection policy, which the selection \
+                 service does not run; remove worker_selection or route through the frontend"
+                    .to_string(),
+            ));
+        }
         let selector = DefaultWorkerSelector::new(Some(self.kv_router_config.clone()), WORKER_TYPE);
         let profile = self
             .kv_router_config

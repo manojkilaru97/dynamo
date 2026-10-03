@@ -1635,8 +1635,17 @@ async fn create_kv_router_from_endpoint(
         .as_ref()
         .map(|cfg| cfg.use_remote_indexer || cfg.serve_indexer)
         .unwrap_or(false);
+    // A worker-selection policy is chosen per worker pool from the card's worker role, so a
+    // router configured with one must not resolve its stage from a snapshot taken before any
+    // worker registered.
+    let needs_worker_role = match kv_router_config.as_ref() {
+        Some(cfg) => cfg
+            .selects_worker_selection_policy()
+            .map_err(|error| to_pyerr(anyhow::anyhow!("router_policy_config: {error}")))?,
+        None => false,
+    };
     let (model_name, enable_eagle, worker_role) = {
-        let maybe_card = if needs_model_name {
+        let maybe_card = if needs_model_name || needs_worker_role {
             let wait_secs: u64 = std::env::var("DYN_ROUTER_MODEL_CARD_WAIT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1646,7 +1655,9 @@ async fn create_kv_router_from_endpoint(
                 component = %endpoint_id.component,
                 endpoint = %endpoint_id.name,
                 wait_secs,
-                "Waiting for worker model card in discovery (required for remote/served indexer)"
+                needs_model_name,
+                needs_worker_role,
+                "Waiting for worker model card in discovery (required for remote/served indexer or worker_selection)"
             );
             llm_rs::discovery::wait_for_endpoint_model_card(
                 &endpoint.inner,
@@ -1672,6 +1683,21 @@ async fn create_kv_router_from_endpoint(
                     .ok()
             })
         };
+
+        if needs_worker_role
+            && maybe_card
+                .as_ref()
+                .is_none_or(|card| card.worker_type.is_none())
+        {
+            return Err(to_pyerr(anyhow::anyhow!(
+                "router_policy_config selects a worker-selection policy, but no worker model card \
+                 with a worker role registered on {}/{}/{} before the wait expired \
+                 (DYN_ROUTER_MODEL_CARD_WAIT_SECS); refusing to guess the worker pool",
+                endpoint_id.namespace,
+                endpoint_id.component,
+                endpoint_id.name
+            )));
+        }
 
         match maybe_card {
             Some(card) => {

@@ -107,11 +107,26 @@ pub(super) fn replay_slots(
 }
 
 pub(super) fn replay_selector(config: &KvRouterConfig) -> DefaultWorkerSelector {
+    warn_if_worker_selection_ignored(config);
     #[cfg(feature = "replay-bench")]
     return DefaultWorkerSelector::new_seeded(Some(config.clone()), "replay", 0xD1A0_5EED);
 
     #[cfg(not(feature = "replay-bench"))]
     DefaultWorkerSelector::new(Some(config.clone()), "replay")
+}
+
+/// Replay runs the built-in selector; say so when the policy document selects another one, so a
+/// replay A/B of a worker-selection policy is not mistaken for a measurement of it.
+fn warn_if_worker_selection_ignored(config: &KvRouterConfig) {
+    match config.selects_worker_selection_policy() {
+        Ok(false) => {}
+        Ok(true) => tracing::warn!(
+            router_policy_config = ?config.router_policy_config,
+            "replay ignores the worker_selection policy in router_policy_config and uses the \
+             built-in selector"
+        ),
+        Err(error) => tracing::warn!(%error, "replay could not read router_policy_config"),
+    }
 }
 
 pub(crate) fn replay_router_config(

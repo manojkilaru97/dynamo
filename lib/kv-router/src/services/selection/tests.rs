@@ -547,6 +547,35 @@ policy_classes:
 }
 
 #[tokio::test]
+async fn worker_selection_policy_document_is_rejected_not_ignored() {
+    let policy_file = tempfile::NamedTempFile::new().expect("create policy file");
+    std::fs::write(
+        policy_file.path(),
+        r#"
+worker_selection:
+  aggregated: two-tier
+  instances:
+    - name: two-tier
+      type: dynamo-two-tier-cost-fn
+"#,
+    )
+    .expect("write policy file");
+
+    let mut config = test_config();
+    config.router_policy_config = Some(policy_file.path().to_string_lossy().into_owned());
+    let service = Arc::new(SelectionService::new_local_for_test(config, 1));
+    let app = create_router(Arc::new(AppState { service }));
+
+    let response = register_worker(app, None).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert!(
+        body.to_string().contains("worker_selection"),
+        "error should name worker_selection: {body}"
+    );
+}
+
+#[tokio::test]
 async fn select_echoes_selection_id_and_does_not_book_load() {
     let app = app();
     assert_eq!(

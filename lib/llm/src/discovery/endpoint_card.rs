@@ -78,3 +78,75 @@ pub async fn wait_for_endpoint_model_card(
         _ = cancel_token.cancelled() => None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use dynamo_runtime::discovery::DiscoverySpec;
+    use dynamo_runtime::distributed::DistributedConfig;
+    use dynamo_runtime::{DistributedRuntime, Runtime};
+
+    use super::*;
+    use crate::worker_type::WorkerType;
+
+    /// A standalone router that needs the worker role (worker_selection) or model name waits for
+    /// a card registered after it starts, instead of resolving from an empty snapshot.
+    #[tokio::test]
+    async fn waits_for_a_typed_card_registered_after_the_router_starts() {
+        let runtime = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("delayed-card".to_string())
+            .unwrap()
+            .component("decode".to_string())
+            .unwrap()
+            .endpoint("generate");
+        let eid = endpoint.id();
+
+        let snapshot = drt
+            .discovery()
+            .list(DiscoveryQuery::EndpointModels {
+                namespace: eid.namespace.clone(),
+                component: eid.component.clone(),
+                endpoint: eid.name.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(snapshot.is_empty(), "nothing is registered yet");
+
+        let waiter = {
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move {
+                wait_for_endpoint_model_card(&endpoint, Duration::from_secs(30), None).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the wait must block until a card registers"
+        );
+
+        let mut card = ModelDeploymentCard::with_name_only("delayed-model");
+        card.worker_type = Some(WorkerType::Decode);
+        let _registration = drt
+            .discovery()
+            .register(
+                DiscoverySpec::from_model(eid.namespace, eid.component, eid.name, &card).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let found = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the wait must return once the card registers")
+            .unwrap()
+            .unwrap()
+            .expect("card");
+        assert_eq!(found.worker_type, Some(WorkerType::Decode));
+        assert_eq!(found.display_name, "delayed-model");
+
+        drt.shutdown();
+        runtime.shutdown();
+    }
+}
