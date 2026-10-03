@@ -15,7 +15,8 @@ use dynamo_kv_router::selector::WorkerSelector as WorkerSelectorTrait;
 
 use super::metrics::{ROUTER_QUEUE_METRICS, RouterQueueMetricHandles};
 use super::sequence::{
-    RuntimeSequencePublisher, SequenceError, SequenceRequest, create_multi_worker_sequences,
+    ReplicaFlush, RuntimeSequencePublisher, SequenceError, SequenceRequest,
+    create_multi_worker_sequences_with_flush,
 };
 use crate::discovery::RuntimeConfigWatch;
 use crate::local_model::runtime_config::ModelRuntimeConfig;
@@ -69,7 +70,17 @@ where
             workers_with_configs.borrow().clone();
 
         let router_id = endpoint.drt().discovery().instance_id();
-        let slots = create_multi_worker_sequences(
+        // A worker-selection policy reads peers' active-request counts for its load tier, so
+        // publish admissions to replicas without the batching linger.
+        let replica_flush = if kv_router_config
+            .selects_worker_selection_policy()
+            .unwrap_or(false)
+        {
+            ReplicaFlush::Immediate
+        } else {
+            ReplicaFlush::Linger
+        };
+        let slots = create_multi_worker_sequences_with_flush(
             endpoint,
             block_size as usize,
             initial_workers,
@@ -77,6 +88,7 @@ where
             router_id,
             worker_type,
             cancellation_token.child_token(),
+            replica_flush,
         )
         .await
         .map_err(|e| KvSchedulerError::InitFailed(e.to_string()))?;

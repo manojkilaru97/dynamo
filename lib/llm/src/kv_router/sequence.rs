@@ -246,13 +246,36 @@ async fn publish_replica_batch(publisher: &EventPublisher, events: Vec<ActiveSeq
     }
 }
 
+/// How the ZMQ replica publisher groups outbound active-sequence events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplicaFlush {
+    /// Hold the first event up to [`MAX_REPLICA_BATCH_DURATION`] to fill a batch.
+    #[default]
+    Linger,
+    /// Publish as soon as an event is queued, batching only events already waiting. Used when a
+    /// worker-selection policy reads peers' active-request counts, so admissions reach peers
+    /// without the batching delay.
+    Immediate,
+}
+
 async fn collect_replica_batch(
     first_event: ActiveSequenceEvent,
     event_rx: &mut mpsc::Receiver<ActiveSequenceEvent>,
     cancellation_token: &CancellationToken,
+    flush: ReplicaFlush,
 ) -> (Vec<ActiveSequenceEvent>, bool) {
     let mut events = Vec::with_capacity(MAX_REPLICA_BATCH_EVENTS);
     events.push(first_event);
+    if flush == ReplicaFlush::Immediate {
+        while events.len() < MAX_REPLICA_BATCH_EVENTS {
+            match event_rx.try_recv() {
+                Ok(event) => events.push(event),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => return (events, true),
+            }
+        }
+        return (events, cancellation_token.is_cancelled());
+    }
     let deadline = Instant::now() + MAX_REPLICA_BATCH_DURATION;
     let flush_timer = tokio::time::sleep_until(deadline);
     tokio::pin!(flush_timer);
@@ -275,6 +298,7 @@ async fn run_replica_batch_publisher(
     publisher: EventPublisher,
     mut event_rx: mpsc::Receiver<ActiveSequenceEvent>,
     cancellation_token: CancellationToken,
+    flush: ReplicaFlush,
 ) {
     loop {
         let first_event = tokio::select! {
@@ -285,7 +309,7 @@ async fn run_replica_batch_publisher(
             },
         };
         let (events, stop_after_flush) =
-            collect_replica_batch(first_event, &mut event_rx, &cancellation_token).await;
+            collect_replica_batch(first_event, &mut event_rx, &cancellation_token, flush).await;
         publish_replica_batch(&publisher, events).await;
         if stop_after_flush {
             break;
@@ -391,6 +415,31 @@ pub async fn create_multi_worker_sequences(
     worker_type: &'static str,
     cancellation_token: CancellationToken,
 ) -> Result<Arc<ActiveSequencesMulti>> {
+    create_multi_worker_sequences_with_flush(
+        endpoint,
+        block_size,
+        workers_with_configs,
+        replica_sync,
+        router_id,
+        worker_type,
+        cancellation_token,
+        ReplicaFlush::Linger,
+    )
+    .await
+}
+
+/// [`create_multi_worker_sequences`] with an explicit outbound replica flush mode.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_multi_worker_sequences_with_flush(
+    endpoint: Endpoint,
+    block_size: usize,
+    workers_with_configs: HashMap<u64, ModelRuntimeConfig>,
+    replica_sync: bool,
+    router_id: u64,
+    worker_type: &'static str,
+    cancellation_token: CancellationToken,
+    replica_flush: ReplicaFlush,
+) -> Result<Arc<ActiveSequencesMulti>> {
     let transport_kind = endpoint.drt().default_event_transport_kind();
     let event_sender = if let Some((event_sender, event_rx)) = active_sequence_event_channel(
         replica_sync,
@@ -417,6 +466,7 @@ pub async fn create_multi_worker_sequences(
                     event_publisher,
                     event_rx,
                     publisher_cancellation_token,
+                    replica_flush,
                 ));
             }
         }
@@ -703,8 +753,13 @@ mod tests {
 
         let first = event_rx.recv().await.unwrap();
         let start = Instant::now();
-        let (events, stop) =
-            collect_replica_batch(first, &mut event_rx, &CancellationToken::new()).await;
+        let (events, stop) = collect_replica_batch(
+            first,
+            &mut event_rx,
+            &CancellationToken::new(),
+            ReplicaFlush::Linger,
+        )
+        .await;
         assert!(!stop);
         assert_eq!(events.len(), 100);
         assert_eq!(Instant::now() - start, MAX_REPLICA_BATCH_DURATION);
@@ -725,8 +780,13 @@ mod tests {
         }
         let first = event_rx.recv().await.unwrap();
         let start = Instant::now();
-        let (events, stop) =
-            collect_replica_batch(first, &mut event_rx, &CancellationToken::new()).await;
+        let (events, stop) = collect_replica_batch(
+            first,
+            &mut event_rx,
+            &CancellationToken::new(),
+            ReplicaFlush::Linger,
+        )
+        .await;
         assert!(!stop);
         assert_eq!(events.len(), MAX_REPLICA_BATCH_EVENTS);
         assert_eq!(Instant::now(), start);
@@ -734,11 +794,69 @@ mod tests {
 
         let last = event_rx.recv().await.unwrap();
         let start = Instant::now();
-        let (remaining, stop) =
-            collect_replica_batch(last, &mut event_rx, &CancellationToken::new()).await;
+        let (remaining, stop) = collect_replica_batch(
+            last,
+            &mut event_rx,
+            &CancellationToken::new(),
+            ReplicaFlush::Linger,
+        )
+        .await;
         assert!(!stop);
         assert_eq!(remaining.len(), 1);
         assert_eq!(Instant::now() - start, MAX_REPLICA_BATCH_DURATION);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn immediate_replica_flush_publishes_without_lingering() {
+        let (event_tx, mut event_rx) = mpsc::channel(MAX_REPLICA_BATCH_EVENTS + 8);
+        // A lone admission is published at once instead of after the 1 ms linger.
+        event_tx.send(free_event("lone".to_string())).await.unwrap();
+        let first = event_rx.recv().await.unwrap();
+        let start = Instant::now();
+        let (events, stop) = collect_replica_batch(
+            first,
+            &mut event_rx,
+            &CancellationToken::new(),
+            ReplicaFlush::Immediate,
+        )
+        .await;
+        assert!(!stop);
+        assert_eq!(events.len(), 1);
+        assert_eq!(Instant::now(), start);
+
+        // Events already queued ride along, still capped at the batch size, with no waiting.
+        for request_id in 0..MAX_REPLICA_BATCH_EVENTS + 3 {
+            event_tx
+                .send(free_event(format!("queued-{request_id}")))
+                .await
+                .unwrap();
+        }
+        let first = event_rx.recv().await.unwrap();
+        let start = Instant::now();
+        let (events, stop) = collect_replica_batch(
+            first,
+            &mut event_rx,
+            &CancellationToken::new(),
+            ReplicaFlush::Immediate,
+        )
+        .await;
+        assert!(!stop);
+        assert_eq!(events.len(), MAX_REPLICA_BATCH_EVENTS);
+        assert_eq!(Instant::now(), start);
+        assert_eq!(event_rx.len(), 3);
+
+        // A closed channel stops the publisher after this flush.
+        let first = event_rx.recv().await.unwrap();
+        drop(event_tx);
+        let (events, stop) = collect_replica_batch(
+            first,
+            &mut event_rx,
+            &CancellationToken::new(),
+            ReplicaFlush::Immediate,
+        )
+        .await;
+        assert_eq!(events.len(), 3);
+        assert!(stop);
     }
 
     #[test]
