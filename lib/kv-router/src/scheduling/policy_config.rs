@@ -10,8 +10,7 @@ use thiserror::Error;
 
 use super::worker_selection_config::RawWorkerSelectionConfig;
 pub use super::worker_selection_config::{
-    WorkerSelectionConfig, WorkerSelectionInstance, WorkerSelectionPolicyKind,
-    WorkerSelectionStage,
+    WorkerSelectionConfig, WorkerSelectionInstance, WorkerSelectionPolicyKind, WorkerSelectionStage,
 };
 use super::{config::RouterQueuePolicy, queue_admission::AdmissionPolicyConfig};
 

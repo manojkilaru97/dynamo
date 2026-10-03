@@ -1278,6 +1278,7 @@ impl ModelManager {
             kv_router_config.clone(),
             metric_worker_type,
             worker_selection_stage(worker_role, metric_worker_type),
+            is_eagle,
         )
         .map_err(|error| anyhow::anyhow!("router_policy_config: {error}"))?;
 
@@ -2244,7 +2245,10 @@ mod tests {
             (WorkerType::Encode, WorkerSelectionStage::Encode),
             (WorkerType::Aggregated, WorkerSelectionStage::Aggregated),
         ] {
-            assert_eq!(worker_selection_stage(Some(role), WORKER_TYPE_DECODE), stage);
+            assert_eq!(
+                worker_selection_stage(Some(role), WORKER_TYPE_DECODE),
+                stage
+            );
         }
         // Aggregated workers route through the "decode" label; a card without a role is
         // aggregated unless routed as prefill.

@@ -1006,6 +1006,27 @@ impl KvRouterConfig {
             .and_then(|selection| selection.policy_for(stage)))
     }
 
+    /// Whether `router_policy_config` selects a worker-selection policy for any worker pool.
+    ///
+    /// Hosts that cannot tell which pool they serve (or only run the built-in selector) use this
+    /// to wait for the worker role or to reject a document they would otherwise ignore.
+    pub fn selects_worker_selection_policy(
+        &self,
+    ) -> Result<bool, super::policy_config::RouterPolicyConfigError> {
+        use super::policy_config::WorkerSelectionStage;
+        for stage in [
+            WorkerSelectionStage::Aggregated,
+            WorkerSelectionStage::Prefill,
+            WorkerSelectionStage::Decode,
+            WorkerSelectionStage::Encode,
+        ] {
+            if self.worker_selection_policy(stage)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn policy_profile(
         &self,
         model_name: Option<&str>,
@@ -1678,6 +1699,51 @@ mod tests {
             config.router_queue_recheck_interval(),
             Duration::from_millis(100)
         );
+    }
+
+    fn worker_selection_only_policy_file() -> tempfile::NamedTempFile {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(
+            b"worker_selection:\n  decode: two-tier\n  instances:\n    - name: two-tier\n      type: dynamo-two-tier-cost-fn\n",
+        )
+        .unwrap();
+        file
+    }
+
+    #[test]
+    fn worker_selection_only_policy_keeps_slow_recheck_with_prefill_load_model() {
+        let file = worker_selection_only_policy_file();
+        let config = KvRouterConfig {
+            router_prefill_load_model: RouterPrefillLoadModel::Aic,
+            router_policy_config: Some(file.path().display().to_string()),
+            router_queue_threshold: None,
+            ..Default::default()
+        };
+        config.validate().unwrap();
+
+        // The document has no queue profiles, so it must not switch on the fast recheck.
+        assert_eq!(
+            config.router_queue_recheck_interval(),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn selects_worker_selection_policy_reports_any_stage() {
+        assert!(
+            !KvRouterConfig::default()
+                .selects_worker_selection_policy()
+                .unwrap()
+        );
+
+        let file = worker_selection_only_policy_file();
+        let config = KvRouterConfig {
+            router_policy_config: Some(file.path().display().to_string()),
+            ..Default::default()
+        };
+        assert!(config.selects_worker_selection_policy().unwrap());
     }
 
     #[test]

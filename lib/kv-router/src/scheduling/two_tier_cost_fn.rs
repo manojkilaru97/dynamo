@@ -15,8 +15,8 @@
 //! 1. Load tier: if active-request spread exceeds `balance_abs_threshold` and the largest count
 //!    exceeds `balance_rel_threshold` times the smallest, select the least-loaded worker.
 //! 2. Cache tier: otherwise, if the largest *effective* KV overlap is strictly greater than
-//!    `cache_threshold` of the request's block count, select the least-loaded worker holding that
-//!    maximum overlap. Effective overlap is device-resident blocks plus host-pinned (CPU offload)
+//!    `cache_threshold` of the request's matchable (complete) block count, select the
+//!    least-loaded worker holding that maximum overlap. Effective overlap is device-resident blocks plus host-pinned (CPU offload)
 //!    blocks scaled by `host_cache_weight`, so a worker holding the prefix in CPU can win the cache
 //!    tier over one holding nothing, while still losing to an equal device-resident hit.
 //! 3. Otherwise, select the least-loaded worker.
@@ -36,6 +36,16 @@
 //! `BlockStored(medium=CPU)` events, including the token-less lazy-offload stores the ZMQ wire
 //! layer completes from device identities (`zmq_wire`, `DYN_KV_ROUTER_FILL_LOWER_TIER`). Device
 //! and host overlap are therefore disjoint prefix measurements, so they add rather than max.
+//!
+//! Deviation from upstream: the cache-tier ratio divides by the request's *complete* block count
+//! (`isl / block_size`, or `(isl - 1) / block_size` for Eagle), the blocks the indexer can match,
+//! instead of upstream's `isl.div_ceil(block_size)`. Overlap only ever counts complete blocks, so
+//! with the ceiled denominator a full prefix hit on a prompt with a partial tail block can sit at
+//! exactly the threshold and be rejected; with this branch's 4336-token blocks that disabled the
+//! cache tier for every 4.3k-8.7k-token prompt. The ceiled count still sizes admission.
+//!
+//! Absent device overlap counts as 0.0, as upstream supplies it: the policy never substitutes the
+//! weighted effective overlap for the device column.
 //!
 //! Ties between equally ranked workers resolve on candidate row order, which the host leaves
 //! unspecified. This matches the ported implementation; note that Dynamo's built-in selector
@@ -171,17 +181,19 @@ fn effective_overlap(row: &TwoTierRow, host_cache_weight: f64) -> f64 {
 
 impl TwoTierCostFn {
     /// Return the selected row and the tier that decided it, or `None` for an empty table.
+    ///
+    /// `matchable_blocks` is the request's complete block count, the denominator of the cache
+    /// ratio. This slice form is the reference for [`TwoTierAccumulator`], which the selector uses
+    /// to decide in one allocation-free pass.
     pub fn select_row(
         &self,
         rows: &[TwoTierRow],
-        request_blocks: u64,
+        matchable_blocks: u64,
     ) -> Option<(usize, TwoTierDecision)> {
         let parameters = &self.parameters;
         let min_load = rows.iter().map(|row| row.active_requests).min()?;
         let max_load = rows.iter().map(|row| row.active_requests).max()?;
-        if max_load.saturating_sub(min_load) > parameters.balance_abs_threshold
-            && (max_load as f64) > parameters.balance_rel_threshold * (min_load as f64)
-        {
+        if self.load_tier_applies(min_load, max_load) {
             return least_loaded(rows, 0..rows.len()).map(|row| (row, TwoTierDecision::Load));
         }
 
@@ -189,25 +201,96 @@ impl TwoTierCostFn {
             .iter()
             .map(|row| effective_overlap(row, self.host_cache_weight))
             .max_by(f64::total_cmp)?;
-        let cache_ratio = if request_blocks == 0 {
-            0.0
-        } else {
-            max_overlap / request_blocks as f64
-        };
-        if cache_ratio > parameters.cache_threshold {
+        if self.cache_ratio(max_overlap, matchable_blocks) > parameters.cache_threshold {
             return least_loaded(
                 rows,
                 rows.iter().enumerate().filter_map(|(index, row)| {
                     // Recomputed identically to `max_overlap`, so the equality is exact, not a
                     // tolerance comparison on independently derived floats.
-                    (effective_overlap(row, self.host_cache_weight) == max_overlap)
-                        .then_some(index)
+                    (effective_overlap(row, self.host_cache_weight) == max_overlap).then_some(index)
                 }),
             )
             .map(|row| (row, TwoTierDecision::Cache));
         }
 
         least_loaded(rows, 0..rows.len()).map(|row| (row, TwoTierDecision::LeastLoaded))
+    }
+
+    fn cache_ratio(&self, max_overlap: f64, matchable_blocks: u64) -> f64 {
+        if matchable_blocks == 0 {
+            0.0
+        } else {
+            max_overlap / matchable_blocks as f64
+        }
+    }
+
+    fn load_tier_applies(&self, min_load: usize, max_load: usize) -> bool {
+        max_load.saturating_sub(min_load) > self.parameters.balance_abs_threshold
+            && (max_load as f64) > self.parameters.balance_rel_threshold * (min_load as f64)
+    }
+
+    /// Start a single-pass decision over candidates fed through [`TwoTierAccumulator::push`].
+    pub fn accumulator<T: Copy>(&self) -> TwoTierAccumulator<'_, T> {
+        TwoTierAccumulator {
+            policy: self,
+            min_load: usize::MAX,
+            max_load: 0,
+            least_loaded: None,
+            cache_best: None,
+        }
+    }
+}
+
+/// Allocation-free, single-pass form of [`TwoTierCostFn::select_row`].
+///
+/// Candidates are pushed in row order; the result is identical to `select_row` over the same rows,
+/// including first-row tie resolution: the least-loaded row is the first with the minimum count,
+/// and the cache winner is the first least-loaded row among those at the maximum effective overlap.
+pub struct TwoTierAccumulator<'a, T> {
+    policy: &'a TwoTierCostFn,
+    min_load: usize,
+    max_load: usize,
+    least_loaded: Option<(T, TwoTierRow)>,
+    cache_best: Option<(T, TwoTierRow, f64)>,
+}
+
+impl<T: Copy> TwoTierAccumulator<'_, T> {
+    pub fn push(&mut self, item: T, row: TwoTierRow) {
+        let load = row.active_requests;
+        self.min_load = self.min_load.min(load);
+        self.max_load = self.max_load.max(load);
+        if self
+            .least_loaded
+            .is_none_or(|(_, best)| load < best.active_requests)
+        {
+            self.least_loaded = Some((item, row));
+        }
+        let overlap = effective_overlap(&row, self.policy.host_cache_weight);
+        let replace = match self.cache_best {
+            None => true,
+            Some((_, best, best_overlap)) => {
+                overlap > best_overlap || (overlap == best_overlap && load < best.active_requests)
+            }
+        };
+        if replace {
+            self.cache_best = Some((item, row, overlap));
+        }
+    }
+
+    /// Return the selected candidate, its row and the deciding tier, or `None` if nothing was
+    /// pushed.
+    pub fn finish(self, matchable_blocks: u64) -> Option<(T, TwoTierRow, TwoTierDecision)> {
+        let (least_item, least_row) = self.least_loaded?;
+        if self.policy.load_tier_applies(self.min_load, self.max_load) {
+            return Some((least_item, least_row, TwoTierDecision::Load));
+        }
+        if let Some((item, row, overlap)) = self.cache_best
+            && self.policy.cache_ratio(overlap, matchable_blocks)
+                > self.policy.parameters.cache_threshold
+        {
+            return Some((item, row, TwoTierDecision::Cache));
+        }
+        Some((least_item, least_row, TwoTierDecision::LeastLoaded))
     }
 }
 
@@ -226,7 +309,10 @@ mod tests {
 
     /// Select among two workers given as `(device_blocks, host_blocks, active_requests)`;
     /// returns 0 for A and 1 for B.
-    fn select_tiers(parameters: TwoTierCostFnParameters, rows: [(usize, usize, usize); 2]) -> usize {
+    fn select_tiers(
+        parameters: TwoTierCostFnParameters,
+        rows: [(usize, usize, usize); 2],
+    ) -> usize {
         let rows = rows.map(|(device, host, active)| TwoTierRow {
             device_overlap_blocks: device as f64,
             host_overlap_blocks: host as f64,
@@ -393,12 +479,61 @@ mod tests {
             TwoTierCostFnParameters::default()
         );
 
-        let typo: serde_yaml::Value = serde_yaml::from_str("cache_affinity_threshold: 0.3").unwrap();
+        let typo: serde_yaml::Value =
+            serde_yaml::from_str("cache_affinity_threshold: 0.3").unwrap();
         let error = TwoTierCostFnParameters::from_yaml(&typo).unwrap_err();
         assert!(error.contains("cache_affinity_threshold"), "{error}");
 
         let bad: serde_yaml::Value = serde_yaml::from_str("cache_threshold: 2.0").unwrap();
         assert!(TwoTierCostFnParameters::from_yaml(&bad).is_err());
+    }
+
+    #[test]
+    fn accumulator_matches_select_row() {
+        // Deterministic LCG so the comparison covers ties, both tiers and the load gate without a
+        // test-only RNG dependency.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+        for weight in [0.0, 0.75, 1.0] {
+            let parameters = TwoTierCostFnParameters {
+                host_cache_weight: Some(weight),
+                ..Default::default()
+            };
+            let p = policy(parameters);
+            for _ in 0..2000 {
+                let len = 1 + next(8) as usize;
+                let spread = [4, 40, 800][next(3) as usize];
+                let rows: Vec<TwoTierRow> = (0..len)
+                    .map(|_| TwoTierRow {
+                        device_overlap_blocks: next(6) as f64,
+                        host_overlap_blocks: next(6) as f64,
+                        active_requests: next(spread) as usize,
+                    })
+                    .collect();
+                let blocks = next(12);
+                let expected = p.select_row(&rows, blocks);
+                let mut acc = p.accumulator::<usize>();
+                for (index, row) in rows.iter().enumerate() {
+                    acc.push(index, *row);
+                }
+                let actual = acc.finish(blocks).map(|(index, row, decision)| {
+                    assert_eq!(row, rows[index]);
+                    (index, decision)
+                });
+                assert_eq!(actual, expected, "rows={rows:?} blocks={blocks}");
+            }
+        }
+        assert!(
+            policy(TwoTierCostFnParameters::default())
+                .accumulator::<usize>()
+                .finish(10)
+                .is_none()
+        );
     }
 
     #[test]

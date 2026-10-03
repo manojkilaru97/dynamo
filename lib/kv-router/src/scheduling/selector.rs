@@ -11,15 +11,28 @@ use rustc_hash::FxHashMap;
 
 use super::config::KvRouterConfig;
 use super::filter::{RoutingEligibility, WorkerEligibilityError};
-use super::policy_config::{RouterPolicyConfigError, WorkerSelectionPolicyKind, WorkerSelectionStage};
+use super::policy_config::{
+    RouterPolicyConfigError, WorkerSelectionPolicyKind, WorkerSelectionStage,
+};
 use super::two_tier_cost_fn::{self, TwoTierCostFn, TwoTierRow};
 use super::types::{KvSchedulerError, SchedulingRequest};
+use crate::protocols::complete_block_count;
 use crate::protocols::{WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank};
 
 /// A trait that users can implement to define custom selection logic.
 ///
 /// Generic over `C` so that the scheduling layer does not depend on a concrete config type.
 pub trait WorkerSelector<C: WorkerConfigLike> {
+    /// Whether a session-affinity binding should be enforced as a hard pin.
+    ///
+    /// The built-in selector treats an affinity target as exclusive. A worker-selection policy
+    /// (e.g. `dynamo-two-tier-cost-fn`) receives it as advisory, as upstream custom policies do, so
+    /// its load tier can move a session off an overloaded worker. Explicit routing pins are always
+    /// enforced.
+    fn uses_exclusive_affinity_target(&self) -> bool {
+        true
+    }
+
     fn select_worker(
         &self,
         workers: &HashMap<WorkerId, C>,
@@ -111,7 +124,11 @@ pub struct DefaultWorkerSelector {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SelectedWorkerPolicy {
-    TwoTierCostFn(TwoTierCostFn),
+    /// `is_eagle` selects Eagle's shifted token windows when counting a request's complete blocks.
+    TwoTierCostFn {
+        policy: TwoTierCostFn,
+        is_eagle: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -135,10 +152,14 @@ impl DefaultWorkerSelector {
 
     /// Build the selector for one worker pool, applying the worker-selection policy that
     /// `router_policy_config` selects for `stage` (upstream `worker_selection.<stage>`).
+    ///
+    /// `is_eagle` must match the router's block hashing, so the policy's cache ratio counts the
+    /// same complete blocks the indexer matches.
     pub fn for_stage(
         kv_router_config: Option<KvRouterConfig>,
         worker_type: &'static str,
         stage: WorkerSelectionStage,
+        is_eagle: bool,
     ) -> Result<Self, RouterPolicyConfigError> {
         let mut selector = Self::new(kv_router_config, worker_type);
         selector.worker_selection_policy = selector
@@ -146,13 +167,17 @@ impl DefaultWorkerSelector {
             .worker_selection_policy(stage)?
             .map(|kind| match kind {
                 WorkerSelectionPolicyKind::TwoTierCostFn(parameters) => {
-                    SelectedWorkerPolicy::TwoTierCostFn(TwoTierCostFn::new(
-                        parameters,
-                        selector.kv_router_config.host_cache_hit_weight,
-                    ))
+                    SelectedWorkerPolicy::TwoTierCostFn {
+                        policy: TwoTierCostFn::new(
+                            parameters,
+                            selector.kv_router_config.host_cache_hit_weight,
+                        ),
+                        is_eagle,
+                    }
                 }
             });
-        if let Some(SelectedWorkerPolicy::TwoTierCostFn(policy)) = selector.worker_selection_policy
+        if let Some(SelectedWorkerPolicy::TwoTierCostFn { policy, .. }) =
+            selector.worker_selection_policy
         {
             tracing::info!(
                 worker_type,
@@ -171,46 +196,46 @@ impl DefaultWorkerSelector {
     /// The shipped policy type this selector runs, or `None` for the built-in cost function.
     pub fn worker_selection_policy_type(&self) -> Option<&'static str> {
         self.worker_selection_policy.map(|policy| match policy {
-            SelectedWorkerPolicy::TwoTierCostFn(_) => two_tier_cost_fn::POLICY_TYPE,
+            SelectedWorkerPolicy::TwoTierCostFn { .. } => two_tier_cost_fn::POLICY_TYPE,
         })
     }
 
     /// Select among eligible workers with the two-tier cost function.
+    ///
+    /// One pass over the eligible ranks, with no allocation: device overlap is the indexed device
+    /// prefix (0.0 when absent, as upstream supplies it), host overlap the host-pinned
+    /// continuation, and load the router's active-request count.
     fn select_two_tier<C: WorkerConfigLike>(
         &self,
         policy: &TwoTierCostFn,
+        is_eagle: bool,
         workers: &HashMap<WorkerId, C>,
         request: &SchedulingRequest,
         eligibility: RoutingEligibility<'_>,
         block_size: u32,
     ) -> Result<WorkerSelectionResult, KvSchedulerError> {
         let tiers = &request.overlap.tier_overlap_blocks;
-        // Without indexed tier blocks (e.g. approximate routing) fall back to the effective
-        // overlap for the device column, as the built-in selector does.
-        let has_tier_overlap_blocks =
-            !tiers.device.is_empty() || !tiers.host_pinned.is_empty() || !tiers.disk.is_empty();
-        let mut candidates = Vec::new();
-        let mut rows = Vec::new();
+        let mut candidates = 0usize;
+        let mut accumulator = policy.accumulator::<WorkerWithDpRank>();
         eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
-            let device_overlap_blocks = match tiers.device.get(&worker) {
-                Some(&blocks) => blocks as f64,
-                None if has_tier_overlap_blocks => 0.0,
-                None => request.effective_overlap_blocks_for(worker),
-            };
-            candidates.push(worker);
-            rows.push(TwoTierRow {
-                device_overlap_blocks,
-                host_overlap_blocks: tiers.host_pinned.get(&worker).copied().unwrap_or(0) as f64,
-                active_requests: request.worker_load_for(worker).active_requests,
-            });
+            candidates += 1;
+            accumulator.push(
+                worker,
+                TwoTierRow {
+                    device_overlap_blocks: tiers.device.get(&worker).copied().unwrap_or(0) as f64,
+                    host_overlap_blocks: tiers.host_pinned.get(&worker).copied().unwrap_or(0)
+                        as f64,
+                    active_requests: request.worker_load_for(worker).active_requests,
+                },
+            );
         });
 
         let request_blocks = request.request_blocks(block_size);
-        let Some((row, decision)) = policy.select_row(&rows, request_blocks) else {
+        let matchable_blocks =
+            complete_block_count(request.isl_tokens, block_size, is_eagle) as u64;
+        let Some((worker, selected, decision)) = accumulator.finish(matchable_blocks) else {
             return Err(KvSchedulerError::NoEndpoints);
         };
-        let worker = candidates[row];
-        let selected = rows[row];
         let effective_overlap_blocks = request.effective_overlap_blocks_for(worker);
         let total_kv_blocks = workers
             .get(&worker.worker_id)
@@ -223,8 +248,9 @@ impl DefaultWorkerSelector {
             dp_rank = ?worker.dp_rank,
             policy = two_tier_cost_fn::POLICY_TYPE,
             tier = decision.as_str(),
-            candidates = rows.len(),
+            candidates,
             request_blocks,
+            matchable_blocks,
             device_blocks = selected.device_overlap_blocks,
             host_pinned_blocks = selected.host_overlap_blocks,
             active_requests = selected.active_requests,
@@ -431,6 +457,10 @@ impl DefaultWorkerSelector {
 }
 
 impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
+    fn uses_exclusive_affinity_target(&self) -> bool {
+        self.worker_selection_policy.is_none()
+    }
+
     fn select_worker(
         &self,
         workers: &HashMap<WorkerId, C>,
@@ -527,8 +557,17 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             });
         }
 
-        if let Some(SelectedWorkerPolicy::TwoTierCostFn(policy)) = &self.worker_selection_policy {
-            return self.select_two_tier(policy, workers, request, eligibility, block_size);
+        if let Some(SelectedWorkerPolicy::TwoTierCostFn { policy, is_eagle }) =
+            &self.worker_selection_policy
+        {
+            return self.select_two_tier(
+                policy,
+                *is_eagle,
+                workers,
+                request,
+                eligibility,
+                block_size,
+            );
         }
 
         let temperature = request
@@ -1893,6 +1932,14 @@ mod tests {
     }
 
     fn two_tier_selector(yaml: &str, config: KvRouterConfig) -> DefaultWorkerSelector {
+        two_tier_selector_with(yaml, config, false)
+    }
+
+    fn two_tier_selector_with(
+        yaml: &str,
+        config: KvRouterConfig,
+        is_eagle: bool,
+    ) -> DefaultWorkerSelector {
         use std::io::Write;
 
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -1902,8 +1949,13 @@ mod tests {
             ..config
         };
         // The policy document is parsed and cached during construction, so the file may go.
-        DefaultWorkerSelector::for_stage(Some(config), "decode", WorkerSelectionStage::Aggregated)
-            .unwrap()
+        DefaultWorkerSelector::for_stage(
+            Some(config),
+            "decode",
+            WorkerSelectionStage::Aggregated,
+            is_eagle,
+        )
+        .unwrap()
     }
 
     const TWO_TIER_YAML: &str = r#"
@@ -1917,10 +1969,22 @@ worker_selection:
     /// Request of ten 16-token blocks over workers given as
     /// `(worker_id, device_blocks, host_blocks, active_requests)`.
     fn two_tier_request(workers: &[(u64, usize, usize, usize)]) -> SchedulingRequest {
-        let mut request = base_request(160);
+        two_tier_request_isl(160, workers)
+    }
+
+    /// As [`two_tier_request`] with an explicit prompt length in tokens (16-token blocks).
+    fn two_tier_request_isl(
+        isl_tokens: usize,
+        workers: &[(u64, usize, usize, usize)],
+    ) -> SchedulingRequest {
+        let mut request = base_request(isl_tokens);
         for &(id, device, host, active) in workers {
             let worker = WorkerWithDpRank::from_worker_id(id);
-            request.overlap.tier_overlap_blocks.device.insert(worker, device);
+            request
+                .overlap
+                .tier_overlap_blocks
+                .device
+                .insert(worker, device);
             request
                 .overlap
                 .tier_overlap_blocks
@@ -1957,9 +2021,16 @@ worker_selection:
 
     #[test]
     fn stage_without_worker_selection_keeps_builtin_selector() {
-        let selector =
-            DefaultWorkerSelector::for_stage(None, "decode", WorkerSelectionStage::Aggregated)
-                .unwrap();
+        let selector = DefaultWorkerSelector::for_stage(
+            None,
+            "decode",
+            WorkerSelectionStage::Aggregated,
+            false,
+        )
+        .unwrap();
+        assert!(<DefaultWorkerSelector as WorkerSelector<
+            TaintedWorkerConfig,
+        >>::uses_exclusive_affinity_target(&selector));
         assert_eq!(selector.worker_selection_policy_type(), None);
 
         // A document that selects the policy only for prefill leaves aggregated on the built-in.
@@ -1973,16 +2044,25 @@ worker_selection:
         use std::io::Write;
 
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(TWO_TIER_YAML.replace("type: dynamo-two-tier-cost-fn", "type: nope").as_bytes())
-            .unwrap();
+        file.write_all(
+            TWO_TIER_YAML
+                .replace("type: dynamo-two-tier-cost-fn", "type: nope")
+                .as_bytes(),
+        )
+        .unwrap();
         let config = KvRouterConfig {
             router_policy_config: Some(file.path().display().to_string()),
             ..Default::default()
         };
         assert!(config.validate().is_err());
         assert!(
-            DefaultWorkerSelector::for_stage(Some(config), "decode", WorkerSelectionStage::Aggregated)
-                .is_err()
+            DefaultWorkerSelector::for_stage(
+                Some(config),
+                "decode",
+                WorkerSelectionStage::Aggregated,
+                false,
+            )
+            .is_err()
         );
     }
 
@@ -1999,6 +2079,74 @@ worker_selection:
         assert_eq!(result.worker.worker_id, 2);
         assert_eq!(result.required_blocks, 10);
         assert_eq!(result.effective_overlap_blocks, 6.0);
+    }
+
+    #[test]
+    fn two_tier_policy_treats_affinity_as_advisory() {
+        let selector = two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default());
+        assert!(!<DefaultWorkerSelector as WorkerSelector<
+            TaintedWorkerConfig,
+        >>::uses_exclusive_affinity_target(&selector));
+    }
+
+    #[test]
+    fn two_tier_cache_ratio_uses_complete_blocks() {
+        let selector = two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default());
+        let pick = |isl, workers: &[(u64, usize, usize, usize)]| {
+            let request = two_tier_request_isl(isl, workers);
+            select_ids(&selector, &request, &[1, 2]).worker.worker_id
+        };
+        // 1 complete block + 1-token tail: a full hit is 1/1, not 1/2 = 0.5 (rejected upstream).
+        assert_eq!(pick(17, &[(1, 0, 0, 0), (2, 1, 0, 4)]), 2);
+        // 5 complete + 3-token tail: 3 device blocks are 3/5 = 0.6, not 3/6 = 0.5.
+        assert_eq!(pick(83, &[(1, 0, 0, 0), (2, 3, 0, 4)]), 2);
+        // Same with CPU blocks: 4 host blocks at 0.75 are 3.0 effective, 3/5 = 0.6.
+        assert_eq!(pick(83, &[(1, 0, 0, 0), (2, 0, 4, 4)]), 2);
+        // Exact boundary on the complete count stays strict: 10 complete + tail, 2 device +
+        // 4 host * 0.75 = 5.0 effective = 5/10 = 0.5, so load decides.
+        assert_eq!(pick(165, &[(1, 0, 0, 0), (2, 2, 4, 4)]), 1);
+        // Below one complete block nothing can match; least-loaded wins.
+        assert_eq!(pick(15, &[(1, 0, 0, 0), (2, 0, 0, 4)]), 1);
+        // The ceiled count still sizes admission.
+        let request = two_tier_request_isl(83, &[(1, 0, 0, 0), (2, 3, 0, 4)]);
+        assert_eq!(select_ids(&selector, &request, &[1, 2]).required_blocks, 6);
+    }
+
+    #[test]
+    fn two_tier_cache_ratio_counts_eagle_windows() {
+        // Eagle hashes (isl - 1) / block_size complete blocks: 160 tokens are 9 blocks, so 5
+        // device blocks are 5/9 > 0.5; without Eagle they are 5/10 = 0.5 and load decides.
+        let request = two_tier_request_isl(160, &[(1, 0, 0, 0), (2, 5, 0, 4)]);
+        let eagle = two_tier_selector_with(TWO_TIER_YAML, KvRouterConfig::default(), true);
+        assert_eq!(select_ids(&eagle, &request, &[1, 2]).worker.worker_id, 2);
+        let plain = two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default());
+        assert_eq!(select_ids(&plain, &request, &[1, 2]).worker.worker_id, 1);
+    }
+
+    #[test]
+    fn two_tier_policy_does_not_receive_effective_overlap_as_device_overlap() {
+        // Equivalent of upstream custom_policy_does_not_receive_effective_overlap_as_device_overlap:
+        // with no tier maps, worker 2's six effective blocks are not device blocks, so the idle
+        // worker 1 wins instead of the cache tier picking worker 2.
+        let selector = two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default());
+        let mut request = base_request(160);
+        let (cold, warm) = (
+            WorkerWithDpRank::from_worker_id(1),
+            WorkerWithDpRank::from_worker_id(2),
+        );
+        request.overlap.effective_overlap_blocks.insert(warm, 6.0);
+        request.overlap.effective_cached_tokens.insert(warm, 96);
+        for (worker, active_requests) in [(cold, 0), (warm, 4)] {
+            request.worker_loads.insert(
+                worker,
+                crate::sequences::WorkerLoadProjection {
+                    active_requests,
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(request.overlap.tier_overlap_blocks.device.is_empty());
+        assert_eq!(select_ids(&selector, &request, &[1, 2]).worker, cold);
     }
 
     #[test]
@@ -2027,7 +2175,8 @@ worker_selection:
         assert_eq!(select_ids(&selector, &request, &[1, 2]).worker.worker_id, 1);
 
         // An instance override wins over the router weight.
-        let overridden = format!("{TWO_TIER_YAML}      parameters:\n        host_cache_weight: 1.0\n");
+        let overridden =
+            format!("{TWO_TIER_YAML}      parameters:\n        host_cache_weight: 1.0\n");
         let selector = two_tier_selector(
             &overridden,
             KvRouterConfig {
