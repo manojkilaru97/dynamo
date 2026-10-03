@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::env::{self, VarError};
+
+/// Override of the worker-selection policy for every worker pool (upstream name).
+pub const DYN_ROUTER_WORKER_SELECTION_POLICY: &str = "DYN_ROUTER_WORKER_SELECTION_POLICY";
+/// Override for prefill pools; takes precedence over [`DYN_ROUTER_WORKER_SELECTION_POLICY`].
+pub const DYN_ROUTER_PREFILL_POLICY: &str = "DYN_ROUTER_PREFILL_POLICY";
+/// Override for decode pools; takes precedence over [`DYN_ROUTER_WORKER_SELECTION_POLICY`].
+pub const DYN_ROUTER_DECODE_POLICY: &str = "DYN_ROUTER_DECODE_POLICY";
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -971,6 +978,10 @@ fn validate_kv_router_config(config: &KvRouterConfig) -> Result<(), String> {
     if let Err(error) = config.loaded_policy_config() {
         return Err(format!("router_policy_config: {error}"));
     }
+    // Resolve the env overrides now so a misspelled policy name fails startup.
+    if let Err(error) = config.selects_worker_selection_policy() {
+        return Err(format!("router_policy_config: {error}"));
+    }
     Ok(())
 }
 
@@ -991,8 +1002,15 @@ impl KvRouterConfig {
         Ok(self.policy_config_cache.get())
     }
 
-    /// The worker-selection policy `router_policy_config` selects for one worker pool, or
-    /// `None` for the built-in selector.
+    /// The worker-selection policy selected for one worker pool, or `None` for the built-in
+    /// selector.
+    ///
+    /// Precedence matches upstream: the role-specific `DYN_ROUTER_PREFILL_POLICY` /
+    /// `DYN_ROUTER_DECODE_POLICY`, then `DYN_ROUTER_WORKER_SELECTION_POLICY` for every pool, then the
+    /// `worker_selection` stage in `router_policy_config`. A value names a configured instance;
+    /// `default` (trimmed) selects the built-in selector, so
+    /// `DYN_ROUTER_WORKER_SELECTION_POLICY=default` is the restart-only rollback switch. Empty
+    /// values are ignored; a name that is not a configured instance is an error.
     pub fn worker_selection_policy(
         &self,
         stage: super::policy_config::WorkerSelectionStage,
@@ -1000,10 +1018,59 @@ impl KvRouterConfig {
         Option<super::policy_config::WorkerSelectionPolicyKind>,
         super::policy_config::RouterPolicyConfigError,
     > {
-        Ok(self
+        self.worker_selection_policy_with_env(stage, |key| match env::var(key) {
+            Ok(value) => Some(value),
+            Err(VarError::NotPresent) => None,
+            Err(VarError::NotUnicode(value)) => Some(value.to_string_lossy().into_owned()),
+        })
+    }
+
+    /// [`Self::worker_selection_policy`] with an explicit environment lookup.
+    pub(crate) fn worker_selection_policy_with_env(
+        &self,
+        stage: super::policy_config::WorkerSelectionStage,
+        get_env: impl Fn(&str) -> Option<String>,
+    ) -> Result<
+        Option<super::policy_config::WorkerSelectionPolicyKind>,
+        super::policy_config::RouterPolicyConfigError,
+    > {
+        use super::policy_config::{RouterPolicyConfigError, WorkerSelectionStage};
+
+        let lookup = |key: &'static str| {
+            get_env(key)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .map(|value| (key, value))
+        };
+        let role_override = match stage {
+            WorkerSelectionStage::Prefill => lookup(DYN_ROUTER_PREFILL_POLICY),
+            WorkerSelectionStage::Decode => lookup(DYN_ROUTER_DECODE_POLICY),
+            WorkerSelectionStage::Aggregated | WorkerSelectionStage::Encode => None,
+        };
+        let selection = self
             .loaded_policy_config()?
-            .and_then(super::policy_config::RouterPolicyConfig::worker_selection)
-            .and_then(|selection| selection.policy_for(stage)))
+            .and_then(super::policy_config::RouterPolicyConfig::worker_selection);
+        let Some((source, name)) =
+            role_override.or_else(|| lookup(DYN_ROUTER_WORKER_SELECTION_POLICY))
+        else {
+            return Ok(selection.and_then(|selection| selection.policy_for(stage)));
+        };
+        if name == "default" {
+            return Ok(None);
+        }
+        selection
+            .and_then(|selection| selection.instance(&name))
+            .map(|instance| Some(instance.kind()))
+            .ok_or_else(|| {
+                RouterPolicyConfigError::Validation(format!(
+                    "{source}={name:?} does not name a worker_selection instance in \
+                     router_policy_config (configured: {:?}); use \"default\" for the built-in \
+                     selector",
+                    selection
+                        .map(super::policy_config::WorkerSelectionConfig::instance_names)
+                        .unwrap_or_default()
+                ))
+            })
     }
 
     /// Whether `router_policy_config` selects a worker-selection policy for any worker pool.
@@ -1727,6 +1794,99 @@ mod tests {
         assert_eq!(
             config.router_queue_recheck_interval(),
             Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn worker_selection_env_overrides_follow_upstream_precedence() {
+        use crate::scheduling::{WorkerSelectionPolicyKind, WorkerSelectionStage as Stage};
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(
+            b"worker_selection:\n  aggregated: tuned\n  instances:\n    - name: tuned\n      type: dynamo-two-tier-cost-fn\n      parameters:\n        cache_threshold: 0.3\n    - name: plain\n      type: dynamo-two-tier-cost-fn\n",
+        )
+        .unwrap();
+        let config = KvRouterConfig {
+            router_policy_config: Some(file.path().display().to_string()),
+            ..Default::default()
+        };
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        let threshold = |kind: Option<WorkerSelectionPolicyKind>| {
+            kind.map(|WorkerSelectionPolicyKind::TwoTierCostFn(p)| p.cache_threshold)
+        };
+        let resolve = |stage: Stage, pairs: &'static [(&'static str, &'static str)]| {
+            threshold(
+                config
+                    .worker_selection_policy_with_env(stage, env(pairs))
+                    .unwrap(),
+            )
+        };
+
+        // YAML only: aggregated selects `tuned`, other stages the built-in selector.
+        assert_eq!(resolve(Stage::Aggregated, &[]), Some(0.3));
+        assert_eq!(resolve(Stage::Decode, &[]), None);
+        // The global override replaces the YAML stage selection for every pool.
+        let global_plain = &[(DYN_ROUTER_WORKER_SELECTION_POLICY, "plain")];
+        assert_eq!(resolve(Stage::Aggregated, global_plain), Some(0.5));
+        assert_eq!(resolve(Stage::Decode, global_plain), Some(0.5));
+        // "default" (trimmed) is the rollback switch.
+        let rollback = &[(DYN_ROUTER_WORKER_SELECTION_POLICY, "  default ")];
+        assert_eq!(resolve(Stage::Aggregated, rollback), None);
+        // Empty values are ignored.
+        assert_eq!(
+            resolve(
+                Stage::Aggregated,
+                &[(DYN_ROUTER_WORKER_SELECTION_POLICY, " ")]
+            ),
+            Some(0.3)
+        );
+        // Role-specific overrides beat the global one, and only for their own role.
+        let roles = &[
+            (DYN_ROUTER_WORKER_SELECTION_POLICY, "default"),
+            (DYN_ROUTER_DECODE_POLICY, "tuned"),
+            (DYN_ROUTER_PREFILL_POLICY, "plain"),
+        ];
+        assert_eq!(resolve(Stage::Decode, roles), Some(0.3));
+        assert_eq!(resolve(Stage::Prefill, roles), Some(0.5));
+        assert_eq!(resolve(Stage::Aggregated, roles), None);
+        assert_eq!(resolve(Stage::Encode, roles), None);
+        // An unknown instance name is an error, naming the variable.
+        let error = config
+            .worker_selection_policy_with_env(
+                Stage::Aggregated,
+                env(&[(DYN_ROUTER_WORKER_SELECTION_POLICY, "missing")]),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(DYN_ROUTER_WORKER_SELECTION_POLICY),
+            "{error}"
+        );
+
+        // Without a policy document only "default" is valid.
+        let bare = KvRouterConfig::default();
+        assert_eq!(
+            bare.worker_selection_policy_with_env(
+                Stage::Aggregated,
+                env(&[(DYN_ROUTER_WORKER_SELECTION_POLICY, "default")])
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            bare.worker_selection_policy_with_env(
+                Stage::Aggregated,
+                env(&[(DYN_ROUTER_WORKER_SELECTION_POLICY, "plain")])
+            )
+            .is_err()
         );
     }
 

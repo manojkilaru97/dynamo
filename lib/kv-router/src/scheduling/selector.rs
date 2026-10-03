@@ -166,6 +166,20 @@ impl DefaultWorkerSelector {
                     }
                 }
             });
+        if selector.worker_selection_policy.is_none()
+            && selector
+                .kv_router_config
+                .worker_selection_policy_with_env(stage, |_| None)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            tracing::warn!(
+                worker_type,
+                stage = stage.as_str(),
+                "worker-selection policy override selects the built-in selector over router_policy_config"
+            );
+        }
         if let Some(SelectedWorkerPolicy::TwoTierCostFn { policy, .. }) =
             selector.worker_selection_policy
         {
