@@ -139,11 +139,30 @@ about 2-4. Without replica sync the excess is up to N x (`balance_abs_threshold`
 for 60 routers. `balance_abs_threshold` keeps its upstream default of 32 (a quarter of a 128-slot
 worker); lower it only after measuring the cache-hit cost.
 
-Two limits remain. A frontend that (re)starts sees only requests admitted after it joined until the
-older ones finish, so it undercounts for at most one request lifetime. And the tracker drops a
-request from the counts `DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS` (default 300 s) after admission even
-if it is still streaming; set it above the longest valid request (queueing, prefill, and the maximum
-generation time) wherever generations can run longer than five minutes.
+Known limits of replica-synced counts:
+
+- **Restart undercount.** A frontend that (re)starts sees only requests admitted after it joined
+  until the older ones finish, so it undercounts for at most one request lifetime.
+- **Phantom load from a lost `Free`.** A peer's copy of a request is removed only by that request's
+  `Free`, the worker leaving, or the active-request expiry. If the `Free` never arrives (the origin
+  frontend died or restarted, or a sequence gap), the copy stays counted on every peer until
+  `DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS` (default 300 s) after it was applied. A failed publish is
+  retried in order with backoff rather than dropped, so only shutdown and transport gaps lose
+  events. The bound is the dead frontend's in-flight requests, spread over its workers: at 60
+  frontends and 2,400 requests in flight that is about 40 phantoms, under one per worker, for at
+  most five minutes. A rolling restart replaces one frontend at a time, so at most one frontend's
+  phantoms are live at once.
+- **Long-stream undercount.** The same expiry drops a request that is still streaming 300 s after
+  admission. Raising the expiry keeps long streams counted but stretches every phantom by the same
+  amount: with a 4,000 s expiry, a rolling restart that replaces a frontend every 9 minutes keeps
+  the phantoms of the last seven or so (hundreds of requests, up to thousands at full concurrency)
+  counted for over an hour. Keep the default unless long streams dominate. In the Super deployment, end-to-end
+  latency is p95 65 s and p99 192 s; requests longer than 240 s are 0.35% of traffic, and those
+  longer than 480 s are 0.03%.
+
+Tagging replica copies with their origin router and dropping them when that router's registration
+disappears, or reconciling from periodic snapshots, would remove the phantom limit; neither is
+implemented here.
 
 Measured on 4 TP2 workers with 4 frontends, a multi-turn session load, and 192 concurrent requests
 sharing one 72k-token prefix:
