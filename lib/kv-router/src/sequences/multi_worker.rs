@@ -1344,6 +1344,69 @@ mod tests {
         );
     }
 
+    /// A request that is still running past the default five-minute expiry stays in the active
+    /// counts the two-tier load tier reads once `DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS` is raised
+    /// above the longest valid request (the Super rollout sets 4000 s for 3600 s generations);
+    /// with the default it is dropped while the worker is still busy.
+    #[tokio::test(start_paused = true)]
+    async fn raised_expiry_keeps_long_streams_in_active_counts() {
+        let raised = active_request_expiry_duration_from_lookup(|key| {
+            (key == DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS).then(|| "4000".to_string())
+        });
+        assert_eq!(raised, Duration::from_secs(4000));
+
+        let worker = WorkerWithDpRank::new(7, 0);
+        let active_requests = |expiry: Duration| {
+            let tracker = ActiveSequencesMultiWorker::new_with_expiry_duration(
+                NoopSequencePublisher,
+                4,
+                HashMap::from([(7, (0, 1))]),
+                false,
+                1,
+                "test",
+                expiry,
+            );
+            tracker
+                .add_request(
+                    local_sequence_request("long-stream", worker),
+                    Instant::now(),
+                )
+                .unwrap();
+            tracker
+        };
+
+        let default_tracker = active_requests(DEFAULT_ACTIVE_REQUEST_EXPIRY_DURATION);
+        let raised_tracker = active_requests(raised);
+        // One hour into a 3600 s generation (plus queueing), still running on the worker.
+        tokio::time::advance(Duration::from_secs(3700)).await;
+        default_tracker.force_expire_requests_across_all_workers();
+        raised_tracker.force_expire_requests_across_all_workers();
+
+        assert_eq!(
+            default_tracker
+                .active_request_counts()
+                .get(&worker)
+                .copied(),
+            Some(0),
+            "the default expiry drops a live long stream"
+        );
+        assert_eq!(
+            raised_tracker.active_request_counts().get(&worker).copied(),
+            Some(1),
+            "a raised expiry keeps it counted"
+        );
+        let projection = raised_tracker.project_worker_loads(None, Instant::now());
+        assert_eq!(projection[&worker].active_requests, 1);
+
+        // Past the raised expiry the stale-request guard still cleans up.
+        tokio::time::advance(Duration::from_secs(400)).await;
+        raised_tracker.force_expire_requests_across_all_workers();
+        assert_eq!(
+            raised_tracker.active_request_counts().get(&worker).copied(),
+            Some(0)
+        );
+    }
+
     /// Verifies that absent and invalid expiry overrides use the default.
     #[test]
     fn active_request_expiry_duration_override_falls_back_to_default() {
