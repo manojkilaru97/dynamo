@@ -4,19 +4,21 @@
 //! Two-tier worker-selection cost function.
 //!
 //! Ported from upstream `lib/router-plugins/builtin/src/two_tier_cost_fn.rs`
-//! (ai-dynamo/dynamo#14498). This branch has no
+//! (ai-dynamo/dynamo#14498, with the CPU-prefix extension from 3c438f32c). This branch has no
 //! upstream plugin registry, so the policy is linked directly into the KV router and selected by
 //! the same `worker_selection` router-policy YAML.
 //!
 //! Dynamo's built-in selector folds cache overlap and load into one additive cost. This policy
 //! instead ranks on two tiers, taking the first that applies. For each eligible worker it reads
-//! device-KV overlap and active-request count, then:
+//! KV overlap and active-request count, then:
 //!
 //! 1. Load tier: if active-request spread exceeds `balance_abs_threshold` and the largest count
 //!    exceeds `balance_rel_threshold` times the smallest, select the least-loaded worker.
-//! 2. Cache tier: otherwise, if the largest device-KV overlap is strictly greater than
+//! 2. Cache tier: otherwise, if the largest *effective* KV overlap is strictly greater than
 //!    `cache_threshold` of the request's block count, select the least-loaded worker holding that
-//!    maximum overlap.
+//!    maximum overlap. Effective overlap is device-resident blocks plus host-pinned (CPU offload)
+//!    blocks scaled by `host_cache_weight`, so a worker holding the prefix in CPU can win the cache
+//!    tier over one holding nothing, while still losing to an equal device-resident hit.
 //! 3. Otherwise, select the least-loaded worker.
 //!
 //! Both load gates must hold to take step 1, so load displaces cache affinity only when the
@@ -25,9 +27,21 @@
 //! The thresholds default to `experimental/sgl-router`'s `cache_aware_zmq` values, so an instance
 //! with no `parameters` mapping reproduces it exactly.
 //!
+//! `host_cache_weight` defaults to [`KvRouterConfig::host_cache_hit_weight`], which
+//! `DYN_ROUTER_HOST_CACHE_HIT_WEIGHT` sets (0.75 by default) and which the built-in selector
+//! already applies to the same quantity. Set the weight to 0.0 to restore device-only ranking.
+//!
+//! Host overlap comes from `TierOverlapBlocks::host_pinned`, the host-pinned lower-tier indexer's
+//! continuation beyond the device prefix. On this branch that indexer is fed by vLLM's
+//! `BlockStored(medium=CPU)` events, including the token-less lazy-offload stores the ZMQ wire
+//! layer completes from device identities (`zmq_wire`, `DYN_KV_ROUTER_FILL_LOWER_TIER`). Device
+//! and host overlap are therefore disjoint prefix measurements, so they add rather than max.
+//!
 //! Ties between equally ranked workers resolve on candidate row order, which the host leaves
 //! unspecified. This matches the ported implementation; note that Dynamo's built-in selector
 //! instead samples uniformly among ties.
+//!
+//! [`KvRouterConfig::host_cache_hit_weight`]: super::config::KvRouterConfig::host_cache_hit_weight
 
 /// Policy type selected by `worker_selection.instances[].type`.
 pub const POLICY_TYPE: &str = "dynamo-two-tier-cost-fn";
@@ -45,13 +59,18 @@ const DEFAULT_BALANCE_REL_THRESHOLD: f64 = 1.1;
 #[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TwoTierCostFnParameters {
-    /// Fraction of the request's blocks that must be device-resident on the best worker before the
-    /// cache tier applies. Compared strictly.
+    /// Fraction of the request's blocks that must be reusable on the best worker before the cache
+    /// tier applies. Compared strictly.
     pub cache_threshold: f64,
     /// Minimum active-request spread before the load tier applies.
     pub balance_abs_threshold: usize,
     /// Minimum ratio of largest to smallest active-request count before the load tier applies.
     pub balance_rel_threshold: f64,
+    /// Weight applied to host-pinned (CPU offload) overlap when ranking cache affinity.
+    ///
+    /// `None` inherits `KvRouterConfig::host_cache_hit_weight`, i.e. whatever
+    /// `DYN_ROUTER_HOST_CACHE_HIT_WEIGHT` is set to.
+    pub host_cache_weight: Option<f64>,
 }
 
 impl Default for TwoTierCostFnParameters {
@@ -60,6 +79,7 @@ impl Default for TwoTierCostFnParameters {
             cache_threshold: DEFAULT_CACHE_THRESHOLD,
             balance_abs_threshold: DEFAULT_BALANCE_ABS_THRESHOLD,
             balance_rel_threshold: DEFAULT_BALANCE_REL_THRESHOLD,
+            host_cache_weight: None,
         }
     }
 }
@@ -83,19 +103,34 @@ impl TwoTierCostFnParameters {
                     .to_string(),
             );
         }
+        if let Some(weight) = self.host_cache_weight
+            && (!weight.is_finite() || weight < 0.0)
+        {
+            return Err(
+                "host_cache_weight must be a finite number greater than or equal to 0.0"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 }
 
-/// A configured two-tier policy.
+/// A two-tier policy with its host-cache weight resolved once at construction: the instance
+/// override when given, else the router config's `host_cache_hit_weight`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TwoTierCostFn {
     pub parameters: TwoTierCostFnParameters,
+    pub host_cache_weight: f64,
 }
 
 impl TwoTierCostFn {
-    pub fn new(parameters: TwoTierCostFnParameters) -> Self {
-        Self { parameters }
+    pub fn new(parameters: TwoTierCostFnParameters, router_host_cache_hit_weight: f64) -> Self {
+        Self {
+            parameters,
+            host_cache_weight: parameters
+                .host_cache_weight
+                .unwrap_or(router_host_cache_hit_weight),
+        }
     }
 }
 
@@ -103,6 +138,7 @@ impl TwoTierCostFn {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TwoTierRow {
     pub device_overlap_blocks: f64,
+    pub host_overlap_blocks: f64,
     pub active_requests: usize,
 }
 
@@ -128,6 +164,11 @@ fn least_loaded(rows: &[TwoTierRow], candidates: impl Iterator<Item = usize>) ->
     candidates.min_by_key(|&row| rows[row].active_requests)
 }
 
+/// Blocks this worker can reuse, counting CPU-offloaded blocks at `host_cache_weight`.
+fn effective_overlap(row: &TwoTierRow, host_cache_weight: f64) -> f64 {
+    row.device_overlap_blocks + host_cache_weight * row.host_overlap_blocks
+}
+
 impl TwoTierCostFn {
     /// Return the selected row and the tier that decided it, or `None` for an empty table.
     pub fn select_row(
@@ -146,7 +187,7 @@ impl TwoTierCostFn {
 
         let max_overlap = rows
             .iter()
-            .map(|row| row.device_overlap_blocks)
+            .map(|row| effective_overlap(row, self.host_cache_weight))
             .max_by(f64::total_cmp)?;
         let cache_ratio = if request_blocks == 0 {
             0.0
@@ -156,11 +197,12 @@ impl TwoTierCostFn {
         if cache_ratio > parameters.cache_threshold {
             return least_loaded(
                 rows,
-                rows.iter()
-                    .enumerate()
-                    .filter_map(|(index, row)| {
-                        (row.device_overlap_blocks == max_overlap).then_some(index)
-                    }),
+                rows.iter().enumerate().filter_map(|(index, row)| {
+                    // Recomputed identically to `max_overlap`, so the equality is exact, not a
+                    // tolerance comparison on independently derived floats.
+                    (effective_overlap(row, self.host_cache_weight) == max_overlap)
+                        .then_some(index)
+                }),
             )
             .map(|row| (row, TwoTierDecision::Cache));
         }
@@ -175,26 +217,41 @@ mod tests {
 
     /// Ten blocks, so five overlapping blocks sit exactly on the 0.5 threshold.
     const TEN_BLOCKS: u64 = 10;
+    /// Upstream `KvRouterConfig::default().host_cache_hit_weight`.
+    const DEFAULT_HOST_WEIGHT: f64 = 0.75;
+
     fn policy(parameters: TwoTierCostFnParameters) -> TwoTierCostFn {
-        TwoTierCostFn::new(parameters)
+        TwoTierCostFn::new(parameters, DEFAULT_HOST_WEIGHT)
     }
 
-    /// Select among two workers given as `(device_blocks, active_requests)`; returns 0 for A and
-    /// 1 for B.
-    fn select_with(parameters: TwoTierCostFnParameters, rows: [(usize, usize); 2]) -> usize {
-        let rows = rows.map(|(device, active)| TwoTierRow {
+    /// Select among two workers given as `(device_blocks, host_blocks, active_requests)`;
+    /// returns 0 for A and 1 for B.
+    fn select_tiers(parameters: TwoTierCostFnParameters, rows: [(usize, usize, usize); 2]) -> usize {
+        let rows = rows.map(|(device, host, active)| TwoTierRow {
             device_overlap_blocks: device as f64,
+            host_overlap_blocks: host as f64,
             active_requests: active,
         });
         policy(parameters).select_row(&rows, TEN_BLOCKS).unwrap().0
     }
 
     fn select(rows: [(usize, usize); 2]) -> usize {
-        select_with(TwoTierCostFnParameters::default(), rows)
+        select_tiers(
+            TwoTierCostFnParameters::default(),
+            rows.map(|(device, active)| (device, 0, active)),
+        )
     }
 
     const A: usize = 0;
     const B: usize = 1;
+
+    #[test]
+    fn default_host_weight_matches_router_default() {
+        assert_eq!(
+            super::super::config::KvRouterConfig::default().host_cache_hit_weight,
+            DEFAULT_HOST_WEIGHT
+        );
+    }
 
     #[test]
     fn cache_tier_outranks_a_less_loaded_worker() {
@@ -211,14 +268,14 @@ mod tests {
     #[test]
     fn parameters_override_the_upstream_defaults() {
         // Three of ten blocks is 0.3: below the 0.5 default, above a tuned 0.2 threshold.
-        let rows = [(0, 0), (3, 4)];
-        assert_eq!(select(rows), A);
+        let rows = [(0, 0, 0), (3, 0, 4)];
+        assert_eq!(select_tiers(TwoTierCostFnParameters::default(), rows), A);
 
         let tuned = TwoTierCostFnParameters {
             cache_threshold: 0.2,
             ..TwoTierCostFnParameters::default()
         };
-        assert_eq!(select_with(tuned, rows), B);
+        assert_eq!(select_tiers(tuned, rows), B);
     }
 
     #[test]
@@ -254,10 +311,80 @@ mod tests {
     }
 
     #[test]
+    fn host_overlap_can_win_the_cache_tier() {
+        // B holds nothing on device but eight of ten blocks in CPU offload. At the inherited
+        // weight of 0.75 that is an effective 6.0 blocks, a ratio of 0.6 above the 0.5 threshold,
+        // so B wins despite carrying more load.
+        assert_eq!(
+            select_tiers(TwoTierCostFnParameters::default(), [(0, 0, 0), (0, 8, 4)]),
+            B
+        );
+    }
+
+    #[test]
+    fn host_cache_weight_zero_restores_device_only_ranking() {
+        let device_only = TwoTierCostFnParameters {
+            host_cache_weight: Some(0.0),
+            ..TwoTierCostFnParameters::default()
+        };
+        assert_eq!(select_tiers(device_only, [(0, 0, 0), (0, 8, 4)]), A);
+    }
+
+    #[test]
+    fn device_blocks_outrank_the_same_count_of_host_blocks() {
+        // A's six device blocks score 6.0 against B's six host blocks at 4.5, so A wins even
+        // though B is idle and A carries four requests.
+        assert_eq!(
+            select_tiers(TwoTierCostFnParameters::default(), [(6, 0, 4), (0, 6, 0)]),
+            A
+        );
+    }
+
+    #[test]
+    fn device_and_host_overlap_add() {
+        // A: 3 device + 4 host * 0.75 = 6.0 (ratio 0.6) beats B's 5 device blocks even though
+        // neither tier alone clears the threshold on A.
+        assert_eq!(
+            select_tiers(TwoTierCostFnParameters::default(), [(3, 4, 4), (5, 0, 0)]),
+            A
+        );
+    }
+
+    #[test]
+    fn rejects_negative_host_cache_weight() {
+        let weight = |v| {
+            TwoTierCostFnParameters {
+                host_cache_weight: Some(v),
+                ..Default::default()
+            }
+            .validate()
+        };
+        assert!(weight(-0.1).is_err());
+        assert!(weight(f64::NAN).is_err());
+        assert!(weight(0.0).is_ok());
+        assert!(weight(1.0).is_ok());
+    }
+
+    #[test]
+    fn instance_override_beats_router_host_weight() {
+        let parameters = TwoTierCostFnParameters {
+            host_cache_weight: Some(0.25),
+            ..Default::default()
+        };
+        assert_eq!(TwoTierCostFn::new(parameters, 0.75).host_cache_weight, 0.25);
+        assert_eq!(
+            TwoTierCostFn::new(TwoTierCostFnParameters::default(), 0.5).host_cache_weight,
+            0.5
+        );
+    }
+
+    #[test]
     fn parameters_parse_from_yaml_and_reject_unknown_keys() {
-        let value: serde_yaml::Value = serde_yaml::from_str("cache_threshold: 0.3\n").unwrap();
+        let value: serde_yaml::Value =
+            serde_yaml::from_str("cache_threshold: 0.3\nhost_cache_weight: 0.5\n").unwrap();
         let parsed = TwoTierCostFnParameters::from_yaml(&value).unwrap();
         assert_eq!(parsed.cache_threshold, 0.3);
+        assert_eq!(parsed.host_cache_weight, Some(0.5));
         assert_eq!(parsed.balance_abs_threshold, DEFAULT_BALANCE_ABS_THRESHOLD);
 
         let empty = serde_yaml::Value::Mapping(Default::default());
@@ -288,6 +415,7 @@ mod tests {
         let p = policy(TwoTierCostFnParameters::default());
         let row = |device: usize, active| TwoTierRow {
             device_overlap_blocks: device as f64,
+            host_overlap_blocks: 0.0,
             active_requests: active,
         };
         assert_eq!(

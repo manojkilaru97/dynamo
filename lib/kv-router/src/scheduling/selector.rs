@@ -146,7 +146,10 @@ impl DefaultWorkerSelector {
             .worker_selection_policy(stage)?
             .map(|kind| match kind {
                 WorkerSelectionPolicyKind::TwoTierCostFn(parameters) => {
-                    SelectedWorkerPolicy::TwoTierCostFn(TwoTierCostFn::new(parameters))
+                    SelectedWorkerPolicy::TwoTierCostFn(TwoTierCostFn::new(
+                        parameters,
+                        selector.kv_router_config.host_cache_hit_weight,
+                    ))
                 }
             });
         if let Some(SelectedWorkerPolicy::TwoTierCostFn(policy)) = selector.worker_selection_policy
@@ -158,6 +161,7 @@ impl DefaultWorkerSelector {
                 cache_threshold = policy.parameters.cache_threshold,
                 balance_abs_threshold = policy.parameters.balance_abs_threshold,
                 balance_rel_threshold = policy.parameters.balance_rel_threshold,
+                host_cache_weight = policy.host_cache_weight,
                 "Using worker-selection policy"
             );
         }
@@ -196,6 +200,7 @@ impl DefaultWorkerSelector {
             candidates.push(worker);
             rows.push(TwoTierRow {
                 device_overlap_blocks,
+                host_overlap_blocks: tiers.host_pinned.get(&worker).copied().unwrap_or(0) as f64,
                 active_requests: request.worker_load_for(worker).active_requests,
             });
         });
@@ -221,7 +226,7 @@ impl DefaultWorkerSelector {
             candidates = rows.len(),
             request_blocks,
             device_blocks = selected.device_overlap_blocks,
-            host_pinned_blocks = tiers.host_pinned.get(&worker).copied().unwrap_or(0),
+            host_pinned_blocks = selected.host_overlap_blocks,
             active_requests = selected.active_requests,
             effective_cached_blocks = effective_overlap_blocks,
             total_kv_blocks = ?total_kv_blocks,
@@ -2001,6 +2006,76 @@ worker_selection:
         let selector = two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default());
         let request = two_tier_request(&[(1, 0, 0, 0), (2, 10, 0, 40)]);
         assert_eq!(select_ids(&selector, &request, &[1, 2]).worker.worker_id, 1);
+    }
+
+    #[test]
+    fn two_tier_policy_counts_cpu_tier_at_router_host_weight() {
+        // Worker 2 has 8/10 blocks only in CPU offload: 8 * 0.75 = 6.0 effective blocks.
+        let request = two_tier_request(&[(1, 0, 0, 0), (2, 0, 8, 4)]);
+        let selector = two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default());
+        assert_eq!(select_ids(&selector, &request, &[1, 2]).worker.worker_id, 2);
+
+        // DYN_ROUTER_HOST_CACHE_HIT_WEIGHT=0.5 lands in host_cache_hit_weight: 8 * 0.5 = 4.0,
+        // below the threshold, so load decides.
+        let selector = two_tier_selector(
+            TWO_TIER_YAML,
+            KvRouterConfig {
+                host_cache_hit_weight: 0.5,
+                ..Default::default()
+            },
+        );
+        assert_eq!(select_ids(&selector, &request, &[1, 2]).worker.worker_id, 1);
+
+        // An instance override wins over the router weight.
+        let overridden = format!("{TWO_TIER_YAML}      parameters:\n        host_cache_weight: 1.0\n");
+        let selector = two_tier_selector(
+            &overridden,
+            KvRouterConfig {
+                host_cache_hit_weight: 0.0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(select_ids(&selector, &request, &[1, 2]).worker.worker_id, 2);
+    }
+
+    #[test]
+    fn two_tier_policy_reads_host_pinned_lower_tier_matches() {
+        // Feed the policy from the indexer's tiered matches, as the scheduler queue does: worker 2
+        // holds no device prefix but an 8-block HostPinned continuation (the CPU tier that lazy
+        // offload stores, completed by the zmq_wire lower-tier fill, populate).
+        use crate::indexer::{LowerTierMatchDetails, MatchDetails, TieredMatchDetails};
+        use crate::protocols::{OverlapScores, StorageTier};
+        use crate::scheduling::OverlapAnalysis;
+
+        let cold = WorkerWithDpRank::from_worker_id(1);
+        let cpu = WorkerWithDpRank::from_worker_id(2);
+        let mut host = LowerTierMatchDetails::default();
+        host.hits.insert(cpu, 8);
+        let tiered = TieredMatchDetails {
+            device: MatchDetails {
+                overlap_scores: OverlapScores::new(),
+                last_matched_hashes: Default::default(),
+            },
+            lower_tier: std::collections::HashMap::from([(StorageTier::HostPinned, host)]),
+        };
+        let config = KvRouterConfig::default();
+        let mut request = base_request(160);
+        request.overlap = OverlapAnalysis::new(&config, 16, &tiered).signals();
+        assert_eq!(request.overlap.tier_overlap_blocks.host_pinned[&cpu], 8);
+        for (worker, active_requests) in [(cold, 0), (cpu, 4)] {
+            request.worker_loads.insert(
+                worker,
+                crate::sequences::WorkerLoadProjection {
+                    active_requests,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let selector = two_tier_selector(TWO_TIER_YAML, config);
+        let result = select_ids(&selector, &request, &[1, 2]);
+        assert_eq!(result.worker, cpu);
+        assert_eq!(result.effective_overlap_blocks, 6.0);
     }
 
     #[test]

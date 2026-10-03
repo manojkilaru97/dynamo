@@ -47,7 +47,7 @@ and accounting. The built-in selector and its cost model above remain the defaul
 | Policy type | Behavior |
 |---|---|
 | `default` | Dynamo's built-in selector and cost model. Reserved; always available. |
-| `dynamo-two-tier-cost-fn` | Ranks on two tiers instead of one additive cost: active-request load first, then device-KV prefix overlap. Prefers the worker holding the largest prefix overlap unless load is badly imbalanced. Thresholds and selection order ported from the experimental SGLang router's `cache_aware_zmq` policy; the defaults reproduce it exactly. |
+| `dynamo-two-tier-cost-fn` | Ranks on two tiers instead of one additive cost: active-request load first, then KV prefix overlap. Prefers the worker holding the largest prefix overlap unless load is badly imbalanced. Thresholds and selection order ported from the experimental SGLang router's `cache_aware_zmq` policy; the defaults reproduce it exactly. |
 
 Write the instance into the same YAML file that `--router-policy-config` points at:
 
@@ -72,15 +72,19 @@ An instance may carry a `parameters` mapping; omitting it keeps every default:
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `cache_threshold` | `0.5` | Fraction of the request's blocks that must be device-resident on the best worker before the cache tier applies. Compared strictly. Must be in `[0.0, 1.0]`. |
+| `cache_threshold` | `0.5` | Fraction of the request's blocks that must be reusable on the best worker before the cache tier applies. Compared strictly. Must be in `[0.0, 1.0]`. |
 | `balance_abs_threshold` | `32` | Minimum active-request spread before the load tier applies. |
 | `balance_rel_threshold` | `1.1` | Minimum ratio of largest to smallest active-request count before the load tier applies. Must be at least `1.0`. |
+| `host_cache_weight` | `host_cache_hit_weight` | Weight of host-pinned (CPU offload) prefix blocks in the cache tier. Defaults to the router's `--router-host-cache-hit-weight` / `DYN_ROUTER_HOST_CACHE_HIT_WEIGHT` (`0.75`). `0.0` ranks on device blocks only. Must be finite and non-negative. |
 
 The policy selects the least-loaded worker once the active-request spread is greater than
 `balance_abs_threshold` and the largest count is more than `balance_rel_threshold` times the
-smallest. Otherwise it selects the least-loaded worker among those holding the largest device-KV
+smallest. Otherwise it selects the least-loaded worker among those holding the largest effective
 overlap when that overlap covers more than `cache_threshold` of the request's blocks, and the
-least-loaded worker when it does not. Active-request counts are the counts this router instance
+least-loaded worker when it does not. Effective overlap is device-resident prefix blocks plus the
+host-pinned blocks that continue that prefix, weighted by `host_cache_weight`, so a CPU-offloaded
+prefix can win the cache tier but never outranks the same number of device blocks while the weight
+is below `1.0`. Active-request counts are the counts this router instance
 tracks.
 
 ### Policy-Class Queues
