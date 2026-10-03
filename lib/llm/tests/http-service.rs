@@ -1777,8 +1777,28 @@ const SECRET_499: &str = r#"{"message":"client went away at /srv/secret.py","cod
 const SECRET_400: &str = "ValueError: bad schema at /srv/secret.py";
 
 /// Chat engine whose `max_tokens` picks the outcome: 1 = immediate 499,
-/// 2 = one token then 499, 3 = immediate 400, 4 = one token then 400.
+/// 2 = one token then 499, 3 = immediate 400, 4 = one token then 400,
+/// 5 = one token then a typed `Backend(Cancelled)` (Python `CancelledError`),
+/// 6 = immediate 400 and then a stream that never ends,
+/// 7 = one token then a typed `Backend(Disconnected)` (worker connection lost).
 struct ScriptedRejectionEngine {}
+
+fn typed_cancellation_event<T>() -> Annotated<T> {
+    Annotated {
+        data: None,
+        id: None,
+        event: Some("error".to_string()),
+        comment: None,
+        error: Some(
+            DynamoError::builder()
+                .error_type(dynamo_runtime::error::ErrorType::Backend(
+                    dynamo_runtime::error::BackendError::Cancelled,
+                ))
+                .message("CancelledError at /srv/secret.py")
+                .build(),
+        ),
+    }
+}
 
 #[async_trait]
 impl
@@ -1802,10 +1822,35 @@ impl
             .unwrap_or(0);
         let mut generator = request.response_generator(ctx.id().to_string());
         let stream = stream! {
-            if mode == 2 || mode == 4 {
+            if matches!(mode, 2 | 4 | 5) {
                 yield Annotated::from_data(generator.create_choice(0, Some("tok".to_string()), None, None));
             }
-            yield backend_rejection_event(if mode <= 2 { SECRET_499 } else { SECRET_400 });
+            if matches!(mode, 7) {
+                yield Annotated::from_data(generator.create_choice(0, Some("tok".to_string()), None, None));
+            }
+            if mode == 5 {
+                yield typed_cancellation_event();
+            } else if mode == 7 {
+                yield Annotated {
+                    data: None,
+                    id: None,
+                    event: Some("error".to_string()),
+                    comment: None,
+                    error: Some(
+                        DynamoError::builder()
+                            .error_type(dynamo_runtime::error::ErrorType::Backend(
+                                dynamo_runtime::error::BackendError::Disconnected,
+                            ))
+                            .message("connection lost at /srv/secret.py")
+                            .build(),
+                    ),
+                };
+            } else {
+                yield backend_rejection_event(if mode <= 2 { SECRET_499 } else { SECRET_400 });
+            }
+            if mode == 6 {
+                std::future::pending::<()>().await;
+            }
         };
         Ok(ResponseStream::new(Box::pin(stream), ctx))
     }
@@ -1961,6 +2006,163 @@ async fn test_backend_rejections_on_chat_and_responses() {
             );
         }
     }
+    // A typed cancellation after output is a sanitized cancellation too.
+    for (path, endpoint, budget) in [
+        ("chat/completions", Endpoint::ChatCompletions, "max_tokens"),
+        ("responses", Endpoint::Responses, "max_output_tokens"),
+    ] {
+        let mut body = serde_json::json!({"model": "scripted", "stream": false});
+        body[budget] = serde_json::json!(5);
+        if path == "responses" {
+            body["input"] = serde_json::json!("hi");
+        } else {
+            body["messages"] = serde_json::json!([{"role": "user", "content": "hi"}]);
+        }
+        let response = client
+            .post(format!("http://localhost:{port}/v1/{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 499, "{path} typed cancellation");
+        let text = response.text().await.unwrap();
+        assert!(!text.contains("/srv/secret.py"), "{path}: {text}");
+        *expected
+            .entry((
+                endpoint.as_str().to_string(),
+                false,
+                "cancelled".to_string(),
+            ))
+            .or_default() += 1;
+        compare_counter(
+            &metrics,
+            "scripted",
+            &endpoint,
+            &RequestType::Unary,
+            &Status::Error,
+            &ErrorType::Cancelled,
+            expected[&(
+                endpoint.as_str().to_string(),
+                false,
+                "cancelled".to_string(),
+            )],
+        );
+    }
+    let response = client
+        .post(format!("http://localhost:{port}/v1/responses"))
+        .json(&serde_json::json!({"model": "scripted", "stream": true, "input": "hi", "max_output_tokens": 5}))
+        .send()
+        .await
+        .unwrap();
+    let text = timeout(std::time::Duration::from_secs(10), response.text())
+        .await
+        .expect("stream finished")
+        .unwrap();
+    assert!(
+        text.contains("response.failed") && text.contains("Request cancelled"),
+        "{text}"
+    );
+    assert!(!text.contains("/srv/secret.py"), "{text}");
+    *expected
+        .entry((
+            Endpoint::Responses.as_str().to_string(),
+            true,
+            "cancelled".to_string(),
+        ))
+        .or_default() += 1;
+    compare_counter(
+        &metrics,
+        "scripted",
+        &Endpoint::Responses,
+        &RequestType::Stream,
+        &Status::Error,
+        &ErrorType::Cancelled,
+        expected[&(
+            Endpoint::Responses.as_str().to_string(),
+            true,
+            "cancelled".to_string(),
+        )],
+    );
+
+    // A lost worker connection after output is a sanitized server error.
+    for path in ["chat/completions", "responses"] {
+        let mut body = serde_json::json!({"model": "scripted", "stream": true, "max_tokens": 7});
+        if path == "responses" {
+            body = serde_json::json!({"model": "scripted", "stream": true, "max_output_tokens": 7, "input": "hi"});
+        } else {
+            body["messages"] = serde_json::json!([{"role": "user", "content": "hi"}]);
+        }
+        let response = client
+            .post(format!("http://localhost:{port}/v1/{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let text = timeout(std::time::Duration::from_secs(10), response.text())
+            .await
+            .expect("stream finished")
+            .unwrap();
+        assert!(!text.contains("/srv/secret.py"), "{path}: {text}");
+        if path == "responses" {
+            assert!(
+                text.contains("response.failed") && text.contains("server_error"),
+                "{text}"
+            );
+        } else {
+            assert!(text.contains("\"code\":500"), "{text}");
+        }
+        let endpoint = if path == "responses" {
+            Endpoint::Responses
+        } else {
+            Endpoint::ChatCompletions
+        };
+        let key = (endpoint.as_str().to_string(), true, "internal".to_string());
+        *expected.entry(key.clone()).or_default() += 1;
+        compare_counter(
+            &metrics,
+            "scripted",
+            &endpoint,
+            &RequestType::Stream,
+            &Status::Error,
+            &ErrorType::Internal,
+            expected[&key],
+        );
+    }
+
+    // A rejection ends a streaming Responses request even if the backend
+    // stream never finishes.
+    let response = client
+        .post(format!("http://localhost:{port}/v1/responses"))
+        .json(&serde_json::json!({"model": "scripted", "stream": true, "input": "hi", "max_output_tokens": 6}))
+        .send()
+        .await
+        .unwrap();
+    let text = timeout(std::time::Duration::from_secs(10), response.text())
+        .await
+        .expect("a rejection must end the stream without waiting for the backend")
+        .unwrap();
+    assert!(text.contains("response.failed"), "{text}");
+    *expected
+        .entry((
+            Endpoint::Responses.as_str().to_string(),
+            true,
+            "validation".to_string(),
+        ))
+        .or_default() += 1;
+    compare_counter(
+        &metrics,
+        "scripted",
+        &Endpoint::Responses,
+        &RequestType::Stream,
+        &Status::Error,
+        &ErrorType::Validation,
+        expected[&(
+            Endpoint::Responses.as_str().to_string(),
+            true,
+            "validation".to_string(),
+        )],
+    );
+
     for endpoint in [Endpoint::ChatCompletions, Endpoint::Responses] {
         for request_type in [RequestType::Unary, RequestType::Stream] {
             compare_counter(
@@ -2032,6 +2234,14 @@ macro_rules! stream_rejection_engine {
     };
 }
 
+stream_rejection_engine!(
+    dynamo_llm::protocols::openai::images::NvCreateImageRequest,
+    dynamo_llm::protocols::openai::images::NvImagesResponse
+);
+stream_rejection_engine!(
+    dynamo_llm::protocols::openai::videos::NvCreateVideoRequest,
+    dynamo_llm::protocols::openai::videos::NvVideosResponse
+);
 stream_rejection_engine!(
     dynamo_llm::protocols::openai::embeddings::NvCreateEmbeddingRequest,
     dynamo_llm::protocols::openai::embeddings::NvCreateEmbeddingResponse
@@ -2166,8 +2376,13 @@ impl
         request: SingleIn<dynamo_llm::protocols::openai::videos::NvCreateVideoRequest>,
     ) -> Result<ManyOut<Annotated<dynamo_llm::protocols::openai::videos::NvVideosResponse>>, Error>
     {
-        let (_request, context) = request.transfer(());
+        let (request, context) = request.transfer(());
         let ctx = context.context();
+        let message = if request.prompt == "cancel" {
+            SECRET_499
+        } else {
+            SECRET_400
+        };
         let chunk: dynamo_llm::protocols::openai::videos::NvVideosResponse =
             serde_json::from_value(serde_json::json!({
                 "id": "video-1",
@@ -2180,7 +2395,7 @@ impl
             .unwrap();
         let stream = stream! {
             yield Annotated::from_data(chunk);
-            yield backend_rejection_event(SECRET_400);
+            yield backend_rejection_event(message);
         };
         Ok(ResponseStream::new(Box::pin(stream), ctx))
     }
@@ -2244,8 +2459,8 @@ async fn test_videos_stream_late_rejection_is_sanitized() {
     task.await.unwrap().unwrap();
 }
 
-/// Streams one token, then kills its context and ends without an error item,
-/// as the request plane does when the worker connection fails.
+/// Streams one token, then kills its context and ends without an error item
+/// (an external kill: the stream ends with no error to report).
 struct KilledContextEngine {}
 
 #[async_trait]
@@ -2338,6 +2553,144 @@ async fn test_killed_stream_is_not_a_success() {
             &Status::Success,
             &ErrorType::None,
             0,
+        );
+    }
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
+
+/// Images and unary videos: a rejection before output keeps its 4xx (a 499 is
+/// a sanitized cancellation); after video output a 400 is a sanitized 500 and
+/// a 499 stays a cancellation.
+#[tokio::test]
+async fn test_images_and_unary_videos_rejections() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder().port(port).build().unwrap();
+    for endpoint in [
+        dynamo_llm::endpoint_type::EndpointType::Images,
+        dynamo_llm::endpoint_type::EndpointType::Videos,
+    ] {
+        service.enable_model_endpoint(endpoint, true).unwrap();
+    }
+    let state = service.state_clone();
+    let manager = state.manager();
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task =
+        tokio::spawn(async move { service.run_with_listener(token.clone(), listener).await });
+    wait_for_service_ready(port).await;
+    for (model, message) in [("rejects", SECRET_400), ("cancels", SECRET_499)] {
+        let card = ModelDeploymentCard::with_name_only(model);
+        let engine = Arc::new(StreamRejectionEngine { message });
+        manager
+            .add_images_model(model, card.mdcsum(), engine.clone())
+            .unwrap();
+        manager
+            .add_videos_model(model, card.mdcsum(), engine)
+            .unwrap();
+    }
+    let card = ModelDeploymentCard::with_name_only("late");
+    manager
+        .add_videos_model(
+            "late",
+            card.mdcsum(),
+            Arc::new(LateRejectionVideosEngine {}),
+        )
+        .unwrap();
+    let metrics = state.metrics_clone();
+    let client = reqwest::Client::new();
+
+    // (path, endpoint, model, prompt, status, metrics type, message forwarded)
+    let cases = [
+        (
+            "images/generations",
+            Endpoint::Images,
+            "rejects",
+            "x",
+            400u16,
+            ErrorType::Validation,
+            true,
+        ),
+        (
+            "images/generations",
+            Endpoint::Images,
+            "cancels",
+            "x",
+            499,
+            ErrorType::Cancelled,
+            false,
+        ),
+        (
+            "videos",
+            Endpoint::Videos,
+            "rejects",
+            "x",
+            400,
+            ErrorType::Validation,
+            true,
+        ),
+        (
+            "videos",
+            Endpoint::Videos,
+            "cancels",
+            "x",
+            499,
+            ErrorType::Cancelled,
+            false,
+        ),
+        (
+            "videos",
+            Endpoint::Videos,
+            "late",
+            "x",
+            500,
+            ErrorType::Internal,
+            false,
+        ),
+        (
+            "videos",
+            Endpoint::Videos,
+            "late",
+            "cancel",
+            499,
+            ErrorType::Cancelled,
+            false,
+        ),
+    ];
+    let mut expected: std::collections::HashMap<(String, String, String), u64> = Default::default();
+    for (path, endpoint, model, prompt, status, error_type, forwarded) in cases {
+        let response = client
+            .post(format!("http://localhost:{port}/v1/{path}"))
+            .json(&serde_json::json!({"model": model, "prompt": prompt}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            status,
+            "{path} {model} {prompt}"
+        );
+        let text = response.text().await.unwrap();
+        assert_eq!(
+            text.contains("/srv/secret.py"),
+            forwarded,
+            "{path} {model} {prompt}: {text}"
+        );
+        let key = (
+            endpoint.as_str().to_string(),
+            model.to_string(),
+            error_type.as_str().to_string(),
+        );
+        *expected.entry(key.clone()).or_default() += 1;
+        compare_counter(
+            &metrics,
+            model,
+            &endpoint,
+            &RequestType::Unary,
+            &Status::Error,
+            &error_type,
+            expected[&key],
         );
     }
 

@@ -242,8 +242,34 @@ fn fold_rejection_or_internal(
 ) -> ErrorResponse {
     match find_invalid_argument_in_chain(err) {
         Some(invalid) => rejection_error_response(invalid),
+        None if is_typed_cancellation(err) => {
+            ErrorMessage::sanitized_with_details(SanitizedError::Cancelled, format!("{err:#}"))
+        }
         None => ErrorMessage::internal_server_error(message),
     }
+}
+
+/// Whether the error chain holds a typed cancellation (`Cancelled`, or
+/// `Backend(Cancelled)` from a Python `asyncio.CancelledError`).
+fn is_typed_cancellation(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if let Some(dynamo_err) = e.downcast_ref::<dynamo_runtime::error::DynamoError>()
+            && is_cancellation_type(dynamo_err.error_type())
+        {
+            return true;
+        }
+        current = e.source();
+    }
+    false
+}
+
+fn is_cancellation_type(error_type: dynamo_runtime::error::ErrorType) -> bool {
+    use dynamo_runtime::error::{BackendError, ErrorType};
+    matches!(
+        error_type,
+        ErrorType::Cancelled | ErrorType::Backend(BackendError::Cancelled)
+    )
 }
 
 /// Error response for a non-streaming aggregation failure after model output: a
@@ -252,10 +278,19 @@ fn late_cancellation_or_internal(
     err: &(dyn std::error::Error + 'static),
     message: &str,
 ) -> ErrorResponse {
-    if let Some(invalid) = find_invalid_argument_in_chain(err)
-        && super::disconnect::rejection_message_and_code(invalid.message()).1 == 499
-    {
-        return rejection_error_response(invalid);
+    match find_invalid_argument_in_chain(err) {
+        Some(invalid)
+            if super::disconnect::rejection_message_and_code(invalid.message()).1 == 499 =>
+        {
+            return rejection_error_response(invalid);
+        }
+        None if is_typed_cancellation(err) => {
+            return ErrorMessage::sanitized_with_details(
+                SanitizedError::Cancelled,
+                format!("{err:#}"),
+            );
+        }
+        _ => {}
     }
     ErrorMessage::internal_server_error(message)
 }
@@ -3241,9 +3276,8 @@ async fn responses(
                 yield event.map_err(axum::Error::new);
             }
 
-            // The backend error event, whether model output preceded it, and
-            // whether it is the request plane's response inactivity timeout.
-            let mut failure: Option<(String, StatusCode, bool, bool)> = None;
+            // The backend error event, and whether model output preceded it.
+            let mut failure: Option<(String, StatusCode, bool)> = None;
             let mut saw_output = false;
 
             while let Some(annotated_chunk) = engine_stream.next().await {
@@ -3254,14 +3288,15 @@ async fn responses(
                 );
 
                 if let Some((message, status)) = extract_backend_error_if_present(&annotated_chunk) {
-                    let timed_out = annotated_chunk.error.as_ref().is_some_and(|error| {
-                        matches!(
-                            error.error_type(),
-                            dynamo_runtime::error::ErrorType::ResponseTimeout
-                        )
-                    });
+                    let error_type = annotated_chunk.error.as_ref().map(|error| error.error_type());
+                    // A typed cancellation is a 499 whatever its message.
+                    let status = if error_type.is_some_and(is_cancellation_type) {
+                        StatusCode::from_u16(499).expect("499 is a valid status")
+                    } else {
+                        status
+                    };
                     // The first backend error ends the response.
-                    failure = Some((message, status, saw_output, timed_out));
+                    failure = Some((message, status, saw_output));
                     break;
                 }
 
@@ -3277,16 +3312,15 @@ async fn responses(
             }
 
             match failure {
-                Some((message, status, after_output, timed_out)) => {
+                Some((message, status, after_output)) => {
                     tracing::warn!(
                         request_id = %stream_request_id,
                         %status,
                         after_output,
-                        timed_out,
                         "Streaming responses request failed: {message}"
                     );
                     let (error, error_type) =
-                        responses_stream_failure(message, status, after_output, timed_out);
+                        responses_stream_failure(message, status, after_output);
                     let _ = stream_outcome.set(error_type);
                     converter.append_failed_events(Some(error), &mut events);
                 }
@@ -3301,7 +3335,6 @@ async fn responses(
                         String::new(),
                         StatusCode::from_u16(499).expect("499 is a valid status"),
                         saw_output,
-                        false,
                     );
                     let _ = stream_outcome.set(error_type);
                     converter.append_failed_events(Some(error), &mut events);
@@ -3397,19 +3430,12 @@ fn responses_stream_failure(
     message: String,
     status: StatusCode,
     after_output: bool,
-    timed_out: bool,
 ) -> (dynamo_protocols::types::responses::ErrorObject, ErrorType) {
     use dynamo_protocols::types::responses::ErrorObject;
     let error = |code: &str, message: String| ErrorObject {
         code: code.to_string(),
         message,
     };
-    if timed_out {
-        return (
-            error("server_error", SanitizedError::Internal.to_string()),
-            ErrorType::ResponseTimeout,
-        );
-    }
     if status.as_u16() == 499 {
         return (
             error("server_error", SanitizedError::Cancelled.to_string()),
@@ -4618,91 +4644,56 @@ mod tests {
     }
 
     #[test]
+    fn test_typed_cancellations_are_sanitized_cancellations() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as RuntimeErrorType};
+        for error_type in [
+            RuntimeErrorType::Cancelled,
+            RuntimeErrorType::Backend(BackendError::Cancelled),
+        ] {
+            let cancelled = DynamoError::builder()
+                .error_type(error_type)
+                .message("CancelledError at /srv/x.py")
+                .build();
+            for (status, Json(body)) in [
+                late_cancellation_or_internal(&cancelled, "fold failed"),
+                fold_rejection_or_internal(&cancelled, "fold failed"),
+            ] {
+                assert_eq!(status.as_u16(), 499, "{error_type:?}");
+                assert!(!body.message.contains("/srv/x.py"), "{}", body.message);
+            }
+        }
+        let (status, Json(body)) =
+            fold_rejection_or_internal(&backend_rejection("ValueError: bad"), "fold failed");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.message, "ValueError: bad");
+        let unknown = DynamoError::builder()
+            .error_type(RuntimeErrorType::Unknown)
+            .message("boom at /srv/x.py")
+            .build();
+        let (status, Json(body)) = fold_rejection_or_internal(&unknown, "fold failed");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.message.contains("/srv/x.py"));
+    }
+
+    #[test]
     fn test_responses_stream_failure_classification() {
-        // (status, after output, timed out, code, metrics type, message forwarded)
+        use ErrorType::{Cancelled, Internal, NotFound, Overload, Unavailable, Validation};
+        // (status, after output, code, metrics type, message forwarded)
         let cases = [
-            (
-                499,
-                false,
-                false,
-                "server_error",
-                ErrorType::Cancelled,
-                false,
-            ),
-            (
-                499,
-                true,
-                false,
-                "server_error",
-                ErrorType::Cancelled,
-                false,
-            ),
-            (
-                400,
-                false,
-                false,
-                "invalid_prompt",
-                ErrorType::Validation,
-                true,
-            ),
-            (
-                404,
-                false,
-                false,
-                "invalid_prompt",
-                ErrorType::NotFound,
-                true,
-            ),
-            (
-                429,
-                false,
-                false,
-                "rate_limit_exceeded",
-                ErrorType::Overload,
-                true,
-            ),
-            (400, true, false, "server_error", ErrorType::Internal, false),
-            (
-                500,
-                false,
-                false,
-                "server_error",
-                ErrorType::Internal,
-                false,
-            ),
-            (
-                503,
-                false,
-                false,
-                "server_error",
-                ErrorType::Unavailable,
-                false,
-            ),
-            (
-                529,
-                false,
-                false,
-                "rate_limit_exceeded",
-                ErrorType::Overload,
-                false,
-            ),
-            (
-                500,
-                true,
-                true,
-                "server_error",
-                ErrorType::ResponseTimeout,
-                false,
-            ),
+            (499, false, "server_error", Cancelled, false),
+            (499, true, "server_error", Cancelled, false),
+            (400, false, "invalid_prompt", Validation, true),
+            (404, false, "invalid_prompt", NotFound, true),
+            (429, false, "rate_limit_exceeded", Overload, true),
+            (400, true, "server_error", Internal, false),
+            (500, false, "server_error", Internal, false),
+            (503, false, "server_error", Unavailable, false),
+            (529, false, "rate_limit_exceeded", Overload, false),
         ];
-        for (code, after_output, timed_out, slug, error_type, forwarded) in cases {
+        for (code, after_output, slug, error_type, forwarded) in cases {
             let status = StatusCode::from_u16(code).unwrap();
-            let (error, got_type) = responses_stream_failure(
-                "secret /srv/x.py".to_string(),
-                status,
-                after_output,
-                timed_out,
-            );
+            let (error, got_type) =
+                responses_stream_failure("secret /srv/x.py".to_string(), status, after_output);
             assert_eq!(got_type, error_type, "{code} {after_output}");
             assert_eq!(error.code, slug, "{code} {after_output}");
             assert_eq!(
