@@ -3,6 +3,16 @@
 
 use std::env::{self, VarError};
 
+/// Process environment lookup for the worker-selection overrides; a non-UTF-8 value is kept
+/// (lossily) so it fails validation instead of being ignored.
+fn process_env(key: &str) -> Option<String> {
+    match env::var(key) {
+        Ok(value) => Some(value),
+        Err(VarError::NotPresent) => None,
+        Err(VarError::NotUnicode(value)) => Some(value.to_string_lossy().into_owned()),
+    }
+}
+
 /// Override of the worker-selection policy for every worker pool (upstream name).
 pub const DYN_ROUTER_WORKER_SELECTION_POLICY: &str = "DYN_ROUTER_WORKER_SELECTION_POLICY";
 /// Override for prefill pools; takes precedence over [`DYN_ROUTER_WORKER_SELECTION_POLICY`].
@@ -1018,11 +1028,7 @@ impl KvRouterConfig {
         Option<super::policy_config::WorkerSelectionPolicyKind>,
         super::policy_config::RouterPolicyConfigError,
     > {
-        self.worker_selection_policy_with_env(stage, |key| match env::var(key) {
-            Ok(value) => Some(value),
-            Err(VarError::NotPresent) => None,
-            Err(VarError::NotUnicode(value)) => Some(value.to_string_lossy().into_owned()),
-        })
+        self.worker_selection_policy_with_env(stage, process_env)
     }
 
     /// [`Self::worker_selection_policy`] with an explicit environment lookup.
@@ -1077,21 +1083,39 @@ impl KvRouterConfig {
     ///
     /// Hosts that cannot tell which pool they serve (or only run the built-in selector) use this
     /// to wait for the worker role or to reject a document they would otherwise ignore.
+    ///
+    /// Resolves every stage (no short-circuit), so startup validation reports an invalid override
+    /// for any pool even when an earlier pool already selects a policy; all errors are reported.
     pub fn selects_worker_selection_policy(
         &self,
     ) -> Result<bool, super::policy_config::RouterPolicyConfigError> {
-        use super::policy_config::WorkerSelectionStage;
+        self.selects_worker_selection_policy_with_env(process_env)
+    }
+
+    /// [`Self::selects_worker_selection_policy`] with an explicit environment lookup.
+    pub(crate) fn selects_worker_selection_policy_with_env(
+        &self,
+        get_env: impl Fn(&str) -> Option<String>,
+    ) -> Result<bool, super::policy_config::RouterPolicyConfigError> {
+        use super::policy_config::{RouterPolicyConfigError, WorkerSelectionStage};
+        let mut selects = false;
+        let mut errors = Vec::new();
         for stage in [
             WorkerSelectionStage::Aggregated,
             WorkerSelectionStage::Prefill,
             WorkerSelectionStage::Decode,
             WorkerSelectionStage::Encode,
         ] {
-            if self.worker_selection_policy(stage)?.is_some() {
-                return Ok(true);
+            match self.worker_selection_policy_with_env(stage, &get_env) {
+                Ok(policy) => selects |= policy.is_some(),
+                Err(error) => errors.push(format!("{} stage: {error}", stage.as_str())),
             }
         }
-        Ok(false)
+        if errors.is_empty() {
+            Ok(selects)
+        } else {
+            Err(RouterPolicyConfigError::Validation(errors.join("; ")))
+        }
     }
 
     pub fn policy_profile(
@@ -1887,6 +1911,66 @@ mod tests {
                 env(&[(DYN_ROUTER_WORKER_SELECTION_POLICY, "plain")])
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn selection_validation_resolves_every_stage() {
+        use std::io::Write;
+
+        // Kimi's document: aggregated selects a valid instance.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(
+            b"worker_selection:\n  aggregated: dynamo-two-tier-cost-fn\n  instances:\n    - name: dynamo-two-tier-cost-fn\n      type: dynamo-two-tier-cost-fn\n",
+        )
+        .unwrap();
+        let config = KvRouterConfig {
+            router_policy_config: Some(file.path().display().to_string()),
+            ..Default::default()
+        };
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        assert!(
+            config
+                .selects_worker_selection_policy_with_env(env(&[]))
+                .unwrap()
+        );
+
+        // A valid earlier stage must not hide an invalid later role override.
+        let error = config
+            .selects_worker_selection_policy_with_env(env(&[(DYN_ROUTER_DECODE_POLICY, "missing")]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(DYN_ROUTER_DECODE_POLICY), "{error}");
+        assert!(error.contains("decode stage"), "{error}");
+
+        // Every invalid stage is reported, not only the first.
+        let error = config
+            .selects_worker_selection_policy_with_env(env(&[
+                (DYN_ROUTER_PREFILL_POLICY, "nope"),
+                (DYN_ROUTER_DECODE_POLICY, "missing"),
+            ]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("prefill stage") && error.contains("decode stage"),
+            "{error}"
+        );
+
+        // A valid role override alongside the YAML selection is accepted.
+        assert!(
+            config
+                .selects_worker_selection_policy_with_env(env(&[(
+                    DYN_ROUTER_DECODE_POLICY,
+                    "default"
+                )]))
+                .unwrap()
         );
     }
 
