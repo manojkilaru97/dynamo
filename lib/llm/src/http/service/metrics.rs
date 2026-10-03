@@ -2517,6 +2517,11 @@ fn observe_annotation_metrics<T>(
     }
 }
 
+/// Whether a rejection message is a backend `HttpError(499)` envelope.
+fn is_cancellation(message: &str) -> bool {
+    crate::http::service::disconnect::rejection_message_and_code(message).1 == 499
+}
+
 /// Report a request rejection as a client error only before any model output.
 ///
 /// A rejection (`InvalidArgument`) that arrives after model data has been
@@ -2526,10 +2531,6 @@ fn observe_annotation_metrics<T>(
 /// do not count as output.
 /// A backend `HttpError(499)` is a cancellation, not a rejection; it keeps its
 /// type so the cancellation handling sanitizes it whenever it arrives.
-fn is_cancellation(message: &str) -> bool {
-    crate::http::service::disconnect::rejection_message_and_code(message).1 == 499
-}
-
 pub(crate) fn demote_late_rejections<T: crate::http::service::openai::ModelOutput>(
     stream: impl futures::Stream<Item = crate::types::Annotated<T>>,
 ) -> impl futures::Stream<Item = crate::types::Annotated<T>> {

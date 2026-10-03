@@ -787,9 +787,20 @@ impl ResponseStreamConverter {
 
     /// Append error events when the stream ends due to a backend error.
     pub fn append_error_events(&mut self, events: &mut Vec<Result<Event, anyhow::Error>>) {
+        self.append_failed_events(None, events);
+    }
+
+    /// Append `response.failed` carrying `error` as the response's error object.
+    pub fn append_failed_events(
+        &mut self,
+        error: Option<dynamo_protocols::types::responses::ErrorObject>,
+        events: &mut Vec<Result<Event, anyhow::Error>>,
+    ) {
+        let mut response = self.make_response(Status::Failed, vec![]);
+        response.error = error;
         let failed = ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
             sequence_number: self.next_seq(),
-            response: self.make_response(Status::Failed, vec![]),
+            response,
         });
         events.push(self.make_sse_event(&failed));
     }

@@ -233,6 +233,20 @@ fn rejection_error_response(invalid: &dynamo_runtime::error::DynamoError) -> Err
     )
 }
 
+/// Error response for a non-streaming aggregation failure after model output: a
+/// backend 499 stays a sanitized cancellation; anything else is a server error.
+fn late_cancellation_or_internal(
+    err: &(dyn std::error::Error + 'static),
+    message: &str,
+) -> ErrorResponse {
+    if let Some(invalid) = find_invalid_argument_in_chain(err)
+        && super::disconnect::rejection_message_and_code(invalid.message()).1 == 499
+    {
+        return rejection_error_response(invalid);
+    }
+    ErrorMessage::internal_server_error(message)
+}
+
 /// Match `InvalidArgument` at top-level OR under `Backend()`.
 /// `py_err_to_dynamo` wraps Python `ValueError`/`TypeError` as
 /// `Backend(InvalidArgument)`; both variants are 400-worthy.
@@ -469,17 +483,10 @@ impl ErrorMessage {
             );
         }
 
-        // InvalidArgument (top-level OR Backend) → 400.
+        // InvalidArgument (top-level OR Backend) → its 4xx: 400 by default, the
+        // status of a backend `HttpError` envelope, or a sanitized 499.
         if let Some(dynamo_err) = find_invalid_argument_in_chain(err.as_ref()) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorMessage {
-                    message: dynamo_err.message().to_string(),
-                    error_type: map_error_code_to_error_type(StatusCode::BAD_REQUEST),
-                    code: StatusCode::BAD_REQUEST.as_u16(),
-                    details: None,
-                }),
-            );
+            return rejection_error_response(dynamo_err);
         }
 
         // Check for Cancelled anywhere in the error chain → HTTP 499 (Client Closed Request)
@@ -1374,7 +1381,7 @@ async fn embeddings(
                 .inc_rejection(&model_name, super::metrics::Endpoint::Embeddings);
         }
         let err_response = ErrorMessage::from_anyhow(e, "Failed to generate embeddings");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        inflight.mark_error(backend_error_type_from_response(&err_response));
         err_response
     })?;
 
@@ -1560,7 +1567,7 @@ async fn classify(
                 .inc_rejection(&model_name, super::metrics::Endpoint::Classify);
         }
         let err_response = ErrorMessage::from_anyhow(e, "Failed to generate classification");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        inflight.mark_error(backend_error_type_from_response(&err_response));
         err_response
     })?;
 
@@ -1840,7 +1847,7 @@ async fn pooling(
                 .inc_rejection(&model_name, super::metrics::Endpoint::Pooling);
         }
         let err_response = ErrorMessage::from_anyhow(e, "Failed to generate pooling output");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        inflight.mark_error(backend_error_type_from_response(&err_response));
         err_response
     })?;
 
@@ -2804,10 +2811,11 @@ async fn chat_completions(
                         "Failed to parse chat completion response: {:?}",
                         e
                     );
-                    let err_response = ErrorMessage::internal_server_error(
+                    let err_response = late_cancellation_or_internal(
+                        &e,
                         "Failed to parse chat completion response",
                     );
-                    inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+                    inflight_guard.mark_error(backend_error_type_from_response(&err_response));
                     err_response
                 })?;
 
@@ -3208,6 +3216,8 @@ async fn responses(
         };
 
         let mut http_queue_guard = Some(http_queue_guard);
+        let outcome = super::disconnect::StreamOutcome::default();
+        let stream_outcome = outcome.clone();
 
         let mut engine_stream = Box::pin(engine_stream);
         let full_stream = async_stream::stream! {
@@ -3217,8 +3227,9 @@ async fn responses(
                 yield event.map_err(axum::Error::new);
             }
 
-            // Track whether the backend sent an error event during the stream.
-            let mut saw_error = false;
+            // The first backend error event, and whether model output preceded it.
+            let mut failure: Option<(String, StatusCode, bool)> = None;
+            let mut saw_output = false;
 
             while let Some(annotated_chunk) = engine_stream.next().await {
                 process_chat_response_and_observe_metrics(
@@ -3227,14 +3238,15 @@ async fn responses(
                     &mut http_queue_guard,
                 );
 
-                if extract_backend_error_if_present(&annotated_chunk).is_some() {
-                    saw_error = true;
+                if let Some((message, status)) = extract_backend_error_if_present(&annotated_chunk) {
+                    failure.get_or_insert((message, status, saw_output));
                     continue;
                 }
 
                 let Some(stream_resp) = annotated_chunk.data else {
                     continue;
                 };
+                saw_output |= stream_resp.has_model_output();
 
                 converter.append_chunk_events(&stream_resp, &mut events);
                 for event in events.drain(..) {
@@ -3242,10 +3254,14 @@ async fn responses(
                 }
             }
 
-            if saw_error {
-                converter.append_error_events(&mut events);
-            } else {
-                converter.append_end_events(&mut events);
+            match failure {
+                Some((message, status, after_output)) => {
+                    let (error, error_type) =
+                        responses_stream_failure(message, status, after_output);
+                    let _ = stream_outcome.set(error_type);
+                    converter.append_failed_events(Some(error), &mut events);
+                }
+                None => converter.append_end_events(&mut events),
             }
             for event in events.drain(..) {
                 yield event.map_err(axum::Error::new);
@@ -3253,8 +3269,15 @@ async fn responses(
         };
 
         // Wrap with disconnect monitoring: detects client disconnects, cancels generation,
-        // and defers inflight_guard.mark_ok() until the stream completes.
-        let stream = monitor_for_disconnects(full_stream, ctx, inflight_guard, stream_handle);
+        // and defers inflight_guard.mark_ok() until the stream completes; a
+        // `response.failed` stream records its error type instead.
+        let stream = super::disconnect::monitor_for_disconnects_with_outcome(
+            full_stream,
+            ctx,
+            inflight_guard,
+            stream_handle,
+            outcome,
+        );
 
         let mut sse_stream = Sse::new(stream);
         if let Some(keep_alive) = state.sse_keep_alive() {
@@ -3290,8 +3313,8 @@ async fn responses(
                 .map_err(|e| {
                     tracing::error!(request_id, "Failed to fold responses stream: {:?}", e);
                     let err_response =
-                        ErrorMessage::internal_server_error("Failed to fold responses stream");
-                    inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+                        late_cancellation_or_internal(&e, "Failed to fold responses stream");
+                    inflight_guard.mark_error(backend_error_type_from_response(&err_response));
                     err_response
                 })?;
 
@@ -3318,6 +3341,49 @@ async fn responses(
         }
 
         Ok(Json(response).into_response())
+    }
+}
+
+/// `response.failed` error object and metrics type for a backend error in a
+/// streaming Responses request. A 4xx rejection before model output is forwarded
+/// (499 as a sanitized cancellation, at any point); anything else is sanitized.
+fn responses_stream_failure(
+    message: String,
+    status: StatusCode,
+    after_output: bool,
+) -> (dynamo_protocols::types::responses::ErrorObject, ErrorType) {
+    use dynamo_protocols::types::responses::ErrorObject;
+    let sanitized = |error: SanitizedError, error_type: ErrorType| {
+        (
+            ErrorObject {
+                code: error.openai_type_slug().to_string(),
+                message: error.to_string(),
+            },
+            error_type,
+        )
+    };
+    if status.as_u16() == 499 {
+        return sanitized(SanitizedError::Cancelled, ErrorType::Cancelled);
+    }
+    if status.is_client_error() && !after_output {
+        let code = match status.as_u16() {
+            404 => "not_found_error",
+            429 => "rate_limit_error",
+            _ => "invalid_request_error",
+        };
+        return (
+            ErrorObject {
+                code: code.to_string(),
+                message,
+            },
+            backend_rejection_error_type(status.as_u16()),
+        );
+    }
+    match SanitizedError::for_backend_status(status) {
+        Some(error) if status.is_server_error() => {
+            sanitized(error, classify_error_for_metrics(status, ""))
+        }
+        _ => sanitized(SanitizedError::Internal, ErrorType::Internal),
     }
 }
 
@@ -4316,7 +4382,7 @@ async fn audio_speech(
         .map_err(|e| {
             let err_response =
                 ErrorMessage::from_anyhow(anyhow::Error::new(e), "Failed to fold audio stream");
-            inflight.mark_error(extract_error_type_from_response(&err_response));
+            inflight.mark_error(backend_error_type_from_response(&err_response));
             err_response
         })?;
 
@@ -4445,6 +4511,94 @@ mod tests {
             rejection_error_response(&rejection(r#"{"message":"gone /srv/x.py","code":499}"#));
         assert_eq!(status.as_u16(), 499);
         assert!(!body.message.contains("/srv/x.py"));
+    }
+
+    fn backend_rejection(message: &str) -> dynamo_runtime::error::DynamoError {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
+        DynamoError::builder()
+            .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+            .message(message)
+            .build()
+    }
+
+    #[test]
+    fn test_from_anyhow_maps_backend_rejection_envelopes() {
+        let response = |message: &str| {
+            ErrorMessage::from_anyhow(anyhow::Error::new(backend_rejection(message)), "alt")
+        };
+        let (status, Json(body)) = response(r#"{"message":"gone /srv/x.py","code":499}"#);
+        assert_eq!(status.as_u16(), 499);
+        assert!(!body.message.contains("/srv/x.py"), "{}", body.message);
+        assert_eq!(
+            backend_error_type_from_response(&(status, Json(body))),
+            ErrorType::Cancelled
+        );
+        let (status, Json(body)) = response(r#"{"message":"no such voice","code":404}"#);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.message, "no such voice");
+        let (status, Json(body)) = response("ValueError: bad");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.message, "ValueError: bad");
+        assert_eq!(
+            backend_error_type_from_response(&(status, Json(body))),
+            ErrorType::Validation
+        );
+    }
+
+    #[test]
+    fn test_late_aggregation_failure_keeps_only_cancellation() {
+        let cancelled = backend_rejection(r#"{"message":"gone /srv/x.py","code":499}"#);
+        let (status, Json(body)) = late_cancellation_or_internal(&cancelled, "fold failed");
+        assert_eq!(status.as_u16(), 499);
+        assert!(!body.message.contains("/srv/x.py"));
+        let rejected = backend_rejection("ValueError: bad schema");
+        let (status, Json(body)) = late_cancellation_or_internal(&rejected, "fold failed");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.message.contains("bad schema"));
+        let other = anyhow::anyhow!("parse failure");
+        let (status, _) = late_cancellation_or_internal(other.as_ref(), "fold failed");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_responses_stream_failure_classification() {
+        let cases = [
+            (499, false, "request_cancelled", ErrorType::Cancelled, false),
+            (499, true, "request_cancelled", ErrorType::Cancelled, false),
+            (
+                400,
+                false,
+                "invalid_request_error",
+                ErrorType::Validation,
+                true,
+            ),
+            (404, false, "not_found_error", ErrorType::NotFound, true),
+            (429, false, "rate_limit_error", ErrorType::Overload, true),
+            (400, true, "internal_error", ErrorType::Internal, false),
+            (500, false, "internal_error", ErrorType::Internal, false),
+            (
+                503,
+                false,
+                "service_unavailable",
+                ErrorType::Unavailable,
+                false,
+            ),
+        ];
+        for (code, after_output, slug, error_type, forwarded) in cases {
+            let status = StatusCode::from_u16(code).unwrap();
+            let (error, got_type) =
+                responses_stream_failure("secret /srv/x.py".to_string(), status, after_output);
+            assert_eq!(got_type, error_type, "{code} {after_output}");
+            assert_eq!(
+                error.message.contains("/srv/x.py"),
+                forwarded,
+                "{code} {after_output}: {}",
+                error.message
+            );
+            if forwarded || code == 499 {
+                assert_eq!(error.code, slug, "{code} {after_output}");
+            }
+        }
     }
 
     fn binary_pooling_response() -> NvCreatePoolingResponse {

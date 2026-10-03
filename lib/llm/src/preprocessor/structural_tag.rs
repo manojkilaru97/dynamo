@@ -51,22 +51,41 @@ impl OpenAIPreprocessor {
             return Ok(false);
         }
 
+        let ctx = Self::tool_call_format_context(
+            &self.runtime_config,
+            parser_name,
+            tool_choice,
+            tools,
+            parallel_tool_calls,
+            prompt_injected_reasoning,
+        );
+
+        Self::apply_tool_call_format(parser_name, builder, &ctx, preprocessed_request)
+    }
+
+    /// Build context for the tool-call tag of one request.
+    fn tool_call_format_context<'a>(
+        runtime_config: &crate::local_model::runtime_config::ModelRuntimeConfig,
+        parser_name: &str,
+        tool_choice: &'a ToolChoice,
+        tools: &'a [ToolDefinition],
+        parallel_tool_calls: Option<bool>,
+        prompt_injected_reasoning: bool,
+    ) -> dynamo_parsers::tool_calling::ToolCallFormatBuildContext<'a> {
         // Nemotron-v3's native vLLM reasoner owns the prompt-seeded reasoning
         // phase and consumes its single `</think>` boundary before advancing
         // guided decoding. Start Qwen3-coder's structural grammar at the tool
         // suffix so the two layers do not both wait for the same boundary.
         let native_reasoning_owns_prefix = prompt_injected_reasoning
             && parser_name == "qwen3_coder"
-            && self.runtime_config.reasoning_parser.as_deref() == Some("nemotron_v3");
-        let ctx = dynamo_parsers::tool_calling::ToolCallFormatBuildContext {
+            && runtime_config.reasoning_parser.as_deref() == Some("nemotron_v3");
+        dynamo_parsers::tool_calling::ToolCallFormatBuildContext {
             tool_choice,
             tools,
             parallel_tool_calls: Self::tag_parallel_tool_calls(tool_choice, parallel_tool_calls),
-            schema_mode: self.runtime_config.structural_tag_schema,
+            schema_mode: runtime_config.structural_tag_schema,
             starts_in_reasoning: prompt_injected_reasoning && !native_reasoning_owns_prefix,
-        };
-
-        Self::apply_tool_call_format(parser_name, builder, &ctx, preprocessed_request)
+        }
     }
 
     /// `parallel_tool_calls` for the tool-call tag. A named `tool_choice` forces
@@ -162,8 +181,9 @@ impl OpenAIPreprocessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dynamo_parsers::tool_calling::{StructuralTagSchemaMode, ToolCallFormatBuildContext};
 
+    /// The tag `apply_tool_choice_structural_tag` installs for qwen3_coder with
+    /// Super 3.5's nemotron_v3 reasoning parser.
     fn tag(tool_choice: &ToolChoice, parallel_tool_calls: Option<bool>) -> serde_json::Value {
         let tools = [ToolDefinition {
             name: "record".to_string(),
@@ -172,16 +192,18 @@ mod tests {
         }];
         let builder = OpenAIPreprocessor::structural_tag_builder_for_parser("qwen3_coder")
             .expect("qwen3_coder has a structural tag builder");
-        let ctx = ToolCallFormatBuildContext {
-            tool_choice,
-            tools: &tools,
-            parallel_tool_calls: OpenAIPreprocessor::tag_parallel_tool_calls(
-                tool_choice,
-                parallel_tool_calls,
-            ),
-            schema_mode: StructuralTagSchemaMode::default(),
-            starts_in_reasoning: false,
+        let runtime_config = crate::local_model::runtime_config::ModelRuntimeConfig {
+            reasoning_parser: Some("nemotron_v3".to_string()),
+            ..Default::default()
         };
+        let ctx = OpenAIPreprocessor::tool_call_format_context(
+            &runtime_config,
+            "qwen3_coder",
+            tool_choice,
+            &tools,
+            parallel_tool_calls,
+            true,
+        );
         builder
             .build_tool_call_format(&ctx)
             .expect("tag builds")

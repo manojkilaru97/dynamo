@@ -1393,20 +1393,15 @@ async fn test_audio_speech_backend_invalid_argument_returns_4xx() {
         "expected the backend validation message to name the offending field; got: {text}"
     );
 
-    // Backport divergence from main, which asserts `Validation` here.
-    // `ErrorMessage::metric_error_type` arrived with #12092 and is not on this
-    // release branch, so the label falls back to `classify_error_for_metrics`,
-    // which maps 400 to `Internal` unless the message begins with
-    // "Validation:" — the backend's text begins with "ValidationError:".
-    // The status code and message the caller sees are unaffected.
-    // If #12092 is ever backported, restore the `Validation` assertion.
+    // A backend rejection is a validation error whatever its message prefix,
+    // as on main.
     compare_counter(
         &metrics,
         "tts-model",
         &Endpoint::Audios,
         &RequestType::Unary,
         &Status::Error,
-        &ErrorType::Internal,
+        &ErrorType::Validation,
         1,
     );
 
@@ -1755,6 +1750,435 @@ async fn test_streaming_batch_rejection_after_other_prompt_output_is_sanitized()
     assert!(
         body.contains("\"code\":500"),
         "expected a sanitized 500 frame: {body}"
+    );
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
+
+fn backend_rejection_event<T>(message: &str) -> Annotated<T> {
+    Annotated {
+        data: None,
+        id: None,
+        event: Some("error".to_string()),
+        comment: None,
+        error: Some(
+            DynamoError::builder()
+                .error_type(dynamo_runtime::error::ErrorType::Backend(
+                    dynamo_runtime::error::BackendError::InvalidArgument,
+                ))
+                .message(message)
+                .build(),
+        ),
+    }
+}
+
+const SECRET_499: &str = r#"{"message":"client went away at /srv/secret.py","code":499}"#;
+const SECRET_400: &str = "ValueError: bad schema at /srv/secret.py";
+
+/// Chat engine whose `max_tokens` picks the outcome: 1 = immediate 499,
+/// 2 = one token then 499, 3 = immediate 400, 4 = one token then 400.
+struct ScriptedRejectionEngine {}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<NvCreateChatCompletionRequest>,
+        ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
+        Error,
+    > for ScriptedRejectionEngine
+{
+    async fn generate(
+        &self,
+        request: SingleIn<NvCreateChatCompletionRequest>,
+    ) -> Result<ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>, Error> {
+        let (request, context) = request.transfer(());
+        let ctx = context.context();
+        #[allow(deprecated)]
+        let mode = request
+            .inner
+            .max_completion_tokens
+            .or(request.inner.max_tokens)
+            .unwrap_or(0);
+        let mut generator = request.response_generator(ctx.id().to_string());
+        let stream = stream! {
+            if mode == 2 || mode == 4 {
+                yield Annotated::from_data(generator.create_choice(0, Some("tok".to_string()), None, None));
+            }
+            yield backend_rejection_event(if mode <= 2 { SECRET_499 } else { SECRET_400 });
+        };
+        Ok(ResponseStream::new(Box::pin(stream), ctx))
+    }
+}
+
+/// Backend rejections on chat and Responses, before and after model output: a
+/// 499 is always a sanitized cancellation; a 400 is forwarded only before
+/// output; failed Responses streams carry the error and are not successes.
+#[tokio::test]
+async fn test_backend_rejections_on_chat_and_responses() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder()
+        .port(port)
+        .enable_chat_endpoints(true)
+        .build()
+        .unwrap();
+    let state = service.state_clone();
+    let manager = state.manager();
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task =
+        tokio::spawn(async move { service.run_with_listener(token.clone(), listener).await });
+    wait_for_service_ready(port).await;
+    let card = ModelDeploymentCard::with_name_only("scripted");
+    manager
+        .add_chat_completions_model(
+            "scripted",
+            card.mdcsum(),
+            Arc::new(ScriptedRejectionEngine {}),
+        )
+        .expect("register model");
+    let metrics = state.metrics_clone();
+    let client = reqwest::Client::new();
+
+    // (mode, unary status, metrics error type, forwarded message)
+    let cases = [
+        (1u32, 499u16, ErrorType::Cancelled, false),
+        (2, 499, ErrorType::Cancelled, false),
+        (3, 400, ErrorType::Validation, true),
+        (4, 500, ErrorType::Internal, false),
+    ];
+    let mut expected: std::collections::HashMap<(String, bool, String), u64> = Default::default();
+    for (mode, status, error_type, forwarded) in cases {
+        for (path, endpoint, budget) in [
+            ("chat/completions", Endpoint::ChatCompletions, "max_tokens"),
+            ("responses", Endpoint::Responses, "max_output_tokens"),
+        ] {
+            let mut body = serde_json::json!({"model": "scripted", "stream": false});
+            body[budget] = serde_json::json!(mode);
+            if path == "responses" {
+                body["input"] = serde_json::json!("hi");
+            } else {
+                body["messages"] = serde_json::json!([{"role": "user", "content": "hi"}]);
+            }
+            let response = client
+                .post(format!("http://localhost:{port}/v1/{path}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status, "{path} mode={mode}");
+            let text = response.text().await.unwrap();
+            assert_eq!(
+                text.contains("/srv/secret.py"),
+                forwarded,
+                "{path} mode={mode}: {text}"
+            );
+            *expected
+                .entry((
+                    endpoint.as_str().to_string(),
+                    false,
+                    error_type.as_str().to_string(),
+                ))
+                .or_default() += 1;
+            compare_counter(
+                &metrics,
+                "scripted",
+                &endpoint,
+                &RequestType::Unary,
+                &Status::Error,
+                &error_type,
+                expected[&(
+                    endpoint.as_str().to_string(),
+                    false,
+                    error_type.as_str().to_string(),
+                )],
+            );
+
+            body["stream"] = serde_json::json!(true);
+            let response = client
+                .post(format!("http://localhost:{port}/v1/{path}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{path} mode={mode} stream"
+            );
+            let text = timeout(std::time::Duration::from_secs(10), response.text())
+                .await
+                .expect("stream finished")
+                .unwrap();
+            assert_eq!(
+                text.contains("/srv/secret.py"),
+                forwarded,
+                "{path} mode={mode} stream: {text}"
+            );
+            if path == "responses" {
+                let failed = text
+                    .lines()
+                    .find(|line| line.contains("\"type\":\"response.failed\""))
+                    .unwrap_or_else(|| panic!("no response.failed: {text}"));
+                let failed: serde_json::Value =
+                    serde_json::from_str(failed.trim_start_matches("data: ")).unwrap();
+                assert!(
+                    failed["response"]["error"]["message"].is_string(),
+                    "failed without an error: {failed}"
+                );
+            }
+            if mode <= 2 {
+                assert!(
+                    text.contains("request_cancelled"),
+                    "{path} mode={mode} stream: {text}"
+                );
+            }
+            let stream_type = if mode == 4 && path == "chat/completions" {
+                // A late chat rejection is the sanitized internal-error frame.
+                ErrorType::Internal
+            } else {
+                error_type.clone()
+            };
+            *expected
+                .entry((
+                    endpoint.as_str().to_string(),
+                    true,
+                    stream_type.as_str().to_string(),
+                ))
+                .or_default() += 1;
+            compare_counter(
+                &metrics,
+                "scripted",
+                &endpoint,
+                &RequestType::Stream,
+                &Status::Error,
+                &stream_type,
+                expected[&(
+                    endpoint.as_str().to_string(),
+                    true,
+                    stream_type.as_str().to_string(),
+                )],
+            );
+        }
+    }
+    for endpoint in [Endpoint::ChatCompletions, Endpoint::Responses] {
+        for request_type in [RequestType::Unary, RequestType::Stream] {
+            compare_counter(
+                &metrics,
+                "scripted",
+                &endpoint,
+                &request_type,
+                &Status::Success,
+                &ErrorType::None,
+                0,
+            );
+        }
+    }
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
+
+/// Pooling-family engine that rejects in `generate()` itself.
+struct ImmediateRejectionEngine {
+    message: &'static str,
+}
+
+macro_rules! immediate_rejection_engine {
+    ($req:ty, $resp:ty) => {
+        #[async_trait]
+        impl AsyncEngine<SingleIn<$req>, ManyOut<Annotated<$resp>>, Error>
+            for ImmediateRejectionEngine
+        {
+            async fn generate(
+                &self,
+                _request: SingleIn<$req>,
+            ) -> Result<ManyOut<Annotated<$resp>>, Error> {
+                Err(DynamoError::builder()
+                    .error_type(dynamo_runtime::error::ErrorType::Backend(
+                        dynamo_runtime::error::BackendError::InvalidArgument,
+                    ))
+                    .message(self.message)
+                    .build())?
+            }
+        }
+    };
+}
+
+immediate_rejection_engine!(
+    dynamo_llm::protocols::openai::embeddings::NvCreateEmbeddingRequest,
+    dynamo_llm::protocols::openai::embeddings::NvCreateEmbeddingResponse
+);
+immediate_rejection_engine!(
+    dynamo_llm::protocols::openai::classify::NvCreateClassifyRequest,
+    dynamo_llm::protocols::openai::classify::NvCreateClassifyResponse
+);
+immediate_rejection_engine!(
+    dynamo_llm::protocols::openai::pooling::NvCreatePoolingRequest,
+    dynamo_llm::protocols::openai::pooling::NvCreatePoolingResponse
+);
+
+/// An immediate backend rejection from embeddings, classify, or pooling is
+/// metered as validation (400) or cancellation (sanitized 499), not internal.
+#[tokio::test]
+async fn test_pooling_family_immediate_rejections_are_metered() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder().port(port).build().unwrap();
+    service
+        .enable_model_endpoint(dynamo_llm::endpoint_type::EndpointType::Classify, true)
+        .unwrap();
+    service
+        .enable_model_endpoint(dynamo_llm::endpoint_type::EndpointType::Pooling, true)
+        .unwrap();
+    let state = service.state_clone();
+    let manager = state.manager();
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task =
+        tokio::spawn(async move { service.run_with_listener(token.clone(), listener).await });
+    wait_for_service_ready(port).await;
+
+    for (model, message) in [("rejects", SECRET_400), ("cancels", SECRET_499)] {
+        let card = ModelDeploymentCard::with_name_only(model);
+        let engine = Arc::new(ImmediateRejectionEngine { message });
+        manager
+            .add_embeddings_model(model, card.mdcsum(), engine.clone())
+            .unwrap();
+        manager
+            .add_classify_model(model, card.mdcsum(), engine.clone())
+            .unwrap();
+        manager
+            .add_pooling_model(model, card.mdcsum(), engine)
+            .unwrap();
+    }
+    let metrics = state.metrics_clone();
+    let client = reqwest::Client::new();
+    for (model, status, error_type) in [
+        ("rejects", 400u16, ErrorType::Validation),
+        ("cancels", 499, ErrorType::Cancelled),
+    ] {
+        for (path, endpoint) in [
+            ("embeddings", Endpoint::Embeddings),
+            ("classify", Endpoint::Classify),
+            ("pooling", Endpoint::Pooling),
+        ] {
+            let response = client
+                .post(format!("http://localhost:{port}/v1/{path}"))
+                .json(&serde_json::json!({"model": model, "input": "hi"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status, "{path} {model}");
+            let text = response.text().await.unwrap();
+            assert_eq!(
+                text.contains("/srv/secret.py"),
+                status == 400,
+                "{path} {model}: {text}"
+            );
+            compare_counter(
+                &metrics,
+                model,
+                &endpoint,
+                &RequestType::Unary,
+                &Status::Error,
+                &error_type,
+                1,
+            );
+        }
+    }
+
+    cancel_token.cancel();
+    task.await.unwrap().unwrap();
+}
+
+/// Streams one video chunk, then a typed rejection.
+struct LateRejectionVideosEngine {}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<dynamo_llm::protocols::openai::videos::NvCreateVideoRequest>,
+        ManyOut<Annotated<dynamo_llm::protocols::openai::videos::NvVideosResponse>>,
+        Error,
+    > for LateRejectionVideosEngine
+{
+    async fn generate(
+        &self,
+        request: SingleIn<dynamo_llm::protocols::openai::videos::NvCreateVideoRequest>,
+    ) -> Result<ManyOut<Annotated<dynamo_llm::protocols::openai::videos::NvVideosResponse>>, Error>
+    {
+        let (_request, context) = request.transfer(());
+        let ctx = context.context();
+        let chunk: dynamo_llm::protocols::openai::videos::NvVideosResponse =
+            serde_json::from_value(serde_json::json!({
+                "id": "video-1",
+                "model": "video",
+                "created": 0,
+                "status": "in_progress",
+                "progress": 50,
+                "data": []
+            }))
+            .unwrap();
+        let stream = stream! {
+            yield Annotated::from_data(chunk);
+            yield backend_rejection_event(SECRET_400);
+        };
+        Ok(ResponseStream::new(Box::pin(stream), ctx))
+    }
+}
+
+/// A rejection after streamed video output is the sanitized 500 frame.
+#[tokio::test]
+async fn test_videos_stream_late_rejection_is_sanitized() {
+    let (listener, port) = bind_random_port().await;
+    let service = HttpService::builder().port(port).build().unwrap();
+    service
+        .enable_model_endpoint(dynamo_llm::endpoint_type::EndpointType::Videos, true)
+        .unwrap();
+    let state = service.state_clone();
+    let manager = state.manager();
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let task =
+        tokio::spawn(async move { service.run_with_listener(token.clone(), listener).await });
+    wait_for_service_ready(port).await;
+    let card = ModelDeploymentCard::with_name_only("video");
+    manager
+        .add_videos_model(
+            "video",
+            card.mdcsum(),
+            Arc::new(LateRejectionVideosEngine {}),
+        )
+        .unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("http://localhost:{port}/v1/videos"))
+        .json(&serde_json::json!({"model": "video", "prompt": "a cat", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = timeout(std::time::Duration::from_secs(10), response.text())
+        .await
+        .expect("stream finished")
+        .unwrap();
+    assert!(body.contains("video-1"), "{body}");
+    assert!(
+        !body.contains("/srv/secret.py"),
+        "late rejection leaked: {body}"
+    );
+    assert!(
+        body.contains("\"code\":500"),
+        "expected a sanitized 500 frame: {body}"
+    );
+    compare_counter(
+        &state.metrics_clone(),
+        "video",
+        &Endpoint::Videos,
+        &RequestType::Stream,
+        &Status::Error,
+        &ErrorType::Internal,
+        1,
     );
 
     cancel_token.cancel();

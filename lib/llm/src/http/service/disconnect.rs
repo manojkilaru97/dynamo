@@ -239,12 +239,53 @@ pub fn monitor_for_disconnects(
     )
 }
 
+/// Like [`monitor_for_disconnects`], for streams that report their own failure
+/// in-band (Responses `response.failed`): if `outcome` is set when the stream
+/// ends, the request is recorded with that error type instead of success.
+pub fn monitor_for_disconnects_with_outcome(
+    stream: impl Stream<Item = Result<Event, axum::Error>>,
+    context: Arc<dyn AsyncEngineContext>,
+    inflight_guard: InflightGuard,
+    stream_handle: ConnectionHandle,
+    outcome: StreamOutcome,
+) -> impl Stream<Item = Result<Event, axum::Error>> {
+    monitor_with_outcome(
+        stream,
+        context,
+        inflight_guard,
+        stream_handle,
+        backend_stream_timeout(),
+        Some(outcome),
+    )
+}
+
+/// In-band failure of a stream, set by the producer before the stream ends.
+pub type StreamOutcome = Arc<std::sync::OnceLock<ErrorType>>;
+
 fn monitor_for_disconnects_with_timeout(
+    stream: impl Stream<Item = Result<Event, axum::Error>>,
+    context: Arc<dyn AsyncEngineContext>,
+    inflight_guard: InflightGuard,
+    stream_handle: ConnectionHandle,
+    inactivity_timeout: Option<Duration>,
+) -> impl Stream<Item = Result<Event, axum::Error>> {
+    monitor_with_outcome(
+        stream,
+        context,
+        inflight_guard,
+        stream_handle,
+        inactivity_timeout,
+        None,
+    )
+}
+
+fn monitor_with_outcome(
     stream: impl Stream<Item = Result<Event, axum::Error>>,
     context: Arc<dyn AsyncEngineContext>,
     mut inflight_guard: InflightGuard,
     mut stream_handle: ConnectionHandle,
     inactivity_timeout: Option<Duration>,
+    outcome: Option<StreamOutcome>,
 ) -> impl Stream<Item = Result<Event, axum::Error>> {
     stream_handle.arm();
 
@@ -276,7 +317,9 @@ fn monitor_for_disconnects_with_timeout(
                                 crate::http::service::openai::find_invalid_argument_in_chain(&err)
                             {
                                 // A request rejection is a client error: forward its
-                                // message with code 400, as the non-streaming path does.
+                                // message and 4xx code (400 unless the backend's
+                                // HttpError envelope says otherwise), as the
+                                // non-streaming path does; 499 is a cancellation.
                                 let (message, code) = rejection_message_and_code(invalid.message());
                                 inflight_guard.mark_error(
                                     crate::http::service::openai::backend_rejection_error_type(code),
@@ -345,8 +388,11 @@ fn monitor_for_disconnects_with_timeout(
                             break;
                         }
                         None => {
-                            // Stream ended normally
-                            inflight_guard.mark_ok();
+                            // Stream ended normally (possibly after an in-band failure)
+                            match outcome.as_ref().and_then(|outcome| outcome.get()) {
+                                Some(error_type) => inflight_guard.mark_error(error_type.clone()),
+                                None => inflight_guard.mark_ok(),
+                            }
                             stream_handle.disarm();
 
                             // todo: if we yield a dynamo sentinel event, we need to do it before the done or the
@@ -914,6 +960,106 @@ mod tests {
         assert!(body.contains("\"code\":499"), "{body}");
         assert!(!body.contains("/srv/x.py"), "{body}");
         assert!(body.contains("data: [DONE]"), "{body}");
+    }
+
+    fn stream_counter(metrics: &Metrics, model: &str, error_type: ErrorType) -> u64 {
+        metrics.get_request_counter(
+            model,
+            &Endpoint::ChatCompletions,
+            &RequestType::Stream,
+            &Status::Error,
+            &error_type,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_streamed_rejection_envelope_status_sets_frame_and_metrics() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as RuntimeErrorType};
+        for (code, slug, error_type) in [
+            (404, "not_found_error", ErrorType::NotFound),
+            (429, "rate_limit_error", ErrorType::Overload),
+            (422, "invalid_request_error", ErrorType::Validation),
+        ] {
+            let model = format!("envelope-{code}");
+            let (metrics, guard, ctx, handle) = setup_test(&model, "req-envelope");
+            let message = format!(r#"{{"message":"backend says {code}","code":{code}}}"#);
+            let stream = async_stream::try_stream! {
+                Err(axum::Error::new(
+                    DynamoError::builder()
+                        .error_type(RuntimeErrorType::Backend(BackendError::InvalidArgument))
+                        .message(message)
+                        .build(),
+                ))?;
+                yield axum::response::sse::Event::default().data("unreachable");
+            };
+            let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+            let body = collect_sse_body(monitored).await;
+            assert!(body.contains(&format!("\"code\":{code}")), "{body}");
+            assert!(body.contains(slug), "{body}");
+            assert!(body.contains(&format!("backend says {code}")), "{body}");
+            assert_eq!(stream_counter(&metrics, &model, error_type), 1, "{code}");
+            assert_eq!(
+                stream_counter(&metrics, &model, ErrorType::Cancelled),
+                0,
+                "{code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streamed_499_rejection_is_metered_as_cancelled() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as RuntimeErrorType};
+        let (metrics, guard, ctx, handle) = setup_test("cancel-metered", "req-cancel");
+        let stream = async_stream::try_stream! {
+            yield axum::response::sse::Event::default().data("token");
+            Err(axum::Error::new(
+                DynamoError::builder()
+                    .error_type(RuntimeErrorType::Backend(BackendError::InvalidArgument))
+                    .message(r#"{"message":"client went away at /srv/x.py","code":499}"#)
+                    .build(),
+            ))?;
+        };
+        let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+        assert!(body.contains("\"code\":499"), "{body}");
+        assert!(!body.contains("/srv/x.py"), "{body}");
+        assert_eq!(
+            stream_counter(&metrics, "cancel-metered", ErrorType::Cancelled),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_outcome_monitor_records_in_band_failure() {
+        for (outcome_type, expect_error) in [(Some(ErrorType::Validation), true), (None, false)] {
+            let model = format!("outcome-{expect_error}");
+            let (metrics, guard, ctx, handle) = setup_test(&model, "req-outcome");
+            let outcome = StreamOutcome::default();
+            let producer = outcome.clone();
+            let stream = async_stream::stream! {
+                yield Ok(axum::response::sse::Event::default().data("response.failed"));
+                if let Some(error_type) = outcome_type.clone() {
+                    let _ = producer.set(error_type);
+                }
+            };
+            let monitored = monitor_with_outcome(stream, ctx, guard, handle, None, Some(outcome));
+            let body = collect_sse_body(monitored).await;
+            assert!(body.contains("data: [DONE]"), "{body}");
+            assert_eq!(
+                stream_counter(&metrics, &model, ErrorType::Validation),
+                u64::from(expect_error)
+            );
+            assert_eq!(
+                metrics.get_request_counter(
+                    &model,
+                    &Endpoint::ChatCompletions,
+                    &RequestType::Stream,
+                    &Status::Success,
+                    &ErrorType::None,
+                ),
+                u64::from(!expect_error)
+            );
+        }
     }
 
     #[test]
