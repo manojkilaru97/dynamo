@@ -373,6 +373,23 @@ fn monitor_with_outcome(
                                 yield Event::default().data("[DONE]");
                                 break;
                             }
+                            if crate::http::service::metrics::request_was_cancelled(&err) {
+                                // A typed cancellation keeps the sanitized cancelled frame.
+                                inflight_guard.mark_error(ErrorType::Cancelled);
+                                stream_handle.disarm();
+                                tracing::warn!("Streaming request cancelled by the backend: {err}");
+                                let cancelled = SanitizedError::Cancelled;
+                                let err_json = serde_json::json!({
+                                    "error": {
+                                        "message": cancelled.to_string(),
+                                        "type": cancelled.openai_type_slug(),
+                                        "code": 499,
+                                    }
+                                });
+                                yield Event::default().data(err_json.to_string());
+                                yield Event::default().data("[DONE]");
+                                break;
+                            }
                             let sanitized = classify_stream_error(&err);
                             let error_type = if matches!(sanitized, SanitizedError::Overloaded) {
                                 ErrorType::Overload
@@ -1146,6 +1163,74 @@ mod tests {
         let body = collect_sse_body(monitored).await;
         assert!(body.contains("\"code\":499"), "{body}");
         assert!(body.contains("data: [DONE]"), "{body}");
+        assert_eq!(stream_counter(&metrics, model, ErrorType::Cancelled), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_event_ready_with_the_inactivity_deadline_is_delivered() {
+        let model = "deadline-tie";
+        let (metrics, guard, ctx, handle) = setup_test(model, "req-tie");
+        let deadline = Duration::from_secs(5);
+        let stream = async_stream::stream! {
+            tokio::time::sleep(deadline).await;
+            yield Ok(axum::response::sse::Event::default().data("late-but-on-time"));
+        };
+        let monitored =
+            monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, Some(deadline));
+        let body = collect_sse_body(monitored).await;
+        assert!(body.contains("late-but-on-time"), "{body}");
+        assert_eq!(
+            stream_counter(&metrics, model, ErrorType::ResponseTimeout),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_inactivity_timeout_after_an_in_band_failure_keeps_its_type() {
+        let model = "outcome-timeout";
+        let (metrics, guard, ctx, handle) = setup_test(model, "req-outcome-timeout");
+        let outcome = StreamOutcome::default();
+        let producer = outcome.clone();
+        let stream = async_stream::stream! {
+            let _ = producer.set(ErrorType::Validation);
+            yield Ok(axum::response::sse::Event::default().data("response.failed"));
+            std::future::pending::<()>().await;
+        };
+        let monitored = monitor_with_outcome(
+            stream,
+            ctx,
+            guard,
+            handle,
+            Some(Duration::from_secs(5)),
+            Some(outcome),
+        );
+        let body = collect_sse_body(monitored).await;
+        assert!(body.contains("response.failed"), "{body}");
+        assert_eq!(stream_counter(&metrics, model, ErrorType::Validation), 1);
+        assert_eq!(
+            stream_counter(&metrics, model, ErrorType::ResponseTimeout),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streamed_typed_cancellation_is_a_sanitized_cancellation() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as RuntimeErrorType};
+        let model = "typed-cancel";
+        let (metrics, guard, ctx, handle) = setup_test(model, "req-typed-cancel");
+        let stream = async_stream::try_stream! {
+            yield axum::response::sse::Event::default().data("token");
+            Err(axum::Error::new(
+                DynamoError::builder()
+                    .error_type(RuntimeErrorType::Backend(BackendError::Cancelled))
+                    .message("CancelledError at /srv/x.py")
+                    .build(),
+            ))?;
+        };
+        let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+        assert!(body.contains("\"code\":499"), "{body}");
+        assert!(!body.contains("/srv/x.py"), "{body}");
         assert_eq!(stream_counter(&metrics, model, ErrorType::Cancelled), 1);
     }
 

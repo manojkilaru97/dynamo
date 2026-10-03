@@ -67,8 +67,12 @@ pub fn request_was_unavailable(err: &(dyn std::error::Error + 'static)) -> bool 
 }
 
 /// Check whether an error chain indicates the request was cancelled.
+/// `Backend(Cancelled)` is a Python worker's `asyncio.CancelledError`.
 pub fn request_was_cancelled(err: &(dyn std::error::Error + 'static)) -> bool {
-    const CANCELLATION: &[DynamoErrorType] = &[DynamoErrorType::Cancelled];
+    const CANCELLATION: &[DynamoErrorType] = &[
+        DynamoErrorType::Cancelled,
+        DynamoErrorType::Backend(dynamo_runtime::error::BackendError::Cancelled),
+    ];
     const NON_CANCELLATION: &[DynamoErrorType] = &[];
     dynamo_runtime::error::match_error_chain(err, CANCELLATION, NON_CANCELLATION)
 }
@@ -2573,14 +2577,19 @@ fn annotated_to_sse_event<T: Serialize>(
 
     if let Some(ref msg) = annotated.event {
         if msg == "error" {
-            // Keep request rejections typed so the stream monitor can report them
-            // as client errors instead of a sanitized internal error.
+            // Keep request rejections and cancellations typed so the stream
+            // monitor can report them as client errors or cancellations instead
+            // of a sanitized internal error.
             if let Some(ref dynamo_err) = annotated.error
                 && matches!(
                     dynamo_err.error_type(),
                     dynamo_runtime::error::ErrorType::InvalidArgument
                         | dynamo_runtime::error::ErrorType::Backend(
                             dynamo_runtime::error::BackendError::InvalidArgument
+                        )
+                        | dynamo_runtime::error::ErrorType::Cancelled
+                        | dynamo_runtime::error::ErrorType::Backend(
+                            dynamo_runtime::error::BackendError::Cancelled
                         )
                 )
             {

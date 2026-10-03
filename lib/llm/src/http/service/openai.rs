@@ -252,16 +252,7 @@ fn fold_rejection_or_internal(
 /// Whether the error chain holds a typed cancellation (`Cancelled`, or
 /// `Backend(Cancelled)` from a Python `asyncio.CancelledError`).
 fn is_typed_cancellation(err: &(dyn std::error::Error + 'static)) -> bool {
-    let mut current = Some(err);
-    while let Some(e) = current {
-        if let Some(dynamo_err) = e.downcast_ref::<dynamo_runtime::error::DynamoError>()
-            && is_cancellation_type(dynamo_err.error_type())
-        {
-            return true;
-        }
-        current = e.source();
-    }
-    false
+    super::metrics::request_was_cancelled(err)
 }
 
 fn is_cancellation_type(error_type: dynamo_runtime::error::ErrorType) -> bool {
@@ -1028,6 +1019,11 @@ async fn completions_single(
                 let err_response = if let Some(invalid) = find_invalid_argument_in_chain(&e) {
                     // A rejection from any prompt of a batch is a client error.
                     rejection_error_response(invalid)
+                } else if is_typed_cancellation(&e) {
+                    ErrorMessage::sanitized_with_details(
+                        SanitizedError::Cancelled,
+                        format!("{e:#}"),
+                    )
                 } else {
                     ErrorMessage::internal_server_error(&format!(
                         "Failed to fold completions stream for {request_id}"
@@ -1324,6 +1320,11 @@ async fn completions_batch(
                 let err_response = if let Some(invalid) = find_invalid_argument_in_chain(&e) {
                     // A rejection from any prompt of a batch is a client error.
                     rejection_error_response(invalid)
+                } else if is_typed_cancellation(&e) {
+                    ErrorMessage::sanitized_with_details(
+                        SanitizedError::Cancelled,
+                        format!("{e:#}"),
+                    )
                 } else {
                     ErrorMessage::internal_server_error(&format!(
                         "Failed to fold completions stream for {request_id}"
@@ -2185,6 +2186,16 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
         && event_type == "error"
     {
         use dynamo_runtime::error::{BackendError, ErrorType};
+
+        // A typed cancellation is a 499 whatever its message.
+        if let Some(error) = event.error.as_ref()
+            && is_cancellation_type(error.error_type())
+        {
+            return Some((
+                error.message().to_string(),
+                StatusCode::from_u16(499).expect("499 is a valid status"),
+            ));
+        }
 
         // Classify only this event's error, not its causes. An inner invalid
         // argument must not override an outer unavailable or internal error.
@@ -3288,13 +3299,6 @@ async fn responses(
                 );
 
                 if let Some((message, status)) = extract_backend_error_if_present(&annotated_chunk) {
-                    let error_type = annotated_chunk.error.as_ref().map(|error| error.error_type());
-                    // A typed cancellation is a 499 whatever its message.
-                    let status = if error_type.is_some_and(is_cancellation_type) {
-                        StatusCode::from_u16(499).expect("499 is a valid status")
-                    } else {
-                        status
-                    };
                     // The first backend error ends the response.
                     failure = Some((message, status, saw_output));
                     break;

@@ -1780,7 +1780,8 @@ const SECRET_400: &str = "ValueError: bad schema at /srv/secret.py";
 /// 2 = one token then 499, 3 = immediate 400, 4 = one token then 400,
 /// 5 = one token then a typed `Backend(Cancelled)` (Python `CancelledError`),
 /// 6 = immediate 400 and then a stream that never ends,
-/// 7 = one token then a typed `Backend(Disconnected)` (worker connection lost).
+/// 7 = one token then a typed `Backend(Disconnected)` (worker connection lost),
+/// 8 = an immediate typed `Backend(Cancelled)`.
 struct ScriptedRejectionEngine {}
 
 fn typed_cancellation_event<T>() -> Annotated<T> {
@@ -1828,7 +1829,7 @@ impl
             if matches!(mode, 7) {
                 yield Annotated::from_data(generator.create_choice(0, Some("tok".to_string()), None, None));
             }
-            if mode == 5 {
+            if mode == 5 || mode == 8 {
                 yield typed_cancellation_event();
             } else if mode == 7 {
                 yield Annotated {
@@ -2006,13 +2007,25 @@ async fn test_backend_rejections_on_chat_and_responses() {
             );
         }
     }
-    // A typed cancellation after output is a sanitized cancellation too.
-    for (path, endpoint, budget) in [
-        ("chat/completions", Endpoint::ChatCompletions, "max_tokens"),
-        ("responses", Endpoint::Responses, "max_output_tokens"),
+    // A typed cancellation, before or after output, is a sanitized cancellation too.
+    for (path, endpoint, budget, mode) in [
+        (
+            "chat/completions",
+            Endpoint::ChatCompletions,
+            "max_tokens",
+            5,
+        ),
+        ("responses", Endpoint::Responses, "max_output_tokens", 5),
+        (
+            "chat/completions",
+            Endpoint::ChatCompletions,
+            "max_tokens",
+            8,
+        ),
+        ("responses", Endpoint::Responses, "max_output_tokens", 8),
     ] {
         let mut body = serde_json::json!({"model": "scripted", "stream": false});
-        body[budget] = serde_json::json!(5);
+        body[budget] = serde_json::json!(mode);
         if path == "responses" {
             body["input"] = serde_json::json!("hi");
         } else {
@@ -2024,7 +2037,11 @@ async fn test_backend_rejections_on_chat_and_responses() {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status().as_u16(), 499, "{path} typed cancellation");
+        assert_eq!(
+            response.status().as_u16(),
+            499,
+            "{path} typed cancellation mode={mode}"
+        );
         let text = response.text().await.unwrap();
         assert!(!text.contains("/srv/secret.py"), "{path}: {text}");
         *expected
@@ -2046,6 +2063,41 @@ async fn test_backend_rejections_on_chat_and_responses() {
                 false,
                 "cancelled".to_string(),
             )],
+        );
+    }
+    for mode in [5, 8] {
+        let response = client
+            .post(format!("http://localhost:{port}/v1/chat/completions"))
+            .json(
+                &serde_json::json!({"model": "scripted", "stream": true, "max_tokens": mode,
+                "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .send()
+            .await
+            .unwrap();
+        let text = timeout(std::time::Duration::from_secs(10), response.text())
+            .await
+            .expect("stream finished")
+            .unwrap();
+        assert!(
+            text.contains("\"code\":499") && text.contains("Request cancelled"),
+            "mode={mode}: {text}"
+        );
+        assert!(!text.contains("/srv/secret.py"), "mode={mode}: {text}");
+        let key = (
+            Endpoint::ChatCompletions.as_str().to_string(),
+            true,
+            "cancelled".to_string(),
+        );
+        *expected.entry(key.clone()).or_default() += 1;
+        compare_counter(
+            &metrics,
+            "scripted",
+            &Endpoint::ChatCompletions,
+            &RequestType::Stream,
+            &Status::Error,
+            &ErrorType::Cancelled,
+            expected[&key],
         );
     }
     let response = client
