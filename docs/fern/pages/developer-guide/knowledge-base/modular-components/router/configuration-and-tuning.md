@@ -72,7 +72,7 @@ An instance may carry a `parameters` mapping; omitting it keeps every default:
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `cache_threshold` | `0.5` | Fraction of the request's blocks that must be reusable on the best worker before the cache tier applies. Compared strictly. Must be in `[0.0, 1.0]`. |
+| `cache_threshold` | `0.5` | Fraction of the request's complete blocks that must be reusable on the best worker before the cache tier applies. Compared strictly. Must be in `[0.0, 1.0]`. |
 | `balance_abs_threshold` | `32` | Minimum active-request spread before the load tier applies. |
 | `balance_rel_threshold` | `1.1` | Minimum ratio of largest to smallest active-request count before the load tier applies. Must be at least `1.0`. |
 | `host_cache_weight` | `host_cache_hit_weight` | Weight of host-pinned (CPU offload) prefix blocks in the cache tier. Defaults to the router's `--router-host-cache-hit-weight` / `DYN_ROUTER_HOST_CACHE_HIT_WEIGHT` (`0.75`). `0.0` ranks on device blocks only. Must be finite and non-negative. |
@@ -80,12 +80,60 @@ An instance may carry a `parameters` mapping; omitting it keeps every default:
 The policy selects the least-loaded worker once the active-request spread is greater than
 `balance_abs_threshold` and the largest count is more than `balance_rel_threshold` times the
 smallest. Otherwise it selects the least-loaded worker among those holding the largest effective
-overlap when that overlap covers more than `cache_threshold` of the request's blocks, and the
-least-loaded worker when it does not. Effective overlap is device-resident prefix blocks plus the
+overlap when that overlap covers more than `cache_threshold` of the request's complete blocks,
+and the least-loaded worker when it does not. Effective overlap is device-resident prefix blocks plus the
 host-pinned blocks that continue that prefix, weighted by `host_cache_weight`, so a CPU-offloaded
 prefix can win the cache tier but never outranks the same number of device blocks while the weight
-is below `1.0`. Active-request counts are the counts this router instance
-tracks.
+is below `1.0`. A worker with no indexed device prefix counts 0 device blocks.
+
+The cache ratio divides by the request's complete blocks (`isl / block_size`, or
+`(isl - 1) / block_size` with Eagle), the blocks the indexer can match. Upstream divides by
+`isl.div_ceil(block_size)`, which counts a partial tail block that can never match, so a full hit
+on a prompt with a short tail can land exactly on the threshold and lose; with large KV blocks that
+disables the cache tier for prompts between one and two blocks long.
+
+Active-request counts are the counts this router instance tracks. With several frontends, each sees
+only its own in-flight requests unless `--router-replica-sync` shares them, so the load tier fires
+late. See [Load Guard With Many Frontends](#load-guard-with-many-frontends).
+
+Session affinity (`--router-session-affinity-ttl-secs`) is advisory under a worker-selection
+policy, as for upstream custom policies: the policy selects without the binding and the session
+follows its choice. Explicit routing pins (`backend_instance_id`, `decode_worker_id`) stay hard.
+The built-in selector keeps enforcing a session binding.
+
+The standalone selection service runs only the built-in selector and rejects a document that
+selects a worker-selection policy; offline and online replay log a warning and use the built-in
+selector. A standalone Python `KvRouter` configured with a policy waits for a worker card with a
+worker role (`DYN_ROUTER_MODEL_CARD_WAIT_SECS`, default 600 s) and fails if none registers.
+
+#### Load Guard With Many Frontends
+
+The load tier compares active-request counts. Each router counts only the requests it routed itself,
+so with N frontends a worker that wins the cache tier can collect about `balance_abs_threshold`
+requests from every frontend (N x 32) before any of them sheds load. A hot shared prefix then piles
+onto one worker. The built-in selector has the same exposure, because its overlap credit outweighs
+the load it can see.
+
+Run the policy with `--router-replica-sync` whenever more than one frontend routes to the same
+workers. Routers then replay each other's admission, prefill-complete, and free events, so the
+counts the load tier compares are fleet-wide. Worker busy thresholds
+(`--active-decode-blocks-threshold`) do not substitute for it: a burst is admitted before the hot
+worker's KV usage rises, so the threshold trips too late.
+
+Measured on 4 TP2 workers with 4 frontends, a multi-turn session load, and 192 concurrent requests
+sharing one 72k-token prefix:
+
+| Configuration | Hot worker peak running / waiting | Burst TTFT p50 / p90 / p99 (s) | Session hit share |
+|---|---|---|---|
+| Built-in selector | 64 / 136 | 19.5 / 33.8 / 36.9 | 59.7% |
+| Two-tier, no guard | 64 / 105-107 | 9.1-9.8 / 24.3-25.3 / 27.6-29.8 | 73.6-73.8% |
+| Two-tier, decode-blocks threshold 0.35 | 64 / 115 | 9.1 / 23.3 / 27.6 | 73.2% |
+| Two-tier, one frontend | 64 / 52 | 9.8 / 12.8 / 16.2 | 72.8% |
+| Two-tier, `--router-replica-sync` | 55-64 / 38-59 | 8.5-8.9 / 11.3-11.6 / 17.4-18.0 | 72.9-73.1% |
+
+Replica sync cost about one percentage point of a CPU core per frontend at 8 requests per second
+across the fleet. Each router receives about three events per fleet request whatever the number of
+routers, and sends its own events to every peer.
 
 ### Policy-Class Queues
 
