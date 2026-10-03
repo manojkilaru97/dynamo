@@ -144,25 +144,42 @@ Known limits of replica-synced counts:
 - **Restart undercount.** A frontend that (re)starts sees only requests admitted after it joined
   until the older ones finish, so it undercounts for at most one request lifetime.
 - **Phantom load from a lost `Free`.** A peer's copy of a request is removed only by that request's
-  `Free`, the worker leaving, or the active-request expiry. If the `Free` never arrives (the origin
-  frontend died or restarted, or a sequence gap), the copy stays counted on every peer until
-  `DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS` (default 300 s) after it was applied. A failed publish is
-  retried in order with backoff rather than dropped, so only shutdown and transport gaps lose
-  events. The bound is the dead frontend's in-flight requests, spread over its workers: at 60
-  frontends and 2,400 requests in flight that is about 40 phantoms, under one per worker, for at
-  most five minutes. A rolling restart replaces one frontend at a time, so at most one frontend's
-  phantoms are live at once.
+  `Free`, the worker leaving, or the active-request expiry. If the `Free` never arrives, the copy
+  stays counted on every peer for the expiry (`DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS`, default
+  300 s) plus up to 60 s, because expiry runs on the next periodic sweep (every 60 s) or admission
+  on that worker after the deadline. A `Free` can be lost when:
+  - the origin frontend dies or restarts before publishing it;
+  - a publish fails for good. Under a worker-selection policy the ZMQ batch publisher retries a
+    failed batch in order with backoff for up to 30 s, then drops it with a warning naming the
+    dropped event count; without a policy, and on the NATS singleton publisher
+    (`DYN_EVENT_PLANE=nats`), a failed publish is logged and dropped as before;
+  - ZMQ drops it under backpressure. The PUB socket does not set `ZMQ_XPUB_NODROP`, so when a
+    subscriber's pipe reaches its high-water mark (or no subscriber is attached yet) the message
+    is discarded while the send still succeeds, and no retry runs. This applies to every replica
+    sync user, not only the policy.
+
+  The bound is the dead frontend's in-flight requests spread over its workers: at 60 frontends and
+  2,400 requests in flight, about 40 phantoms, under one per worker, for at most about six minutes.
+  Phantoms from different frontends do not overlap if restarts are spaced at least the expiry plus
+  60 s apart; a rolling restart that replaces a frontend every ~9 minutes satisfies that.
+- **Retries appear as sequence gaps.** Each publish attempt takes a new envelope sequence number,
+  so on peers a batch that failed N times before succeeding shows up as N sequence gaps
+  (`dynamo_component_router_active_sequence_zmq_ingress_sequence_gaps_total`) although nothing
+  was lost. Gaps that coincide with "re-queued for retry" errors on the publishing frontend are
+  retries; gaps without them are real losses.
 - **Long-stream undercount.** The same expiry drops a request that is still streaming 300 s after
   admission. Raising the expiry keeps long streams counted but stretches every phantom by the same
   amount: with a 4,000 s expiry, a rolling restart that replaces a frontend every 9 minutes keeps
   the phantoms of the last seven or so (hundreds of requests, up to thousands at full concurrency)
-  counted for over an hour. Keep the default unless long streams dominate. In the Super deployment, end-to-end
-  latency is p95 65 s and p99 192 s; requests longer than 240 s are 0.35% of traffic, and those
-  longer than 480 s are 0.03%.
+  counted for over an hour. Keep the default unless long streams dominate. In the Super deployment,
+  end-to-end latency is p95 65 s and p99 192 s; requests longer than 240 s are 0.35% of traffic,
+  and those longer than 480 s are 0.03%.
 
-Tagging replica copies with their origin router and dropping them when that router's registration
-disappears, or reconciling from periodic snapshots, would remove the phantom limit; neither is
-implemented here.
+Follow-ups that would narrow these limits, none implemented here: tag replica copies with their
+origin router and drop them when that router's registration disappears, or reconcile from periodic
+snapshots (phantoms); set `ZMQ_XPUB_NODROP` on the replica PUB socket so backpressure surfaces as a
+publish error that the retry covers (silent drops); reserve the envelope sequence once per batch and
+reuse it across retries (spurious gaps).
 
 Measured on 4 TP2 workers with 4 frontends, a multi-turn session load, and 192 concurrent requests
 sharing one 72k-token prefix:
