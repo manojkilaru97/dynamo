@@ -1644,12 +1644,12 @@ async fn create_kv_router_from_endpoint(
             .map_err(|error| to_pyerr(anyhow::anyhow!("router_policy_config: {error}")))?,
         None => false,
     };
+    let wait_secs: u64 = std::env::var("DYN_ROUTER_MODEL_CARD_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
     let (model_name, enable_eagle, worker_role) = {
         let maybe_card = if needs_model_name || needs_worker_role {
-            let wait_secs: u64 = std::env::var("DYN_ROUTER_MODEL_CARD_WAIT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(600);
             tracing::info!(
                 namespace = %endpoint_id.namespace,
                 component = %endpoint_id.component,
@@ -1659,10 +1659,13 @@ async fn create_kv_router_from_endpoint(
                 needs_worker_role,
                 "Waiting for worker model card in discovery (required for remote/served indexer or worker_selection)"
             );
-            llm_rs::discovery::wait_for_endpoint_model_card(
+            // With a worker-selection policy the stage comes from the card's worker role, so keep
+            // waiting past legacy cards without one.
+            llm_rs::discovery::wait_for_endpoint_model_card_where(
                 &endpoint.inner,
                 std::time::Duration::from_secs(wait_secs),
                 None,
+                |card| !needs_worker_role || card.worker_type.is_some(),
             )
             .await
             .map_err(to_pyerr)?
@@ -1690,9 +1693,9 @@ async fn create_kv_router_from_endpoint(
                 .is_none_or(|card| card.worker_type.is_none())
         {
             return Err(to_pyerr(anyhow::anyhow!(
-                "router_policy_config selects a worker-selection policy, but no worker model card \
-                 with a worker role registered on {}/{}/{} before the wait expired \
-                 (DYN_ROUTER_MODEL_CARD_WAIT_SECS); refusing to guess the worker pool",
+                "a worker-selection policy is configured, but no worker model card with a worker \
+                 role registered on {}/{}/{} within {wait_secs}s (DYN_ROUTER_MODEL_CARD_WAIT_SECS); \
+                 refusing to guess the worker pool",
                 endpoint_id.namespace,
                 endpoint_id.component,
                 endpoint_id.name

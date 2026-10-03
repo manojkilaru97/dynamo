@@ -29,6 +29,19 @@ pub async fn wait_for_endpoint_model_card(
     timeout: Duration,
     cancel_token: Option<CancellationToken>,
 ) -> Result<Option<ModelDeploymentCard>> {
+    wait_for_endpoint_model_card_where(endpoint, timeout, cancel_token, |_| true).await
+}
+
+/// [`wait_for_endpoint_model_card`], returning only a card that satisfies `accept`.
+///
+/// Cards that fail `accept` (e.g. a legacy card without a worker role) are skipped and the wait
+/// continues until an accepted card arrives or the same `timeout` / `cancel_token` ends it.
+pub async fn wait_for_endpoint_model_card_where(
+    endpoint: &Endpoint,
+    timeout: Duration,
+    cancel_token: Option<CancellationToken>,
+    accept: impl Fn(&ModelDeploymentCard) -> bool,
+) -> Result<Option<ModelDeploymentCard>> {
     let cancel_token = cancel_token.unwrap_or_else(|| endpoint.drt().primary_token());
     let eid = endpoint.id();
     let query = DiscoveryQuery::EndpointModels {
@@ -58,6 +71,13 @@ pub async fn wait_for_endpoint_model_card(
                             continue;
                         }
                     };
+                    if !accept(&card) {
+                        tracing::debug!(
+                            discovery_instance = ?instance.id(),
+                            "Skipping a model card that does not satisfy the wait; continuing"
+                        );
+                        continue;
+                    }
                     return Some(card);
                 }
                 Ok(DiscoveryEvent::Removed(_)) => {}
@@ -145,6 +165,80 @@ mod tests {
             .expect("card");
         assert_eq!(found.worker_type, Some(WorkerType::Decode));
         assert_eq!(found.display_name, "delayed-model");
+
+        drt.shutdown();
+        runtime.shutdown();
+    }
+
+    /// An untyped (legacy) card already registered does not end a wait that needs a worker role;
+    /// the typed card registered later does.
+    #[tokio::test]
+    async fn typed_card_wait_skips_an_untyped_card() {
+        let runtime = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("untyped-then-typed".to_string())
+            .unwrap()
+            .component("decode".to_string())
+            .unwrap()
+            .endpoint("generate");
+        let eid = endpoint.id();
+        // Distinct suffixes give two cards of the same model separate keys on one endpoint.
+        let register = |card: ModelDeploymentCard, suffix: &'static str| {
+            let drt = drt.clone();
+            let eid = eid.clone();
+            async move {
+                drt.discovery()
+                    .register(
+                        DiscoverySpec::from_model_with_suffix(
+                            eid.namespace,
+                            eid.component,
+                            eid.name,
+                            &card,
+                            Some(suffix.to_string()),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let untyped = ModelDeploymentCard::with_name_only("shared-model");
+        assert!(untyped.worker_type.is_none());
+        let _untyped_registration = register(untyped, "legacy").await;
+
+        let waiter = {
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move {
+                wait_for_endpoint_model_card_where(
+                    &endpoint,
+                    Duration::from_secs(30),
+                    None,
+                    |card| card.worker_type.is_some(),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !waiter.is_finished(),
+            "an untyped card must not end the wait"
+        );
+
+        let mut typed = ModelDeploymentCard::with_name_only("shared-model");
+        typed.worker_type = Some(WorkerType::Decode);
+        let _typed_registration = register(typed, "typed").await;
+
+        let found = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the typed card must end the wait")
+            .unwrap()
+            .unwrap()
+            .expect("card");
+        assert_eq!(found.worker_type, Some(WorkerType::Decode));
 
         drt.shutdown();
         runtime.shutdown();
