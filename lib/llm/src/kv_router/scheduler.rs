@@ -71,15 +71,8 @@ where
 
         let router_id = endpoint.drt().discovery().instance_id();
         // A worker-selection policy reads peers' active-request counts for its load tier, so
-        // publish admissions to replicas without the batching linger.
-        let replica_flush = if kv_router_config
-            .selects_worker_selection_policy()
-            .unwrap_or(false)
-        {
-            ReplicaFlush::Immediate
-        } else {
-            ReplicaFlush::Linger
-        };
+        // publish admissions to replicas without the batching linger (and re-queue failures).
+        let replica_flush = ReplicaFlush::for_config(kv_router_config);
         let slots = create_multi_worker_sequences_with_flush(
             endpoint,
             block_size as usize,

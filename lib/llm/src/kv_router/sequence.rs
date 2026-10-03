@@ -239,19 +239,68 @@ impl BatchEventPublisher for EventPublisher {
 /// [`REPLICA_PUBLISH_RETRY_MAX`].
 const REPLICA_PUBLISH_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(10);
 const REPLICA_PUBLISH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+/// Total time an [`ReplicaFlush::Immediate`] publisher keeps retrying one failed batch before it
+/// drops the batch and moves on, so a persistent transport error cannot stall the channel.
+const REPLICA_PUBLISH_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Publish one replica batch, re-queueing it on failure instead of dropping it.
+/// Result of publishing one replica batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicaPublishOutcome {
+    Published,
+    /// The batch was dropped after a failure (at once in `Linger`, after the retry budget in
+    /// `Immediate`); the publisher continues with the next batch.
+    Dropped,
+    /// Cancellation abandoned the batch; the publisher stops.
+    Cancelled,
+}
+
+/// Publish one replica batch.
 ///
-/// A dropped batch can carry a `Free`, which would leave the request counted on every peer until
-/// its active-request expiry. The batch is retried in order, with capped exponential backoff, until
-/// it is published or the publisher is cancelled; later events wait in the bounded channel behind
-/// it (whose overflow policy is unchanged). Returns `false` if cancellation abandoned the batch.
+/// `Linger` (the default, no worker-selection policy) keeps the original behavior: one attempt, and
+/// a failed batch is logged and dropped.
+///
+/// `Immediate` (a worker-selection policy reads peers' counts) re-queues a failed batch instead:
+/// a dropped batch can carry a `Free`, which would leave the request counted on every peer until
+/// its active-request expiry. The batch is retried in order with capped exponential backoff, later
+/// events waiting behind it in the bounded channel, until it is published, cancellation abandons
+/// it, or [`REPLICA_PUBLISH_RETRY_BUDGET`] runs out, after which it is dropped with a warning
+/// naming the dropped event count. Each attempt takes a new envelope sequence number, so peers
+/// count a retried batch's failed attempts as sequence gaps although nothing was lost.
 async fn publish_replica_batch<P: BatchEventPublisher>(
     publisher: &P,
     events: Vec<ActiveSequenceEvent>,
     cancellation_token: &CancellationToken,
-) -> bool {
+    flush: ReplicaFlush,
+) -> ReplicaPublishOutcome {
     let batch = ActiveSequenceEventBatch { events };
+    let first_request_id = &batch
+        .events
+        .first()
+        .expect("replica batch must contain an event")
+        .request_id;
+    let last_request_id = &batch
+        .events
+        .last()
+        .expect("replica batch must contain an event")
+        .request_id;
+
+    if flush == ReplicaFlush::Linger {
+        return match publisher.publish_batch(&batch).await {
+            Ok(()) => ReplicaPublishOutcome::Published,
+            Err(error) => {
+                tracing::error!(
+                    event_count = batch.events.len(),
+                    first_request_id = %first_request_id,
+                    last_request_id = %last_request_id,
+                    error = %error,
+                    "Failed to publish active-sequence replica batch"
+                );
+                ReplicaPublishOutcome::Dropped
+            }
+        };
+    }
+
+    let started = Instant::now();
     let mut delay = REPLICA_PUBLISH_RETRY_INITIAL;
     let mut attempt = 1u32;
     loop {
@@ -264,20 +313,23 @@ async fn publish_replica_batch<P: BatchEventPublisher>(
                         "Published active-sequence replica batch after retrying"
                     );
                 }
-                return true;
+                return ReplicaPublishOutcome::Published;
             }
             Err(error) => error,
         };
-        let first_request_id = &batch
-            .events
-            .first()
-            .expect("replica batch must contain an event")
-            .request_id;
-        let last_request_id = &batch
-            .events
-            .last()
-            .expect("replica batch must contain an event")
-            .request_id;
+        if started.elapsed() + delay > REPLICA_PUBLISH_RETRY_BUDGET {
+            tracing::warn!(
+                dropped_event_count = batch.events.len(),
+                first_request_id = %first_request_id,
+                last_request_id = %last_request_id,
+                attempt,
+                retry_budget_secs = REPLICA_PUBLISH_RETRY_BUDGET.as_secs(),
+                error = %error,
+                "Dropping active-sequence replica batch after the retry budget; peers keep any \
+                 copies it would have freed until their active-request expiry"
+            );
+            return ReplicaPublishOutcome::Dropped;
+        }
         // Log the first failure and then every 16th, so a persistent outage stays visible
         // without one line per retry.
         if attempt == 1 || attempt.is_multiple_of(16) {
@@ -298,7 +350,7 @@ async fn publish_replica_batch<P: BatchEventPublisher>(
                     attempt,
                     "Dropping unpublished active-sequence replica batch on shutdown"
                 );
-                return false;
+                return ReplicaPublishOutcome::Cancelled;
             }
             _ = tokio::time::sleep(delay) => {}
         }
@@ -317,6 +369,21 @@ pub enum ReplicaFlush {
     /// worker-selection policy reads peers' active-request counts, so admissions reach peers
     /// without the batching delay.
     Immediate,
+}
+
+impl ReplicaFlush {
+    /// `Immediate` when the router config selects a worker-selection policy for any pool (its
+    /// load tier reads peers' active-request counts), else the default `Linger`.
+    pub fn for_config(kv_router_config: &dynamo_kv_router::config::KvRouterConfig) -> Self {
+        if kv_router_config
+            .selects_worker_selection_policy()
+            .unwrap_or(false)
+        {
+            Self::Immediate
+        } else {
+            Self::Linger
+        }
+    }
 }
 
 async fn collect_replica_batch(
@@ -371,7 +438,9 @@ async fn run_replica_batch_publisher<P: BatchEventPublisher>(
         };
         let (events, stop_after_flush) =
             collect_replica_batch(first_event, &mut event_rx, &cancellation_token, flush).await;
-        if !publish_replica_batch(&publisher, events, &cancellation_token).await {
+        if publish_replica_batch(&publisher, events, &cancellation_token, flush).await
+            == ReplicaPublishOutcome::Cancelled
+        {
             break;
         }
         if stop_after_flush {
@@ -932,27 +1001,143 @@ mod tests {
         task.await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn replica_publish_retry_stops_on_cancellation() {
-        let publisher = Arc::new(FlakyBatchPublisher {
-            fail_first: usize::MAX,
+    fn flaky(fail_first: usize) -> Arc<FlakyBatchPublisher> {
+        Arc::new(FlakyBatchPublisher {
+            fail_first,
             attempts: Default::default(),
             published: Default::default(),
-        });
+        })
+    }
+
+    fn attempts(publisher: &FlakyBatchPublisher) -> usize {
+        publisher.attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replica_publish_retry_stops_on_cancellation() {
+        let publisher = flaky(usize::MAX);
         let cancellation_token = CancellationToken::new();
         let retry = tokio::spawn({
             let publisher = publisher.clone();
             let cancellation_token = cancellation_token.clone();
             async move {
-                publish_replica_batch(&publisher, vec![free_event("r1")], &cancellation_token).await
+                publish_replica_batch(
+                    &publisher,
+                    vec![free_event("r1")],
+                    &cancellation_token,
+                    ReplicaFlush::Immediate,
+                )
+                .await
             }
         });
         // Retries keep going (capped at 1 s) while the transport stays down.
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        assert!(publisher.attempts.load(std::sync::atomic::Ordering::SeqCst) > 5);
+        assert!(attempts(&publisher) > 5);
         cancellation_token.cancel();
-        assert!(!retry.await.unwrap(), "cancellation abandons the batch");
+        assert_eq!(
+            retry.await.unwrap(),
+            ReplicaPublishOutcome::Cancelled,
+            "cancellation abandons the batch"
+        );
         assert!(publisher.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn immediate_replica_retry_gives_up_after_the_budget() {
+        let publisher = flaky(usize::MAX);
+        let start = Instant::now();
+        let outcome = publish_replica_batch(
+            &publisher,
+            vec![free_event("r1"), free_event("r2")],
+            &CancellationToken::new(),
+            ReplicaFlush::Immediate,
+        )
+        .await;
+        assert_eq!(outcome, ReplicaPublishOutcome::Dropped);
+        let elapsed = Instant::now() - start;
+        assert!(
+            elapsed <= REPLICA_PUBLISH_RETRY_BUDGET,
+            "gave up within the budget: {elapsed:?}"
+        );
+        assert!(elapsed >= REPLICA_PUBLISH_RETRY_BUDGET - REPLICA_PUBLISH_RETRY_MAX);
+        assert!(publisher.published.lock().unwrap().is_empty());
+
+        // After giving up, the publisher task moves on to the next batch.
+        let publisher = flaky(usize::MAX);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let cancellation_token = CancellationToken::new();
+        let task = tokio::spawn(run_replica_batch_publisher(
+            publisher.clone(),
+            event_rx,
+            cancellation_token.clone(),
+            ReplicaFlush::Immediate,
+        ));
+        event_tx.send(free_event("dropped")).await.unwrap();
+        tokio::time::sleep(REPLICA_PUBLISH_RETRY_BUDGET + std::time::Duration::from_secs(1)).await;
+        let attempts_after_first = attempts(&publisher);
+        event_tx.send(free_event("next")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert!(
+            attempts(&publisher) > attempts_after_first,
+            "the next batch is attempted after the first was dropped"
+        );
+        cancellation_token.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn linger_replica_publish_still_drops_a_failed_batch() {
+        // Without a worker-selection policy the publisher keeps its original behavior: one
+        // attempt per batch, a failed batch is dropped, and the next batch goes out.
+        let publisher = flaky(1);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let cancellation_token = CancellationToken::new();
+        let task = tokio::spawn(run_replica_batch_publisher(
+            publisher.clone(),
+            event_rx,
+            cancellation_token.clone(),
+            ReplicaFlush::Linger,
+        ));
+        event_tx.send(free_event("lost")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        event_tx.send(free_event("delivered")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        assert_eq!(publisher.published.lock().unwrap().clone(), [["delivered"]]);
+        assert_eq!(attempts(&publisher), 2, "no retry of the failed batch");
+        assert_eq!(
+            publish_replica_batch(
+                &flaky(usize::MAX),
+                vec![free_event("x")],
+                &CancellationToken::new(),
+                ReplicaFlush::Linger,
+            )
+            .await,
+            ReplicaPublishOutcome::Dropped
+        );
+        cancellation_token.cancel();
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn replica_flush_follows_the_worker_selection_policy() {
+        use std::io::Write;
+
+        assert_eq!(
+            ReplicaFlush::for_config(&dynamo_kv_router::config::KvRouterConfig::default()),
+            ReplicaFlush::Linger,
+            "the default path keeps the batching linger and its drop-on-failure"
+        );
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(
+            b"worker_selection:\n  aggregated: two-tier\n  instances:\n    - name: two-tier\n      type: dynamo-two-tier-cost-fn\n",
+        )
+        .unwrap();
+        let config = dynamo_kv_router::config::KvRouterConfig {
+            router_policy_config: Some(file.path().display().to_string()),
+            ..Default::default()
+        };
+        assert_eq!(ReplicaFlush::for_config(&config), ReplicaFlush::Immediate);
     }
 
     #[tokio::test(start_paused = true)]
