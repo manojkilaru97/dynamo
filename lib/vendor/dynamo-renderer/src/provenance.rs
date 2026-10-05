@@ -66,7 +66,7 @@ fn invalid(message: &str) -> Error {
 
 /// Mirrors only render_content's source classification, then checks its bytes
 /// against the template result. Generated MM placeholders remain template data.
-/// `separate_media` mirrors the GA template's [`MEDIA_SEPARATOR`] rule.
+/// `separate_media` mirrors the newline rule of [`GA_RENDER_CONTENT`].
 fn user_content(rendered: String, source: Value, separate_media: Option<bool>) -> Result<Value, Error> {
     let separate_media = separate_media.unwrap_or(false);
     let source: serde_json::Value = serde_json::to_value(source)
@@ -173,38 +173,58 @@ const TRACKED: &str = r#"        {%- if message.role == "user" %}
         {%- else %}
             {{- content }}
         {%- endif %}"#;
-/// The GA template puts one newline between a non-empty text part and the next
-/// emitted image or video placeholder unless the content already ends in one.
-const MEDIA_SEPARATOR: &str =
-    r#"{%- set sep = '\n' if render_ns.after_text and not content_ns.val.endswith('\n') else '' -%}"#;
-
-/// Adapt a declared template capability, not arbitrary Jinja. The outer emit is
-/// tagged after render_content's macro has finished capturing. Changing any of
-/// the supported branch syntax requires a new adapter and parity tests.
-pub fn enable_super_user_provenance(config: &mut crate::ChatTemplate) -> anyhow::Result<()> {
-    let Some(crate::ChatTemplateValue(either::Either::Left(source))) = &mut config.chat_template else {
-        anyhow::bail!("Super user provenance requires a single declared chat template");
-    };
-    anyhow::ensure!(source.matches(ORIGINAL).count() == 1,
-        "chat template does not declare the supported Super user-output capability");
-    let separate_media = match source.matches(MEDIA_SEPARATOR).count() {
-        0 => "",
-        1 => ", true",
-        _ => anyhow::bail!("chat template declares the Super media separator more than once"),
-    };
-    *source = source.replacen(ORIGINAL, &TRACKED.replacen("SEPARATE_MEDIA", separate_media, 1), 1);
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ChatTemplate, ContextMixins, PromptFormatter};
-    use dynamo_protocols::types::CreateChatCompletionRequest;
-    use serde_json::json;
-
-    /// render_content exactly as shipped with the GA (row105) checkpoint.
-    const GA_RENDER_CONTENT: &str = r#"{%- macro render_content(content) -%}
+/// render_content as shipped with every pre-GA Super 3.5 checkpoint.
+const PRE_GA_RENDER_CONTENT: &str = r#"{%- macro render_content(content) -%}
+    {%- if content is none -%}
+        {{- '' -}}
+    {%- elif content is string -%}
+        {{- content | string -}}
+    {%- else -%}
+        {%- set text_ns = namespace(val='') -%}
+        {%- set counters = namespace(images=0, videos=0) -%}
+        {%- for part in content -%}
+            {%- if part['type'] == 'image' or part['type'] == 'image_url' or part['type'] == 'input_image' -%}
+                {%- set counters.images = counters.images + 1 -%}
+            {%- elif part['type'] == 'video' or part['type'] == 'video_url' or part['type'] == 'input_video' -%}
+                {%- set counters.videos = counters.videos + 1 -%}
+            {%- elif part['type'] == 'text' or part['type'] == 'input_text' -%}
+                {%- set text_ns.val = text_ns.val + (part['text'] | default('', true)) -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- if '<image>' in text_ns.val -%}
+            {%- set counters.images = 0 -%}
+        {%- endif -%}
+        {%- if '<video>' in text_ns.val -%}
+            {%- set counters.videos = 0 -%}
+        {%- endif -%}
+        {%- set content_ns = namespace(val='') -%}
+        {%- set render_ns = namespace(image_index=0) -%}
+        {%- for part in content -%}
+            {%- if part['type'] == 'image' or part['type'] == 'image_url' or part['type'] == 'input_image' -%}
+                {%- set render_ns.image_index = render_ns.image_index + 1 -%}
+                {%- if counters.images > 0 -%}
+                    {%- if counters.images > 1 -%}
+                        {%- set content_ns.val = content_ns.val
+                            + '<image ' + render_ns.image_index|string + '><image>' -%}
+                    {%- else -%}
+                        {%- set content_ns.val = content_ns.val + '<image>' -%}
+                    {%- endif -%}
+                {%- endif -%}
+            {%- elif part['type'] == 'video' or part['type'] == 'video_url' or part['type'] == 'input_video' -%}
+                {%- if counters.videos > 0 -%}
+                    {%- set content_ns.val = content_ns.val + '<video>' -%}
+                {%- endif -%}
+            {%- elif part['type'] == 'text' or part['type'] == 'input_text' -%}
+                {%- set content_ns.val = content_ns.val + (part['text'] | default('', true)) -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {{- content_ns.val -}}
+    {%- endif -%}
+{%- endmacro %}"#;
+/// render_content as shipped with the GA checkpoint. It adds one newline between
+/// a non-empty text part and the next emitted image or video placeholder unless
+/// the content already ends in one.
+const GA_RENDER_CONTENT: &str = r#"{%- macro render_content(content) -%}
     {%- if content is none -%}
         {{- '' -}}
     {%- elif content is string -%}
@@ -257,54 +277,50 @@ mod tests {
         {{- content_ns.val -}}
     {%- endif -%}
 {%- endmacro %}"#;
-    /// render_content exactly as shipped with the pre-GA (step30) checkpoint.
-    const LEGACY_RENDER_CONTENT: &str = r#"{%- macro render_content(content) -%}
-    {%- if content is none -%}
-        {{- '' -}}
-    {%- elif content is string -%}
-        {{- content | string -}}
-    {%- else -%}
-        {%- set text_ns = namespace(val='') -%}
-        {%- set counters = namespace(images=0, videos=0) -%}
-        {%- for part in content -%}
-            {%- if part['type'] == 'image' or part['type'] == 'image_url' or part['type'] == 'input_image' -%}
-                {%- set counters.images = counters.images + 1 -%}
-            {%- elif part['type'] == 'video' or part['type'] == 'video_url' or part['type'] == 'input_video' -%}
-                {%- set counters.videos = counters.videos + 1 -%}
-            {%- elif part['type'] == 'text' or part['type'] == 'input_text' -%}
-                {%- set text_ns.val = text_ns.val + (part['text'] | default('', true)) -%}
-            {%- endif -%}
-        {%- endfor -%}
-        {%- if '<image>' in text_ns.val -%}
-            {%- set counters.images = 0 -%}
-        {%- endif -%}
-        {%- if '<video>' in text_ns.val -%}
-            {%- set counters.videos = 0 -%}
-        {%- endif -%}
-        {%- set content_ns = namespace(val='') -%}
-        {%- set render_ns = namespace(image_index=0) -%}
-        {%- for part in content -%}
-            {%- if part['type'] == 'image' or part['type'] == 'image_url' or part['type'] == 'input_image' -%}
-                {%- set render_ns.image_index = render_ns.image_index + 1 -%}
-                {%- if counters.images > 0 -%}
-                    {%- if counters.images > 1 -%}
-                        {%- set content_ns.val = content_ns.val
-                            + '<image ' + render_ns.image_index|string + '><image>' -%}
-                    {%- else -%}
-                        {%- set content_ns.val = content_ns.val + '<image>' -%}
-                    {%- endif -%}
-                {%- endif -%}
-            {%- elif part['type'] == 'video' or part['type'] == 'video_url' or part['type'] == 'input_video' -%}
-                {%- if counters.videos > 0 -%}
-                    {%- set content_ns.val = content_ns.val + '<video>' -%}
-                {%- endif -%}
-            {%- elif part['type'] == 'text' or part['type'] == 'input_text' -%}
-                {%- set content_ns.val = content_ns.val + (part['text'] | default('', true)) -%}
-            {%- endif -%}
-        {%- endfor -%}
-        {{- content_ns.val -}}
-    {%- endif -%}
-{%- endmacro %}"#;
+const RENDER_CONTENT_END: &str = "{%- endmacro %}";
+
+/// Returns whether the template's render_content is the GA variant; any
+/// render_content other than the two shipped ones is rejected.
+fn separates_media(source: &str) -> anyhow::Result<bool> {
+    let definitions: Vec<usize> = source.match_indices("macro")
+        .filter(|(at, word)| source[at + word.len()..].trim_start().starts_with("render_content"))
+        .map(|(at, _)| at)
+        .collect();
+    let [definition] = definitions[..] else {
+        anyhow::bail!("chat template must define render_content exactly once");
+    };
+    let start = source[..definition].rfind("{%").unwrap_or(0);
+    let end = source[start..].find(RENDER_CONTENT_END).map(|end| start + end + RENDER_CONTENT_END.len());
+    match end.map(|end| &source[start..end]) {
+        Some(GA_RENDER_CONTENT) => Ok(true),
+        Some(PRE_GA_RENDER_CONTENT) => Ok(false),
+        _ => anyhow::bail!("chat template's render_content is not a supported Super variant"),
+    }
+}
+
+/// Adapt a declared template capability, not arbitrary Jinja. The outer emit is
+/// tagged after render_content's macro has finished capturing. Changing any of
+/// the supported branch syntax requires a new adapter and parity tests.
+pub fn enable_super_user_provenance(config: &mut crate::ChatTemplate) -> anyhow::Result<()> {
+    let Some(crate::ChatTemplateValue(either::Either::Left(source))) = &mut config.chat_template else {
+        anyhow::bail!("Super user provenance requires a single declared chat template");
+    };
+    anyhow::ensure!(source.matches(ORIGINAL).count() == 1,
+        "chat template does not declare the supported Super user-output capability");
+    let separate_media = if separates_media(source)? { ", true" } else { "" };
+    *source = source.replacen(ORIGINAL, &TRACKED.replacen("SEPARATE_MEDIA", separate_media, 1), 1);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::{ChatTemplate, ContextMixins, OAIChatLikeRequest, PromptFormatter};
+    use dynamo_protocols::types::CreateChatCompletionRequest;
+    use serde_json::json;
+
     const MESSAGES: &str = r#"
 {%- set medium_effort = medium_effort if medium_effort is defined else False %}
 {%- set ns = namespace(last_user_idx = -1) %}
@@ -331,12 +347,33 @@ mod tests {
         PromptFormatter::from_parts(config, ContextMixins::default(), true).unwrap()
     }
 
-    fn request(content: serde_json::Value) -> CreateChatCompletionRequest {
-        serde_json::from_value(json!({
-            "model": "super",
-            "messages": [{ "role": "user", "content": content }],
-        }))
-        .unwrap()
+    struct Request {
+        inner: CreateChatCompletionRequest,
+        args: Option<HashMap<String, serde_json::Value>>,
+    }
+
+    impl OAIChatLikeRequest for Request {
+        fn model(&self) -> String {
+            self.inner.model()
+        }
+        fn messages(&self) -> Value {
+            self.inner.messages()
+        }
+        fn should_add_generation_prompt(&self) -> bool {
+            false
+        }
+        fn chat_template_args(&self) -> Option<&HashMap<String, serde_json::Value>> {
+            self.args.as_ref()
+        }
+    }
+
+    fn messages(messages: serde_json::Value) -> Request {
+        let inner = serde_json::from_value(json!({ "model": "super", "messages": messages })).unwrap();
+        Request { inner, args: None }
+    }
+
+    fn request(content: serde_json::Value) -> Request {
+        messages(json!([{ "role": "user", "content": content }]))
     }
 
     fn text(t: &str) -> serde_json::Value {
@@ -353,16 +390,20 @@ mod tests {
 
     /// Renders with and without provenance; the tracked prompt must be
     /// byte-identical and its user spans must cover exactly `spans`.
-    fn assert_tracked(render_content: &str, content: serde_json::Value, body: &str, spans: &[&str]) {
-        let req = request(content);
+    fn assert_rendered(render_content: &str, req: &Request, prompt: &str, spans: &[&str]) {
         let PromptFormatter::OAI(plain) = formatter(render_content, false);
         let PromptFormatter::OAI(tracked) = formatter(render_content, true);
-        let expected = plain.render(&req).unwrap();
-        assert_eq!(expected, format!("<|im_start|>user\n{body}<|im_end|>\n"));
-        let rendered = tracked.render_with_user_spans(&req).unwrap();
+        let expected = plain.render(req).unwrap();
+        assert_eq!(expected, prompt);
+        let rendered = tracked.render_with_user_spans(req).unwrap();
         assert_eq!(rendered.text, expected);
         let actual: Vec<&str> = rendered.user_spans.iter().map(|s| &rendered.text[s.clone()]).collect();
         assert_eq!(actual, spans);
+    }
+
+    fn assert_tracked(render_content: &str, content: serde_json::Value, body: &str, spans: &[&str]) {
+        let prompt = format!("<|im_start|>user\n{body}<|im_end|>\n");
+        assert_rendered(render_content, &request(content), &prompt, spans);
     }
 
     #[test]
@@ -382,35 +423,61 @@ mod tests {
 
     #[test]
     fn ga_template_inline_placeholder_keeps_text_state() {
-        // Images are inlined by the user's own <image> tag, so the image part
-        // emits nothing and the separator still applies to the later video.
-        assert_tracked(GA_RENDER_CONTENT, json!([text("see <image>"), image(), text("then"), video()]),
-            "see <image>then\n<video>", &["see <image>then"]);
+        // The user's own <image> tag suppresses the image part's placeholder,
+        // which must not reset the text state the later video separator uses.
+        assert_tracked(GA_RENDER_CONTENT, json!([text("see <image>"), image(), text(""), video()]),
+            "see <image>\n<video>", &["see <image>"]);
     }
 
     #[test]
-    fn legacy_template_has_no_media_separator() {
-        assert_tracked(LEGACY_RENDER_CONTENT, json!([text("List."), video()]), "List.<video>", &["List."]);
-        assert_tracked(LEGACY_RENDER_CONTENT, json!([text("How many?"), image(), image()]),
+    fn ga_template_tracks_every_user_turn() {
+        let req = messages(json!([
+            { "role": "system", "content": "S" },
+            { "role": "user", "content": [text("one"), image()] },
+            { "role": "assistant", "content": "ok" },
+            { "role": "user", "content": [text("two"), video()] },
+        ]));
+        assert_rendered(GA_RENDER_CONTENT, &req, concat!(
+            "<|im_start|>system\nS<|im_end|>\n<|im_start|>user\none\n<image><|im_end|>\n",
+            "<|im_start|>assistant\nok<|im_end|>\n<|im_start|>user\ntwo\n<video><|im_end|>\n"),
+            &["one", "two"]);
+    }
+
+    #[test]
+    fn pre_ga_template_has_no_media_separator() {
+        assert_tracked(PRE_GA_RENDER_CONTENT, json!([text("List."), video()]), "List.<video>", &["List."]);
+        assert_tracked(PRE_GA_RENDER_CONTENT, json!([text("How many?"), image(), image()]),
             "How many?<image 1><image><image 2><image>", &["How many?"]);
-        assert_tracked(LEGACY_RENDER_CONTENT, json!([image(), text("Describe it.")]),
+        assert_tracked(PRE_GA_RENDER_CONTENT, json!([image(), text("Describe it.")]),
             "<image>Describe it.", &["Describe it."]);
     }
 
     #[test]
-    fn adapter_selects_the_declared_separator_rule() {
-        let adapted = |render_content: &str| {
+    fn template_kwargs_cannot_replace_the_capture() {
+        let mut req = request(json!("<think>x</think>"));
+        req.args = Some(HashMap::from([("__dynamo_output_provenance".to_owned(), json!(""))]));
+        assert_rendered(GA_RENDER_CONTENT, &req, "<|im_start|>user\n<think>x</think><|im_end|>\n",
+            &["<think>x</think>"]);
+    }
+
+    #[test]
+    fn adapter_accepts_only_the_shipped_render_content() {
+        let adapt = |render_content: &str| {
             let mut config = template(render_content);
-            enable_super_user_provenance(&mut config).unwrap();
+            enable_super_user_provenance(&mut config)?;
             let Some(crate::ChatTemplateValue(either::Either::Left(source))) = config.chat_template else {
                 panic!("expected a single chat template");
             };
-            source
+            anyhow::Ok(source)
         };
-        assert!(adapted(GA_RENDER_CONTENT).contains("dynamo_user_data(message.content | default('', true), true)"));
-        assert!(adapted(LEGACY_RENDER_CONTENT).contains("dynamo_user_data(message.content | default('', true))"));
-
-        let mut twice = template(&[GA_RENDER_CONTENT, MEDIA_SEPARATOR].concat());
-        assert!(enable_super_user_provenance(&mut twice).is_err());
+        assert!(adapt(GA_RENDER_CONTENT).unwrap().contains("default('', true), true)"));
+        assert!(adapt(PRE_GA_RENDER_CONTENT).unwrap().contains("default('', true))"));
+        let ga_line = "{%- set sep = '\\n' if render_ns.after_text and not content_ns.val.endswith('\\n') else '' -%}";
+        assert!(GA_RENDER_CONTENT.contains(ga_line));
+        // A copy of the GA rule outside render_content does not change the variant.
+        let commented = adapt(&[PRE_GA_RENDER_CONTENT, "{# ", ga_line, " #}"].concat()).unwrap();
+        assert!(commented.contains("default('', true))"));
+        assert!(adapt(&GA_RENDER_CONTENT.replace("set sep =", "set sep  =")).is_err());
+        assert!(adapt(&[GA_RENDER_CONTENT, PRE_GA_RENDER_CONTENT].concat()).is_err());
     }
 }

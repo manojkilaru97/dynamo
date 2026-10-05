@@ -544,9 +544,10 @@ impl OAIPromptFormatter for HfTokenizerConfigJsonFormatter {
             });
         }
         let capture = crate::provenance::Capture::default();
-        // Reserved internal object wins over untrusted template kwargs.
+        // Reserved internal object wins over untrusted template kwargs; in
+        // `context!` the leftmost merged value takes precedence.
         let private = context! { __dynamo_output_provenance => Value::from_object(capture.clone()) };
-        let ctx = context! { ..ctx, ..private };
+        let ctx = context! { ..private, ..ctx };
         #[allow(deprecated)]
         tmpl.render_to_write(&ctx, capture.clone())?;
         capture.finish()
