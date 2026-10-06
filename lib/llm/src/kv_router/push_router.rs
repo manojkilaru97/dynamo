@@ -262,13 +262,21 @@ impl KvPushRouter {
         let block_size = self.chooser.block_size() as usize;
         // Funnel F2/F3 for tracked attempts: the router's raw cached-prefix estimates at
         // selection, compared later against the worker's own reuse report (F4).
+        // Label funnel series with the router's own model when it has one, so a caller-chosen
+        // `model` string (the standalone router does not validate it) cannot grow cardinality.
+        let metrics_model = self
+            .chooser
+            .served_model_name()
+            .unwrap_or(request.model.as_str());
         let kv_route = (!is_query_only)
             .then(|| {
                 selection
                     .max_raw_cached_tokens
                     .zip(selection.selected_raw_cached_tokens)
                     .map(|(best, selected)| RouteObservation {
-                        prompt_tokens: routing_parts.token_ids.len() as u64,
+                        // The unpadded routed length: the engine reports the expanded
+                        // multimodal prompt without the routing buffer's block padding.
+                        prompt_tokens: request.routed_prompt_len() as u64,
                         best_router_tokens: best as u64,
                         selected_router_tokens: selected as u64,
                     })
@@ -301,6 +309,7 @@ impl KvPushRouter {
             !is_query_only,
             selection.lifecycle.take(),
             kv_route,
+            metrics_model,
         );
         if let (Some(history), Some(prompt_hashes)) =
             (self.cache_history.as_ref(), history_prompt_hashes)
@@ -309,7 +318,7 @@ impl KvPushRouter {
                 CacheHistoryTracking::new(
                     Arc::clone(history),
                     prompt_hashes,
-                    routing_parts.token_ids.len() as u64,
+                    request.routed_prompt_len() as u64,
                 ),
                 request,
                 self.chooser.block_size(),
@@ -377,7 +386,7 @@ impl KvPushRouter {
             if !is_query_only {
                 guard.request_metrics().observe_input_sequence_tokens(
                     request.phase(),
-                    &request.model,
+                    metrics_model,
                     request.token_ids.len(),
                 );
             }
@@ -882,6 +891,7 @@ mod tests {
                     .take()
                     .zip(response.lifecycle_lease.take()),
                 None,
+                "test",
             );
             guard.mark_dispatched().await;
 
@@ -962,6 +972,7 @@ mod tests {
             false,
             None,
             None,
+            "test",
         );
         let monitored = monitor_response_stream(source, context, guard);
         tokio::pin!(monitored);
@@ -1427,6 +1438,221 @@ mod tests {
         drop(guard);
         assert_eq!(reused.get(), reused_before + 1);
 
+        drop(router);
+        runtime.shutdown();
+    }
+
+    /// Drive one tracked attempt with router estimates (best 96, selected 64 tokens) through
+    /// `monitor_response_stream` until the stream ends; return the (F2, F3, F4) deltas.
+    async fn run_kv_hit_attempt(
+        router: &KvPushRouter,
+        model: &str,
+        items: Vec<Annotated<LLMEngineOutput>>,
+    ) -> (u64, u64, u64) {
+        let labels = [RequestPhase::Aggregated.as_str(), model];
+        let metrics = &router.request_metrics;
+        let read = || {
+            (
+                metrics
+                    .kv_best_eligible_cached_prefix_tokens
+                    .with_label_values(&labels)
+                    .get(),
+                metrics
+                    .kv_selected_cached_prefix_tokens
+                    .with_label_values(&labels)
+                    .get(),
+                metrics
+                    .kv_worker_reused_tokens
+                    .with_label_values(&labels)
+                    .get(),
+            )
+        };
+        let before = read();
+        let context = Context::new(()).context();
+        let source = ResponseStream::new(Box::pin(stream::iter(items)), Arc::clone(&context));
+        let guard = RequestGuard::new(
+            Arc::clone(&router.chooser),
+            Arc::clone(&router.request_metrics),
+            format!("kv-hit-{model}"),
+            &request(),
+            false,
+            None,
+            Some(RouteObservation {
+                prompt_tokens: 1,
+                best_router_tokens: 96,
+                selected_router_tokens: 64,
+            }),
+            model,
+        );
+        let monitored = monitor_response_stream(source, context, guard);
+        tokio::pin!(monitored);
+        while monitored.next().await.is_some() {}
+        drop(monitored);
+        let after = read();
+        (after.0 - before.0, after.1 - before.1, after.2 - before.2)
+    }
+
+    fn kv_hit_item(
+        finish_reason: Option<FinishReason>,
+        reused: Option<u64>,
+    ) -> Annotated<LLMEngineOutput> {
+        Annotated::from_data(LLMEngineOutput {
+            token_ids: vec![42],
+            finish_reason,
+            engine_data: reused.map(|reused_tokens| {
+                serde_json::json!({
+                    "kv_cache_hit": {"prompt_tokens": 1, "reused_tokens": reused_tokens}
+                })
+            }),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn kv_cache_hit_complete_attempt_records_every_stage_once() {
+        let (router, runtime) = router(None).await;
+        let deltas = run_kv_hit_attempt(
+            &router,
+            "complete",
+            vec![
+                kv_hit_item(None, None),
+                kv_hit_item(Some(FinishReason::Stop), Some(72)),
+            ],
+        )
+        .await;
+        assert_eq!(deltas, (96, 64, 72));
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn kv_cache_hit_attempt_without_worker_report_contributes_zero() {
+        let (router, runtime) = router(None).await;
+        let deltas = run_kv_hit_attempt(
+            &router,
+            "silent",
+            vec![kv_hit_item(Some(FinishReason::Stop), None)],
+        )
+        .await;
+        assert_eq!(deltas, (96, 64, 0));
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn kv_cache_hit_cancelled_attempt_keeps_reported_reuse() {
+        let (router, runtime) = router(None).await;
+        // A report on a cancelled terminal frame still counts, although the guard aborts.
+        let deltas = run_kv_hit_attempt(
+            &router,
+            "cancelled",
+            vec![kv_hit_item(Some(FinishReason::Cancelled), Some(33))],
+        )
+        .await;
+        assert_eq!(deltas, (96, 64, 33));
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn multimodal_report_matches_the_unpadded_routed_prompt() {
+        use crate::protocols::common::preprocessor::MmRoutingInfo;
+
+        let (router, runtime) = router(None).await;
+        let reused = router
+            .request_metrics
+            .kv_worker_reused_tokens
+            .with_label_values(&[RequestPhase::Aggregated.as_str(), "test"]);
+        let before = reused.get();
+        // 20 expanded prompt tokens, zero-padded to two 16-token routing blocks.
+        let mut padded = request();
+        let mut routing_token_ids: Vec<u32> = (1..=20).collect();
+        routing_token_ids.resize(32, 0);
+        padded.mm_routing_info = Some(MmRoutingInfo {
+            routing_token_ids,
+            block_mm_infos: vec![None, None],
+            expanded_prompt_len: 20,
+        });
+        assert_eq!(padded.routed_prompt_len(), 20);
+        let padded = Context::new(padded);
+        let (mut selection, _) = router
+            .select_with_affinity(&padded, RequestPhase::Aggregated, false)
+            .await
+            .unwrap();
+        let mut guard = router
+            .track_selection(&padded, &mut selection, false)
+            .await
+            .unwrap();
+        guard
+            .on_item(&Annotated::from_data(LLMEngineOutput {
+                engine_data: Some(serde_json::json!({
+                    "kv_cache_hit": {"prompt_tokens": 20, "reused_tokens": 16}
+                })),
+                ..Default::default()
+            }))
+            .await;
+        guard.abort().await;
+        drop(guard);
+        assert_eq!(reused.get(), before + 16);
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn zero_worker_cache_hit_report_also_closes_the_attempt() {
+        use crate::protocols::common::timing::RequestTracker;
+
+        let (router, runtime) = router(None).await;
+        let metrics = router.request_metrics.clone();
+        let series = |phase: RequestPhase| {
+            metrics
+                .kv_worker_reused_tokens
+                .with_label_values(&[phase.as_str(), "test"])
+        };
+        let (prefill_before, decode_before) = (
+            series(RequestPhase::Prefill).get(),
+            series(RequestPhase::Decode).get(),
+        );
+        let report = |reused_tokens: u64| {
+            Annotated::from_data(LLMEngineOutput {
+                engine_data: Some(serde_json::json!({
+                    "kv_cache_hit": {"prompt_tokens": 1, "reused_tokens": reused_tokens}
+                })),
+                ..Default::default()
+            })
+        };
+        for first_report in [0, 4] {
+            let tracker = Arc::new(RequestTracker::new());
+            drop(tracker.set_phase(RequestPhase::Prefill).await);
+            let mut prefill_request = request();
+            prefill_request.tracker = Some(tracker.clone());
+            let prefill_request = Context::new(prefill_request);
+            let (mut selection, _) = router
+                .select_with_affinity(&prefill_request, RequestPhase::Prefill, false)
+                .await
+                .unwrap();
+            let mut guard = router
+                .track_selection(&prefill_request, &mut selection, false)
+                .await
+                .unwrap();
+            // The attempt keeps the labels it was selected under even if the tracker moves on.
+            drop(tracker.set_phase(RequestPhase::Decode).await);
+            guard.on_item(&report(first_report)).await;
+            guard.on_item(&report(9)).await;
+            guard.abort().await;
+            drop(guard);
+        }
+        assert_eq!(
+            series(RequestPhase::Prefill).get(),
+            prefill_before + 4,
+            "only the first report of each attempt counts, including a zero report"
+        );
+        assert_eq!(series(RequestPhase::Decode).get(), decode_before);
         drop(router);
         runtime.shutdown();
     }

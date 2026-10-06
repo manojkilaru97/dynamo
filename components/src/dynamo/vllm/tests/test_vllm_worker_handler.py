@@ -2303,3 +2303,125 @@ def test_kv_cache_hit_engine_data_uses_stock_aggregate_counter(
         num_cached_tokens=num_cached_tokens,
     )
     assert mod.BaseWorkerHandler._kv_cache_hit_engine_data(request_output) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("cached_tokens", "n"), [(0, 1), (2, 1), (None, 1), (2, 2)])
+async def test_prefill_emits_attempt_cache_reuse(monkeypatch, cached_tokens, n):
+    handler = mod.PrefillWorkerHandler.__new__(mod.PrefillWorkerHandler)
+    request = {"token_ids": [1, 2, 3]}
+    response = mod.RequestOutput(
+        request_id="prefill-reuse",
+        prompt=None,
+        prompt_token_ids=request["token_ids"],
+        prompt_logprobs=None,
+        outputs=[],
+        finished=True,
+        num_cached_tokens=cached_tokens,
+    )
+
+    async def responses():
+        yield response
+
+    handler._multimodal_request_processor = SimpleNamespace(
+        prepare_input=AsyncMock(
+            return_value=PreparedMultimodalInput(
+                request=request, multi_modal_data=None, mm_processor_kwargs=None
+            )
+        ),
+        build_prefill_handoff=MagicMock(return_value=None),
+    )
+    handler._build_prompt_from_request = MagicMock(
+        return_value=({"prompt_token_ids": request["token_ids"]}, None)
+    )
+    handler.default_sampling_params = {}
+    handler.model_max_len = 128
+    handler.config = SimpleNamespace(enable_rl=False)
+    handler.engine_client = MagicMock()
+    handler._resolve_lora_request = MagicMock(return_value=None)
+    handler._to_local_dp_rank = MagicMock(return_value=None)
+
+    @asynccontextmanager
+    async def no_abort_monitor(*args, **kwargs):
+        yield
+
+    handler._abort_monitor = no_abort_monitor
+    handler._generate_with_lora_admission_lock = MagicMock(return_value=responses())
+    handler._log_with_lora_context = MagicMock()
+    protocol = MagicMock()
+    protocol.prefill_request_kv_transfer_params.return_value = {}
+    protocol.decode_request_kv_transfer_params.return_value = None
+    monkeypatch.setattr(mod, "make_kv_connector_protocol", lambda *_: protocol)
+    monkeypatch.setattr(
+        mod, "build_sampling_params", lambda *args, **kwargs: MagicMock(n=n)
+    )
+
+    chunks = [
+        chunk
+        async for chunk in handler._generate_token_mode(
+            request, MagicMock(), "prefill-reuse"
+        )
+    ]
+
+    if cached_tokens is None or n > 1:
+        assert "engine_data" not in chunks[0]
+    else:
+        assert chunks[0]["engine_data"]["kv_cache_hit"] == {
+            "prompt_tokens": 3,
+            "reused_tokens": cached_tokens,
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+@pytest.mark.parametrize(
+    ("prefill_result", "annotations", "expected_report"),
+    [
+        (None, [], True),
+        ({"disaggregated_params": {"kv_transfer_params": {"remote": 1}}}, [], False),
+        ({"disaggregated_params": None}, [], True),
+    ],
+)
+async def test_decode_reports_cache_hit_only_without_transferred_kv(
+    prefill_result, annotations, expected_report
+):
+    """A decode worker loading prefill KV counts it as cached, so it must not report."""
+    config = _make_config(disaggregation_mode="DECODE")
+    handler = _make_handler(config=config)
+    handler.engine_client = MagicMock()
+    handler.engine_client.abort = AsyncMock()
+    handler.shutdown_event = None
+    handler.runtime = MagicMock()
+    handler.config = config
+    handler.default_sampling_params = {}
+    handler.model_max_len = None
+    handler._resolve_lora_request = MagicMock(return_value=None)
+    handler._build_prompt_from_request = MagicMock(return_value=(MagicMock(), None))
+
+    seen_report_flags: list[bool] = []
+
+    async def _fake_generate_tokens(*args, report_kv_cache_hit=True, **kwargs):
+        seen_report_flags.append(report_kv_cache_hit)
+        if False:
+            yield None
+
+    handler.generate_tokens = _fake_generate_tokens
+    context = MagicMock()
+    context.async_killed_or_stopped.return_value = (
+        asyncio.get_running_loop().create_future()
+    )
+    request = {
+        "token_ids": [1, 2, 3],
+        "sampling_options": {},
+        "stop_conditions": {},
+        "output_options": {},
+        "prefill_result": prefill_result,
+        "routing": {},
+        "annotations": annotations,
+        "model": "test-model",
+    }
+
+    async for _ in handler._generate_token_mode(request, context, "req-decode"):
+        pass
+
+    assert seen_report_flags == [expected_report]

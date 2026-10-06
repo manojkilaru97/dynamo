@@ -42,14 +42,15 @@ pub const DYN_ROUTER_DECISION_TRACE_ENABLED: &str = "DYN_ROUTER_DECISION_TRACE_E
 pub const DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE: &str = "DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE";
 const DECISION_TRACE_SCHEMA: &str = "dynamo.router.decision.v1";
 
-static ROUTER_DECISION_TRACE_ENABLED: LazyLock<bool> =
-    LazyLock::new(|| dynamo_truthy::env_is_truthy(DYN_ROUTER_DECISION_TRACE_ENABLED));
-
-static ROUTER_DECISION_TRACE_SAMPLE_RATE: LazyLock<f64> = LazyLock::new(|| {
-    parse_decision_trace_sample_rate(
-        std::env::var_os(DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE)
-            .map(|value| value.to_string_lossy().into_owned()),
-    )
+/// Process-wide decision-trace setting, read once: `None` when disabled, otherwise the
+/// sample rate. Selectors copy it at construction.
+static ROUTER_DECISION_TRACE: LazyLock<Option<f64>> = LazyLock::new(|| {
+    dynamo_truthy::env_is_truthy(DYN_ROUTER_DECISION_TRACE_ENABLED).then(|| {
+        parse_decision_trace_sample_rate(
+            std::env::var_os(DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE)
+                .map(|value| value.to_string_lossy().into_owned()),
+        )
+    })
 });
 
 fn parse_decision_trace_sample_rate(value: Option<String>) -> f64 {
@@ -92,9 +93,12 @@ fn should_trace_decision(request: &SchedulingRequest, sample_rate: f64) -> bool 
 }
 
 /// Mark the max-overlap candidate and assemble the trace around the policy-specific rows.
+/// `policy_overlap` is the overlap the selecting policy ranked on, so `max_overlap` and the
+/// avoidable prefill describe that policy's own view.
 #[allow(clippy::too_many_arguments)]
 fn finish_decision_trace(
     mut candidates: Vec<RoutingDecisionCandidate>,
+    policy_overlap: fn(&RoutingDecisionCandidate) -> f64,
     config: &KvRouterConfig,
     worker_type: &'static str,
     policy: &str,
@@ -107,19 +111,15 @@ fn finish_decision_trace(
     two_tier: Option<TwoTierDecisionTrace>,
 ) -> Option<Box<RoutingDecisionTrace>> {
     candidates.sort_unstable_by_key(|candidate| (candidate.worker_id, candidate.dp_rank));
-    let max_overlap = candidates.iter().max_by(|left, right| {
-        left.effective_overlap_blocks
-            .total_cmp(&right.effective_overlap_blocks)
-    })?;
+    let max_overlap = candidates
+        .iter()
+        .max_by(|left, right| policy_overlap(left).total_cmp(&policy_overlap(right)))?;
     let (max_overlap_worker_id, max_overlap_dp_rank, max_overlap_blocks) = (
         max_overlap.worker_id,
         max_overlap.dp_rank,
-        max_overlap.effective_overlap_blocks,
+        policy_overlap(max_overlap),
     );
-    let selected_overlap = candidates
-        .iter()
-        .find(|candidate| candidate.selected)?
-        .effective_overlap_blocks;
+    let selected_overlap = policy_overlap(candidates.iter().find(|candidate| candidate.selected)?);
     for candidate in &mut candidates {
         candidate.max_overlap = candidate.worker_id == max_overlap_worker_id
             && candidate.dp_rank == max_overlap_dp_rank;
@@ -186,7 +186,10 @@ impl<'a> RawCacheReuse<'a> {
     fn track_raw_blocks(&self, worker: WorkerWithDpRank, raw_blocks: usize) {
         if let Some(current) = self.max.get() {
             let raw = raw_blocks.saturating_mul(self.block_size as usize);
-            debug_assert_eq!(raw, self.request.raw_cached_tokens_for(worker, self.block_size));
+            debug_assert_eq!(
+                raw,
+                self.request.raw_cached_tokens_for(worker, self.block_size)
+            );
             self.max.set(Some(current.max(raw)));
         }
     }
@@ -213,7 +216,10 @@ impl<'a> RawCacheReuse<'a> {
                 .saturating_add(host_blocks)
                 .saturating_add(disk_blocks)
                 .saturating_mul(self.block_size as usize);
-            debug_assert_eq!(raw, self.request.raw_cached_tokens_for(worker, self.block_size));
+            debug_assert_eq!(
+                raw,
+                self.request.raw_cached_tokens_for(worker, self.block_size)
+            );
             self.max.set(Some(current.max(raw)));
         }
     }
@@ -305,6 +311,8 @@ pub struct DefaultWorkerSelector {
     /// Worker-selection policy chosen by `router_policy_config`'s `worker_selection` section.
     /// `None` keeps the built-in additive cost function.
     worker_selection_policy: Option<SelectedWorkerPolicy>,
+    /// Routing-decision trace sample rate, or `None` when tracing is off (the default).
+    decision_trace_sample_rate: Option<f64>,
     #[cfg(any(test, feature = "bench"))]
     deterministic_rng: Option<Arc<Mutex<fastrand::Rng>>>,
 }
@@ -357,6 +365,7 @@ impl DefaultWorkerSelector {
             kv_router_config: kv_router_config.unwrap_or_default(),
             worker_type,
             worker_selection_policy: None,
+            decision_trace_sample_rate: *ROUTER_DECISION_TRACE,
             #[cfg(any(test, feature = "bench"))]
             deterministic_rng: None,
         }
@@ -417,6 +426,13 @@ impl DefaultWorkerSelector {
             );
         }
         Ok(selector)
+    }
+
+    /// Override the process-wide decision-trace setting (`None` disables tracing).
+    #[cfg(test)]
+    fn with_decision_trace_sample_rate(mut self, sample_rate: Option<f64>) -> Self {
+        self.decision_trace_sample_rate = sample_rate;
+        self
     }
 
     /// The shipped policy type this selector runs, or `None` for the built-in cost function.
@@ -491,22 +507,23 @@ impl DefaultWorkerSelector {
         );
 
         let (max_raw_cached_tokens, selected_raw_cached_tokens) = raw_reuse.finish(worker);
-        let decision_trace = (*ROUTER_DECISION_TRACE_ENABLED
-            && should_trace_decision(request, *ROUTER_DECISION_TRACE_SAMPLE_RATE))
-        .then(|| {
-            self.two_tier_decision_trace(
-                policy,
-                workers,
-                request,
-                eligibility,
-                block_size,
-                weights,
-                matchable_blocks,
-                decision.as_str(),
-                worker,
-            )
-        })
-        .flatten();
+        let decision_trace = self
+            .decision_trace_sample_rate
+            .is_some_and(|rate| should_trace_decision(request, rate))
+            .then(|| {
+                self.two_tier_decision_trace(
+                    policy,
+                    workers,
+                    request,
+                    eligibility,
+                    block_size,
+                    weights,
+                    matchable_blocks,
+                    decision.as_str(),
+                    worker,
+                )
+            })
+            .flatten();
         Ok(WorkerSelectionResult {
             worker,
             required_blocks: request_blocks,
@@ -580,6 +597,11 @@ impl DefaultWorkerSelector {
             .unwrap_or(self.kv_router_config.router_temperature);
         finish_decision_trace(
             candidates,
+            |candidate| {
+                candidate
+                    .two_tier_overlap_blocks
+                    .unwrap_or(candidate.effective_overlap_blocks)
+            },
             &self.kv_router_config,
             self.worker_type,
             two_tier_cost_fn::POLICY_TYPE,
@@ -658,6 +680,7 @@ impl DefaultWorkerSelector {
         });
         finish_decision_trace(
             candidates,
+            |candidate| candidate.effective_overlap_blocks,
             &self.kv_router_config,
             self.worker_type,
             "default",
@@ -685,6 +708,7 @@ impl DefaultWorkerSelector {
             kv_router_config: kv_router_config.unwrap_or_default(),
             worker_type,
             worker_selection_policy: None,
+            decision_trace_sample_rate: *ROUTER_DECISION_TRACE,
             deterministic_rng: Some(Arc::new(Mutex::new(fastrand::Rng::with_seed(seed)))),
         }
     }
@@ -1203,21 +1227,22 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         #[cfg(not(any(test, feature = "bench")))]
         let (best_worker, best_logit) = random_choice();
 
-        let decision_trace = (*ROUTER_DECISION_TRACE_ENABLED
-            && should_trace_decision(request, *ROUTER_DECISION_TRACE_SAMPLE_RATE))
-        .then(|| {
-            self.default_decision_trace(
-                workers,
-                request,
-                eligibility,
-                block_size,
-                min_active_prefill_tokens,
-                weights,
-                temperature,
-                best_worker,
-            )
-        })
-        .flatten();
+        let decision_trace = self
+            .decision_trace_sample_rate
+            .is_some_and(|rate| should_trace_decision(request, rate))
+            .then(|| {
+                self.default_decision_trace(
+                    workers,
+                    request,
+                    eligibility,
+                    block_size,
+                    min_active_prefill_tokens,
+                    weights,
+                    temperature,
+                    best_worker,
+                )
+            })
+            .flatten();
 
         let best_host_pinned_overlap_blocks = request
             .overlap
@@ -2979,71 +3004,87 @@ worker_selection:
         assert!(!should_trace_decision(&anonymous, 1.0));
     }
 
+    fn select_traced(
+        selector: &DefaultWorkerSelector,
+        request: &SchedulingRequest,
+        ids: &[u64],
+    ) -> (WorkerSelectionResult, RoutingDecisionTrace) {
+        let mut result = select_ids(selector, request, ids);
+        let trace = *result
+            .decision_trace
+            .take()
+            .expect("an enabled, fully sampled selector traces the decision");
+        (result, trace)
+    }
+
     #[test]
     fn default_decision_trace_scores_match_selection() {
-        let selector = DefaultWorkerSelector::new(
-            Some(KvRouterConfig {
-                overlap_score_credit: 1.0,
-                router_temperature: 0.0,
-                ..Default::default()
-            }),
-            "test",
-        );
-        let warm = WorkerWithDpRank::from_worker_id(0);
-        let cold = WorkerWithDpRank::from_worker_id(1);
-        let mut request = tracked(two_tier_request_isl(128, &[(0, 4, 0, 0), (1, 0, 0, 0)]));
-        request.worker_loads.insert(
-            warm,
-            crate::sequences::WorkerLoadProjection {
-                active_decode_blocks: 10,
-                ..Default::default()
-            },
-        );
-        request.worker_loads.insert(
-            cold,
-            crate::sequences::WorkerLoadProjection {
-                active_decode_blocks: 1,
-                ..Default::default()
-            },
-        );
-        let workers = HashMap::from([
-            (0, TaintedWorkerConfig::default()),
-            (1, TaintedWorkerConfig::default()),
-        ]);
-        let selected = selector
-            .select_worker(&workers, &request, request.eligibility(), 16)
-            .unwrap();
-        assert_eq!(selected.worker, cold);
-        let weights = weights_for(&selector);
-        let trace = selector
-            .default_decision_trace(
-                &workers,
-                &request,
-                request.eligibility(),
-                16,
-                0,
-                weights,
-                0.0,
-                selected.worker,
-            )
-            .expect("full sampling yields a trace");
+        // A positive credit decay makes the min-active-prefill floor matter; worker 2 carries
+        // prefill backlog so the floor is nonzero for the others.
+        let config = KvRouterConfig {
+            overlap_score_credit: 1.0,
+            overlap_score_credit_decay: 0.5,
+            router_temperature: 0.0,
+            ..Default::default()
+        };
+        let selector = DefaultWorkerSelector::new(Some(config), "test")
+            .with_decision_trace_sample_rate(Some(1.0));
+        let mut request = tracked(two_tier_request_isl(
+            128,
+            &[(0, 4, 0, 0), (1, 0, 2, 0), (2, 1, 0, 0)],
+        ));
+        for (id, decode, prefill) in [(0, 10, 32), (1, 1, 16), (2, 3, 400)] {
+            request.worker_loads.insert(
+                WorkerWithDpRank::from_worker_id(id),
+                crate::sequences::WorkerLoadProjection {
+                    active_decode_blocks: decode,
+                    active_prefill_tokens: prefill,
+                    ..Default::default()
+                },
+            );
+        }
+        request.router_config_override = Some(crate::config::RouterConfigOverride {
+            prefill_load_scale: Some(2.0),
+            ..Default::default()
+        });
+        let (selected, trace) = select_traced(&selector, &request, &[0, 1, 2]);
         assert_eq!(trace.policy, "default");
         assert_eq!(trace.selection_reason, "minimum_cost");
-        assert_eq!(trace.selected_worker_id, cold.worker_id);
-        assert_eq!(trace.max_overlap_worker_id, warm.worker_id);
-        assert_eq!(trace.avoidable_prefill_token_equivalents, 64.0);
+        assert_eq!(trace.prefill_load_scale, 2.0);
+        assert_eq!(trace.selected_worker_id, selected.worker.worker_id);
+        assert_eq!(trace.max_overlap_worker_id, 0);
         assert!(trace.two_tier.is_none());
+        assert_eq!(trace.candidates.len(), 3);
+        let weights = LogitWeights {
+            overlap_score_credit: 1.0,
+            overlap_score_credit_decay: 0.5,
+            prefill_load_scale: 2.0,
+            shared_cache_multiplier: selector.kv_router_config.shared_cache_multiplier,
+        };
+        let best_cost = trace
+            .candidates
+            .iter()
+            .map(|candidate| candidate.total_cost_blocks)
+            .fold(f64::INFINITY, f64::min);
         for candidate in &trace.candidates {
             let worker = WorkerWithDpRank::new(candidate.worker_id, candidate.dp_rank);
-            let expected = selector.worker_logit(&request, worker, 16, 0, weights, "test");
+            // Floor = least active prefill tokens among eligible workers = 16.
+            let expected = selector.worker_logit(&request, worker, 16, 16, weights, "test");
             assert_eq!(candidate.total_cost_blocks, expected);
-            assert_eq!(candidate.selected, worker == cold);
+            assert_eq!(candidate.selected, worker == selected.worker);
             assert_eq!(
                 candidate.raw_cached_tokens,
                 request.raw_cached_tokens_for(worker, 16)
             );
         }
-        let json = serde_json::to_value(&*trace).unwrap();
+        let chosen = trace.candidates.iter().find(|c| c.selected).unwrap();
+        assert_eq!(chosen.total_cost_blocks, best_cost);
+        let selected_overlap = chosen.effective_overlap_blocks;
+        assert_eq!(
+            trace.avoidable_prefill_token_equivalents,
+            (4.0 - selected_overlap) * 16.0
+        );
+        let json = serde_json::to_value(&trace).unwrap();
         assert!(json.get("two_tier").is_none());
         assert!(
             json["candidates"][0]
@@ -3053,65 +3094,147 @@ worker_selection:
     }
 
     #[test]
-    fn two_tier_decision_trace_reports_tier_and_cpu_overlap() {
-        let selector = two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default());
-        let Some(SelectedWorkerPolicy::TwoTierCostFn { policy, .. }) =
-            selector.worker_selection_policy
-        else {
-            panic!("two-tier policy expected");
+    fn default_decision_trace_applies_preferred_taint_multiplier() {
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                router_temperature: 0.0,
+                ..Default::default()
+            }),
+            "test",
+        )
+        .with_decision_trace_sample_rate(Some(1.0));
+        let mut request = tracked(two_tier_request(&[(1, 2, 0, 0), (2, 0, 0, 0)]));
+        request.routing_constraints = crate::protocols::RoutingConstraints {
+            preferred_taints: HashMap::from([("fast".to_string(), 0.5)]),
+            ..Default::default()
         };
-        // Worker 1 holds 2 device + 8 CPU blocks; worker 2 holds 4 device blocks.
-        let request = tracked(two_tier_request(&[(1, 2, 8, 0), (2, 4, 0, 1)]));
-        let selected = select_ids(&selector, &request, &[1, 2]);
-        assert_eq!(selected.worker.worker_id, 1);
-        let workers: HashMap<_, _> = [1, 2]
-            .into_iter()
-            .map(|id| (id, TaintedWorkerConfig::default()))
-            .collect();
-        let trace = selector
-            .two_tier_decision_trace(
-                &policy,
-                &workers,
-                &request,
-                request.eligibility(),
-                16,
-                weights_for(&selector),
-                10,
-                "cache",
-                selected.worker,
-            )
+        let workers = HashMap::from([
+            (
+                1,
+                TaintedWorkerConfig {
+                    taints: HashSet::from(["fast".to_string()]),
+                },
+            ),
+            (2, TaintedWorkerConfig::default()),
+        ]);
+        let mut result = selector
+            .select_worker(&workers, &request, request.eligibility(), 16)
             .unwrap();
+        let trace = result.decision_trace.take().unwrap();
+        let tainted = trace.candidates.iter().find(|c| c.worker_id == 1).unwrap();
+        let multiplier = tainted.preferred_taint_multiplier.unwrap();
+        assert!(multiplier < 1.0);
+        assert_eq!(
+            tainted.total_cost_blocks,
+            tainted.base_score_blocks * multiplier
+        );
+        let plain = trace.candidates.iter().find(|c| c.worker_id == 2).unwrap();
+        assert_eq!(plain.preferred_taint_multiplier, Some(1.0));
+    }
+
+    #[test]
+    fn two_tier_decision_trace_reports_the_deciding_tier() {
+        // Load tier: worker 1 holds the prefix but is far busier.
+        let selector = two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default())
+            .with_decision_trace_sample_rate(Some(1.0));
+        let request = tracked(two_tier_request(&[(1, 8, 2, 100), (2, 0, 0, 0)]));
+        let (selected, trace) = select_traced(&selector, &request, &[1, 2]);
+        assert_eq!(selected.worker.worker_id, 2);
         assert_eq!(trace.policy, two_tier_cost_fn::POLICY_TYPE);
+        assert_eq!(trace.selection_reason, "two_tier_load");
+        assert_eq!(trace.two_tier.as_ref().unwrap().tier, "load");
+        assert_eq!(trace.two_tier.as_ref().unwrap().matchable_blocks, 10);
+        assert_eq!(trace.max_overlap_worker_id, 1);
+        assert_eq!(trace.candidates[0].raw_cached_tokens, 160);
+        assert_eq!(trace.candidates[0].active_requests, 100);
+
+        // Cache tier with a CPU-held prefix.
+        let request = tracked(two_tier_request(&[(1, 2, 8, 0), (2, 4, 0, 1)]));
+        let (selected, trace) = select_traced(&selector, &request, &[1, 2]);
+        assert_eq!(selected.worker.worker_id, 1);
         assert_eq!(trace.selection_reason, "two_tier_cache");
-        let two_tier = trace.two_tier.as_ref().unwrap();
-        assert_eq!(two_tier.tier, "cache");
-        assert_eq!(two_tier.matchable_blocks, 10);
-        assert_eq!(two_tier.host_cache_weight, policy.host_cache_weight);
         let first = &trace.candidates[0];
-        assert_eq!(first.worker_id, 1);
         assert!(first.selected && first.max_overlap);
         assert_eq!(first.host_overlap_blocks, 8.0);
         assert_eq!(first.raw_cached_tokens, 160);
-        assert_eq!(
-            first.two_tier_overlap_blocks,
-            Some(2.0 + policy.host_cache_weight * 8.0)
-        );
-        assert_eq!(trace.candidates[1].active_requests, 1);
+        let host_weight = trace.two_tier.as_ref().unwrap().host_cache_weight;
+        assert_eq!(first.two_tier_overlap_blocks, Some(2.0 + host_weight * 8.0));
         assert_eq!(trace.avoidable_prefill_token_equivalents, 0.0);
     }
 
     #[test]
-    fn decision_tracing_is_off_by_default() {
-        // The process environment of the test runner does not set the flag.
-        if std::env::var_os(DYN_ROUTER_DECISION_TRACE_ENABLED).is_none() {
-            assert!(!*ROUTER_DECISION_TRACE_ENABLED);
-            let selector = DefaultWorkerSelector::new(None, "decode");
-            let request = tracked(two_tier_request(&[(1, 4, 0, 0)]));
+    fn two_tier_decision_trace_ranks_on_the_policy_cpu_weight() {
+        // The policy weighs CPU blocks at 1.0 while the router's estimate uses 0.75: the policy
+        // picks B (8 CPU blocks over A's 7 device blocks), and the trace must agree.
+        let yaml = r#"
+worker_selection:
+  aggregated: dynamo-two-tier-cost-fn
+  instances:
+    - name: dynamo-two-tier-cost-fn
+      type: dynamo-two-tier-cost-fn
+      parameters:
+        host_cache_weight: 1.0
+"#;
+        let selector = two_tier_selector(yaml, KvRouterConfig::default())
+            .with_decision_trace_sample_rate(Some(1.0));
+        let request = tracked(two_tier_request(&[(1, 7, 0, 0), (2, 0, 8, 0)]));
+        let (selected, trace) = select_traced(&selector, &request, &[1, 2]);
+        assert_eq!(selected.worker.worker_id, 2);
+        assert_eq!(selected.max_raw_cached_tokens, Some(128));
+        assert_eq!(trace.max_overlap_worker_id, 2);
+        assert_eq!(trace.avoidable_prefill_token_equivalents, 0.0);
+        assert!(
+            trace
+                .candidates
+                .iter()
+                .find(|c| c.worker_id == 2)
+                .unwrap()
+                .max_overlap
+        );
+    }
+
+    #[test]
+    fn decision_traces_respect_enablement_sampling_and_pins() {
+        let request = tracked(two_tier_request(&[(1, 4, 0, 0), (2, 0, 0, 0)]));
+        for selector in [
+            DefaultWorkerSelector::new(None, "decode"),
+            two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default()),
+        ] {
+            let disabled = selector.clone().with_decision_trace_sample_rate(None);
             assert!(
-                select_ids(&selector, &request, &[1])
+                select_ids(&disabled, &request, &[1, 2])
                     .decision_trace
                     .is_none()
             );
+            let unsampled = selector.clone().with_decision_trace_sample_rate(Some(0.0));
+            assert!(
+                select_ids(&unsampled, &request, &[1, 2])
+                    .decision_trace
+                    .is_none()
+            );
+            let enabled = selector.with_decision_trace_sample_rate(Some(1.0));
+            assert!(
+                select_ids(&enabled, &request, &[1, 2])
+                    .decision_trace
+                    .is_some()
+            );
+            let mut pinned = tracked(two_tier_request(&[(1, 4, 0, 0), (2, 0, 0, 0)]));
+            pinned.pinned_worker = Some(WorkerWithDpRank::from_worker_id(1));
+            assert!(
+                select_ids(&enabled, &pinned, &[1, 2])
+                    .decision_trace
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn decision_tracing_is_off_by_default() {
+        // The test runner does not set the flag, so a default selector never traces.
+        if std::env::var_os(DYN_ROUTER_DECISION_TRACE_ENABLED).is_none() {
+            assert_eq!(*ROUTER_DECISION_TRACE, None);
+            let selector = DefaultWorkerSelector::new(None, "decode");
+            assert_eq!(selector.decision_trace_sample_rate, None);
         }
     }
 

@@ -1294,7 +1294,8 @@ mod tests {
         let hierarchy = test_hierarchy::IsolatedHierarchy::default();
         let metrics = RouterRequestMetrics::for_test(&hierarchy);
         let legacy = prometheus::Histogram::with_opts(
-            HistogramOpts::new("legacy_isl", "legacy").buckets(generate_log_buckets(50.0, 128000.0, 12)),
+            HistogramOpts::new("legacy_isl", "legacy")
+                .buckets(generate_log_buckets(50.0, 128000.0, 12)),
         )
         .unwrap();
         let model = "private/nvidia/nemotron-3.5-super-120b-a12b";
@@ -1307,7 +1308,11 @@ mod tests {
             let legacy_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
             let start = Instant::now();
             for index in 0..iterations {
-                metrics.observe_input_sequence_tokens(RequestPhase::Aggregated, model, black_box(index));
+                metrics.observe_input_sequence_tokens(
+                    RequestPhase::Aggregated,
+                    model,
+                    black_box(index),
+                );
                 black_box(metrics.observe_kv_route_estimate(
                     RequestPhase::Aggregated,
                     model,

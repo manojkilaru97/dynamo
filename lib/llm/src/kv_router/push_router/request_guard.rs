@@ -88,6 +88,7 @@ impl CacheHistoryTracking {
 }
 
 struct CacheHistoryFinalization {
+    history: Arc<CacheHistory>,
     prompt_tokens: u64,
     previously_seen_tokens: u64,
     retained: Option<CacheHistoryStats>,
@@ -111,6 +112,7 @@ fn finalize_cache_history(
         })
         .flatten();
     Some(CacheHistoryFinalization {
+        history: tracking.history,
         prompt_tokens: tracking.prompt_tokens,
         previously_seen_tokens: tracking.previously_seen_tokens,
         retained,
@@ -143,6 +145,8 @@ impl CanonicalOutputTracker {
         parent_hash: Option<u64>,
     ) -> Self {
         let (tokens, mm_infos) = request.block_mm_routing_info();
+        // Drop multimodal block padding so generated tokens continue the real prompt.
+        let tokens = &tokens[..request.routed_prompt_len()];
         let routing = request.routing.as_ref();
         Self::from_parts(
             tokens,
@@ -518,6 +522,7 @@ impl RequestGuard {
         scheduler_tracked: bool,
         lifecycle: Option<(RequestProgressUpdater, RequestLifecycleLease)>,
         kv_route: Option<RouteObservation>,
+        metrics_model: &str,
     ) -> Self {
         // Snapshot request-scoped inputs now so the guard can outlive the
         // PreprocessedRequest after it is moved into backend dispatch.
@@ -537,7 +542,7 @@ impl RequestGuard {
             prompt_tokens: route.prompt_tokens,
             reused_tokens: Some(request_metrics.observe_kv_route_estimate(
                 request.phase(),
-                &request.model,
+                metrics_model,
                 route.best_router_tokens,
                 route.selected_router_tokens,
             )),
@@ -597,8 +602,10 @@ impl RequestGuard {
         } else {
             metrics.observe_cache_history_incomplete();
         }
-        if let Some(stats) = finalization.retained {
-            metrics.set_cache_history_retained(stats);
+        if finalization.retained.is_some() {
+            // Publish the history's current size, not this completion's snapshot: a
+            // concurrent completion may have published a newer size already.
+            metrics.set_cache_history_retained(finalization.history.stats());
         }
     }
 

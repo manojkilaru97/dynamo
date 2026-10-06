@@ -539,6 +539,12 @@ where
         self.is_eagle
     }
 
+    /// The model this router serves, when it was built for one (the frontend passes the
+    /// model card's display name). Bounds the `model` label on router metrics.
+    pub(crate) fn served_model_name(&self) -> Option<&str> {
+        (!self.tracking_model_name.is_empty()).then_some(self.tracking_model_name.as_str())
+    }
+
     fn tracking_hash_scope(&self) -> TrackingHashScope<'_> {
         TrackingHashScope {
             partition: RoutingPartitionRef::new(&self.tracking_model_name, DEFAULT_ROUTING_GROUP),

@@ -395,6 +395,16 @@ impl PreprocessedRequest {
         }
         (tokens, Some(mm.block_mm_infos.as_slice()))
     }
+
+    /// Prompt length the router routed on, without the block padding the multimodal
+    /// routing buffer may carry. This is the length the engine reports for the prompt.
+    pub fn routed_prompt_len(&self) -> usize {
+        let (tokens, _) = self.block_mm_routing_info();
+        match self.mm_routing_info.as_ref() {
+            Some(mm) if mm.expanded_prompt_len > 0 => mm.expanded_prompt_len.min(tokens.len()),
+            _ => tokens.len(),
+        }
+    }
 }
 
 /// [`PreprocessedEmbeddingRequest`] is the internal representation of an embedding request

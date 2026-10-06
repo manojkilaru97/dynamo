@@ -252,7 +252,7 @@ The router exposes metrics for routing decisions and overhead. Not every metric 
 
 ### Router request metrics
 
-`dynamo_component_router_*` histograms and counters for aggregate request-level statistics. On the frontend, exposed at `/metrics` on the HTTP port; on the standalone router, exposed on `DYN_SYSTEM_PORT`. Populated per-request when `--router-mode kv` is active; registered with zero values in non-KV modes.
+`dynamo_component_router_*` histograms and counters for aggregate request-level statistics. On the frontend, exposed at `/metrics` on the HTTP port; on the standalone router, exposed on `DYN_SYSTEM_PORT`. Populated per-request when `--router-mode kv` is active; unlabelled series are registered with zero values in non-KV modes. Labelled series (`phase`/`model` on `input_sequence_tokens` and the cache-reuse counters) appear only after their first observation.
 
 <ParamField path="dynamo_component_router_requests_started_total" type="counter">
   Requests admitted by the router scheduler.
@@ -286,7 +286,7 @@ The router exposes metrics for routing decisions and overhead. Not every metric 
 
 The cache reuse funnel shows how much of the incoming prompt could be reused, and how much the worker reports reusing. Each step counts tokens, not requests.
 
-All metric names below start with `dynamo_component_router_`. F0, F2, F3, and F4 carry `phase` and `model` labels.
+All metric names below start with `dynamo_component_router_`. F0, F2, F3, and F4 carry `phase` and `model` labels; `model` is the router's served model name (the frontend passes the model card's display name), falling back to the request's model when the router has none.
 
 | Step | Meaning | Metric suffix |
 | --- | --- | --- |
@@ -300,7 +300,7 @@ F2 and F3 need no enable flag. They count raw router-visible blocks on every tie
 
 F1 is off by default. Set `DYN_ROUTER_CACHE_REUSE_HISTORY=true` to enable it, and `DYN_ROUTER_CACHE_REUSE_HISTORY_BYTES` to change the default 256 MiB history budget per router. Its own denominator is `cache_loss_funnel_tokens_total{stage="f0"}`, which counts completed requests only; `cache_loss_observations_total{result}` counts completed and incomplete attempts, and the `cache_loss_history_*` gauges report retained entries and capacity. With `--router-replica-sync`, frontends share completed hashes so a frontend recognizes blocks learned through a peer.
 
-Compare token increases over the same time window and matching KV-routing traffic. Use a long enough window: the steps are recorded at different times, and F4 depends on worker reports arriving after routing. Divide each step by F0 to express it as a percentage of incoming tokens.
+Compare token increases over the same time window and matching KV-routing traffic. Use a long enough window: the steps are recorded at different times, and F4 depends on worker reports arriving after routing. Divide F2, F3, and F4 by F0 (matching `phase` and `model`) to express them as a percentage of incoming tokens. F1 has no `phase`/`model` labels and counts completed requests only, so divide it by `cache_loss_funnel_tokens_total{stage="f0"}` instead.
 
 vLLM workers report F4 on the final response chunk of each aggregated or prefill attempt, as `engine_data.kv_cache_hit` with `prompt_tokens` and `reused_tokens`. `reused_tokens` is vLLM's per-request `num_cached_tokens`: local prefix-cache hits plus KV connector hits such as CPU-offload loads, the same tiers F2 and F3 count.
 
@@ -311,7 +311,7 @@ vLLM workers report F4 on the final response chunk of each aggregated or prefill
 
 ### Routing-decision traces
 
-Set `DYN_ROUTER_DECISION_TRACE_ENABLED=true` to attach a `routing_decision` object to sampled `request_end` request-trace records (request tracing must also be enabled). `DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE` (default `1.0` when tracing is enabled) samples requests deterministically by request ID. Each record lists every eligible worker with its tier overlaps, raw cached tokens, load inputs, and cost, plus the selected and max-overlap workers, so an F2 to F3 loss can be explained. Two-tier selections add the deciding tier and the policy thresholds under `two_tier`. Records contain numerical routing state only, no prompt text, token IDs, or cache keys. Pinned selections are not traced.
+Set `DYN_ROUTER_DECISION_TRACE_ENABLED=true` to attach a `routing_decision` object to sampled `request_end` request-trace records (request tracing must also be enabled). `DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE` (default `1.0` when tracing is enabled) samples requests deterministically by request ID. Each record lists every eligible worker with its tier overlaps, raw cached tokens, load inputs, and cost, plus the selected and max-overlap workers, so an F2 to F3 loss can be explained. Two-tier selections add the deciding tier and the policy thresholds under `two_tier`. Records contain numerical routing state only, no prompt text, token IDs, or cache keys. Pinned selections are not traced. The trace is attached on the frontend's request tracker, so a standalone router (`python -m dynamo.router`) does not forward it to the frontend's request-end records.
 
 ### Per-request routing overhead
 
