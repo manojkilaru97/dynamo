@@ -365,6 +365,7 @@ where
         for token_id in token_ids.iter() {
             self.request.token_ids.push(*token_id);
         }
+        self.request.migrated_output_tokens += token_ids.len();
     }
 
     /// Returns `true` if the tracked request token length plus `new_output_len`
@@ -1517,6 +1518,8 @@ mod tests {
             retry_manager.request.token_ids,
             vec![1, 2, 3, 200, 201, 202]
         );
+        // Recorded so routing can tell which trailing tokens a multimodal buffer lacks.
+        assert_eq!(retry_manager.request.migrated_output_tokens, 3);
     }
 
     /// 2-hop migration: A → fail → B → fail → C. Each retry's

@@ -146,7 +146,7 @@ impl CanonicalOutputTracker {
     ) -> Self {
         let (tokens, mm_infos) = request.block_mm_routing_info();
         // Drop multimodal block padding so generated tokens continue the real prompt.
-        let tokens = &tokens[..request.routed_prompt_len()];
+        let tokens = &tokens[..request.unpadded_routing_len()];
         let routing = request.routing.as_ref();
         Self::from_parts(
             tokens,
@@ -514,6 +514,7 @@ pub(super) struct RequestGuard {
 }
 
 impl RequestGuard {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         chooser: Arc<KvRouter>,
         request_metrics: Arc<RouterRequestMetrics>,

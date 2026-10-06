@@ -1278,6 +1278,53 @@ mod tests {
     use super::*;
     use prometheus::{Encoder, TextEncoder};
 
+    #[tokio::test]
+    async fn router_request_metrics_register_with_component_labels() {
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let component = distributed
+            .namespace("funnel-labels".to_string())
+            .unwrap()
+            .component("frontend".to_string())
+            .unwrap();
+        let metrics = RouterRequestMetrics::build(&component, &[(labels::ROUTER_ID, "291")]);
+        metrics
+            .observe_kv_route_estimate(RequestPhase::Prefill, "m", 96, 64)
+            .inc_by(72);
+        metrics.observe_input_sequence_tokens(RequestPhase::Prefill, "m", 100);
+        let exposition = component
+            .get_metrics_registry()
+            .prometheus_expfmt_combined()
+            .unwrap();
+        for name in [
+            "input_sequence_tokens_sum",
+            "kv_best_eligible_cached_prefix_tokens_total",
+            "kv_selected_cached_prefix_tokens_total",
+            "kv_worker_reused_tokens_total",
+        ] {
+            let line = exposition
+                .lines()
+                .find(|line| line.starts_with(&format!("dynamo_component_router_{name}{{")))
+                .unwrap_or_else(|| panic!("missing {name} in:\n{exposition}"));
+            for label in [
+                "dynamo_namespace=\"funnel_labels\"",
+                "dynamo_component=\"frontend\"",
+                "router_id=\"291\"",
+                "phase=\"prefill\"",
+                "model=\"m\"",
+            ] {
+                assert!(line.contains(label), "missing {label} on {line}");
+            }
+        }
+        drop(distributed);
+        runtime.shutdown();
+    }
+
     #[test]
     fn kv_estimates_and_input_tokens_have_matching_labels() {
         let hierarchy = test_hierarchy::IsolatedHierarchy::default();

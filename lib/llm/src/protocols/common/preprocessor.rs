@@ -312,6 +312,13 @@ pub struct PreprocessedRequest {
     #[serde(skip)]
     pub tracker: Option<Arc<RequestTracker>>,
 
+    /// Generated tokens a migration retry appended to `token_ids` (frontend-local). The
+    /// multimodal routing buffer is not extended, so the executed prompt is the expanded
+    /// prompt plus these trailing `token_ids`.
+    #[builder(default)]
+    #[serde(skip)]
+    pub migrated_output_tokens: usize,
+
     /// Set by the runtime's `HealthCheckManager` when this request originated
     /// from a canary probe. Engines may use it in `generate()` to bypass
     /// cross-worker coordination (KV transfer, bootstrap handshake,
@@ -396,14 +403,36 @@ impl PreprocessedRequest {
         (tokens, Some(mm.block_mm_infos.as_slice()))
     }
 
-    /// Prompt length the router routed on, without the block padding the multimodal
-    /// routing buffer may carry. This is the length the engine reports for the prompt.
-    pub fn routed_prompt_len(&self) -> usize {
+    /// Unpadded length of the routing token sequence: the multimodal routing buffer without
+    /// its block padding, otherwise `token_ids`.
+    pub fn unpadded_routing_len(&self) -> usize {
         let (tokens, _) = self.block_mm_routing_info();
         match self.mm_routing_info.as_ref() {
-            Some(mm) if mm.expanded_prompt_len > 0 => mm.expanded_prompt_len.min(tokens.len()),
+            Some(mm) if mm.expanded_prompt_len > 0 && !mm.routing_token_ids.is_empty() => {
+                mm.expanded_prompt_len.min(tokens.len())
+            }
             _ => tokens.len(),
         }
+    }
+
+    /// Generated tokens appended by migration that the routing sequence does not contain
+    /// (multimodal requests only; a text request routes on `token_ids` itself).
+    pub fn migrated_tokens_beyond_routing(&self) -> &[TokenIdType] {
+        let routes_on_mm_buffer = self
+            .mm_routing_info
+            .as_ref()
+            .is_some_and(|mm| !mm.routing_token_ids.is_empty());
+        if !routes_on_mm_buffer {
+            return &[];
+        }
+        let count = self.migrated_output_tokens.min(self.token_ids.len());
+        &self.token_ids[self.token_ids.len() - count..]
+    }
+
+    /// Prompt length the engine executes and reports: the unpadded routing sequence plus any
+    /// migration-appended tokens it lacks.
+    pub fn routed_prompt_len(&self) -> usize {
+        self.unpadded_routing_len() + self.migrated_tokens_beyond_routing().len()
     }
 }
 

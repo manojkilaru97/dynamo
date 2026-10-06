@@ -284,10 +284,12 @@ impl KvPushRouter {
             .flatten();
         // F1 reuses the canonical prompt hashes already computed for routing. Clone them only
         // when the routing-decision recorder below still needs its own copy.
+        // A migrated multimodal retry executes generated tokens its routing buffer lacks, so
+        // its canonical chain is unknown here; F1 skips it rather than learn a wrong chain.
         let history_prompt_hashes = self
             .cache_history
             .as_ref()
-            .filter(|_| !is_query_only)
+            .filter(|_| !is_query_only && request.migrated_tokens_beyond_routing().is_empty())
             .and_then(|_| {
                 if self.chooser.indexer().records_routing_decisions() {
                     selection
@@ -305,7 +307,7 @@ impl KvPushRouter {
                 // Multimodal routing buffers are zero-padded to a block multiple; F1 counts only
                 // complete blocks of the real prompt, and generated blocks continue from them.
                 hashes.truncate(complete_prompt_blocks(
-                    request.routed_prompt_len(),
+                    request.unpadded_routing_len(),
                     self.chooser.block_size(),
                     self.chooser.is_eagle(),
                 ));
@@ -1015,6 +1017,16 @@ mod tests {
     }
 
     async fn router(session_affinity_ttl: Option<Duration>) -> (KvPushRouter, Runtime) {
+        router_with_selector(session_affinity_ttl, |config| {
+            DefaultWorkerSelector::new(Some(config), "decode")
+        })
+        .await
+    }
+
+    async fn router_with_selector(
+        session_affinity_ttl: Option<Duration>,
+        selector: impl FnOnce(KvRouterConfig) -> DefaultWorkerSelector,
+    ) -> (KvPushRouter, Runtime) {
         let runtime = Runtime::from_current().unwrap();
         let distributed =
             DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
@@ -1041,7 +1053,7 @@ mod tests {
             workers,
             None,
             16,
-            DefaultWorkerSelector::new(Some(config.clone()), "decode"),
+            selector(config.clone()),
             Some(config),
             None,
             "decode",
@@ -1534,7 +1546,6 @@ mod tests {
         let monitored = monitor_response_stream(source, context, guard);
         tokio::pin!(monitored);
         while monitored.next().await.is_some() {}
-        drop(monitored);
         assert_eq!(history.previously_computed_tokens(&prompt_hashes), 0);
         assert_eq!(history.stats().retained_entries, 0);
         drop(router);
@@ -1729,7 +1740,6 @@ mod tests {
         let monitored = monitor_response_stream(source, context, guard);
         tokio::pin!(monitored);
         while monitored.next().await.is_some() {}
-        drop(monitored);
         let after = read();
         (after.0 - before.0, after.1 - before.1, after.2 - before.2)
     }
@@ -1840,6 +1850,131 @@ mod tests {
         guard.abort().await;
         drop(guard);
         assert_eq!(reused.get(), before + 16);
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn migrated_multimodal_retry_reports_against_the_executed_prompt() {
+        use crate::protocols::common::preprocessor::MmRoutingInfo;
+
+        temp_env::async_with_vars(
+            [(cache_history::CACHE_REUSE_HISTORY_ENABLED_ENV, Some("true"))],
+            async {
+                let (router, runtime) = router(None).await;
+                let history = router.cache_history.clone().expect("history is enabled");
+                let reused = router
+                    .request_metrics
+                    .kv_worker_reused_tokens
+                    .with_label_values(&[RequestPhase::Aggregated.as_str(), UNKNOWN_METRICS_MODEL]);
+                let before = reused.get();
+                // 20 expanded prompt tokens padded to 32; migration then appended 5 generated
+                // tokens to `token_ids` only, so the worker executes 25 prompt tokens.
+                let mut routing_token_ids: Vec<u32> = (1..=20).collect();
+                routing_token_ids.resize(32, 0);
+                let mut retry = request();
+                retry.token_ids = (1..=8).chain(200..205).collect();
+                retry.migrated_output_tokens = 5;
+                retry.mm_routing_info = Some(MmRoutingInfo {
+                    routing_token_ids,
+                    block_mm_infos: vec![None, None],
+                    expanded_prompt_len: 20,
+                });
+                assert_eq!(retry.unpadded_routing_len(), 20);
+                assert_eq!(
+                    retry.migrated_tokens_beyond_routing(),
+                    &[200, 201, 202, 203, 204]
+                );
+                assert_eq!(retry.routed_prompt_len(), 25);
+                let retry = Context::new(retry);
+                let (mut selection, _) = router
+                    .select_with_affinity(&retry, RequestPhase::Aggregated, false)
+                    .await
+                    .unwrap();
+                let mut guard = router
+                    .track_selection(&retry, &mut selection, false)
+                    .await
+                    .unwrap();
+                guard
+                    .on_item(&Annotated::from_data(LLMEngineOutput {
+                        token_ids: (300..330).collect(),
+                        engine_data: Some(serde_json::json!({
+                            "kv_cache_hit": {"prompt_tokens": 25, "reused_tokens": 16}
+                        })),
+                        ..Default::default()
+                    }))
+                    .await;
+                guard.finish().await;
+                drop(guard);
+                assert_eq!(reused.get(), before + 16);
+                // F1 skips the retry instead of learning a chain that omits the replayed tokens.
+                assert_eq!(history.stats().retained_entries, 0);
+                drop(router);
+                runtime.shutdown();
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn query_only_generate_records_the_sampled_decision_without_funnel_counts() {
+        use crate::protocols::common::timing::RequestTracker;
+
+        let (router, runtime) = router_with_selector(None, |config| {
+            DefaultWorkerSelector::new(Some(config), "decode")
+                .with_decision_trace_sample_rate(Some(1.0))
+        })
+        .await;
+        let input = router
+            .request_metrics
+            .input_sequence_tokens
+            .with_label_values(&[RequestPhase::Aggregated.as_str(), UNKNOWN_METRICS_MODEL]);
+        let input_before = input.get_sample_count();
+        let tracker = Arc::new(RequestTracker::new());
+        let mut advisory = request();
+        advisory.annotations.push("query_instance_id:".to_string());
+        advisory.tracker = Some(tracker.clone());
+        let mut stream = router.generate(Context::new(advisory)).await.unwrap();
+        while stream.next().await.is_some() {}
+        let trace = tracker
+            .routing_decision_trace()
+            .expect("the advisory decision is traced");
+        assert_eq!(trace.selected_worker_id, 7);
+        assert_eq!(input.get_sample_count(), input_before);
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn selection_estimates_reach_f2_and_f3_unswapped() {
+        let (router, runtime) = router(None).await;
+        let labels = [RequestPhase::Aggregated.as_str(), UNKNOWN_METRICS_MODEL];
+        let metrics = &router.request_metrics;
+        let best = metrics
+            .kv_best_eligible_cached_prefix_tokens
+            .with_label_values(&labels);
+        let chosen = metrics
+            .kv_selected_cached_prefix_tokens
+            .with_label_values(&labels);
+        let (best_before, chosen_before) = (best.get(), chosen.get());
+        let request = Context::new(request());
+        let (mut selection, _) = router
+            .select_with_affinity(&request, RequestPhase::Aggregated, false)
+            .await
+            .unwrap();
+        selection.max_raw_cached_tokens = Some(96);
+        selection.selected_raw_cached_tokens = Some(64);
+        let mut guard = router
+            .track_selection(&request, &mut selection, false)
+            .await
+            .unwrap();
+        guard.abort().await;
+        drop(guard);
+        assert_eq!(best.get() - best_before, 96);
+        assert_eq!(chosen.get() - chosen_before, 64);
         drop(router);
         runtime.shutdown();
     }

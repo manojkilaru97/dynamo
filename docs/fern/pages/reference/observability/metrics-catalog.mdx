@@ -252,7 +252,7 @@ The router exposes metrics for routing decisions and overhead. Not every metric 
 
 ### Router request metrics
 
-`dynamo_component_router_*` histograms and counters for aggregate request-level statistics. On the frontend, exposed at `/metrics` on the HTTP port; on the standalone router, exposed on `DYN_SYSTEM_PORT`. Populated per-request when `--router-mode kv` is active; unlabelled series are registered with zero values in non-KV modes. Labelled series (`phase`/`model` on `input_sequence_tokens` and the cache-reuse counters) appear only after their first observation.
+`dynamo_component_router_*` histograms and counters for aggregate request-level statistics. On the frontend, exposed at `/metrics` on the HTTP port; on the standalone router, exposed on `DYN_SYSTEM_PORT`. Populated per-request when `--router-mode kv` is active; unlabelled series are registered with zero values in non-KV modes. The `phase`/`model` series of `input_sequence_tokens` and the F2-F4 counters appear only after their first observation; with F1 enabled, its `stage` and `result` series are exported at zero from startup.
 
 <ParamField path="dynamo_component_router_requests_started_total" type="counter">
   Requests admitted by the router scheduler.
@@ -375,7 +375,7 @@ Not all router metrics appear in every deployment. This matrix shows which group
 
 | Metric group | Frontend + KV (agg) | Frontend + KV (disagg) | Frontend + non-KV | Standalone router |
 |---|---|---|---|---|
-| `dynamo_component_router_*` | Registered and populated | Registered and populated | Unlabelled series registered, **always zero**; labelled series (`input_sequence_tokens`, cache-reuse counters) absent | Populated (on `DYN_SYSTEM_PORT`) |
+| `dynamo_component_router_*` | Registered and populated | Registered and populated | Unlabelled series registered, **always zero**; `phase`/`model` series (`input_sequence_tokens`, F2-F4) absent; F1 series at zero when enabled | Populated (on `DYN_SYSTEM_PORT`) |
 | `dynamo_router_overhead_*` | Registered and populated | Registered and populated | **Not registered** | **Not created** |
 | `dynamo_frontend_router_queue_*` | Registered; populated when a CLI or policy-class queue threshold is set | Registered; populated when a CLI or policy-class queue threshold is set | **Not registered** | **Not created** |
 | `dynamo_component_kv_cache_events_applied` | Populated when KV events received | Populated when KV events received | **Not registered** | Populated when KV events received |
@@ -384,7 +384,7 @@ Not all router metrics appear in every deployment. This matrix shows which group
 **Key:**
 
 - **Registered and populated** — the metric appears at `/metrics` with real values.
-- **Registered, always zero** — the metric appears at `/metrics` but is never incremented (useful for dashboards that expect it to exist). Labelled series appear only after their first observation, and the opt-in F1 `cache_loss_*` / `kv_history_*` families exist only with `DYN_ROUTER_CACHE_REUSE_HISTORY=true`.
+- **Registered, always zero** — the metric appears at `/metrics` but is never incremented (useful for dashboards that expect it to exist). `phase`/`model` series appear only after their first observation, and the opt-in F1 `cache_loss_*` / `kv_history_*` families exist only with `DYN_ROUTER_CACHE_REUSE_HISTORY=true` (then from startup).
 - **Not registered / Not created** — the metric does not appear at `/metrics` at all.
 
 ## Related

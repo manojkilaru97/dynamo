@@ -437,9 +437,10 @@ impl DefaultWorkerSelector {
         Ok(selector)
     }
 
-    /// Override the process-wide decision-trace setting (`None` disables tracing).
-    #[cfg(test)]
-    fn with_decision_trace_sample_rate(mut self, sample_rate: Option<f64>) -> Self {
+    /// Override the process-wide decision-trace setting (`None` disables tracing). For tests
+    /// and embedders that configure tracing without the environment.
+    #[doc(hidden)]
+    pub fn with_decision_trace_sample_rate(mut self, sample_rate: Option<f64>) -> Self {
         self.decision_trace_sample_rate = sample_rate;
         self
     }
@@ -2973,15 +2974,6 @@ worker_selection:
     }
 
     // ---- Opt-in routing-decision traces (upstream #14109) ----
-
-    fn weights_for(selector: &DefaultWorkerSelector) -> LogitWeights {
-        LogitWeights {
-            overlap_score_credit: selector.kv_router_config.overlap_score_credit,
-            overlap_score_credit_decay: selector.kv_router_config.overlap_score_credit_decay,
-            prefill_load_scale: selector.kv_router_config.prefill_load_scale,
-            shared_cache_multiplier: selector.kv_router_config.shared_cache_multiplier,
-        }
-    }
 
     #[test]
     fn decision_trace_sampling_is_deterministic_and_bounded() {
