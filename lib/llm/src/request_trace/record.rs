@@ -231,6 +231,77 @@ mod tests {
         );
     }
 
+    pub(crate) fn sample_routing_decision() -> crate::protocols::common::timing::RoutingDecisionTrace
+    {
+        serde_json::from_value(serde_json::json!({
+            "schema": "dynamo.router.decision.v1",
+            "worker_type": "decode",
+            "policy": "default",
+            "selection_reason": "minimum_cost",
+            "candidate_scope": "eligible_workers_only",
+            "block_size": 16,
+            "request_blocks": 2,
+            "track_prefill_tokens": true,
+            "selected_worker_id": 7,
+            "selected_dp_rank": 0,
+            "max_overlap_worker_id": 7,
+            "max_overlap_dp_rank": 0,
+            "avoidable_prefill_token_equivalents": 0.0,
+            "overlap_score_credit": 1.0,
+            "overlap_score_credit_decay": 0.0,
+            "prefill_load_scale": 1.0,
+            "host_cache_hit_weight": 0.75,
+            "disk_cache_hit_weight": 0.25,
+            "shared_cache_multiplier": 0.5,
+            "decode_active_request_weight": 0.0,
+            "router_temperature": 0.0,
+            "candidates": []
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_end_carries_the_tracked_routing_decision() {
+        BUS.init(16);
+        let mut rx = BUS.subscribe();
+        let tracker = RequestTracker::new();
+        tracker.record_routing_decision_trace(Box::new(sample_routing_decision()));
+        tracker.record_finish();
+        emit_request_end(
+            "req-decision".to_string(),
+            &tracker,
+            RequestReplayMetrics {
+                trace_block_size: 2,
+                input_length: 2,
+                input_sequence_hashes: vec![11],
+                output_sequence_hashes: Vec::new(),
+            },
+        );
+        let record = loop {
+            let record = rx.recv().await.unwrap();
+            if record
+                .request
+                .as_ref()
+                .is_some_and(|request| request.request_id == "req-decision")
+            {
+                break record;
+            }
+        };
+        assert_eq!(
+            record.request.unwrap().routing_decision,
+            Some(sample_routing_decision())
+        );
+
+        // The agent-context variant reads the same tracker.
+        let agent = crate::request_trace::agent_context::request_metrics(
+            "req-decision".to_string(),
+            None,
+            "m".to_string(),
+            Some(&tracker),
+        );
+        assert_eq!(agent.routing_decision, Some(sample_routing_decision()));
+    }
+
     #[test]
     fn rejects_non_finite_tool_duration() {
         let mut record = RequestTraceRecord {

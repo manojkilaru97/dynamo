@@ -1560,6 +1560,90 @@ mod tests {
         runtime.shutdown();
     }
 
+    /// A healthy stream drained to end teaches the history; one dropped right after its
+    /// terminal item does not (as upstream: completion needs end of stream).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn monitored_streams_finalize_cache_history_by_outcome() {
+        use crate::kv_router::metrics::{RouterRequestMetrics, test_hierarchy::IsolatedHierarchy};
+
+        let (router, runtime) = router(None).await;
+        let hierarchy = IsolatedHierarchy::default();
+        let metrics = temp_env::with_var(
+            cache_history::CACHE_REUSE_HISTORY_ENABLED_ENV,
+            Some("true"),
+            || RouterRequestMetrics::for_test(&hierarchy),
+        );
+        let prompt: Vec<u32> = (1..=32).collect();
+        let prompt_hashes = dynamo_kv_router::protocols::compute_seq_hash_for_block(
+            &dynamo_kv_router::protocols::compute_block_hash_for_seq(
+                &prompt,
+                16,
+                Default::default(),
+            ),
+        );
+        let monitored = |history: &Arc<CacheHistory>| {
+            let mut request = request();
+            request.token_ids = prompt.clone();
+            let mut guard = RequestGuard::new(
+                Arc::clone(&router.chooser),
+                Arc::clone(&metrics),
+                "monitored-history".to_string(),
+                &request,
+                false,
+                None,
+                None,
+                UNKNOWN_METRICS_MODEL,
+            );
+            guard.track_cache_history(
+                CacheHistoryTracking::new(Arc::clone(history), prompt_hashes.clone(), 32),
+                &request,
+                16,
+                false,
+            );
+            let context = Context::new(()).context();
+            let source = ResponseStream::new(
+                Box::pin(stream::iter(vec![
+                    Annotated::from_data(LLMEngineOutput {
+                        token_ids: vec![7],
+                        ..Default::default()
+                    }),
+                    Annotated::from_data(LLMEngineOutput {
+                        token_ids: vec![8],
+                        finish_reason: Some(FinishReason::Stop),
+                        ..Default::default()
+                    }),
+                ])),
+                Arc::clone(&context),
+            );
+            monitor_response_stream(source, context, guard)
+        };
+
+        let drained = Arc::new(CacheHistory::with_capacity(64, 16));
+        {
+            let stream = monitored(&drained);
+            tokio::pin!(stream);
+            while stream.next().await.is_some() {}
+        }
+        assert_eq!(drained.previously_computed_tokens(&prompt_hashes), 32);
+        let (_, _, complete, incomplete, _) = metrics.cache_history_values_for_test().unwrap();
+        assert_eq!((complete, incomplete), (1, 0));
+
+        let dropped = Arc::new(CacheHistory::with_capacity(64, 16));
+        {
+            let stream = monitored(&dropped);
+            tokio::pin!(stream);
+            stream.next().await.unwrap();
+            let terminal = stream.next().await.unwrap();
+            assert!(terminal.data.unwrap().finish_reason.is_some());
+        }
+        assert_eq!(dropped.previously_computed_tokens(&prompt_hashes), 0);
+        let (_, _, complete, incomplete, _) = metrics.cache_history_values_for_test().unwrap();
+        assert_eq!((complete, incomplete), (1, 1));
+        drop(router);
+        runtime.shutdown();
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn cache_history_ignores_multimodal_padding() {

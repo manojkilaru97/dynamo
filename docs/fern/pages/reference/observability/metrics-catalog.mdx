@@ -305,7 +305,7 @@ Compare token increases over the same time window and matching KV-routing traffi
 vLLM workers report F4 on the final response chunk of each aggregated or prefill attempt, as `engine_data.kv_cache_hit` with `prompt_tokens` and `reused_tokens`. `reused_tokens` is vLLM's per-request `num_cached_tokens`: local prefix-cache hits plus KV connector hits such as CPU-offload loads, the same tiers F2 and F3 count.
 
 - Disaggregated decode attempts that load prefill KV do not report, because vLLM counts transferred KV as cached; read worker reuse from the `prefill` phase (on a frontend-embedded router; a standalone router labels every attempt `aggregated`).
-- The router counts a report only when its `prompt_tokens` equals the routed prompt length. F2 and F3 count expanded multimodal routing tokens while F0 counts the unexpanded prompt, so multimodal ratios to F0 can exceed 100%.
+- The router counts a report only when its `prompt_tokens` equals the routed prompt length, so reported reuse is always in the same token units as F2 and F3. Image requests route on placeholder-expanded tokens and report normally. Video and audio requests route on their unexpanded prompt while the engine counts expanded placeholders, so their reports are dropped and they contribute zero F4 tokens. F2 and F3 count expanded image routing tokens while F0 counts the unexpanded prompt, so image-heavy ratios to F0 can exceed 100%.
 - With `n > 1`, vLLM does not report: later samples reuse the prompt blocks earlier samples just cached.
 - vLLM recomputes the last prompt token, so a full-prefix hit reports up to one block less than F3. Preemption and failed KV loads can also make F4 differ from F3.
 
