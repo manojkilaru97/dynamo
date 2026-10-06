@@ -358,6 +358,9 @@ impl KvPushRouter {
             }
 
             if let Some(ref tracker) = request.tracker {
+                if let Some(trace) = selection.decision_trace.take() {
+                    tracker.record_routing_decision_trace(trace);
+                }
                 let isl_blocks = routing_parts.token_ids.len().div_ceil(block_size);
                 tracker.record_kv_hit(selection.effective_overlap_blocks, isl_blocks);
                 tracker.record_isl(routing_parts.token_ids.len(), Some(selection.cached_tokens));
@@ -1289,10 +1292,8 @@ mod tests {
                             EventChannelQuery::endpoint_topic(endpoint.id(), "cache-history-v1"),
                         );
                         let client = endpoint.client().await.unwrap();
-                        let (_workers_tx, workers) = watch::channel(HashMap::from([(
-                            7,
-                            ModelRuntimeConfig::default(),
-                        )]));
+                        let (_workers_tx, workers) =
+                            watch::channel(HashMap::from([(7, ModelRuntimeConfig::default())]));
                         let config = KvRouterConfig {
                             skip_initial_worker_wait: true,
                             use_kv_events: false,
@@ -1409,11 +1410,19 @@ mod tests {
         assert_eq!(selection.selected_raw_cached_tokens, Some(0));
         assert_eq!(input.get_sample_count(), input_before + 1);
         guard.on_item(&report(2, 5)).await;
-        assert_eq!(reused.get(), reused_before, "prompt length mismatch is ignored");
+        assert_eq!(
+            reused.get(),
+            reused_before,
+            "prompt length mismatch is ignored"
+        );
         guard.on_item(&report(1, 1)).await;
         assert_eq!(reused.get(), reused_before + 1);
         guard.on_item(&report(1, 1)).await;
-        assert_eq!(reused.get(), reused_before + 1, "a second report is not counted");
+        assert_eq!(
+            reused.get(),
+            reused_before + 1,
+            "a second report is not counted"
+        );
         guard.abort().await;
         drop(guard);
         assert_eq!(reused.get(), reused_before + 1);

@@ -229,6 +229,12 @@ impl TwoTierCostFn {
             && (max_load as f64) > self.parameters.balance_rel_threshold * (min_load as f64)
     }
 
+    /// The overlap this policy ranks on for one row: device blocks plus host-pinned blocks at
+    /// `host_cache_weight`.
+    pub fn effective_overlap_blocks(&self, row: &TwoTierRow) -> f64 {
+        effective_overlap(row, self.host_cache_weight)
+    }
+
     /// Start a single-pass decision over candidates fed through [`TwoTierAccumulator::push`].
     pub fn accumulator<T: Copy>(&self) -> TwoTierAccumulator<'_, T> {
         TwoTierAccumulator {

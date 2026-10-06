@@ -1462,6 +1462,7 @@ impl<
             cached_tokens: selection.cached_tokens,
             max_raw_cached_tokens: selection.max_raw_cached_tokens,
             selected_raw_cached_tokens: selection.selected_raw_cached_tokens,
+            decision_trace: selection.decision_trace,
             selected_worker_tiers,
             request_progress,
             lifecycle_lease: None,
@@ -1830,6 +1831,7 @@ mod tests {
                 selected_raw_cached_tokens: None,
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(worker, block_size),
+                decision_trace: None,
             })
         }
     }

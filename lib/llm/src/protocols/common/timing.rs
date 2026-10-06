@@ -22,6 +22,12 @@ use crate::http::service::metrics::{
 };
 use crate::protocols::common::extensions::WorkerIdInfo;
 
+/// Opt-in KV-router decision trace (`DYN_ROUTER_DECISION_TRACE_ENABLED`), as recorded on
+/// request-end traces. Numerical routing state only: no prompt, token, or cache-key data.
+pub use dynamo_kv_router::protocols::{
+    RoutingDecisionCandidate, RoutingDecisionTrace, TwoTierDecisionTrace,
+};
+
 /// Worker type constants for Prometheus metric labels.
 /// These are stored in RequestTracker at routing time to avoid costly MDC lookups
 /// when updating per-worker metrics (TTFT, ITL).
@@ -186,6 +192,10 @@ pub struct RequestTracker {
     /// re-tokenizing. Lives here rather than on `routing_data` because the preprocessor
     /// drains `routing_data` before the delta generator runs. First-write-wins.
     external_query_token_ids: OnceLock<Vec<u32>>,
+
+    /// Sampled routing-decision candidate table, when decision tracing is enabled.
+    /// Boxed and first-write-wins so a multi-hop request keeps one bounded trace.
+    routing_decision_trace: OnceLock<Box<RoutingDecisionTrace>>,
 }
 
 /// Data a standalone router (running the `PushRouter` bindings in its own process)
@@ -245,6 +255,7 @@ impl RequestTracker {
             prefill_complete_time: OnceLock::new(),
             external_timing: OnceLock::new(),
             external_query_token_ids: OnceLock::new(),
+            routing_decision_trace: OnceLock::new(),
         }
     }
 
@@ -516,6 +527,19 @@ impl RequestTracker {
     /// Record router scheduler queue depth at routing time.
     pub fn record_router_queue_depth(&self, depth: usize) {
         let _ = self.router_queue_depth.set(depth);
+    }
+
+    /// Record the routing decision explaining this request's worker choice. First-write-wins
+    /// keeps one bounded trace for requests that make more than one router hop.
+    pub fn record_routing_decision_trace(&self, trace: Box<RoutingDecisionTrace>) {
+        let _ = self.routing_decision_trace.set(trace);
+    }
+
+    /// The sampled routing decision for this request, if one was recorded.
+    pub fn routing_decision_trace(&self) -> Option<RoutingDecisionTrace> {
+        self.routing_decision_trace
+            .get()
+            .map(|trace| (**trace).clone())
     }
 
     /// Get the router scheduler queue depth recorded at routing time.

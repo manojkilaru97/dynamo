@@ -4,14 +4,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use dynamo_kv_router::{
-    protocols::{BlockExtraInfo, BlockHashOptions, compute_block_hash_for_seq, compute_next_seq_hash},
+    protocols::{
+        BlockExtraInfo, BlockHashOptions, compute_block_hash_for_seq, compute_next_seq_hash,
+    },
     scheduling::{RequestLifecycleLease, RequestProgressUpdater},
 };
-use prometheus::IntCounter;
 use dynamo_runtime::{
     metrics::frontend_perf::{STAGE_DISPATCH, StageGuard},
     protocols::annotated::Annotated,
 };
+use prometheus::IntCounter;
 
 use crate::{
     kv_router::{

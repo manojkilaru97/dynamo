@@ -80,6 +80,7 @@ pub(crate) fn emit_request_end(
         worker: None,
         replay: Some(replay),
         finish_reason_metadata: None,
+        routing_decision: tracker.routing_decision_trace(),
     };
 
     publish(RequestTraceRecord {

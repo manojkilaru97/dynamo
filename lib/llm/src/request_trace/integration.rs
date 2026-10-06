@@ -458,7 +458,10 @@ mod tests {
         let record = &records[0];
         let request = record.request.as_ref().expect("request payload");
         // This branch's plain request_end row carries the input length in `replay`.
-        assert_eq!(request.replay.as_ref().map(|replay| replay.input_length), Some(2));
+        assert_eq!(
+            request.replay.as_ref().map(|replay| replay.input_length),
+            Some(2)
+        );
         assert_eq!(request.output_tokens, Some(0));
     }
 

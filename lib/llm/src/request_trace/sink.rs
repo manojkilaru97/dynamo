@@ -323,6 +323,7 @@ mod tests {
                     output_sequence_hashes: Vec::new(),
                 }),
                 finish_reason_metadata: None,
+                routing_decision: None,
             }),
             tool: None,
             payload: None,

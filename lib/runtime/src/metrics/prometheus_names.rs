@@ -1027,7 +1027,11 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                build_component_metric_name(&format!("{}{}", router_request::METRIC_PREFIX, suffix)),
+                build_component_metric_name(&format!(
+                    "{}{}",
+                    router_request::METRIC_PREFIX,
+                    suffix
+                )),
                 expected
             );
         }

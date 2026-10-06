@@ -86,6 +86,8 @@ pub struct SchedulingResponse {
     pub max_raw_cached_tokens: Option<usize>,
     /// Raw prefix overlap for the selected worker and DP rank, in tokens.
     pub selected_raw_cached_tokens: Option<usize>,
+    /// Populated only by opt-in routing-decision tracing.
+    pub decision_trace: Option<Box<crate::protocols::RoutingDecisionTrace>>,
     pub selected_worker_tiers: SelectedWorkerTierSnapshot,
     pub request_progress: Option<RequestProgressUpdater>,
     pub lifecycle_lease: Option<super::queue::RequestLifecycleLease>,

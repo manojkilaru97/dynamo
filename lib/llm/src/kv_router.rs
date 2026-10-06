@@ -142,6 +142,8 @@ pub enum FindBestMatchOutcome {
         /// requests only.
         max_raw_cached_tokens: Option<usize>,
         routing_hashes: Option<RoutingDecisionHashes>,
+        /// Sampled candidate table, only with `DYN_ROUTER_DECISION_TRACE_ENABLED`.
+        decision_trace: Option<Box<dynamo_kv_router::protocols::RoutingDecisionTrace>>,
     },
     QueueRejected {
         rejection: scheduling::QueueRejection,
@@ -919,6 +921,7 @@ where
                 selected_raw_cached_tokens: response.selected_raw_cached_tokens,
                 max_raw_cached_tokens: response.max_raw_cached_tokens,
                 routing_hashes,
+                decision_trace: response.decision_trace,
             },
             lifecycle,
         ))
@@ -1652,6 +1655,7 @@ mod tests {
                 cached_tokens: 0,
                 max_raw_cached_tokens: None,
                 selected_raw_cached_tokens: None,
+                decision_trace: None,
                 potential_decode_blocks: request
                     .worker_load_for(self.selected_worker)
                     .potential_decode_blocks()

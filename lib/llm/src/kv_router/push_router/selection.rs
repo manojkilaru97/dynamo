@@ -31,6 +31,8 @@ pub(super) struct WorkerSelection {
     /// Greatest raw router-visible cached prefix among eligible workers, in tokens (F2).
     pub(super) max_raw_cached_tokens: Option<usize>,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
+    /// Sampled routing-decision trace, recorded on the request tracker at selection.
+    pub(super) decision_trace: Option<Box<dynamo_kv_router::protocols::RoutingDecisionTrace>>,
     pub(super) lifecycle: Option<(RequestProgressUpdater, RequestLifecycleLease)>,
 }
 
@@ -107,6 +109,7 @@ impl KvPushRouter {
                 selected_raw_cached_tokens,
                 max_raw_cached_tokens,
                 routing_hashes,
+                decision_trace,
             } => Ok(WorkerSelection {
                 instance_id: worker.worker_id,
                 dp_rank: worker.dp_rank,
@@ -116,6 +119,7 @@ impl KvPushRouter {
                 selected_raw_cached_tokens,
                 max_raw_cached_tokens,
                 routing_hashes,
+                decision_trace,
                 lifecycle,
             }),
             FindBestMatchOutcome::QueueRejected { rejection } => Err(rejection.into()),

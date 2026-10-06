@@ -1283,6 +1283,46 @@ mod tests {
         }
     }
 
+    /// Per-attempt cost of the always-on funnel series (F0 histogram + F2/F3 counters + the
+    /// F4 handle) against the previous unlabelled F0 histogram. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_kv_funnel_metric_observation() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let hierarchy = test_hierarchy::IsolatedHierarchy::default();
+        let metrics = RouterRequestMetrics::for_test(&hierarchy);
+        let legacy = prometheus::Histogram::with_opts(
+            HistogramOpts::new("legacy_isl", "legacy").buckets(generate_log_buckets(50.0, 128000.0, 12)),
+        )
+        .unwrap();
+        let model = "private/nvidia/nemotron-3.5-super-120b-a12b";
+        let iterations = 2_000_000;
+        for _ in 0..3 {
+            let start = Instant::now();
+            for index in 0..iterations {
+                legacy.observe(black_box(index as f64));
+            }
+            let legacy_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+            let start = Instant::now();
+            for index in 0..iterations {
+                metrics.observe_input_sequence_tokens(RequestPhase::Aggregated, model, black_box(index));
+                black_box(metrics.observe_kv_route_estimate(
+                    RequestPhase::Aggregated,
+                    model,
+                    black_box(index as u64),
+                    black_box(index as u64),
+                ));
+            }
+            let funnel_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+            println!(
+                "BENCH funnel_metrics legacy_f0_ns={legacy_ns:.1} funnel_f0_f2_f3_f4_ns={funnel_ns:.1} delta_ns={:.1}",
+                funnel_ns - legacy_ns
+            );
+        }
+    }
+
     #[test]
     fn missing_worker_reports_export_zero_reused_tokens() {
         let hierarchy = test_hierarchy::IsolatedHierarchy::default();

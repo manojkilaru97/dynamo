@@ -271,7 +271,7 @@ The router exposes metrics for routing decisions and overhead. Not every metric 
 </ParamField>
 
 <ParamField path="dynamo_component_router_input_sequence_tokens" type="histogram">
-  Input sequence length in tokens.
+  Input sequence length per routing attempt, excluding query-only lookups. Labeled by `phase` and `model`.
 </ParamField>
 
 <ParamField path="dynamo_component_router_output_sequence_tokens" type="histogram">
@@ -281,6 +281,37 @@ The router exposes metrics for routing decisions and overhead. Not every metric 
 <ParamField path="dynamo_component_router_kv_hit_rate" type="histogram">
   Predicted KV cache hit rate at routing time (0.0–1.0).
 </ParamField>
+
+### KV-cache reuse telemetry
+
+The cache reuse funnel shows how much of the incoming prompt could be reused, and how much the worker reports reusing. Each step counts tokens, not requests.
+
+All metric names below start with `dynamo_component_router_`. F0, F2, F3, and F4 carry `phase` and `model` labels.
+
+| Step | Meaning | Metric suffix |
+| --- | --- | --- |
+| **F0 — Incoming tokens** | Tokens received by the router. | `input_sequence_tokens_sum` |
+| **F1 — Seen before** (opt-in) | Prompt-prefix tokens in complete blocks this router's bounded history has seen in an earlier completed request. | `kv_history_cached_prefix_tokens_total` |
+| **F2 — Best available match** | Prefix the router estimates is cached on the best-matching eligible worker. | `kv_best_eligible_cached_prefix_tokens_total` |
+| **F3 — Selected worker's match** | Prefix the router estimates is cached on the worker it chooses. | `kv_selected_cached_prefix_tokens_total` |
+| **F4 — Reported reuse** | Tokens the worker reports reusing. Missing reports count as zero. | `kv_worker_reused_tokens_total` |
+
+F2 and F3 need no enable flag. They count raw router-visible blocks on every tier: device, host-pinned (CPU offload), and disk, without the tier weights the selection policy applies. This includes the two-tier cost function's CPU-offloaded prefix. A pinned or session-affinity request has one eligible worker, so its F2 equals F3.
+
+F1 is off by default. Set `DYN_ROUTER_CACHE_REUSE_HISTORY=true` to enable it, and `DYN_ROUTER_CACHE_REUSE_HISTORY_BYTES` to change the default 256 MiB history budget per router. Its own denominator is `cache_loss_funnel_tokens_total{stage="f0"}`, which counts completed requests only; `cache_loss_observations_total{result}` counts completed and incomplete attempts, and the `cache_loss_history_*` gauges report retained entries and capacity. With `--router-replica-sync`, frontends share completed hashes so a frontend recognizes blocks learned through a peer.
+
+Compare token increases over the same time window and matching KV-routing traffic. Use a long enough window: the steps are recorded at different times, and F4 depends on worker reports arriving after routing. Divide each step by F0 to express it as a percentage of incoming tokens.
+
+vLLM workers report F4 on the final response chunk of each aggregated or prefill attempt, as `engine_data.kv_cache_hit` with `prompt_tokens` and `reused_tokens`. `reused_tokens` is vLLM's per-request `num_cached_tokens`: local prefix-cache hits plus KV connector hits such as CPU-offload loads, the same tiers F2 and F3 count.
+
+- Disaggregated decode attempts that load prefill KV do not report, because vLLM counts transferred KV as cached; read worker reuse from the `prefill` phase.
+- The router counts a report only when its `prompt_tokens` equals the routed prompt length. F2 and F3 count expanded multimodal routing tokens while F0 counts the unexpanded prompt, so multimodal ratios to F0 can exceed 100%.
+- With `n > 1`, vLLM does not report: later samples reuse the prompt blocks earlier samples just cached.
+- vLLM recomputes the last prompt token, so a full-prefix hit reports up to one block less than F3. Preemption and failed KV loads can also make F4 differ from F3.
+
+### Routing-decision traces
+
+Set `DYN_ROUTER_DECISION_TRACE_ENABLED=true` to attach a `routing_decision` object to sampled `request_end` request-trace records (request tracing must also be enabled). `DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE` (default `1.0` when tracing is enabled) samples requests deterministically by request ID. Each record lists every eligible worker with its tier overlaps, raw cached tokens, load inputs, and cost, plus the selected and max-overlap workers, so an F2 to F3 loss can be explained. Two-tier selections add the deciding tier and the policy thresholds under `two_tier`. Records contain numerical routing state only, no prompt text, token IDs, or cache keys. Pinned selections are not traced.
 
 ### Per-request routing overhead
 
