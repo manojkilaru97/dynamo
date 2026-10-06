@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use dynamo_kv_router::scheduling::{RequestLifecycleLease, RequestProgressUpdater};
+use dynamo_kv_router::{
+    protocols::{BlockExtraInfo, BlockHashOptions, compute_block_hash_for_seq, compute_next_seq_hash},
+    scheduling::{RequestLifecycleLease, RequestProgressUpdater},
+};
 use prometheus::IntCounter;
 use dynamo_runtime::{
     metrics::frontend_perf::{STAGE_DISPATCH, StageGuard},
@@ -11,7 +14,11 @@ use dynamo_runtime::{
 };
 
 use crate::{
-    kv_router::{KvRouter, metrics::RouterRequestMetrics},
+    kv_router::{
+        KvRouter,
+        cache_history::{CacheHistory, CacheHistoryStats},
+        metrics::RouterRequestMetrics,
+    },
     preprocessor::PreprocessedRequest,
     protocols::common::{
         llm_backend::LLMEngineOutput,
@@ -49,6 +56,185 @@ fn worker_cache_hit_tokens(prompt_tokens: u64, value: &serde_json::Value) -> Opt
         return None;
     }
     Some(report.reused_tokens)
+}
+
+/// Opt-in F1 tracking for one routing attempt: which prompt blocks the router's bounded
+/// history had already seen at selection, plus the generated blocks to add on completion.
+pub(super) struct CacheHistoryTracking {
+    history: Arc<CacheHistory>,
+    prompt_hashes: Vec<u64>,
+    output_hashes: Vec<u64>,
+    prompt_tokens: u64,
+    previously_seen_tokens: u64,
+}
+
+impl CacheHistoryTracking {
+    pub(super) fn new(
+        history: Arc<CacheHistory>,
+        prompt_hashes: Vec<u64>,
+        prompt_tokens: u64,
+    ) -> Self {
+        let previously_seen_tokens = history.previously_computed_tokens(&prompt_hashes);
+        Self {
+            history,
+            prompt_hashes,
+            output_hashes: Vec::new(),
+            prompt_tokens,
+            previously_seen_tokens,
+        }
+    }
+}
+
+struct CacheHistoryFinalization {
+    prompt_tokens: u64,
+    previously_seen_tokens: u64,
+    retained: Option<CacheHistoryStats>,
+}
+
+/// Finalize F1 tracking exactly once. Only a completed attempt teaches the history.
+fn finalize_cache_history(
+    tracking: &mut Option<CacheHistoryTracking>,
+    record_completed: bool,
+) -> Option<CacheHistoryFinalization> {
+    let tracking = tracking.take()?;
+    let retained = record_completed
+        .then(|| {
+            tracking.history.record_completed(
+                tracking
+                    .prompt_hashes
+                    .iter()
+                    .copied()
+                    .chain(tracking.output_hashes.iter().copied()),
+            )
+        })
+        .flatten();
+    Some(CacheHistoryFinalization {
+        prompt_tokens: tracking.prompt_tokens,
+        previously_seen_tokens: tracking.previously_seen_tokens,
+        retained,
+    })
+}
+
+#[derive(Clone)]
+struct OutputHashBranch {
+    tail: Vec<u32>,
+    parent_hash: Option<u64>,
+    first_mm_info: Option<BlockExtraInfo>,
+}
+
+/// Incrementally extends the canonical sequence-hash chain used for prompt routing over
+/// generated tokens, retaining only each choice's unfinished block.
+struct CanonicalOutputTracker {
+    template: OutputHashBranch,
+    branches: HashMap<u32, OutputHashBranch>,
+    block_size: u32,
+    lora_name: Option<String>,
+    cache_namespace: Option<String>,
+    is_eagle: bool,
+}
+
+impl CanonicalOutputTracker {
+    fn new(
+        request: &PreprocessedRequest,
+        block_size: u32,
+        is_eagle: bool,
+        parent_hash: Option<u64>,
+    ) -> Self {
+        let (tokens, mm_infos) = request.block_mm_routing_info();
+        let routing = request.routing.as_ref();
+        Self::from_parts(
+            tokens,
+            mm_infos,
+            block_size,
+            is_eagle,
+            routing.and_then(|routing| routing.lora_name.clone()),
+            routing.and_then(|routing| routing.cache_namespace.clone()),
+            parent_hash,
+        )
+    }
+
+    fn from_parts(
+        tokens: &[u32],
+        mm_infos: Option<&[Option<BlockExtraInfo>]>,
+        block_size: u32,
+        is_eagle: bool,
+        lora_name: Option<String>,
+        cache_namespace: Option<String>,
+        parent_hash: Option<u64>,
+    ) -> Self {
+        let stride = block_size as usize;
+        let complete_blocks = if stride == 0 {
+            0
+        } else if is_eagle {
+            tokens.len().saturating_sub(1) / stride
+        } else {
+            tokens.len() / stride
+        };
+        let tail_start = complete_blocks.saturating_mul(stride).min(tokens.len());
+        Self {
+            template: OutputHashBranch {
+                tail: tokens[tail_start..].to_vec(),
+                parent_hash,
+                first_mm_info: mm_infos
+                    .and_then(|infos| infos.get(complete_blocks))
+                    .cloned()
+                    .flatten(),
+            },
+            branches: HashMap::new(),
+            block_size,
+            lora_name,
+            cache_namespace,
+            is_eagle,
+        }
+    }
+
+    /// Append one choice's streamed tokens and return the sequence hashes of the blocks they
+    /// complete.
+    fn observe(&mut self, index: u32, token_ids: &[u32], completed: &mut Vec<u64>) {
+        if token_ids.is_empty() || self.block_size == 0 {
+            return;
+        }
+        let stride = self.block_size as usize;
+        let window_size = if self.is_eagle { stride + 1 } else { stride };
+        // The newest sampled token is visible before the engine feeds it back, so a normal
+        // block needs one token beyond its window to have KV. Eagle's window already ends
+        // with that lookahead token.
+        let materialization_size = window_size + usize::from(!self.is_eagle);
+        let branch = self
+            .branches
+            .entry(index)
+            .or_insert_with(|| self.template.clone());
+        branch.tail.extend_from_slice(token_ids);
+        let mut consumed = 0;
+        while branch.tail.len().saturating_sub(consumed) >= materialization_size {
+            let mm_info = branch.first_mm_info.clone().map(Some);
+            let mm_infos = mm_info.as_ref().map(std::slice::from_ref);
+            let Some(local_hash) = compute_block_hash_for_seq(
+                &branch.tail[consumed..consumed + window_size],
+                self.block_size,
+                BlockHashOptions {
+                    block_mm_infos: mm_infos,
+                    lora_name: self.lora_name.as_deref(),
+                    cache_namespace: self.cache_namespace.as_deref(),
+                    is_eagle: Some(self.is_eagle),
+                },
+            )
+            .into_iter()
+            .next() else {
+                break;
+            };
+            let sequence_hash = branch.parent_hash.map_or(local_hash.0, |parent| {
+                compute_next_seq_hash(parent, local_hash)
+            });
+            completed.push(sequence_hash);
+            branch.parent_hash = Some(sequence_hash);
+            consumed += stride;
+            branch.first_mm_info = None;
+        }
+        if consumed > 0 {
+            branch.tail.drain(..consumed);
+        }
+    }
 }
 
 /// Owns scheduler cleanup after a worker is selected.
@@ -317,6 +503,8 @@ pub(super) struct RequestGuard {
     output_blocks: OutputBlockTracker,
     prefill_marked: bool,
     kv_hit: Option<KvHitTracking>,
+    cache_history: Option<CacheHistoryTracking>,
+    output_hashes: Option<CanonicalOutputTracker>,
 }
 
 impl RequestGuard {
@@ -365,6 +553,50 @@ impl RequestGuard {
             ),
             prefill_marked: false,
             kv_hit,
+            cache_history: None,
+            output_hashes: None,
+        }
+    }
+
+    /// Start opt-in F1 tracking for this attempt. Generated blocks extend the prompt's
+    /// canonical hash chain so a later turn that replays them also counts as seen.
+    pub(super) fn track_cache_history(
+        &mut self,
+        tracking: CacheHistoryTracking,
+        request: &PreprocessedRequest,
+        block_size: u32,
+        is_eagle: bool,
+    ) {
+        self.observability
+            .request_metrics()
+            .observe_cache_history_input(tracking.prompt_tokens);
+        let parent_hash = tracking.prompt_hashes.last().copied();
+        self.output_hashes = Some(CanonicalOutputTracker::new(
+            request,
+            block_size,
+            is_eagle,
+            parent_hash,
+        ));
+        self.cache_history = Some(tracking);
+    }
+
+    fn finish_cache_history(&mut self, record_completed: bool) {
+        let Some(finalization) = finalize_cache_history(&mut self.cache_history, record_completed)
+        else {
+            return;
+        };
+        self.output_hashes = None;
+        let metrics = self.observability.request_metrics();
+        if record_completed {
+            metrics.observe_cache_history_complete(
+                finalization.prompt_tokens,
+                finalization.previously_seen_tokens,
+            );
+        } else {
+            metrics.observe_cache_history_incomplete();
+        }
+        if let Some(stats) = finalization.retained {
+            metrics.set_cache_history_retained(stats);
         }
     }
 
@@ -428,7 +660,17 @@ impl RequestGuard {
         let new_tokens = item.data.as_ref().map_or(0, |data| data.token_ids.len());
         self.observability.observe_tokens(new_tokens);
         self.capture_kv_worker_hit(item);
-
+        if let (Some(history), Some(tracker), Some(data)) = (
+            self.cache_history.as_mut(),
+            self.output_hashes.as_mut(),
+            item.data.as_ref(),
+        ) {
+            tracker.observe(
+                data.index.unwrap_or(0),
+                &data.token_ids,
+                &mut history.output_hashes,
+            );
+        }
         let cumulative_osl = self.observability.cumulative_osl();
         let Some(update) = self.output_blocks.observe(cumulative_osl) else {
             return;
@@ -460,6 +702,7 @@ impl RequestGuard {
 
     pub(super) async fn finish(&mut self) {
         // Metrics must observe the completed request before cleanup releases its state.
+        self.finish_cache_history(true);
         self.observability.record_metrics();
         self.mark_completed_terminal();
         self.cleanup.finish().await;
@@ -478,6 +721,7 @@ impl RequestGuard {
     }
 
     pub(super) async fn abort(&mut self) {
+        self.finish_cache_history(false);
         self.cleanup.finish().await;
     }
 
@@ -506,6 +750,7 @@ impl RequestGuard {
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
+        self.finish_cache_history(false);
         // RequestCleanup drops immediately afterward and performs resource cleanup.
         self.observability.record_metrics();
     }
@@ -553,3 +798,126 @@ mod kv_cache_hit_tests {
     }
 }
 
+#[cfg(test)]
+mod cache_history_tests {
+    use super::*;
+    use dynamo_kv_router::protocols::compute_seq_hash_for_block;
+
+    fn direct_sequence_hashes(tokens: &[u32], block_size: u32, is_eagle: bool) -> Vec<u64> {
+        let local_hashes = compute_block_hash_for_seq(
+            tokens,
+            block_size,
+            BlockHashOptions {
+                is_eagle: Some(is_eagle),
+                ..Default::default()
+            },
+        );
+        compute_seq_hash_for_block(&local_hashes)
+    }
+
+    fn tracker(prompt: &[u32], block_size: u32, is_eagle: bool) -> CanonicalOutputTracker {
+        let parent = direct_sequence_hashes(prompt, block_size, is_eagle)
+            .last()
+            .copied();
+        CanonicalOutputTracker::from_parts(prompt, None, block_size, is_eagle, None, None, parent)
+    }
+
+    #[test]
+    fn completed_request_observes_once_and_records_membership() {
+        let history = Arc::new(CacheHistory::with_capacity(4, 8));
+        let mut tracking = Some(CacheHistoryTracking::new(history.clone(), vec![10], 8));
+
+        let first = finalize_cache_history(&mut tracking, true).unwrap();
+        assert_eq!(first.prompt_tokens, 8);
+        assert_eq!(first.previously_seen_tokens, 0);
+        assert!(first.retained.is_some());
+        assert_eq!(history.previously_computed_tokens(&[10]), 8);
+        assert!(finalize_cache_history(&mut tracking, true).is_none());
+    }
+
+    #[test]
+    fn aborted_request_observes_once_without_recording_membership() {
+        let history = Arc::new(CacheHistory::with_capacity(4, 8));
+        let mut tracking = Some(CacheHistoryTracking::new(history.clone(), vec![10], 8));
+
+        let first = finalize_cache_history(&mut tracking, false).unwrap();
+        assert_eq!(first.prompt_tokens, 8);
+        assert_eq!(first.previously_seen_tokens, 0);
+        assert!(first.retained.is_none());
+        assert_eq!(history.previously_computed_tokens(&[10]), 0);
+        assert!(finalize_cache_history(&mut tracking, false).is_none());
+    }
+
+    #[test]
+    fn previously_seen_prefix_is_measured_at_selection() {
+        let history = Arc::new(CacheHistory::with_capacity(8, 16));
+        history.record_completed([10, 20].into_iter());
+        let tracking = CacheHistoryTracking::new(history, vec![10, 20, 30], 50);
+        assert_eq!(tracking.previously_seen_tokens, 32);
+    }
+
+    #[test]
+    fn streamed_chunks_complete_prompt_tail_and_extend_canonical_chain() {
+        let mut tracker = tracker(&[1, 2, 3], 4, false);
+        let mut completed = Vec::new();
+        tracker.observe(0, &[4, 5], &mut completed);
+        assert_eq!(completed.len(), 1);
+        tracker.observe(0, &[6, 7, 8, 9], &mut completed);
+        assert_eq!(
+            completed,
+            direct_sequence_hashes(&[1, 2, 3, 4, 5, 6, 7, 8], 4, false)
+        );
+    }
+
+    #[test]
+    fn generated_blocks_continue_an_aligned_prompt_chain() {
+        let prompt = [1, 2, 3, 4];
+        let mut tracker = tracker(&prompt, 4, false);
+        let mut completed = Vec::new();
+        // The newest sampled token has no KV yet, so a block needs one extra token.
+        tracker.observe(0, &[5, 6, 7, 8], &mut completed);
+        assert!(completed.is_empty());
+        tracker.observe(0, &[9], &mut completed);
+        assert_eq!(
+            completed,
+            direct_sequence_hashes(&[1, 2, 3, 4, 5, 6, 7, 8], 4, false)[1..]
+        );
+    }
+
+    #[test]
+    fn eagle_windows_match_routing_hashes() {
+        let prompt = [1, 2, 3, 4, 5];
+        let mut tracker = tracker(&prompt, 4, true);
+        let mut completed = Vec::new();
+        tracker.observe(0, &[6, 7, 8, 9], &mut completed);
+        assert_eq!(
+            completed,
+            direct_sequence_hashes(&[1, 2, 3, 4, 5, 6, 7, 8, 9], 4, true)[1..]
+        );
+    }
+
+    #[test]
+    fn multiple_choices_keep_independent_tails() {
+        let prompt = [1, 2, 3, 4];
+        let mut tracker = tracker(&prompt, 4, false);
+        let mut completed = Vec::new();
+        tracker.observe(0, &[5, 6, 7, 8, 9], &mut completed);
+        tracker.observe(1, &[15, 16, 17, 18, 19], &mut completed);
+        assert_eq!(
+            completed,
+            vec![
+                direct_sequence_hashes(&[1, 2, 3, 4, 5, 6, 7, 8], 4, false)[1],
+                direct_sequence_hashes(&[1, 2, 3, 4, 15, 16, 17, 18], 4, false)[1],
+            ]
+        );
+    }
+
+    #[test]
+    fn incomplete_output_tail_is_not_materialized() {
+        let mut tracker = tracker(&[1], 4, false);
+        let mut completed = Vec::new();
+        tracker.observe(0, &[2, 3], &mut completed);
+        tracker.observe(0, &[], &mut completed);
+        assert!(completed.is_empty());
+    }
+}

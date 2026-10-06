@@ -97,6 +97,7 @@ oneshot = { workspace = true }
 parking_lot = { workspace = true }
 prometheus = { workspace = true }
 rand = { workspace = true }
+rustc-hash = "2.1.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 opentelemetry-proto = { version = "0.31.0", default-features = false, features = ["gen-tonic-messages", "logs"] }

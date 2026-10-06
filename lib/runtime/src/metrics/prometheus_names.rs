@@ -214,6 +214,34 @@ pub mod frontend_service {
     /// Backend-reported cache-hit tokens
     pub const KV_WORKER_REUSED_TOKENS_TOTAL: &str = "kv_worker_reused_tokens_total";
 
+    /// Input tokens for cache-reuse observations started by the router
+    pub const CACHE_LOSS_OBSERVATION_INPUT_TOKENS_TOTAL: &str =
+        "cache_loss_observation_input_tokens_total";
+
+    /// Raw token observations at each cache-reuse funnel stage
+    pub const CACHE_LOSS_FUNNEL_TOKENS_TOTAL: &str = "cache_loss_funnel_tokens_total";
+
+    /// Prompt-prefix tokens previously seen in this router's bounded history
+    pub const KV_HISTORY_CACHED_PREFIX_TOKENS_TOTAL: &str = "kv_history_cached_prefix_tokens_total";
+
+    /// Cache-reuse observations by completion status
+    pub const CACHE_LOSS_OBSERVATIONS_TOTAL: &str = "cache_loss_observations_total";
+
+    /// Distinct canonical block hashes retained by cache history
+    pub const CACHE_LOSS_HISTORY_UNIQUE_HASHES: &str = "cache_loss_history_unique_hashes";
+
+    /// Tokens represented by distinct cache-history entries
+    pub const CACHE_LOSS_HISTORY_REPRESENTED_TOKENS: &str = "cache_loss_history_represented_tokens";
+
+    /// Estimated bytes used by retained cache-history entries
+    pub const CACHE_LOSS_HISTORY_ESTIMATED_BYTES: &str = "cache_loss_history_estimated_bytes";
+
+    /// Configured distinct-block capacity of cache history
+    pub const CACHE_LOSS_HISTORY_CAPACITY_BLOCKS: &str = "cache_loss_history_capacity_blocks";
+
+    /// Configured byte budget of cache history
+    pub const CACHE_LOSS_HISTORY_CAPACITY_BYTES: &str = "cache_loss_history_capacity_bytes";
+
     /// Upper-bound estimation of KV cache transfer latency in disaggregated serving (seconds)
     pub const KV_TRANSFER_ESTIMATED_LATENCY_SECONDS: &str = "kv_transfer_estimated_latency_seconds";
 
@@ -981,6 +1009,10 @@ mod tests {
     #[test]
     fn test_cache_reuse_funnel_metric_names() {
         for (suffix, expected) in [
+            (
+                frontend_service::KV_HISTORY_CACHED_PREFIX_TOKENS_TOTAL,
+                "dynamo_component_router_kv_history_cached_prefix_tokens_total",
+            ),
             (
                 frontend_service::KV_BEST_ELIGIBLE_CACHED_PREFIX_TOKENS_TOTAL,
                 "dynamo_component_router_kv_best_eligible_cached_prefix_tokens_total",

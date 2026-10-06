@@ -1733,6 +1733,7 @@ dependencies = [
  "rayon",
  "reqwest 0.12.28",
  "rmp-serde",
+ "rustc-hash 2.1.2",
  "rustls",
  "serde",
  "serde_json",

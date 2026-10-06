@@ -17,7 +17,11 @@ use futures::stream::{self, StreamExt};
 use tracing::Instrument;
 
 use crate::{
-    kv_router::{KvRouter, metrics::RouterRequestMetrics},
+    kv_router::{
+        KvRouter,
+        cache_history::{self, CacheHistory},
+        metrics::RouterRequestMetrics,
+    },
     preprocessor::PreprocessedRequest,
     protocols::common::{
         FinishReason,
@@ -34,7 +38,7 @@ mod request_guard;
 mod selection;
 
 use cancellation::cancel_on_stop;
-use request_guard::{RequestGuard, RouteObservation};
+use request_guard::{CacheHistoryTracking, RequestGuard, RouteObservation};
 use selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
 
 const OUTPUT_REPLAY_ID_ANNOTATION_KEY: &str = "output_replay_id";
@@ -107,6 +111,8 @@ pub struct KvPushRouter {
     inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     pub chooser: Arc<KvRouter>,
     request_metrics: Arc<RouterRequestMetrics>,
+    /// Opt-in F1 history (`DYN_ROUTER_CACHE_REUSE_HISTORY`); `None` costs nothing per request.
+    cache_history: Option<Arc<CacheHistory>>,
     affinity: Option<AffinityCoordinator>,
 }
 
@@ -133,11 +139,18 @@ impl KvPushRouter {
         // and the standalone router create KvPushRouter, so this covers both.
         let request_metrics =
             RouterRequestMetrics::from_component(chooser.client().endpoint.component());
+        let cache_history =
+            cache_history::enabled().then(|| CacheHistory::from_env(chooser.block_size()));
+        if let Some(history) = &cache_history {
+            request_metrics.set_cache_history_capacity(history.stats());
+            history.start_replica_sync(&chooser, request_metrics.clone());
+        }
 
         KvPushRouter {
             inner,
             chooser,
             request_metrics,
+            cache_history,
             affinity,
         }
     }
@@ -261,6 +274,25 @@ impl KvPushRouter {
                     })
             })
             .flatten();
+        // F1 reuses the canonical prompt hashes already computed for routing. Clone them only
+        // when the routing-decision recorder below still needs its own copy.
+        let history_prompt_hashes = self
+            .cache_history
+            .as_ref()
+            .filter(|_| !is_query_only)
+            .and_then(|_| {
+                if self.chooser.indexer().records_routing_decisions() {
+                    selection
+                        .routing_hashes
+                        .as_ref()
+                        .map(|hashes| hashes.sequence_hashes.clone())
+                } else {
+                    selection
+                        .routing_hashes
+                        .take()
+                        .map(|hashes| hashes.sequence_hashes)
+                }
+            });
         let mut guard = RequestGuard::new(
             self.chooser.clone(),
             self.request_metrics.clone(),
@@ -270,6 +302,20 @@ impl KvPushRouter {
             selection.lifecycle.take(),
             kv_route,
         );
+        if let (Some(history), Some(prompt_hashes)) =
+            (self.cache_history.as_ref(), history_prompt_hashes)
+        {
+            guard.track_cache_history(
+                CacheHistoryTracking::new(
+                    Arc::clone(history),
+                    prompt_hashes,
+                    routing_parts.token_ids.len() as u64,
+                ),
+                request,
+                self.chooser.block_size(),
+                self.chooser.is_eagle(),
+            );
+        }
 
         let record_result: Result<(), Error> = async {
             if !is_query_only && self.chooser.indexer().records_routing_decisions() {
@@ -1129,6 +1175,201 @@ mod tests {
 
         drop(router);
         runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cache_history_learns_completed_prompt_and_output_blocks() {
+        use dynamo_kv_router::protocols::{
+            BlockHashOptions, compute_block_hash_for_seq, compute_seq_hash_for_block,
+        };
+
+        temp_env::async_with_vars(
+            [(cache_history::CACHE_REUSE_HISTORY_ENABLED_ENV, Some("true"))],
+            async {
+                let (router, runtime) = router(None).await;
+                let history = router.cache_history.clone().expect("history is enabled");
+                let sequence_hashes = |tokens: &[u32]| {
+                    compute_seq_hash_for_block(&compute_block_hash_for_seq(
+                        tokens,
+                        16,
+                        BlockHashOptions {
+                            is_eagle: Some(router.chooser.is_eagle()),
+                            ..Default::default()
+                        },
+                    ))
+                };
+                let tracked = |tokens: Vec<u32>| {
+                    let mut request = request();
+                    request.token_ids = tokens;
+                    Context::new(request)
+                };
+                let generated = |tokens: Vec<u32>| {
+                    Annotated::from_data(LLMEngineOutput {
+                        token_ids: tokens,
+                        ..Default::default()
+                    })
+                };
+
+                // Two complete prompt blocks plus an 8-token tail; nine generated tokens
+                // complete a third block (the newest token has no KV yet).
+                let prompt: Vec<u32> = (1..=40).collect();
+                let request = tracked(prompt.clone());
+                let (mut selection, _) = router
+                    .select_with_affinity(&request, RequestPhase::Aggregated, false)
+                    .await
+                    .unwrap();
+                let mut guard = router
+                    .track_selection(&request, &mut selection, false)
+                    .await
+                    .unwrap();
+                guard.mark_dispatched().await;
+                guard.on_item(&generated((41..=49).collect())).await;
+                guard.finish().await;
+                drop(guard);
+
+                let follow_up: Vec<u32> = (1..=48).collect();
+                assert_eq!(
+                    history.previously_computed_tokens(&sequence_hashes(&follow_up)),
+                    48
+                );
+
+                // An aborted attempt does not teach the history.
+                let other: Vec<u32> = (100..=132).collect();
+                let request = tracked(other.clone());
+                let (mut selection, _) = router
+                    .select_with_affinity(&request, RequestPhase::Aggregated, false)
+                    .await
+                    .unwrap();
+                let mut guard = router
+                    .track_selection(&request, &mut selection, false)
+                    .await
+                    .unwrap();
+                guard.abort().await;
+                drop(guard);
+                assert_eq!(
+                    history.previously_computed_tokens(&sequence_hashes(&other)),
+                    0
+                );
+
+                drop(router);
+                runtime.shutdown();
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cache_history_replica_sync_requires_both_flags() {
+        use dynamo_runtime::discovery::{DiscoveryQuery, EventChannelQuery};
+
+        for history_enabled in [true, false] {
+            for replica_sync in [true, false] {
+                temp_env::async_with_vars(
+                    [(
+                        cache_history::CACHE_REUSE_HISTORY_ENABLED_ENV,
+                        Some(if history_enabled { "true" } else { "false" }),
+                    )],
+                    async {
+                        let runtime = Runtime::from_current().unwrap();
+                        let distributed = DistributedRuntime::new(
+                            runtime.clone(),
+                            DistributedConfig::process_local(),
+                        )
+                        .await
+                        .unwrap();
+                        let endpoint = distributed
+                            .namespace(format!("history-gate-{}", uuid::Uuid::new_v4()))
+                            .unwrap()
+                            .component("workers")
+                            .unwrap()
+                            .endpoint("generate");
+                        let query = DiscoveryQuery::EventChannels(
+                            EventChannelQuery::endpoint_topic(endpoint.id(), "cache-history-v1"),
+                        );
+                        let client = endpoint.client().await.unwrap();
+                        let (_workers_tx, workers) = watch::channel(HashMap::from([(
+                            7,
+                            ModelRuntimeConfig::default(),
+                        )]));
+                        let config = KvRouterConfig {
+                            skip_initial_worker_wait: true,
+                            use_kv_events: false,
+                            router_track_active_blocks: false,
+                            router_replica_sync: replica_sync,
+                            ..Default::default()
+                        };
+                        let chooser = KvRouter::new(
+                            endpoint,
+                            client.clone(),
+                            workers,
+                            None,
+                            16,
+                            DefaultWorkerSelector::new(Some(config.clone()), "decode"),
+                            Some(config),
+                            None,
+                            "decode",
+                            None,
+                            false,
+                            None,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                        let inner = PushRouter::from_client(client, RouterMode::KV)
+                            .await
+                            .unwrap();
+                        let router = KvPushRouter::new(inner, Arc::new(chooser), None).unwrap();
+                        assert_eq!(router.cache_history.is_some(), history_enabled);
+                        let expected = usize::from(history_enabled && replica_sync);
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            let start = std::time::Instant::now();
+                            loop {
+                                let count = distributed
+                                    .discovery()
+                                    .list(query.clone())
+                                    .await
+                                    .unwrap()
+                                    .len();
+                                if expected == 0 {
+                                    assert_eq!(
+                                        count, 0,
+                                        "history={history_enabled}, sync={replica_sync}"
+                                    );
+                                    if start.elapsed() >= Duration::from_millis(200) {
+                                        break;
+                                    }
+                                } else if count == expected {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        })
+                        .await
+                        .expect("cache history publisher did not follow the enable flags");
+                        drop(router);
+                        distributed.shutdown();
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cache_history_is_off_by_default() {
+        temp_env::async_with_vars(
+            [(cache_history::CACHE_REUSE_HISTORY_ENABLED_ENV, None::<&str>)],
+            async {
+                let (router, runtime) = router(None).await;
+                assert!(router.cache_history.is_none());
+                drop(router);
+                runtime.shutdown();
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
