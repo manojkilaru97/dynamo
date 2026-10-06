@@ -511,9 +511,6 @@ pub(super) struct RequestGuard {
     kv_hit: Option<KvHitTracking>,
     cache_history: Option<CacheHistoryTracking>,
     output_hashes: Option<CanonicalOutputTracker>,
-    /// A healthy terminal item was delivered; admission already counts the attempt completed,
-    /// so F1 does too even if the consumer stops before end of stream.
-    terminal_completed: bool,
 }
 
 impl RequestGuard {
@@ -565,7 +562,6 @@ impl RequestGuard {
             kv_hit,
             cache_history: None,
             output_hashes: None,
-            terminal_completed: false,
         }
     }
 
@@ -720,7 +716,6 @@ impl RequestGuard {
     }
 
     pub(super) fn mark_completed_terminal(&mut self) {
-        self.terminal_completed = true;
         let context_tokens = self
             .observability
             .context_tokens(self.output_blocks.isl_tokens);
@@ -733,7 +728,10 @@ impl RequestGuard {
     }
 
     pub(super) async fn abort(&mut self) {
-        self.finish_cache_history(self.terminal_completed);
+        // As upstream: only an attempt that reaches end of stream without failure teaches the
+        // history. A consumer that stops after the terminal item, or any later failure in a
+        // multi-choice stream, counts as incomplete (stricter than admission).
+        self.finish_cache_history(false);
         self.cleanup.finish().await;
     }
 
@@ -762,7 +760,7 @@ impl RequestGuard {
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        self.finish_cache_history(self.terminal_completed);
+        self.finish_cache_history(false);
         // RequestCleanup drops immediately afterward and performs resource cleanup.
         self.observability.record_metrics();
     }

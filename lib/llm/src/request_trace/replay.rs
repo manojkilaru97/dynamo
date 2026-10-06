@@ -70,8 +70,7 @@ impl OutputSequenceHashCapture {
         for &token_id in token_ids {
             self.pending_tokens.push(token_id);
             if self.pending_tokens.len() == self.trace_block_size {
-                let block = std::mem::take(&mut self.pending_tokens);
-                self.push_block(&block);
+                self.push_pending_block();
             }
         }
     }
@@ -88,12 +87,14 @@ impl OutputSequenceHashCapture {
         hashes
     }
 
-    fn push_block(&mut self, tokens: &[TokenIdType]) {
+    /// Hash the complete pending block, then clear it in place so its allocation is reused.
+    fn push_pending_block(&mut self) {
         let block = compute_block_hash_for_seq(
-            tokens,
+            &self.pending_tokens,
             self.trace_block_size as u32,
             BlockHashOptions::default(),
         )[0];
+        self.pending_tokens.clear();
         let sequence_hash = self.next_sequence_hash(block);
         self.parent_sequence_hash = Some(sequence_hash);
         self.output_sequence_hashes.push(sequence_hash);

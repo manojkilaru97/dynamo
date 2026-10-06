@@ -289,6 +289,38 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_publication_leaves_gauges_at_the_final_size() {
+        use crate::kv_router::metrics::{RouterRequestMetrics, test_hierarchy::IsolatedHierarchy};
+
+        let hierarchy = IsolatedHierarchy::default();
+        let metrics = temp_env::with_var(CACHE_REUSE_HISTORY_ENABLED_ENV, Some("true"), || {
+            RouterRequestMetrics::for_test(&hierarchy)
+        });
+        for round in 0..20_u64 {
+            let history = Arc::new(CacheHistory::with_capacity(1_000, 16));
+            let barrier = Arc::new(Barrier::new(8));
+            std::thread::scope(|scope| {
+                for thread in 0..8_u64 {
+                    let (history, barrier, metrics) =
+                        (history.clone(), barrier.clone(), metrics.clone());
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for offset in 0..50_u64 {
+                            let hash = round * 1_000_000 + thread * 1_000 + offset;
+                            if history.record_completed([hash].into_iter()).is_some() {
+                                history.publish_retained(&metrics);
+                            }
+                        }
+                    });
+                }
+            });
+            let (_, _, _, _, retained) = metrics.cache_history_values_for_test().unwrap();
+            assert_eq!(retained as usize, history.stats().retained_entries);
+            assert_eq!(retained, 400);
+        }
+    }
+
+    #[test]
     fn environment_variable_names_are_stable() {
         assert_eq!(
             CACHE_REUSE_HISTORY_ENABLED_ENV,

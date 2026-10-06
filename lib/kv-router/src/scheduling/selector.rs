@@ -45,13 +45,18 @@ const DECISION_TRACE_SCHEMA: &str = "dynamo.router.decision.v1";
 /// Process-wide decision-trace setting, read once: `None` when disabled, otherwise the
 /// sample rate. Selectors copy it at construction.
 static ROUTER_DECISION_TRACE: LazyLock<Option<f64>> = LazyLock::new(|| {
-    dynamo_truthy::env_is_truthy(DYN_ROUTER_DECISION_TRACE_ENABLED).then(|| {
-        parse_decision_trace_sample_rate(
-            std::env::var_os(DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE)
-                .map(|value| value.to_string_lossy().into_owned()),
-        )
+    decision_trace_setting(|key| {
+        std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
     })
 });
+
+/// Resolve the decision-trace setting from an environment lookup: `None` unless the enable
+/// flag is truthy, otherwise the sample rate (unset = 1.0, invalid = 0.0).
+fn decision_trace_setting(get_env: impl Fn(&str) -> Option<String>) -> Option<f64> {
+    get_env(DYN_ROUTER_DECISION_TRACE_ENABLED)
+        .is_some_and(|value| dynamo_truthy::is_truthy(&value))
+        .then(|| parse_decision_trace_sample_rate(get_env(DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE)))
+}
 
 fn parse_decision_trace_sample_rate(value: Option<String>) -> f64 {
     let Some(value) = value else {
@@ -3279,13 +3284,59 @@ worker_selection:
     }
 
     #[test]
-    fn decision_tracing_is_off_by_default() {
-        // The test runner does not set the flag, so a default selector never traces.
-        if std::env::var_os(DYN_ROUTER_DECISION_TRACE_ENABLED).is_none() {
-            assert_eq!(*ROUTER_DECISION_TRACE, None);
-            let selector = DefaultWorkerSelector::new(None, "decode");
-            assert_eq!(selector.decision_trace_sample_rate, None);
-        }
+    fn decision_trace_setting_follows_the_environment() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        assert_eq!(decision_trace_setting(env(&[])), None);
+        assert_eq!(
+            decision_trace_setting(env(&[(DYN_ROUTER_DECISION_TRACE_ENABLED, "false")])),
+            None
+        );
+        assert_eq!(
+            decision_trace_setting(env(&[(DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE, "0.5")])),
+            None,
+            "a sample rate alone does not enable tracing"
+        );
+        assert_eq!(
+            decision_trace_setting(env(&[(DYN_ROUTER_DECISION_TRACE_ENABLED, "true")])),
+            Some(1.0)
+        );
+        assert_eq!(
+            decision_trace_setting(env(&[
+                (DYN_ROUTER_DECISION_TRACE_ENABLED, "1"),
+                (DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE, "0.25"),
+            ])),
+            Some(0.25)
+        );
+        assert_eq!(
+            decision_trace_setting(env(&[
+                (DYN_ROUTER_DECISION_TRACE_ENABLED, "true"),
+                (DYN_ROUTER_DECISION_TRACE_SAMPLE_RATE, "2"),
+            ])),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn selectors_take_the_process_decision_trace_setting() {
+        let process = decision_trace_setting(|key| {
+            std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
+        });
+        assert_eq!(*ROUTER_DECISION_TRACE, process);
+        assert_eq!(
+            DefaultWorkerSelector::new(None, "decode").decision_trace_sample_rate,
+            process
+        );
+        assert_eq!(
+            two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default()).decision_trace_sample_rate,
+            process
+        );
     }
 
     /// Hot-path cost of the always-on F2/F3 tracking: identical selections differing only in

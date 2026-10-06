@@ -604,6 +604,10 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         if is_query_only {
             let routing_parts = RoutingRequestParts::new(&request);
             if let Some(ref tracker) = request.tracker {
+                // Advisory (query-only) decisions keep their sampled trace too.
+                if let Some(trace) = selection.decision_trace.take() {
+                    tracker.record_routing_decision_trace(trace);
+                }
                 let isl_blocks = routing_parts
                     .token_ids
                     .len()
@@ -1462,13 +1466,77 @@ mod tests {
             Some((32, 0, 1, 1, 2))
         );
 
-        // A delivered terminal item counts as complete even if the stream is then dropped,
-        // and the repeat sees both prompt blocks.
+        // As upstream, a consumer that drops the stream after the terminal item, before end of
+        // stream, leaves the attempt incomplete; a completed repeat then sees both blocks.
         drop(attempt(true));
         assert_eq!(
             metrics.cache_history_values_for_test(),
-            Some((64, 32, 2, 1, 2))
+            Some((32, 0, 1, 2, 2))
         );
+        let mut repeat = attempt(false);
+        repeat.finish().await;
+        drop(repeat);
+        assert_eq!(
+            metrics.cache_history_values_for_test(),
+            Some((64, 32, 2, 2, 2))
+        );
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cache_history_does_not_learn_a_multi_choice_attempt_that_fails_after_a_stop() {
+        let (router, runtime) = router(None).await;
+        let history = Arc::new(CacheHistory::with_capacity(64, 16));
+        let prompt: Vec<u32> = (1..=32).collect();
+        let prompt_hashes = dynamo_kv_router::protocols::compute_seq_hash_for_block(
+            &dynamo_kv_router::protocols::compute_block_hash_for_seq(
+                &prompt,
+                16,
+                Default::default(),
+            ),
+        );
+        let mut request = request();
+        request.token_ids = prompt.clone();
+        let mut guard = RequestGuard::new(
+            Arc::clone(&router.chooser),
+            Arc::clone(&router.request_metrics),
+            "two-choices".to_string(),
+            &request,
+            false,
+            None,
+            None,
+            UNKNOWN_METRICS_MODEL,
+        );
+        guard.track_cache_history(
+            CacheHistoryTracking::new(Arc::clone(&history), prompt_hashes.clone(), 32),
+            &request,
+            16,
+            false,
+        );
+        let choice = |index: u32, finish_reason: FinishReason| {
+            Annotated::from_data(LLMEngineOutput {
+                index: Some(index),
+                token_ids: vec![7],
+                finish_reason: Some(finish_reason),
+                ..Default::default()
+            })
+        };
+        let context = Context::new(()).context();
+        let source = ResponseStream::new(
+            Box::pin(stream::iter(vec![
+                choice(0, FinishReason::Stop),
+                choice(1, FinishReason::Error("boom".to_string())),
+            ])),
+            Arc::clone(&context),
+        );
+        let monitored = monitor_response_stream(source, context, guard);
+        tokio::pin!(monitored);
+        while monitored.next().await.is_some() {}
+        drop(monitored);
+        assert_eq!(history.previously_computed_tokens(&prompt_hashes), 0);
+        assert_eq!(history.stats().retained_entries, 0);
         drop(router);
         runtime.shutdown();
     }
