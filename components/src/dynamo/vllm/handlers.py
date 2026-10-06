@@ -4631,7 +4631,14 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             async for res in gen:
                 logger.debug(f"kv transfer params: {res.kv_transfer_params}")
 
-                completions = list(res.outputs or [])
+                # A failed choice goes first: the prefill router classifies a
+                # request by its first chunk, so an abort or error in a coalesced
+                # output ends the request instead of handing off to decode.
+                completions = sorted(
+                    res.outputs or [],
+                    key=lambda c: "finish_reason"
+                    not in PrefillWorkerHandler._prefill_choice_fields(c),
+                )
                 completion = completions[0] if completions else None
                 token_ids = completion.token_ids if completion is not None else []
 
@@ -4657,10 +4664,8 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 }
                 if completion is not None:
                     # Parallel samples keep their own choice so the router does not
-                    # join independent samples. `length` (the one-token budget) still
-                    # hands off to decode; any other reason ends the request here, and
-                    # an engine abort becomes `cancelled` so the router counts the
-                    # attempt as failed.
+                    # join independent samples; failures carry a finish reason so the
+                    # router counts the attempt as failed (see _prefill_choice_fields).
                     output.update(self._prefill_choice_fields(completion))
                 # Parallel samples make the count unreliable; see generate_tokens.
                 kv_cache_hit = (
@@ -4694,9 +4699,22 @@ class PrefillWorkerHandler(BaseWorkerHandler):
 
     @staticmethod
     def _prefill_choice_fields(completion) -> Dict[str, Any]:
+        """Choice index plus a finish reason for failed prefills only.
+
+        Successful prefills (`length`, or `stop` from an EOS/stop token) carry no finish
+        reason, so the prefill router hands off to decode exactly as before: a forwarded
+        `stop` would end the request at prefill, and NIXL would then hold the prompt's
+        KV blocks until their lease expires. An engine abort becomes `cancelled`, and
+        vLLM's bare `error` becomes the `error: ...` form the router's FinishReason
+        accepts.
+        """
         fields: Dict[str, Any] = {"index": completion.index}
-        if completion.finish_reason:
-            fields["finish_reason"] = normalize_finish_reason(completion.finish_reason)
+        reason = completion.finish_reason
+        if reason and reason.startswith("abort"):
+            fields["finish_reason"] = normalize_finish_reason(reason)
+        elif reason == "error":
+            detail = getattr(completion, "stop_reason", None) or "engine error"
+            fields["finish_reason"] = f"error: {detail}"
         return fields
 
     def _build_disaggregated_params(

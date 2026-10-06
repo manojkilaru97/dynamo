@@ -2481,7 +2481,10 @@ def _prefill_output(index, token_ids, finish_reason):
         prompt_logprobs=None,
         outputs=[
             SimpleNamespace(
-                index=index, token_ids=token_ids, finish_reason=finish_reason
+                index=index,
+                token_ids=token_ids,
+                finish_reason=finish_reason,
+                stop_reason=None,
             )
         ],
         finished=finish_reason is not None,
@@ -2493,10 +2496,11 @@ def _prefill_output(index, token_ids, finish_reason):
 @pytest.mark.parametrize(
     ("engine_reason", "forwarded"),
     [
-        ("length", "length"),
-        ("abort", "cancelled"),
-        ("stop", "stop"),
+        ("length", None),
+        ("stop", None),
         (None, None),
+        ("abort", "cancelled"),
+        ("error", "error: engine error"),
     ],
 )
 async def test_prefill_forwards_normalized_finish_reason(
@@ -2549,8 +2553,12 @@ async def test_prefill_forwards_every_coalesced_parallel_choice(monkeypatch):
         prompt_token_ids=[1, 2, 3],
         prompt_logprobs=None,
         outputs=[
-            SimpleNamespace(index=0, token_ids=[7], finish_reason="length"),
-            SimpleNamespace(index=1, token_ids=[8], finish_reason="abort"),
+            SimpleNamespace(
+                index=0, token_ids=[7], finish_reason="length", stop_reason=None
+            ),
+            SimpleNamespace(
+                index=1, token_ids=[8], finish_reason="abort", stop_reason=None
+            ),
         ],
         finished=True,
         num_cached_tokens=0,
@@ -2567,6 +2575,18 @@ async def test_prefill_forwards_every_coalesced_parallel_choice(monkeypatch):
     assert [
         (chunk["index"], chunk["token_ids"], chunk.get("finish_reason"))
         for chunk in chunks
-    ] == [(0, [7], "length"), (1, [8], "cancelled")]
+    ] == [(1, [8], "cancelled"), (0, [7], None)]
+    # The failed choice leads, so the prefill router ends the request instead of
+    # handing off; the other choice follows as a bare chunk.
     assert "disaggregated_params" in chunks[0]
-    assert set(chunks[1]) == {"index", "token_ids", "finish_reason"}
+    assert set(chunks[1]) == {"index", "token_ids"}
+
+
+def test_prefill_choice_fields_keep_the_engine_error_detail():
+    completion = SimpleNamespace(
+        index=0, token_ids=[], finish_reason="error", stop_reason="kv load failed"
+    )
+    assert mod.PrefillWorkerHandler._prefill_choice_fields(completion) == {
+        "index": 0,
+        "finish_reason": "error: kv load failed",
+    }

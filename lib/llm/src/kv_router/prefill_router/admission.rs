@@ -345,6 +345,35 @@ mod tests {
         );
     }
 
+    /// A coalesced parallel prefill with an aborted choice: the vLLM handler forwards the
+    /// failed choice first, so the request ends as `cancelled` instead of handing off.
+    #[tokio::test]
+    async fn vllm_coalesced_prefill_abort_is_terminal() {
+        let chunks = [
+            json!({
+                "token_ids": [8],
+                "index": 1,
+                "finish_reason": "cancelled",
+                "disaggregated_params": null
+            }),
+            json!({"token_ids": [7], "index": 0}),
+        ];
+        let stream = chunks
+            .into_iter()
+            .map(|chunk| Annotated::from_data(serde_json::from_value(chunk).unwrap()))
+            .collect();
+        let result = PrefillRouter::consume_prefill_stream(prefill_stream(stream), None, None)
+            .await
+            .unwrap();
+        let PrefillCompletion::Terminal { output } = result else {
+            panic!("an aborted choice must not hand off to decode");
+        };
+        assert_eq!(
+            output.data.and_then(|data| data.finish_reason),
+            Some(FinishReason::Cancelled)
+        );
+    }
+
     #[tokio::test]
     async fn length_limited_prefill_still_requires_handoff() {
         let output = LLMEngineOutput {

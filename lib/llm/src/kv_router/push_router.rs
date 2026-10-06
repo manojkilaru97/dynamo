@@ -1729,7 +1729,6 @@ mod tests {
                 serde_json::json!({
                     "token_ids": [7],
                     "index": 0,
-                    "finish_reason": "length",
                     "disaggregated_params": {"kv_transfer_params": {"remote": 0}}
                 }),
                 serde_json::json!({"token_ids": [8], "index": 1, "finish_reason": "cancelled"}),
@@ -1749,11 +1748,11 @@ mod tests {
         // A 15-token prompt and two independent one-token samples: neither sample's token
         // has KV, so no 16-token block exists. Without choice indexes the router would join
         // them and treat the second token as proof that the first block was computed.
+        // Successful prefills carry no finish reason (the handler forwards failures only).
         let sample = |index: u32, token: u32| {
             serde_json::json!({
                 "token_ids": [token],
                 "index": index,
-                "finish_reason": "length",
                 "disaggregated_params": {"kv_transfer_params": {"remote": index}}
             })
         };
@@ -1767,8 +1766,7 @@ mod tests {
         assert_eq!(history.stats().retained_entries, 0);
 
         // The same tokens without indexes (the old producer) would have materialized one.
-        let unindexed =
-            |token: u32| serde_json::json!({"token_ids": [token], "finish_reason": "length"});
+        let unindexed = |token: u32| serde_json::json!({"token_ids": [token]});
         let (history, _, _) = run_prefill_chunks(
             &router,
             (1..=15).collect(),
