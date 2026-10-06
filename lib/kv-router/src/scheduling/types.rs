@@ -81,6 +81,11 @@ pub struct SchedulingResponse {
     pub best_worker: WorkerWithDpRank,
     pub effective_overlap_blocks: f64,
     pub cached_tokens: usize,
+    /// Greatest raw router-visible overlap among eligible workers, in tokens,
+    /// for tracked requests.
+    pub max_raw_cached_tokens: Option<usize>,
+    /// Raw prefix overlap for the selected worker and DP rank, in tokens.
+    pub selected_raw_cached_tokens: Option<usize>,
     pub selected_worker_tiers: SelectedWorkerTierSnapshot,
     pub request_progress: Option<RequestProgressUpdater>,
     pub lifecycle_lease: Option<super::queue::RequestLifecycleLease>,
@@ -277,6 +282,23 @@ impl SchedulingRequest {
             .get(&worker)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Raw router-visible cached prefix for one worker rank, in tokens.
+    ///
+    /// The tiers are disjoint continuations of one prefix (device, then the host-pinned
+    /// CPU-offload continuation, then disk), so they add. No tier weight is applied: this
+    /// is the cache-reuse funnel's raw token count, not the policy's effective overlap.
+    pub(crate) fn raw_cached_tokens_for(&self, worker: WorkerWithDpRank, block_size: u32) -> usize {
+        let tiers = &self.overlap.tier_overlap_blocks;
+        let blocks = tiers
+            .device
+            .get(&worker)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(tiers.host_pinned.get(&worker).copied().unwrap_or(0))
+            .saturating_add(tiers.disk.get(&worker).copied().unwrap_or(0));
+        blocks.saturating_mul(block_size as usize)
     }
 
     pub(crate) fn effective_overlap_blocks_for(&self, worker: WorkerWithDpRank) -> f64 {

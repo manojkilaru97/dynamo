@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::{cell::Cell, collections::HashMap};
 #[cfg(any(test, feature = "bench"))]
 use std::sync::Arc;
 
@@ -30,6 +30,43 @@ pub trait WorkerSelector<C: WorkerConfigLike> {
         eligibility: RoutingEligibility<'_>,
         block_size: u32,
     ) -> Result<WorkerSelectionResult, KvSchedulerError>;
+}
+
+/// Best raw router-visible cached prefix among the eligible workers a selection visits
+/// (cache-reuse funnel stage F2), tracked in the scan the selector already performs.
+///
+/// Only tracked requests record it; query-only selections report `None` so the router does
+/// not count them. Raw means unweighted device + host-pinned (CPU offload) + disk blocks.
+struct RawCacheReuse<'a> {
+    request: &'a SchedulingRequest,
+    block_size: u32,
+    max: Cell<Option<usize>>,
+}
+
+impl<'a> RawCacheReuse<'a> {
+    fn new(request: &'a SchedulingRequest, block_size: u32) -> Self {
+        Self {
+            request,
+            block_size,
+            max: Cell::new(request.mode.is_tracked().then_some(0)),
+        }
+    }
+
+    /// Count an eligible worker rank toward the best eligible cached prefix.
+    #[inline]
+    fn track(&self, worker: WorkerWithDpRank) {
+        if let Some(current) = self.max.get() {
+            let raw = self.request.raw_cached_tokens_for(worker, self.block_size);
+            self.max.set(Some(current.max(raw)));
+        }
+    }
+
+    /// `(max_raw_cached_tokens, selected_raw_cached_tokens)` for the chosen worker.
+    fn finish(&self, selected: WorkerWithDpRank) -> (Option<usize>, Option<usize>) {
+        let max = self.max.get();
+        let selected_raw = max.map(|_| self.request.raw_cached_tokens_for(selected, self.block_size));
+        (max, selected_raw)
+    }
 }
 
 /// Helper function for softmax sampling.
@@ -221,8 +258,10 @@ impl DefaultWorkerSelector {
         let tiers = &request.overlap.tier_overlap_blocks;
         let mut candidates = 0usize;
         let mut accumulator = policy.accumulator::<WorkerWithDpRank>();
+        let raw_reuse = RawCacheReuse::new(request, block_size);
         eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
             candidates += 1;
+            raw_reuse.track(worker);
             accumulator.push(
                 worker,
                 TwoTierRow {
@@ -263,11 +302,14 @@ impl DefaultWorkerSelector {
             "Selected worker"
         );
 
+        let (max_raw_cached_tokens, selected_raw_cached_tokens) = raw_reuse.finish(worker);
         Ok(WorkerSelectionResult {
             worker,
             required_blocks: request_blocks,
             effective_overlap_blocks,
             cached_tokens: request.effective_cached_tokens_for(worker),
+            max_raw_cached_tokens,
+            selected_raw_cached_tokens,
             potential_decode_blocks: request
                 .potential_decode_blocks_after_admission(worker, block_size),
         })
@@ -547,11 +589,18 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 effective_overlap_blocks,
             );
 
+            // A pin narrows the eligible set to the pinned rank, so the best eligible
+            // cached prefix is the pinned worker's own.
+            let raw_reuse = RawCacheReuse::new(request, block_size);
+            raw_reuse.track(worker);
+            let (max_raw_cached_tokens, selected_raw_cached_tokens) = raw_reuse.finish(worker);
             return Ok(WorkerSelectionResult {
                 worker,
                 required_blocks: request_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                max_raw_cached_tokens,
+                selected_raw_cached_tokens,
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(worker, block_size),
             });
@@ -586,7 +635,11 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             } else {
                 0
             };
+        // Every scan below scores each eligible rank through `get_score`, so tracking the
+        // raw cached prefix there needs no extra pass. `max` is idempotent if a rank repeats.
+        let raw_reuse = RawCacheReuse::new(request, block_size);
         let get_score = |worker: WorkerWithDpRank| -> f64 {
+            raw_reuse.track(worker);
             let base_score = self.worker_logit(
                 request,
                 worker,
@@ -723,11 +776,15 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 "Selected worker"
             );
 
+            let (max_raw_cached_tokens, selected_raw_cached_tokens) =
+                raw_reuse.finish(best_worker);
             return Ok(WorkerSelectionResult {
                 worker: best_worker,
                 required_blocks: request_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                max_raw_cached_tokens,
+                selected_raw_cached_tokens,
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(best_worker, block_size),
             });
@@ -754,11 +811,14 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             "Selected worker"
         );
 
+        let (max_raw_cached_tokens, selected_raw_cached_tokens) = raw_reuse.finish(best_worker);
         Ok(WorkerSelectionResult {
             worker: best_worker,
             required_blocks: request_blocks,
             effective_overlap_blocks: best_overlap,
             cached_tokens: best_cached_tokens,
+            max_raw_cached_tokens,
+            selected_raw_cached_tokens,
             potential_decode_blocks: request
                 .potential_decode_blocks_after_admission(best_worker, block_size),
         })
@@ -2253,5 +2313,154 @@ worker_selection:
         let mut request = two_tier_request(&[(1, 0, 0, 0), (2, 10, 0, 0)]);
         request.pinned_worker = Some(WorkerWithDpRank::from_worker_id(1));
         assert_eq!(select_ids(&selector, &request, &[1, 2]).worker.worker_id, 1);
+    }
+
+    // ---- Cache-reuse funnel (F2/F3): raw router-visible cached prefix ----
+
+    fn tracked(mut request: SchedulingRequest) -> SchedulingRequest {
+        request.mode = ScheduleMode::Tracked {
+            request_id: "tracked".into(),
+        };
+        request
+    }
+
+    #[test]
+    fn raw_cached_tokens_add_every_tier_without_weights() {
+        let mut request = base_request(128);
+        let worker = WorkerWithDpRank::from_worker_id(1);
+        request.overlap.tier_overlap_blocks.device.insert(worker, 2);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .host_pinned
+            .insert(worker, 3);
+        request.overlap.tier_overlap_blocks.disk.insert(worker, 1);
+        request.overlap.effective_cached_tokens.insert(worker, 7);
+        assert_eq!(request.raw_cached_tokens_for(worker, 16), 96);
+    }
+
+    #[test]
+    fn raw_overlap_is_specific_to_the_selected_dp_rank() {
+        let mut request = base_request(128);
+        let selected = WorkerWithDpRank::new(1, 0);
+        let other_rank = WorkerWithDpRank::new(1, 1);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .device
+            .insert(selected, 1);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .host_pinned
+            .insert(selected, 2);
+        request.overlap.tier_overlap_blocks.disk.insert(selected, 1);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .device
+            .insert(other_rank, 7);
+        assert_eq!(request.raw_cached_tokens_for(selected, 16), 64);
+        assert_eq!(request.raw_cached_tokens_for(other_rank, 16), 112);
+    }
+
+    #[test]
+    fn builtin_selector_reports_raw_cache_reuse_for_tracked_requests() {
+        // Worker 1 holds the longer raw prefix (2 device + 4 CPU blocks = 96 tokens) but is
+        // loaded; worker 2 holds 3 device blocks (48 tokens) and is idle, so it wins.
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                router_temperature: 0.0,
+                ..Default::default()
+            }),
+            "decode",
+        );
+        let mut request = tracked(two_tier_request(&[(1, 2, 4, 0), (2, 3, 0, 0)]));
+        request.worker_loads.insert(
+            WorkerWithDpRank::from_worker_id(1),
+            crate::sequences::WorkerLoadProjection {
+                active_decode_blocks: 1_000,
+                ..Default::default()
+            },
+        );
+        let result = select_ids(&selector, &request, &[1, 2]);
+        assert_eq!(result.worker.worker_id, 2);
+        assert_eq!(result.max_raw_cached_tokens, Some(96));
+        assert_eq!(result.selected_raw_cached_tokens, Some(48));
+    }
+
+    #[test]
+    fn two_tier_policy_counts_cpu_tier_in_raw_cache_reuse() {
+        // Load tier: worker 1 (8 device + 2 CPU blocks) is far busier, so the policy takes the
+        // idle cold worker 2; the best eligible raw prefix still counts worker 1's CPU blocks.
+        let selector = two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default());
+        let request = tracked(two_tier_request(&[(1, 8, 2, 100), (2, 0, 0, 0)]));
+        let result = select_ids(&selector, &request, &[1, 2]);
+        assert_eq!(result.worker.worker_id, 2);
+        assert_eq!(result.max_raw_cached_tokens, Some(160));
+        assert_eq!(result.selected_raw_cached_tokens, Some(0));
+
+        // Cache tier: a CPU-only prefix wins over nothing and counts at full raw size.
+        let request = tracked(two_tier_request(&[(1, 0, 8, 0), (2, 0, 0, 0)]));
+        let result = select_ids(&selector, &request, &[1, 2]);
+        assert_eq!(result.worker.worker_id, 1);
+        assert_eq!(result.max_raw_cached_tokens, Some(128));
+        assert_eq!(result.selected_raw_cached_tokens, Some(128));
+    }
+
+    #[test]
+    fn query_only_requests_skip_raw_cache_reuse() {
+        let selector = two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default());
+        let request = two_tier_request(&[(1, 4, 0, 0)]);
+        let result = select_ids(&selector, &request, &[1]);
+        assert_eq!(result.max_raw_cached_tokens, None);
+        assert_eq!(result.selected_raw_cached_tokens, None);
+
+        let builtin = DefaultWorkerSelector::new(None, "decode");
+        let result = select_ids(&builtin, &request, &[1]);
+        assert_eq!(result.max_raw_cached_tokens, None);
+        assert_eq!(result.selected_raw_cached_tokens, None);
+    }
+
+    #[test]
+    fn pinned_worker_is_its_own_best_eligible_prefix() {
+        for selector in [
+            DefaultWorkerSelector::new(None, "decode"),
+            two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default()),
+        ] {
+            let mut request = tracked(two_tier_request(&[(1, 1, 1, 0), (2, 9, 0, 0)]));
+            request.pinned_worker = Some(WorkerWithDpRank::from_worker_id(1));
+            let result = select_ids(&selector, &request, &[1, 2]);
+            assert_eq!(result.worker.worker_id, 1);
+            assert_eq!(result.max_raw_cached_tokens, Some(32));
+            assert_eq!(result.selected_raw_cached_tokens, Some(32));
+        }
+    }
+
+    #[test]
+    fn ineligible_workers_do_not_count_toward_best_eligible_prefix() {
+        for selector in [
+            DefaultWorkerSelector::new(None, "decode"),
+            two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default()),
+        ] {
+            let request = tracked(two_tier_request(&[(1, 9, 0, 0), (2, 1, 0, 0)]));
+            let workers = HashMap::from([
+                (1, TaintedWorkerConfig::default()),
+                (2, TaintedWorkerConfig::default()),
+            ]);
+            let overloaded = HashSet::from([1]);
+            let result = selector
+                .select_worker(
+                    &workers,
+                    &request,
+                    request.eligibility_with_overloaded(Some(&overloaded)),
+                    16,
+                )
+                .unwrap();
+            assert_eq!(result.worker.worker_id, 2);
+            // The overloaded worker's 144 cached tokens are not available reuse.
+            assert_eq!(result.max_raw_cached_tokens, Some(16));
+            assert_eq!(result.selected_raw_cached_tokens, Some(16));
+        }
     }
 }

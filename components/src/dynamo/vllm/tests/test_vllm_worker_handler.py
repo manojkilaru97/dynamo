@@ -2169,3 +2169,137 @@ class TestRLAdminRouteHardening:
         await guard.abort()
         assert len(escalated) == 1
         assert isinstance(escalated[0], EngineDeadError)
+
+
+# ---- Worker-reported KV cache reuse (router funnel F4, upstream #15443) ----
+
+
+def _cache_hit_generate(outputs, *, prompt_token_ids, num_cached_tokens):
+    async def fake_generate(*args, **kwargs):
+        for index, token_ids, finish_reason in outputs:
+            yield SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        index=index,
+                        token_ids=token_ids,
+                        routed_experts=None,
+                        finish_reason=finish_reason,
+                        stop_reason=None,
+                    )
+                ],
+                prompt_token_ids=prompt_token_ids,
+                prompt_logprobs=None,
+                num_cached_tokens=num_cached_tokens,
+            )
+
+    return fake_generate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("report_kv_cache_hit", [True, False])
+async def test_generate_tokens_reports_cache_hit_on_final_chunk(report_kv_cache_hit):
+    from vllm.sampling_params import SamplingParams
+
+    handler = _make_handler()
+    handler._extract_logprobs = MagicMock(return_value=(None, None))
+    handler.engine_client = MagicMock()
+    handler.engine_client.generate = _cache_hit_generate(
+        [(0, [11], None), (0, [12], "stop")],
+        prompt_token_ids=[1, 2, 3],
+        num_cached_tokens=2,
+    )
+
+    chunks = [
+        chunk
+        async for chunk in handler.generate_tokens(
+            PatchedTokensPrompt(prompt_token_ids=[1, 2, 3]),
+            SamplingParams(max_tokens=2),
+            "req-cache-hit",
+            report_kv_cache_hit=report_kv_cache_hit,
+        )
+    ]
+
+    assert "engine_data" not in chunks[0]
+    if report_kv_cache_hit:
+        assert chunks[-1]["engine_data"]["kv_cache_hit"] == {
+            "prompt_tokens": 3,
+            "reused_tokens": 2,
+        }
+    else:
+        assert "kv_cache_hit" not in chunks[-1].get("engine_data", {})
+
+
+@pytest.mark.asyncio
+async def test_generate_tokens_omits_cache_hit_for_parallel_samples():
+    """No n > 1 sample's cached count reliably measures prior reuse."""
+    from vllm.sampling_params import SamplingParams
+
+    handler = _make_handler()
+    handler._extract_logprobs = MagicMock(return_value=(None, None))
+    handler.engine_client = MagicMock()
+    handler.engine_client.generate = _cache_hit_generate(
+        [(1, [11], "stop"), (0, [12], "stop")],
+        prompt_token_ids=[1, 2],
+        num_cached_tokens=2,
+    )
+
+    chunks = [
+        chunk
+        async for chunk in handler.generate_tokens(
+            PatchedTokensPrompt(prompt_token_ids=[1, 2]),
+            SamplingParams(n=2, max_tokens=1),
+            "req-n2",
+        )
+    ]
+
+    assert [chunk.get("engine_data", {}).get("kv_cache_hit") for chunk in chunks] == [
+        None,
+        None,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generate_tokens_omits_cache_hit_without_engine_counters():
+    from vllm.sampling_params import SamplingParams
+
+    handler = _make_handler()
+    handler._extract_logprobs = MagicMock(return_value=(None, None))
+    handler.engine_client = MagicMock()
+    handler.engine_client.generate = _cache_hit_generate(
+        [(0, [11], "stop")], prompt_token_ids=[1, 2], num_cached_tokens=None
+    )
+
+    chunks = [
+        chunk
+        async for chunk in handler.generate_tokens(
+            PatchedTokensPrompt(prompt_token_ids=[1, 2]),
+            SamplingParams(max_tokens=1),
+            "req-no-counter",
+        )
+    ]
+
+    assert "kv_cache_hit" not in chunks[-1].get("engine_data", {})
+
+
+@pytest.mark.parametrize(
+    ("prompt_token_ids", "num_cached_tokens", "expected"),
+    [
+        ([1, 2, 3, 4], 3, {"prompt_tokens": 4, "reused_tokens": 3}),
+        ([1, 2, 3, 4], 0, {"prompt_tokens": 4, "reused_tokens": 0}),
+        ([1, 2], None, {}),
+        (None, 0, {}),
+    ],
+)
+def test_kv_cache_hit_engine_data_uses_stock_aggregate_counter(
+    prompt_token_ids, num_cached_tokens, expected
+):
+    request_output = mod.RequestOutput(
+        request_id="cache-reuse",
+        prompt=None,
+        prompt_token_ids=prompt_token_ids,
+        prompt_logprobs=None,
+        outputs=[],
+        finished=True,
+        num_cached_tokens=num_cached_tokens,
+    )
+    assert mod.BaseWorkerHandler._kv_cache_hit_engine_data(request_output) == expected

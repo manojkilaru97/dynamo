@@ -96,6 +96,34 @@ class frontend_service:
     OUTPUT_SEQUENCE_TOKENS = "output_sequence_tokens"
     # Predicted KV cache hit rate at routing time (0.0-1.0)
     KV_HIT_RATE = "kv_hit_rate"
+    # Raw cached prefix tokens on the best eligible worker at selection (per routing attempt)
+    KV_BEST_ELIGIBLE_CACHED_PREFIX_TOKENS_TOTAL = (
+        "kv_best_eligible_cached_prefix_tokens_total"
+    )
+    # Raw cached prefix tokens on the selected worker and DP rank at selection
+    KV_SELECTED_CACHED_PREFIX_TOKENS_TOTAL = "kv_selected_cached_prefix_tokens_total"
+    # Backend-reported cache-hit tokens
+    KV_WORKER_REUSED_TOKENS_TOTAL = "kv_worker_reused_tokens_total"
+    # Input tokens for cache-reuse observations started by the router
+    CACHE_LOSS_OBSERVATION_INPUT_TOKENS_TOTAL = (
+        "cache_loss_observation_input_tokens_total"
+    )
+    # Raw token observations at each cache-reuse funnel stage
+    CACHE_LOSS_FUNNEL_TOKENS_TOTAL = "cache_loss_funnel_tokens_total"
+    # Prompt-prefix tokens previously seen in this router's bounded history
+    KV_HISTORY_CACHED_PREFIX_TOKENS_TOTAL = "kv_history_cached_prefix_tokens_total"
+    # Cache-reuse observations by completion status
+    CACHE_LOSS_OBSERVATIONS_TOTAL = "cache_loss_observations_total"
+    # Distinct canonical block hashes retained by cache history
+    CACHE_LOSS_HISTORY_UNIQUE_HASHES = "cache_loss_history_unique_hashes"
+    # Tokens represented by distinct cache-history entries
+    CACHE_LOSS_HISTORY_REPRESENTED_TOKENS = "cache_loss_history_represented_tokens"
+    # Estimated bytes used by retained cache-history entries
+    CACHE_LOSS_HISTORY_ESTIMATED_BYTES = "cache_loss_history_estimated_bytes"
+    # Configured distinct-block capacity of cache history
+    CACHE_LOSS_HISTORY_CAPACITY_BLOCKS = "cache_loss_history_capacity_blocks"
+    # Configured byte budget of cache history
+    CACHE_LOSS_HISTORY_CAPACITY_BYTES = "cache_loss_history_capacity_bytes"
     # Upper-bound estimation of KV cache transfer latency in disaggregated serving (seconds)
     KV_TRANSFER_ESTIMATED_LATENCY_SECONDS = "kv_transfer_estimated_latency_seconds"
     # Number of cached tokens (prefix cache hits) per request
@@ -373,6 +401,16 @@ class router:
     OUTPUT_SEQUENCE_TOKENS = "router_output_sequence_tokens"
     # Predicted KV cache hit rate at routing time (0.0-1.0)
     KV_HIT_RATE = "router_kv_hit_rate"
+    # Raw cached prefix tokens on the best eligible worker (counter, per routing attempt)
+    KV_BEST_ELIGIBLE_CACHED_PREFIX_TOKENS_TOTAL = (
+        "router_kv_best_eligible_cached_prefix_tokens_total"
+    )
+    # Raw cached prefix tokens on the selected worker and DP rank (counter)
+    KV_SELECTED_CACHED_PREFIX_TOKENS_TOTAL = (
+        "router_kv_selected_cached_prefix_tokens_total"
+    )
+    # Backend-reported cache-hit tokens (counter)
+    KV_WORKER_REUSED_TOKENS_TOTAL = "router_kv_worker_reused_tokens_total"
     # Whether the router currently has a worker/dp_rank registered (1 = registered)
     WORKER_REGISTERED = "router_worker_registered"
 

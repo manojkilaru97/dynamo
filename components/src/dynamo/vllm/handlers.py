@@ -3634,6 +3634,22 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         return prompt, None
 
     @staticmethod
+    def _kv_cache_hit_engine_data(request_output: RequestOutput) -> Dict[str, Any]:
+        """Expose final cache counters for internal router observability.
+
+        ``num_cached_tokens`` is vLLM's per-request prefix hit at first schedule: local
+        prefix-cache blocks plus KV connector hits (for example CPU-offload loads).
+        """
+        prompt_tokens = getattr(request_output, "prompt_token_ids", None)
+        cached_tokens = getattr(request_output, "num_cached_tokens", None)
+        if prompt_tokens is None or not isinstance(cached_tokens, int):
+            return {}
+        return {
+            "prompt_tokens": len(prompt_tokens),
+            "reused_tokens": cached_tokens,
+        }
+
+    @staticmethod
     def _build_completion_usage(
         request_output: RequestOutput,
         completion_token_counts: dict[int, int] | None = None,
@@ -3761,6 +3777,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         priority=0,
         reasoning_ended=None,
         reasoning_parser_kwargs=None,
+        report_kv_cache_hit=True,
     ):
         try:
             # Log LoRA usage for this generation (debug level to avoid log spam)
@@ -3885,7 +3902,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                     finish_reason,
                     stop_reason,
                 ) in prepared_outputs:
-                    out = {
+                    out: Dict[str, Any] = {
                         "index": output_idx,
                         "token_ids": token_ids,
                     }
@@ -3923,6 +3940,19 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                                 else None
                             ),
                         )
+                        # With n > 1, later samples hit the prompt blocks earlier
+                        # ones just cached, and vLLM keeps the first buffered
+                        # sample's count when it merges outputs, so no sample's
+                        # count reliably measures prior reuse.
+                        kv_cache_hit = (
+                            BaseWorkerHandler._kv_cache_hit_engine_data(res)
+                            if report_kv_cache_hit and sampling_params.n == 1
+                            else {}
+                        )
+                        if kv_cache_hit:
+                            out.setdefault("engine_data", {})[
+                                "kv_cache_hit"
+                            ] = kv_cache_hit
                         if prompt_logprobs_payload is not None:
                             _attach_prompt_logprobs_engine_data(
                                 out, prompt_logprobs_payload
@@ -4288,6 +4318,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         priority=priority,
                         reasoning_ended=reasoning_ended,
                         reasoning_parser_kwargs=reasoning_parser_kwargs,
+                        # Transferred prefill KV counts as cached in vLLM, so a
+                        # decode attempt's count would not be local reuse.
+                        report_kv_cache_hit=kv_params is None,
                     ):
                         if abort_guard is not None:
                             abort_guard.signal_first_token()
@@ -4616,6 +4649,14 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                         request_output=res,
                     ),
                 }
+                # Parallel samples make the count unreliable; see generate_tokens.
+                kv_cache_hit = (
+                    BaseWorkerHandler._kv_cache_hit_engine_data(res)
+                    if sampling_params.n == 1
+                    else {}
+                )
+                if kv_cache_hit:
+                    output["engine_data"] = {"kv_cache_hit": kv_cache_hit}
 
                 # Log prefill completion with LoRA info
                 self._log_with_lora_context(

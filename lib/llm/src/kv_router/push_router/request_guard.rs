@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use dynamo_kv_router::scheduling::{RequestLifecycleLease, RequestProgressUpdater};
+use prometheus::IntCounter;
 use dynamo_runtime::{
     metrics::frontend_perf::{STAGE_DISPATCH, StageGuard},
     protocols::annotated::Annotated,
@@ -17,6 +18,38 @@ use crate::{
         timing::{RequestPhase, RequestTracker},
     },
 };
+
+/// Router-side cached-prefix estimate captured for one tracked routing attempt: the prompt
+/// length, the best cached prefix among eligible workers, and the cached prefix on the
+/// selected worker (all raw tokens, every router-visible tier including CPU offload).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RouteObservation {
+    pub(super) prompt_tokens: u64,
+    pub(super) best_router_tokens: u64,
+    pub(super) selected_router_tokens: u64,
+}
+
+struct KvHitTracking {
+    prompt_tokens: u64,
+    /// Taken by the first valid worker report, so an attempt counts at most once.
+    reused_tokens: Option<IntCounter>,
+}
+
+/// Cache-hit report the worker attaches to its final chunk (`engine_data.kv_cache_hit`).
+#[derive(serde::Deserialize)]
+struct WorkerCacheHitReport {
+    prompt_tokens: u64,
+    reused_tokens: u64,
+}
+
+/// Reused tokens from a worker report, accepted only when it describes the routed prompt.
+fn worker_cache_hit_tokens(prompt_tokens: u64, value: &serde_json::Value) -> Option<u64> {
+    let report = <WorkerCacheHitReport as serde::Deserialize>::deserialize(value).ok()?;
+    if report.prompt_tokens != prompt_tokens {
+        return None;
+    }
+    Some(report.reused_tokens)
+}
 
 /// Owns scheduler cleanup after a worker is selected.
 ///
@@ -283,6 +316,7 @@ pub(super) struct RequestGuard {
     observability: RequestObservability,
     output_blocks: OutputBlockTracker,
     prefill_marked: bool,
+    kv_hit: Option<KvHitTracking>,
 }
 
 impl RequestGuard {
@@ -293,6 +327,7 @@ impl RequestGuard {
         request: &PreprocessedRequest,
         scheduler_tracked: bool,
         lifecycle: Option<(RequestProgressUpdater, RequestLifecycleLease)>,
+        kv_route: Option<RouteObservation>,
     ) -> Self {
         // Snapshot request-scoped inputs now so the guard can outlive the
         // PreprocessedRequest after it is moved into backend dispatch.
@@ -308,6 +343,15 @@ impl RequestGuard {
         if scheduler_tracked {
             request_metrics.requests_started_total().inc();
         }
+        let kv_hit = kv_route.map(|route| KvHitTracking {
+            prompt_tokens: route.prompt_tokens,
+            reused_tokens: Some(request_metrics.observe_kv_route_estimate(
+                request.phase(),
+                &request.model,
+                route.best_router_tokens,
+                route.selected_router_tokens,
+            )),
+        });
 
         Self {
             cleanup: RequestCleanup::new(chooser, context_id, scheduler_tracked, lifecycle),
@@ -320,6 +364,7 @@ impl RequestGuard {
                 expected_output_tokens,
             ),
             prefill_marked: false,
+            kv_hit,
         }
     }
 
@@ -382,6 +427,8 @@ impl RequestGuard {
 
         let new_tokens = item.data.as_ref().map_or(0, |data| data.token_ids.len());
         self.observability.observe_tokens(new_tokens);
+        self.capture_kv_worker_hit(item);
+
         let cumulative_osl = self.observability.cumulative_osl();
         let Some(update) = self.output_blocks.observe(cumulative_osl) else {
             return;
@@ -433,6 +480,28 @@ impl RequestGuard {
     pub(super) async fn abort(&mut self) {
         self.cleanup.finish().await;
     }
+
+    /// Count a worker report once, even if the stream subsequently fails or is cancelled.
+    fn capture_kv_worker_hit(&mut self, item: &Annotated<LLMEngineOutput>) {
+        let Some(kv) = self.kv_hit.as_mut() else {
+            return;
+        };
+        if kv.reused_tokens.is_none() {
+            return;
+        }
+        let Some(reused) = item
+            .data
+            .as_ref()
+            .and_then(|data| data.engine_data.as_ref())
+            .and_then(|data| data.get("kv_cache_hit"))
+            .and_then(|value| worker_cache_hit_tokens(kv.prompt_tokens, value))
+        else {
+            return;
+        };
+        if let Some(counter) = kv.reused_tokens.take() {
+            counter.inc_by(reused);
+        }
+    }
 }
 
 impl Drop for RequestGuard {
@@ -441,3 +510,46 @@ impl Drop for RequestGuard {
         self.observability.record_metrics();
     }
 }
+
+#[cfg(test)]
+mod kv_cache_hit_tests {
+    use super::*;
+
+    fn report(reused: u64) -> serde_json::Value {
+        serde_json::json!({
+            "prompt_tokens": 100,
+            "reused_tokens": reused,
+        })
+    }
+
+    #[test]
+    fn worker_values_may_exceed_router_estimate_and_prompt_length() {
+        assert_eq!(worker_cache_hit_tokens(100, &report(135)), Some(135));
+    }
+
+    #[test]
+    fn missing_invalid_or_mismatched_reports_are_rejected() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"prompt_tokens": 100}),
+            serde_json::json!({"prompt_tokens": 99, "reused_tokens": 70}),
+            serde_json::json!({"prompt_tokens": 100, "reused_tokens": -1}),
+            serde_json::json!({"prompt_tokens": 100, "reused_tokens": null}),
+        ] {
+            assert_eq!(worker_cache_hit_tokens(100, &value), None);
+        }
+    }
+
+    #[test]
+    fn zero_reports_and_additive_extensions_are_accepted() {
+        let mut value = report(0);
+        value["tiers"] = serde_json::json!({"device": 0});
+        value["lookup_tokens"] = 0.into();
+        assert_eq!(worker_cache_hit_tokens(100, &value), Some(0));
+        assert_eq!(
+            worker_cache_hit_tokens(100, &report(u64::MAX)),
+            Some(u64::MAX)
+        );
+    }
+}
+

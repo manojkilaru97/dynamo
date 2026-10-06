@@ -26,6 +26,10 @@ pub(super) struct WorkerSelection {
     pub(super) overlap_amount: u32,
     pub(super) effective_overlap_blocks: f64,
     pub(super) cached_tokens: usize,
+    /// Selected worker's raw router-visible cached prefix, in tokens (F3).
+    pub(super) selected_raw_cached_tokens: Option<usize>,
+    /// Greatest raw router-visible cached prefix among eligible workers, in tokens (F2).
+    pub(super) max_raw_cached_tokens: Option<usize>,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) lifecycle: Option<(RequestProgressUpdater, RequestLifecycleLease)>,
 }
@@ -100,6 +104,8 @@ impl KvPushRouter {
                 overlap_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                selected_raw_cached_tokens,
+                max_raw_cached_tokens,
                 routing_hashes,
             } => Ok(WorkerSelection {
                 instance_id: worker.worker_id,
@@ -107,6 +113,8 @@ impl KvPushRouter {
                 overlap_amount: overlap_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                selected_raw_cached_tokens,
+                max_raw_cached_tokens,
                 routing_hashes,
                 lifecycle,
             }),

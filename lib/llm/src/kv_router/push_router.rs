@@ -34,7 +34,7 @@ mod request_guard;
 mod selection;
 
 use cancellation::cancel_on_stop;
-use request_guard::RequestGuard;
+use request_guard::{RequestGuard, RouteObservation};
 use selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
 
 const OUTPUT_REPLAY_ID_ANNOTATION_KEY: &str = "output_replay_id";
@@ -247,6 +247,20 @@ impl KvPushRouter {
         let request_context = request.context().clone();
         let routing_parts = RoutingRequestParts::new(request);
         let block_size = self.chooser.block_size() as usize;
+        // Funnel F2/F3 for tracked attempts: the router's raw cached-prefix estimates at
+        // selection, compared later against the worker's own reuse report (F4).
+        let kv_route = (!is_query_only)
+            .then(|| {
+                selection
+                    .max_raw_cached_tokens
+                    .zip(selection.selected_raw_cached_tokens)
+                    .map(|(best, selected)| RouteObservation {
+                        prompt_tokens: routing_parts.token_ids.len() as u64,
+                        best_router_tokens: best as u64,
+                        selected_router_tokens: selected as u64,
+                    })
+            })
+            .flatten();
         let mut guard = RequestGuard::new(
             self.chooser.clone(),
             self.request_metrics.clone(),
@@ -254,6 +268,7 @@ impl KvPushRouter {
             request,
             !is_query_only,
             selection.lifecycle.take(),
+            kv_route,
         );
 
         let record_result: Result<(), Error> = async {
@@ -310,10 +325,13 @@ impl KvPushRouter {
                     guard.request_metrics().kv_hit_rate.observe(hit_rate);
                 }
             }
-            guard
-                .request_metrics()
-                .input_sequence_tokens
-                .observe(request.token_ids.len() as f64);
+            if !is_query_only {
+                guard.request_metrics().observe_input_sequence_tokens(
+                    request.phase(),
+                    &request.model,
+                    request.token_ids.len(),
+                );
+            }
             Ok(())
         }
         .await;
@@ -531,9 +549,6 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                 );
                 tracker.record_router_queue_depth(self.chooser.pending_count());
             }
-            self.request_metrics
-                .input_sequence_tokens
-                .observe(request.token_ids.len() as f64);
             let stream_context = request.context().clone();
             let worker_id_info = request
                 .tracker
@@ -817,6 +832,7 @@ mod tests {
                     .request_progress
                     .take()
                     .zip(response.lifecycle_lease.take()),
+                None,
             );
             guard.mark_dispatched().await;
 
@@ -895,6 +911,7 @@ mod tests {
             "terminal-drain".to_string(),
             &request(),
             false,
+            None,
             None,
         );
         let monitored = monitor_response_stream(source, context, guard);
@@ -1109,6 +1126,56 @@ mod tests {
     async fn session_affinity_disabled_does_not_create_coordinator() {
         let (router, runtime) = router(None).await;
         assert!(router.affinity.is_none());
+
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn worker_cache_hit_report_counts_once_per_tracked_attempt() {
+        let (router, runtime) = router(None).await;
+        let metrics = router.request_metrics.clone();
+        let labels = [RequestPhase::Aggregated.as_str(), "test"];
+        let reused = metrics.kv_worker_reused_tokens.with_label_values(&labels);
+        let input = metrics.input_sequence_tokens.with_label_values(&labels);
+        let (reused_before, input_before) = (reused.get(), input.get_sample_count());
+        let report = |prompt_tokens: u64, reused_tokens: u64| {
+            Annotated::from_data(LLMEngineOutput {
+                engine_data: Some(serde_json::json!({
+                    "kv_cache_hit": {
+                        "prompt_tokens": prompt_tokens,
+                        "reused_tokens": reused_tokens,
+                    }
+                })),
+                ..Default::default()
+            })
+        };
+
+        // Query-only selections record no funnel observation.
+        let (_, selection, mut query_guard) = track_request(&router, true).await;
+        assert_eq!(selection.max_raw_cached_tokens, None);
+        assert_eq!(selection.selected_raw_cached_tokens, None);
+        query_guard.on_item(&report(1, 1)).await;
+        query_guard.abort().await;
+        drop(query_guard);
+        assert_eq!(input.get_sample_count(), input_before);
+        assert_eq!(reused.get(), reused_before);
+
+        // A tracked attempt records F0 once and counts the first matching report only.
+        let (_, selection, mut guard) = track_request(&router, false).await;
+        assert_eq!(selection.max_raw_cached_tokens, Some(0));
+        assert_eq!(selection.selected_raw_cached_tokens, Some(0));
+        assert_eq!(input.get_sample_count(), input_before + 1);
+        guard.on_item(&report(2, 5)).await;
+        assert_eq!(reused.get(), reused_before, "prompt length mismatch is ignored");
+        guard.on_item(&report(1, 1)).await;
+        assert_eq!(reused.get(), reused_before + 1);
+        guard.on_item(&report(1, 1)).await;
+        assert_eq!(reused.get(), reused_before + 1, "a second report is not counted");
+        guard.abort().await;
+        drop(guard);
+        assert_eq!(reused.get(), reused_before + 1);
 
         drop(router);
         runtime.shutdown();

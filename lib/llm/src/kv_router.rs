@@ -135,6 +135,11 @@ pub enum FindBestMatchOutcome {
         overlap_blocks: u32,
         effective_overlap_blocks: f64,
         cached_tokens: usize,
+        /// Selected worker's raw router-visible cached prefix (F3), tracked requests only.
+        selected_raw_cached_tokens: Option<usize>,
+        /// Best raw router-visible cached prefix among eligible workers (F2), tracked
+        /// requests only.
+        max_raw_cached_tokens: Option<usize>,
         routing_hashes: Option<RoutingDecisionHashes>,
     },
     QueueRejected {
@@ -910,6 +915,8 @@ where
                 overlap_blocks: response.effective_overlap_blocks.round() as u32,
                 effective_overlap_blocks: response.effective_overlap_blocks,
                 cached_tokens: response.cached_tokens,
+                selected_raw_cached_tokens: response.selected_raw_cached_tokens,
+                max_raw_cached_tokens: response.max_raw_cached_tokens,
                 routing_hashes,
             },
             lifecycle,
@@ -1642,6 +1649,8 @@ mod tests {
                 required_blocks: request.isl_tokens.div_ceil(block_size as usize) as u64,
                 effective_overlap_blocks: 0.0,
                 cached_tokens: 0,
+                max_raw_cached_tokens: None,
+                selected_raw_cached_tokens: None,
                 potential_decode_blocks: request
                     .worker_load_for(self.selected_worker)
                     .potential_decode_blocks()
