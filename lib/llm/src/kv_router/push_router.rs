@@ -348,6 +348,13 @@ impl KvPushRouter {
                 request.token_ids.len(),
             );
         }
+        // Likewise attach the sampled decision before that await, so a request cancelled while
+        // the decision is being recorded still carries it on its request-end record.
+        if let (Some(tracker), Some(trace)) =
+            (request.tracker.as_ref(), selection.decision_trace.take())
+        {
+            tracker.record_routing_decision_trace(trace);
+        }
 
         let record_result: Result<(), Error> = async {
             if !is_query_only && self.chooser.indexer().records_routing_decisions() {
@@ -390,9 +397,6 @@ impl KvPushRouter {
             }
 
             if let Some(ref tracker) = request.tracker {
-                if let Some(trace) = selection.decision_trace.take() {
-                    tracker.record_routing_decision_trace(trace);
-                }
                 let isl_blocks = routing_parts.token_ids.len().div_ceil(block_size);
                 tracker.record_kv_hit(selection.effective_overlap_blocks, isl_blocks);
                 tracker.record_isl(routing_parts.token_ids.len(), Some(selection.cached_tokens));
@@ -2053,6 +2057,44 @@ mod tests {
         drop(guard);
         assert_eq!(best.get() - best_before, 96);
         assert_eq!(chosen.get() - chosen_before, 64);
+        drop(router);
+        runtime.shutdown();
+    }
+
+    /// A request stopped after selection keeps its F0 observation and sampled decision, whether
+    /// or not the routing-decision record then observes the cancellation.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stop_after_selection_keeps_f0_and_the_sampled_decision() {
+        use crate::protocols::common::timing::RequestTracker;
+
+        let (router, runtime) = router_with_selector(None, |config| {
+            DefaultWorkerSelector::new(Some(config), "decode")
+                .with_decision_trace_sample_rate(Some(1.0))
+        })
+        .await;
+        let input = router
+            .request_metrics
+            .input_sequence_tokens
+            .with_label_values(&[RequestPhase::Aggregated.as_str(), UNKNOWN_METRICS_MODEL]);
+        let input_before = input.get_sample_count();
+        let tracker = Arc::new(RequestTracker::new());
+        let mut stopped = request();
+        stopped.tracker = Some(tracker.clone());
+        let stopped = Context::new(stopped);
+        let (mut selection, _) = router
+            .select_with_affinity(&stopped, RequestPhase::Aggregated, false)
+            .await
+            .unwrap();
+        stopped.context().stop_generating();
+        if let Ok(mut guard) = router
+            .track_selection(&stopped, &mut selection, false)
+            .await
+        {
+            guard.abort().await;
+        }
+        assert_eq!(input.get_sample_count(), input_before + 1);
+        assert!(tracker.routing_decision_trace().is_some());
         drop(router);
         runtime.shutdown();
     }

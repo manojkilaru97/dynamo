@@ -1204,6 +1204,8 @@ async def test_prefill_returns_structured_error_when_multimodal_is_disabled():
         {
             "status": "error",
             "message": "use --enable-multimodal",
+            "finish_reason": "error: use --enable-multimodal",
+            "token_ids": [],
             "disaggregated_params": None,
         }
     ]

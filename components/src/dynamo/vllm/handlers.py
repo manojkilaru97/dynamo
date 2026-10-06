@@ -4514,9 +4514,13 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             self._multimodal_request_processor.validate_multimodal_request(request)
         except ValueError as exc:
             logger.error("Request %s: %s", request_id, exc)
+            # `finish_reason` marks the attempt failed for the router, so cache-reuse
+            # history does not learn a prompt the engine never ran.
             yield {
                 "status": "error",
                 "message": str(exc),
+                "finish_reason": f"error: {exc}",
+                "token_ids": [],
                 "disaggregated_params": None,
             }
             return

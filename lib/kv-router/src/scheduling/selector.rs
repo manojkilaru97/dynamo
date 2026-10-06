@@ -3229,6 +3229,75 @@ worker_selection:
         }
     }
 
+    #[derive(Clone, Default)]
+    struct TwoRankWorkerConfig;
+
+    impl WorkerConfigLike for TwoRankWorkerConfig {
+        fn data_parallel_start_rank(&self) -> u32 {
+            0
+        }
+
+        fn data_parallel_size(&self) -> u32 {
+            2
+        }
+
+        fn max_num_batched_tokens(&self) -> Option<u64> {
+            None
+        }
+
+        fn total_kv_blocks(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    #[test]
+    fn f2_and_f3_follow_the_selected_nonzero_dp_rank() {
+        // Worker 1 rank 0: 6 device blocks but heavily loaded; rank 1: 2 device + 2 CPU blocks.
+        let workers = HashMap::from([(1, TwoRankWorkerConfig)]);
+        let rank0 = WorkerWithDpRank::new(1, 0);
+        let rank1 = WorkerWithDpRank::new(1, 1);
+        for selector in [
+            DefaultWorkerSelector::new(
+                Some(KvRouterConfig {
+                    router_temperature: 0.0,
+                    ..Default::default()
+                }),
+                "decode",
+            ),
+            two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default()),
+        ] {
+            let selector = selector.with_decision_trace_sample_rate(Some(1.0));
+            let mut request = tracked(base_request(160));
+            let tiers = &mut request.overlap.tier_overlap_blocks;
+            tiers.device.insert(rank0, 6);
+            tiers.device.insert(rank1, 2);
+            tiers.host_pinned.insert(rank1, 2);
+            request.overlap.effective_overlap_blocks.insert(rank0, 6.0);
+            request.overlap.effective_overlap_blocks.insert(rank1, 3.5);
+            request.worker_loads.insert(
+                rank0,
+                crate::sequences::WorkerLoadProjection {
+                    active_decode_blocks: 10_000,
+                    active_requests: 1_000,
+                    ..Default::default()
+                },
+            );
+            request
+                .worker_loads
+                .insert(rank1, crate::sequences::WorkerLoadProjection::default());
+            let mut result = selector
+                .select_worker(&workers, &request, request.eligibility(), 16)
+                .unwrap();
+            assert_eq!(result.worker, rank1);
+            assert_eq!(result.max_raw_cached_tokens, Some(6 * 16));
+            assert_eq!(result.selected_raw_cached_tokens, Some(4 * 16));
+            let trace = result.decision_trace.take().unwrap();
+            assert_eq!((trace.selected_worker_id, trace.selected_dp_rank), (1, 1));
+            let selected = trace.candidates.iter().find(|c| c.selected).unwrap();
+            assert_eq!((selected.dp_rank, selected.raw_cached_tokens), (1, 64));
+        }
+    }
+
     #[test]
     fn out_of_range_dp_rank_is_not_an_eligible_prefix() {
         // Worker 1 advertises one DP rank (0); a stale overlap entry for rank 1 must not count.
