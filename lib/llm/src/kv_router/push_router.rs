@@ -1644,6 +1644,123 @@ mod tests {
         runtime.shutdown();
     }
 
+    /// Drive the exact chunks the vLLM prefill handler yields through the router's stream
+    /// monitor with a history-enabled guard; return (learned history, complete, incomplete).
+    async fn run_prefill_chunks(
+        router: &KvPushRouter,
+        prompt: Vec<u32>,
+        chunks: Vec<serde_json::Value>,
+    ) -> (Arc<CacheHistory>, u64, u64) {
+        use crate::kv_router::metrics::{RouterRequestMetrics, test_hierarchy::IsolatedHierarchy};
+
+        let hierarchy = IsolatedHierarchy::default();
+        let metrics = temp_env::with_var(
+            cache_history::CACHE_REUSE_HISTORY_ENABLED_ENV,
+            Some("true"),
+            || RouterRequestMetrics::for_test(&hierarchy),
+        );
+        let history = Arc::new(CacheHistory::with_capacity(64, 16));
+        let prompt_hashes = dynamo_kv_router::protocols::compute_seq_hash_for_block(
+            &dynamo_kv_router::protocols::compute_block_hash_for_seq(
+                &prompt,
+                16,
+                Default::default(),
+            ),
+        );
+        let mut request = request();
+        request.token_ids = prompt.clone();
+        let mut guard = RequestGuard::new(
+            Arc::clone(&router.chooser),
+            Arc::clone(&metrics),
+            "prefill-producer".to_string(),
+            &request,
+            false,
+            None,
+            None,
+            UNKNOWN_METRICS_MODEL,
+        );
+        guard.track_cache_history(
+            CacheHistoryTracking::new(Arc::clone(&history), prompt_hashes, prompt.len() as u64),
+            &request,
+            16,
+            false,
+        );
+        let items: Vec<Annotated<LLMEngineOutput>> = chunks
+            .into_iter()
+            .map(|chunk| Annotated::from_data(serde_json::from_value(chunk).unwrap()))
+            .collect();
+        let context = Context::new(()).context();
+        let source = ResponseStream::new(Box::pin(stream::iter(items)), Arc::clone(&context));
+        {
+            let monitored = monitor_response_stream(source, context, guard);
+            tokio::pin!(monitored);
+            while monitored.next().await.is_some() {}
+        }
+        let (_, _, complete, incomplete, _) = metrics.cache_history_values_for_test().unwrap();
+        (history, complete, incomplete)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn engine_aborted_prefill_is_incomplete_and_teaches_nothing() {
+        let (router, runtime) = router(None).await;
+        // `PrefillWorkerHandler` maps vLLM's `abort` to `cancelled`.
+        let (history, complete, incomplete) = run_prefill_chunks(
+            &router,
+            (1..=32).collect(),
+            vec![serde_json::json!({
+                "token_ids": [7],
+                "index": 0,
+                "finish_reason": "cancelled",
+                "disaggregated_params": null,
+                "completion_usage": {"prompt_tokens": 32, "completion_tokens": 1, "total_tokens": 33}
+            })],
+        )
+        .await;
+        assert_eq!((complete, incomplete), (0, 1));
+        assert_eq!(history.stats().retained_entries, 0);
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn split_parallel_prefill_samples_do_not_materialize_a_block() {
+        let (router, runtime) = router(None).await;
+        // A 15-token prompt and two independent one-token samples: neither sample's token
+        // has KV, so no 16-token block exists. Without choice indexes the router would join
+        // them and treat the second token as proof that the first block was computed.
+        let sample = |index: u32, token: u32| {
+            serde_json::json!({
+                "token_ids": [token],
+                "index": index,
+                "finish_reason": "length",
+                "disaggregated_params": {"kv_transfer_params": {"remote": index}}
+            })
+        };
+        let (history, complete, incomplete) = run_prefill_chunks(
+            &router,
+            (1..=15).collect(),
+            vec![sample(0, 100), sample(1, 200)],
+        )
+        .await;
+        assert_eq!((complete, incomplete), (1, 0));
+        assert_eq!(history.stats().retained_entries, 0);
+
+        // The same tokens without indexes (the old producer) would have materialized one.
+        let unindexed =
+            |token: u32| serde_json::json!({"token_ids": [token], "finish_reason": "length"});
+        let (history, _, _) = run_prefill_chunks(
+            &router,
+            (1..=15).collect(),
+            vec![unindexed(100), unindexed(200)],
+        )
+        .await;
+        assert_eq!(history.stats().retained_entries, 1);
+        drop(router);
+        runtime.shutdown();
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn cache_history_ignores_multimodal_padding() {

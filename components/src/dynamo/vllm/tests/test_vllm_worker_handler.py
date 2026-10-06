@@ -2427,3 +2427,115 @@ async def test_decode_reports_cache_hit_only_without_transferred_kv(
         pass
 
     assert seen_report_flags == [expected_report]
+
+
+def _prefill_handler_for_outputs(monkeypatch, responses_list, n=1):
+    """A prefill handler whose engine streams the given RequestOutputs."""
+    handler = mod.PrefillWorkerHandler.__new__(mod.PrefillWorkerHandler)
+    request = {"token_ids": [1, 2, 3]}
+
+    async def responses():
+        for response in responses_list:
+            yield response
+
+    handler._multimodal_request_processor = SimpleNamespace(
+        prepare_input=AsyncMock(
+            return_value=PreparedMultimodalInput(
+                request=request, multi_modal_data=None, mm_processor_kwargs=None
+            )
+        ),
+        build_prefill_handoff=MagicMock(return_value=None),
+    )
+    handler._build_prompt_from_request = MagicMock(
+        return_value=({"prompt_token_ids": request["token_ids"]}, None)
+    )
+    handler.default_sampling_params = {}
+    handler.model_max_len = 128
+    handler.config = SimpleNamespace(enable_rl=False)
+    handler.engine_client = MagicMock()
+    handler._resolve_lora_request = MagicMock(return_value=None)
+    handler._to_local_dp_rank = MagicMock(return_value=None)
+
+    @asynccontextmanager
+    async def no_abort_monitor(*args, **kwargs):
+        yield
+
+    handler._abort_monitor = no_abort_monitor
+    handler._generate_with_lora_admission_lock = MagicMock(return_value=responses())
+    handler._log_with_lora_context = MagicMock()
+    protocol = MagicMock()
+    protocol.prefill_request_kv_transfer_params.return_value = {}
+    protocol.decode_request_kv_transfer_params.return_value = None
+    monkeypatch.setattr(mod, "make_kv_connector_protocol", lambda *_: protocol)
+    monkeypatch.setattr(
+        mod, "build_sampling_params", lambda *args, **kwargs: MagicMock(n=n)
+    )
+    return handler, request
+
+
+def _prefill_output(index, token_ids, finish_reason):
+    return mod.RequestOutput(
+        request_id="prefill-finish",
+        prompt=None,
+        prompt_token_ids=[1, 2, 3],
+        prompt_logprobs=None,
+        outputs=[
+            SimpleNamespace(
+                index=index, token_ids=token_ids, finish_reason=finish_reason
+            )
+        ],
+        finished=finish_reason is not None,
+        num_cached_tokens=0,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("engine_reason", "forwarded"),
+    [
+        ("length", "length"),
+        ("abort", "cancelled"),
+        ("stop", "stop"),
+        (None, None),
+    ],
+)
+async def test_prefill_forwards_normalized_finish_reason(
+    monkeypatch, engine_reason, forwarded
+):
+    handler, request = _prefill_handler_for_outputs(
+        monkeypatch, [_prefill_output(0, [7], engine_reason)]
+    )
+
+    chunks = [
+        chunk
+        async for chunk in handler._generate_token_mode(
+            request, MagicMock(), "prefill-finish"
+        )
+    ]
+
+    assert len(chunks) == 1
+    assert chunks[0].get("finish_reason") == forwarded
+    assert chunks[0]["index"] == 0
+    assert chunks[0]["token_ids"] == [7]
+
+
+@pytest.mark.asyncio
+async def test_prefill_keeps_each_parallel_sample_choice_index(monkeypatch):
+    handler, request = _prefill_handler_for_outputs(
+        monkeypatch,
+        [_prefill_output(0, [7], "length"), _prefill_output(1, [8], "length")],
+        n=2,
+    )
+
+    chunks = [
+        chunk
+        async for chunk in handler._generate_token_mode(
+            request, MagicMock(), "prefill-finish"
+        )
+    ]
+
+    assert [(chunk["index"], chunk["token_ids"]) for chunk in chunks] == [
+        (0, [7]),
+        (1, [8]),
+    ]
+    assert all("engine_data" not in chunk for chunk in chunks)

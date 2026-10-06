@@ -4631,7 +4631,8 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             async for res in gen:
                 logger.debug(f"kv transfer params: {res.kv_transfer_params}")
 
-                token_ids = res.outputs[0].token_ids if res.outputs else []
+                completion = res.outputs[0] if res.outputs else None
+                token_ids = completion.token_ids if completion is not None else []
 
                 # For prefill worker, only one res will be generated,
                 # so we can always build embedding params here without conditionals
@@ -4653,6 +4654,17 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                         request_output=res,
                     ),
                 }
+                if completion is not None:
+                    # Parallel samples stream as separate outputs; keep each one's
+                    # choice so the router does not join independent samples.
+                    output["index"] = completion.index
+                    # `length` (the one-token budget) still hands off to decode; any
+                    # other reason ends the request here. An engine abort becomes
+                    # `cancelled`, so the router counts the attempt as failed.
+                    if completion.finish_reason:
+                        output["finish_reason"] = normalize_finish_reason(
+                            completion.finish_reason
+                        )
                 # Parallel samples make the count unreliable; see generate_tokens.
                 kv_cache_hit = (
                     BaseWorkerHandler._kv_cache_hit_engine_data(res)
