@@ -39,6 +39,9 @@ pub(crate) struct CacheHistory {
     fifo: Mutex<VecDeque<u64>>,
     shards: Box<[RwLock<FxHashSet<u64>>]>,
     retained_entries: AtomicUsize,
+    /// Serializes reading the size and writing the process-global gauges, so concurrent local
+    /// and peer completions cannot leave an older size as the last published value.
+    publish: Mutex<()>,
     sync: OnceLock<sync::HistorySync>,
 }
 
@@ -79,6 +82,7 @@ impl CacheHistory {
             fifo: Mutex::new(VecDeque::new()),
             shards,
             retained_entries: AtomicUsize::new(0),
+            publish: Mutex::new(()),
             sync: OnceLock::new(),
         }
     }
@@ -150,6 +154,15 @@ impl CacheHistory {
         }
         self.retained_entries.store(fifo.len(), Ordering::Relaxed);
         (fifo.len() != initial_len).then(|| self.stats_for_entries(fifo.len()))
+    }
+
+    /// Publish the current retained size to the history gauges.
+    pub(crate) fn publish_retained(
+        &self,
+        metrics: &crate::kv_router::metrics::RouterRequestMetrics,
+    ) {
+        let _publish = self.publish.lock();
+        metrics.set_cache_history_retained(self.stats());
     }
 
     pub(crate) fn stats(&self) -> CacheHistoryStats {

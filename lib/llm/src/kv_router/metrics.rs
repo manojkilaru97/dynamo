@@ -1096,6 +1096,20 @@ impl RouterRequestMetrics {
         }
     }
 
+    /// `(f0, f1, complete, incomplete, retained_entries)` of the F1 series, when enabled.
+    #[cfg(test)]
+    pub(crate) fn cache_history_values_for_test(&self) -> Option<(u64, u64, u64, u64, i64)> {
+        self.cache_history.as_ref().map(|metrics| {
+            (
+                metrics.f0_tokens_total.get(),
+                metrics.f1_tokens_total.get(),
+                metrics.complete_observations_total.get(),
+                metrics.incomplete_observations_total.get(),
+                metrics.retained_entries.get(),
+            )
+        })
+    }
+
     pub(crate) fn observe_cache_history_input(&self, prompt_tokens: u64) {
         let Some(metrics) = &self.cache_history else {
             return;

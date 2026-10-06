@@ -262,12 +262,12 @@ impl KvPushRouter {
         let block_size = self.chooser.block_size() as usize;
         // Funnel F2/F3 for tracked attempts: the router's raw cached-prefix estimates at
         // selection, compared later against the worker's own reuse report (F4).
-        // Label funnel series with the router's own model when it has one, so a caller-chosen
-        // `model` string (the standalone router does not validate it) cannot grow cardinality.
+        // Label funnel series with the router's own model, never a caller-chosen string (the
+        // standalone router does not validate `model`), so the label set stays bounded.
         let metrics_model = self
             .chooser
             .served_model_name()
-            .unwrap_or(request.model.as_str());
+            .unwrap_or(UNKNOWN_METRICS_MODEL);
         let kv_route = (!is_query_only)
             .then(|| {
                 selection
@@ -300,6 +300,16 @@ impl KvPushRouter {
                         .take()
                         .map(|hashes| hashes.sequence_hashes)
                 }
+            })
+            .map(|mut hashes| {
+                // Multimodal routing buffers are zero-padded to a block multiple; F1 counts only
+                // complete blocks of the real prompt, and generated blocks continue from them.
+                hashes.truncate(complete_prompt_blocks(
+                    request.routed_prompt_len(),
+                    self.chooser.block_size(),
+                    self.chooser.is_eagle(),
+                ));
+                hashes
             });
         let mut guard = RequestGuard::new(
             self.chooser.clone(),
@@ -659,6 +669,21 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             Some(operation) => operation.into_stream(selected_target, stream),
             None => Ok(stream),
         }
+    }
+}
+
+/// `model` label for funnel series when the router was not built for a named model.
+const UNKNOWN_METRICS_MODEL: &str = "unknown";
+
+/// Complete blocks the router hashes for a prompt of `tokens` (Eagle windows overlap by one).
+fn complete_prompt_blocks(tokens: usize, block_size: u32, is_eagle: bool) -> usize {
+    let block_size = block_size as usize;
+    if block_size == 0 {
+        0
+    } else if is_eagle {
+        tokens.saturating_sub(1) / block_size
+    } else {
+        tokens / block_size
     }
 }
 
@@ -1369,6 +1394,155 @@ mod tests {
         }
     }
 
+    /// F1 observations and gauges through the guard lifecycle, on isolated history-enabled
+    /// metrics (the process-global metrics may have been created with history off).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cache_history_metrics_follow_the_attempt_outcome() {
+        use crate::kv_router::metrics::{RouterRequestMetrics, test_hierarchy::IsolatedHierarchy};
+
+        let (router, runtime) = router(None).await;
+        let hierarchy = IsolatedHierarchy::default();
+        let metrics = temp_env::with_var(
+            cache_history::CACHE_REUSE_HISTORY_ENABLED_ENV,
+            Some("true"),
+            || RouterRequestMetrics::for_test(&hierarchy),
+        );
+        let history = Arc::new(CacheHistory::with_capacity(64, 16));
+        let prompt: Vec<u32> = (1..=32).collect();
+        let prompt_hashes = |tokens: &[u32]| {
+            dynamo_kv_router::protocols::compute_seq_hash_for_block(
+                &dynamo_kv_router::protocols::compute_block_hash_for_seq(
+                    tokens,
+                    16,
+                    Default::default(),
+                ),
+            )
+        };
+        let attempt = |terminal: bool| {
+            let mut request = request();
+            request.token_ids = prompt.clone();
+            let mut guard = RequestGuard::new(
+                Arc::clone(&router.chooser),
+                Arc::clone(&metrics),
+                format!("history-{terminal}"),
+                &request,
+                false,
+                None,
+                None,
+                UNKNOWN_METRICS_MODEL,
+            );
+            guard.track_cache_history(
+                CacheHistoryTracking::new(Arc::clone(&history), prompt_hashes(&prompt), 32),
+                &request,
+                16,
+                false,
+            );
+            if terminal {
+                guard.mark_completed_terminal();
+            }
+            guard
+        };
+
+        // Aborted before any terminal: one incomplete observation, nothing learned.
+        let mut aborted = attempt(false);
+        aborted.abort().await;
+        drop(aborted);
+        assert_eq!(
+            metrics.cache_history_values_for_test(),
+            Some((0, 0, 0, 1, 0))
+        );
+
+        // Completed: F0 32, nothing seen before, two blocks learned; drop adds nothing.
+        let mut completed = attempt(false);
+        completed.finish().await;
+        drop(completed);
+        assert_eq!(
+            metrics.cache_history_values_for_test(),
+            Some((32, 0, 1, 1, 2))
+        );
+
+        // A delivered terminal item counts as complete even if the stream is then dropped,
+        // and the repeat sees both prompt blocks.
+        drop(attempt(true));
+        assert_eq!(
+            metrics.cache_history_values_for_test(),
+            Some((64, 32, 2, 1, 2))
+        );
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cache_history_ignores_multimodal_padding() {
+        use crate::protocols::common::preprocessor::MmRoutingInfo;
+        use dynamo_kv_router::protocols::{compute_block_hash_for_seq, compute_seq_hash_for_block};
+
+        temp_env::async_with_vars(
+            [(cache_history::CACHE_REUSE_HISTORY_ENABLED_ENV, Some("true"))],
+            async {
+                let (router, runtime) = router(None).await;
+                let history = router.cache_history.clone().expect("history is enabled");
+                let hashes = |tokens: &[u32]| {
+                    compute_seq_hash_for_block(&compute_block_hash_for_seq(
+                        tokens,
+                        16,
+                        Default::default(),
+                    ))
+                };
+                // 20 expanded prompt tokens, zero-padded to two 16-token routing blocks.
+                let real: Vec<u32> = (1..=20).collect();
+                let mut padded_tokens = real.clone();
+                padded_tokens.resize(32, 0);
+                let mut padded = request();
+                padded.token_ids = real.clone();
+                padded.mm_routing_info = Some(MmRoutingInfo {
+                    routing_token_ids: padded_tokens.clone(),
+                    block_mm_infos: vec![None, None],
+                    expanded_prompt_len: 20,
+                });
+                let padded = Context::new(padded);
+                let (mut selection, _) = router
+                    .select_with_affinity(&padded, RequestPhase::Aggregated, false)
+                    .await
+                    .unwrap();
+                let mut guard = router
+                    .track_selection(&padded, &mut selection, false)
+                    .await
+                    .unwrap();
+                // Thirteen generated tokens complete the real second block (4 prompt + 12
+                // output; the newest token has no KV yet).
+                let output: Vec<u32> = (100..113).collect();
+                guard.mark_dispatched().await;
+                guard
+                    .on_item(&Annotated::from_data(LLMEngineOutput {
+                        token_ids: output.clone(),
+                        ..Default::default()
+                    }))
+                    .await;
+                guard.finish().await;
+                drop(guard);
+
+                // Only the real complete prompt block is learned, never the padded block.
+                assert_eq!(
+                    history.previously_computed_tokens(&hashes(&padded_tokens)),
+                    16
+                );
+                assert_eq!(history.stats().retained_entries, 2);
+                // The generated block continues the real prompt chain, so a follow-up turn
+                // that replays prompt + output matches both blocks.
+                let mut follow_up = real.clone();
+                follow_up.extend_from_slice(&output[..12]);
+                assert_eq!(history.previously_computed_tokens(&hashes(&follow_up)), 32);
+
+                drop(router);
+                runtime.shutdown();
+            },
+        )
+        .await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn cache_history_is_off_by_default() {
@@ -1389,7 +1563,7 @@ mod tests {
     async fn worker_cache_hit_report_counts_once_per_tracked_attempt() {
         let (router, runtime) = router(None).await;
         let metrics = router.request_metrics.clone();
-        let labels = [RequestPhase::Aggregated.as_str(), "test"];
+        let labels = [RequestPhase::Aggregated.as_str(), UNKNOWN_METRICS_MODEL];
         let reused = metrics.kv_worker_reused_tokens.with_label_values(&labels);
         let input = metrics.input_sequence_tokens.with_label_values(&labels);
         let (reused_before, input_before) = (reused.get(), input.get_sample_count());
@@ -1566,7 +1740,7 @@ mod tests {
         let reused = router
             .request_metrics
             .kv_worker_reused_tokens
-            .with_label_values(&[RequestPhase::Aggregated.as_str(), "test"]);
+            .with_label_values(&[RequestPhase::Aggregated.as_str(), UNKNOWN_METRICS_MODEL]);
         let before = reused.get();
         // 20 expanded prompt tokens, zero-padded to two 16-token routing blocks.
         let mut padded = request();
@@ -1612,7 +1786,7 @@ mod tests {
         let series = |phase: RequestPhase| {
             metrics
                 .kv_worker_reused_tokens
-                .with_label_values(&[phase.as_str(), "test"])
+                .with_label_values(&[phase.as_str(), UNKNOWN_METRICS_MODEL])
         };
         let (prefill_before, decode_before) = (
             series(RequestPhase::Prefill).get(),

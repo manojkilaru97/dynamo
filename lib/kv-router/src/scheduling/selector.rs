@@ -111,15 +111,19 @@ fn finish_decision_trace(
     two_tier: Option<TwoTierDecisionTrace>,
 ) -> Option<Box<RoutingDecisionTrace>> {
     candidates.sort_unstable_by_key(|candidate| (candidate.worker_id, candidate.dp_rank));
+    let selected_candidate = candidates.iter().find(|candidate| candidate.selected)?;
+    let selected_overlap = policy_overlap(selected_candidate);
+    // On a tie the selected worker is the max-overlap worker, so ties never look like a loss.
     let max_overlap = candidates
         .iter()
-        .max_by(|left, right| policy_overlap(left).total_cmp(&policy_overlap(right)))?;
+        .max_by(|left, right| policy_overlap(left).total_cmp(&policy_overlap(right)))
+        .filter(|max| policy_overlap(max) > selected_overlap)
+        .unwrap_or(selected_candidate);
     let (max_overlap_worker_id, max_overlap_dp_rank, max_overlap_blocks) = (
         max_overlap.worker_id,
         max_overlap.dp_rank,
         policy_overlap(max_overlap),
     );
-    let selected_overlap = policy_overlap(candidates.iter().find(|candidate| candidate.selected)?);
     for candidate in &mut candidates {
         candidate.max_overlap = candidate.worker_id == max_overlap_worker_id
             && candidate.dp_rank == max_overlap_dp_rank;
@@ -3226,6 +3230,52 @@ worker_selection:
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn out_of_range_dp_rank_is_not_an_eligible_prefix() {
+        // Worker 1 advertises one DP rank (0); a stale overlap entry for rank 1 must not count.
+        let workers = HashMap::from([
+            (1, TaintedWorkerConfig::default()),
+            (2, TaintedWorkerConfig::default()),
+        ]);
+        for selector in [
+            DefaultWorkerSelector::new(None, "decode"),
+            two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default()),
+        ] {
+            let selector = selector.with_decision_trace_sample_rate(Some(1.0));
+            let mut request = tracked(two_tier_request(&[(1, 2, 0, 0), (2, 1, 0, 0)]));
+            let stale = WorkerWithDpRank::new(1, 1);
+            request.overlap.tier_overlap_blocks.device.insert(stale, 9);
+            request.overlap.effective_overlap_blocks.insert(stale, 9.0);
+            let mut result = selector
+                .select_worker(&workers, &request, request.eligibility(), 16)
+                .unwrap();
+            assert_eq!(result.max_raw_cached_tokens, Some(32));
+            assert_eq!(
+                result.selected_raw_cached_tokens,
+                Some(request.raw_cached_tokens_for(result.worker, 16))
+            );
+            let trace = result.decision_trace.take().unwrap();
+            assert!(
+                trace
+                    .candidates
+                    .iter()
+                    .all(|candidate| candidate.dp_rank == 0)
+            );
+            assert_eq!(trace.candidates.len(), 2);
+        }
+    }
+
+    #[test]
+    fn decision_trace_tie_marks_the_selected_worker_as_max_overlap() {
+        let selector = two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default())
+            .with_decision_trace_sample_rate(Some(1.0));
+        let request = tracked(two_tier_request(&[(1, 0, 0, 1), (2, 0, 0, 0)]));
+        let (selected, trace) = select_traced(&selector, &request, &[1, 2]);
+        assert_eq!(selected.worker.worker_id, 2);
+        assert_eq!(trace.max_overlap_worker_id, 2);
+        assert_eq!(trace.avoidable_prefill_token_equivalents, 0.0);
     }
 
     #[test]

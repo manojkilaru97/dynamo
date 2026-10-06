@@ -170,9 +170,7 @@ async fn run(
                         Some(Ok((_, event))) => {
                             let Some(history) = history.upgrade() else { return Ok(()) };
                             if apply_peer(&history, &source, &domain, event).is_some() {
-                                // Publish the current size so a racing local completion's older
-                                // snapshot cannot be the last value written.
-                                metrics.set_cache_history_retained(history.stats());
+                                history.publish_retained(&metrics);
                             }
                         }
                         Some(Err(error)) => tracing::warn!(%error, "Invalid cache history replica event"),

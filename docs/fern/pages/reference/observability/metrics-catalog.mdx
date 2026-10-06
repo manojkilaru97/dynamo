@@ -286,7 +286,7 @@ The router exposes metrics for routing decisions and overhead. Not every metric 
 
 The cache reuse funnel shows how much of the incoming prompt could be reused, and how much the worker reports reusing. Each step counts tokens, not requests.
 
-All metric names below start with `dynamo_component_router_`. F0, F2, F3, and F4 carry `phase` and `model` labels; `model` is the router's served model name (the frontend passes the model card's display name), falling back to the request's model when the router has none.
+All metric names below start with `dynamo_component_router_`. F0, F2, F3, and F4 carry `phase` and `model` labels; `model` is the router's served model name (the frontend passes the model card's display name), or `unknown` when the router was built without one, so caller-supplied model strings never become label values. `phase` comes from the frontend's request tracker; a standalone router (`python -m dynamo.router`) does not set one, so all of its attempts are labeled `aggregated`.
 
 | Step | Meaning | Metric suffix |
 | --- | --- | --- |
@@ -296,7 +296,7 @@ All metric names below start with `dynamo_component_router_`. F0, F2, F3, and F4
 | **F3 — Selected worker's match** | Prefix the router estimates is cached on the worker it chooses. | `kv_selected_cached_prefix_tokens_total` |
 | **F4 — Reported reuse** | Tokens the worker reports reusing. Missing reports count as zero. | `kv_worker_reused_tokens_total` |
 
-F2 and F3 need no enable flag. They count raw router-visible blocks on every tier: device, host-pinned (CPU offload), and disk, without the tier weights the selection policy applies. This includes the two-tier cost function's CPU-offloaded prefix. A pinned or session-affinity request has one eligible worker, so its F2 equals F3.
+F2 and F3 need no enable flag. They count raw router-visible blocks on every tier: device, host-pinned (CPU offload), and disk, without the tier weights the selection policy applies. This includes the two-tier cost function's CPU-offloaded prefix. A pinned request, including a session-affinity request already bound to a worker, has one eligible worker, so its F2 equals F3; a new or expired session is routed like any other request.
 
 F1 is off by default. Set `DYN_ROUTER_CACHE_REUSE_HISTORY=true` to enable it, and `DYN_ROUTER_CACHE_REUSE_HISTORY_BYTES` to change the default 256 MiB history budget per router. Its own denominator is `cache_loss_funnel_tokens_total{stage="f0"}`, which counts completed requests only; `cache_loss_observations_total{result}` counts completed and incomplete attempts, and the `cache_loss_history_*` gauges report retained entries and capacity. With `--router-replica-sync`, frontends share completed hashes so a frontend recognizes blocks learned through a peer.
 
@@ -304,7 +304,7 @@ Compare token increases over the same time window and matching KV-routing traffi
 
 vLLM workers report F4 on the final response chunk of each aggregated or prefill attempt, as `engine_data.kv_cache_hit` with `prompt_tokens` and `reused_tokens`. `reused_tokens` is vLLM's per-request `num_cached_tokens`: local prefix-cache hits plus KV connector hits such as CPU-offload loads, the same tiers F2 and F3 count.
 
-- Disaggregated decode attempts that load prefill KV do not report, because vLLM counts transferred KV as cached; read worker reuse from the `prefill` phase.
+- Disaggregated decode attempts that load prefill KV do not report, because vLLM counts transferred KV as cached; read worker reuse from the `prefill` phase (on a frontend-embedded router; a standalone router labels every attempt `aggregated`).
 - The router counts a report only when its `prompt_tokens` equals the routed prompt length. F2 and F3 count expanded multimodal routing tokens while F0 counts the unexpanded prompt, so multimodal ratios to F0 can exceed 100%.
 - With `n > 1`, vLLM does not report: later samples reuse the prompt blocks earlier samples just cached.
 - vLLM recomputes the last prompt token, so a full-prefix hit reports up to one block less than F3. Preemption and failed KV loads can also make F4 differ from F3.
@@ -375,7 +375,7 @@ Not all router metrics appear in every deployment. This matrix shows which group
 
 | Metric group | Frontend + KV (agg) | Frontend + KV (disagg) | Frontend + non-KV | Standalone router |
 |---|---|---|---|---|
-| `dynamo_component_router_*` | Registered and populated | Registered and populated | Registered, **always zero** | Populated (on `DYN_SYSTEM_PORT`) |
+| `dynamo_component_router_*` | Registered and populated | Registered and populated | Unlabelled series registered, **always zero**; labelled series (`input_sequence_tokens`, cache-reuse counters) absent | Populated (on `DYN_SYSTEM_PORT`) |
 | `dynamo_router_overhead_*` | Registered and populated | Registered and populated | **Not registered** | **Not created** |
 | `dynamo_frontend_router_queue_*` | Registered; populated when a CLI or policy-class queue threshold is set | Registered; populated when a CLI or policy-class queue threshold is set | **Not registered** | **Not created** |
 | `dynamo_component_kv_cache_events_applied` | Populated when KV events received | Populated when KV events received | **Not registered** | Populated when KV events received |
@@ -384,7 +384,7 @@ Not all router metrics appear in every deployment. This matrix shows which group
 **Key:**
 
 - **Registered and populated** — the metric appears at `/metrics` with real values.
-- **Registered, always zero** — the metric appears at `/metrics` but is never incremented (useful for dashboards that expect it to exist).
+- **Registered, always zero** — the metric appears at `/metrics` but is never incremented (useful for dashboards that expect it to exist). Labelled series appear only after their first observation, and the opt-in F1 `cache_loss_*` / `kv_history_*` families exist only with `DYN_ROUTER_CACHE_REUSE_HISTORY=true`.
 - **Not registered / Not created** — the metric does not appear at `/metrics` at all.
 
 ## Related
