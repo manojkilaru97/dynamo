@@ -317,6 +317,34 @@ mod tests {
         }
     }
 
+    /// The vLLM prefill handler's multimodal validation-error chunk (exact JSON) ends the
+    /// request as a terminal error item carrying the validation message, not a handoff.
+    #[tokio::test]
+    async fn vllm_prefill_validation_error_chunk_is_a_terminal_error() {
+        let chunk: LLMEngineOutput = serde_json::from_value(json!({
+            "status": "error",
+            "message": "use --enable-multimodal",
+            "finish_reason": "error: use --enable-multimodal",
+            "token_ids": [],
+            "disaggregated_params": null
+        }))
+        .unwrap();
+        let result = PrefillRouter::consume_prefill_stream(
+            prefill_stream(vec![Annotated::from_data(chunk)]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let PrefillCompletion::Terminal { output } = result else {
+            panic!("a validation error must not hand off to decode");
+        };
+        assert_eq!(
+            output.data.and_then(|data| data.finish_reason),
+            Some(FinishReason::Error("use --enable-multimodal".to_string()))
+        );
+    }
+
     #[tokio::test]
     async fn length_limited_prefill_still_requires_handoff() {
         let output = LLMEngineOutput {
