@@ -1720,19 +1720,27 @@ mod tests {
         assert_eq!((complete, incomplete), (0, 1));
         assert_eq!(history.stats().retained_entries, 0);
 
-        // Coalesced parallel samples: a completed choice 0 followed by an aborted choice 1
-        // (the handler forwards each completion) still leaves the attempt incomplete.
+        // Coalesced parallel samples, in the order the handler forwards them: the aborted
+        // choice 1 leads as the full chunk, the completed choice 0 follows as a bare chunk.
+        let coalesced = vec![
+            serde_json::json!({
+                "token_ids": [8],
+                "index": 1,
+                "finish_reason": "cancelled",
+                "disaggregated_params": null
+            }),
+            serde_json::json!({"token_ids": [7], "index": 0}),
+        ];
+        let (history, complete, incomplete) =
+            run_prefill_chunks(&router, (1..=32).collect(), coalesced.clone()).await;
+        assert_eq!((complete, incomplete), (0, 1));
+        assert_eq!(history.stats().retained_entries, 0);
+
+        // Separately streamed choices can arrive success-first; the attempt is still failed.
         let (history, complete, incomplete) = run_prefill_chunks(
             &router,
             (1..=32).collect(),
-            vec![
-                serde_json::json!({
-                    "token_ids": [7],
-                    "index": 0,
-                    "disaggregated_params": {"kv_transfer_params": {"remote": 0}}
-                }),
-                serde_json::json!({"token_ids": [8], "index": 1, "finish_reason": "cancelled"}),
-            ],
+            coalesced.into_iter().rev().collect(),
         )
         .await;
         assert_eq!((complete, incomplete), (0, 1));
