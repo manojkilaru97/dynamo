@@ -117,13 +117,10 @@ impl CacheHistory {
     where
         I: Iterator<Item = u64> + Clone,
     {
-        if sequence_hashes.clone().all(|hash| {
-            let shard = self.shard(hash);
-            self.shards[shard].read().contains(&hash)
-        }) {
-            return None;
-        }
-
+        // Membership is checked only under the FIFO lock: an unlocked "everything is already
+        // present" shortcut could observe a hash that a concurrent insert then evicts, and skip
+        // re-inserting it. Completions almost always add new generated blocks, so the shortcut
+        // saved little.
         let mut fifo = self.fifo.lock();
         let initial_len = fifo.len();
         for hash in sequence_hashes {
