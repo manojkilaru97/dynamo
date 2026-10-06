@@ -3268,10 +3268,19 @@ worker_selection:
     fn decision_trace_tie_marks_the_selected_worker_as_max_overlap() {
         let selector = two_tier_selector(TWO_TIER_YAML, KvRouterConfig::default())
             .with_decision_trace_sample_rate(Some(1.0));
-        let request = tracked(two_tier_request(&[(1, 0, 0, 1), (2, 0, 0, 0)]));
+        // Equal (zero) overlap; worker 1 is less loaded and wins. A plain `max_by` would pick
+        // the last equal candidate, worker 2.
+        let request = tracked(two_tier_request(&[(1, 0, 0, 0), (2, 0, 0, 1)]));
         let (selected, trace) = select_traced(&selector, &request, &[1, 2]);
-        assert_eq!(selected.worker.worker_id, 2);
-        assert_eq!(trace.max_overlap_worker_id, 2);
+        assert_eq!(selected.worker.worker_id, 1);
+        assert_eq!(trace.max_overlap_worker_id, 1);
+        let marked: Vec<_> = trace
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.max_overlap)
+            .map(|candidate| candidate.worker_id)
+            .collect();
+        assert_eq!(marked, vec![1]);
         assert_eq!(trace.avoidable_prefill_token_equivalents, 0.0);
     }
 

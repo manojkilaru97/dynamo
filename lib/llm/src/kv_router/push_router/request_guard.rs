@@ -579,12 +579,13 @@ impl RequestGuard {
             .request_metrics()
             .observe_cache_history_input(tracking.prompt_tokens);
         let parent_hash = tracking.prompt_hashes.last().copied();
-        self.output_hashes = Some(CanonicalOutputTracker::new(
-            request,
-            block_size,
-            is_eagle,
-            parent_hash,
-        ));
+        // A migrated multimodal retry executes generated tokens its routing buffer lacks, so
+        // its canonical continuation is unknown: count it and learn its known prompt prefix,
+        // but do not learn output blocks that would chain from the wrong parent.
+        self.output_hashes = request
+            .migrated_tokens_beyond_routing()
+            .is_empty()
+            .then(|| CanonicalOutputTracker::new(request, block_size, is_eagle, parent_hash));
         self.cache_history = Some(tracking);
     }
 

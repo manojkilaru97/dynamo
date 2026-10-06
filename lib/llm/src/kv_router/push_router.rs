@@ -284,12 +284,10 @@ impl KvPushRouter {
             .flatten();
         // F1 reuses the canonical prompt hashes already computed for routing. Clone them only
         // when the routing-decision recorder below still needs its own copy.
-        // A migrated multimodal retry executes generated tokens its routing buffer lacks, so
-        // its canonical chain is unknown here; F1 skips it rather than learn a wrong chain.
         let history_prompt_hashes = self
             .cache_history
             .as_ref()
-            .filter(|_| !is_query_only && request.migrated_tokens_beyond_routing().is_empty())
+            .filter(|_| !is_query_only)
             .and_then(|_| {
                 if self.chooser.indexer().records_routing_decisions() {
                     selection
@@ -335,6 +333,16 @@ impl KvPushRouter {
                 request,
                 self.chooser.block_size(),
                 self.chooser.is_eagle(),
+            );
+        }
+
+        // F0 is observed with F2/F3 (recorded when the guard was built), before the cancellable
+        // routing-decision record, so a cancellation there cannot count one without the other.
+        if !is_query_only {
+            guard.request_metrics().observe_input_sequence_tokens(
+                request.phase(),
+                metrics_model,
+                request.token_ids.len(),
             );
         }
 
@@ -394,13 +402,6 @@ impl KvPushRouter {
                 if let Some(hit_rate) = tracker.kv_hit_rate() {
                     guard.request_metrics().kv_hit_rate.observe(hit_rate);
                 }
-            }
-            if !is_query_only {
-                guard.request_metrics().observe_input_sequence_tokens(
-                    request.phase(),
-                    metrics_model,
-                    request.token_ids.len(),
-                );
             }
             Ok(())
         }
@@ -1908,8 +1909,9 @@ mod tests {
                 guard.finish().await;
                 drop(guard);
                 assert_eq!(reused.get(), before + 16);
-                // F1 skips the retry instead of learning a chain that omits the replayed tokens.
-                assert_eq!(history.stats().retained_entries, 0);
+                // F1 counts the retry and learns its one known complete prompt block, but no
+                // output blocks (their chain would omit the replayed tokens).
+                assert_eq!(history.stats().retained_entries, 1);
                 drop(router);
                 runtime.shutdown();
             },
@@ -1943,6 +1945,58 @@ mod tests {
             .expect("the advisory decision is traced");
         assert_eq!(trace.selected_worker_id, 7);
         assert_eq!(input.get_sample_count(), input_before);
+        drop(router);
+        runtime.shutdown();
+    }
+
+    /// Real selection path with a warm prefix: the approximate indexer learns the first
+    /// attempt, so the repeat's F2/F3 are its nonzero cached prefix.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn warm_repeat_exports_nonzero_f2_and_f3_from_selection() {
+        let (router, runtime) = router(None).await;
+        let labels = [RequestPhase::Aggregated.as_str(), UNKNOWN_METRICS_MODEL];
+        let metrics = &router.request_metrics;
+        let best = metrics
+            .kv_best_eligible_cached_prefix_tokens
+            .with_label_values(&labels);
+        let chosen = metrics
+            .kv_selected_cached_prefix_tokens
+            .with_label_values(&labels);
+        let attempt = || async {
+            let mut prompt = request();
+            prompt.token_ids = (1..=48).collect();
+            let prompt = Context::new(prompt);
+            let (mut selection, _) = router
+                .select_with_affinity(&prompt, RequestPhase::Aggregated, false)
+                .await
+                .unwrap();
+            let estimates = (
+                selection.max_raw_cached_tokens,
+                selection.selected_raw_cached_tokens,
+            );
+            let before = (best.get(), chosen.get());
+            let mut guard = router
+                .track_selection(&prompt, &mut selection, false)
+                .await
+                .unwrap();
+            guard.mark_dispatched().await;
+            guard.finish().await;
+            drop(guard);
+            (estimates, (best.get() - before.0, chosen.get() - before.1))
+        };
+        let (cold_estimates, cold) = attempt().await;
+        assert_eq!(cold_estimates, (Some(0), Some(0)));
+        assert_eq!(cold, (0, 0));
+        let (warm_estimates, warm) = attempt().await;
+        let (Some(warm_best), Some(warm_selected)) = warm_estimates else {
+            panic!("tracked selections carry both estimates");
+        };
+        assert!(
+            warm_best > 0,
+            "the approximate indexer learned the first attempt"
+        );
+        assert_eq!(warm, (warm_best as u64, warm_selected as u64));
         drop(router);
         runtime.shutdown();
     }

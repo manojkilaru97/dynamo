@@ -39,9 +39,6 @@ pub(crate) struct CacheHistory {
     fifo: Mutex<VecDeque<u64>>,
     shards: Box<[RwLock<FxHashSet<u64>>]>,
     retained_entries: AtomicUsize,
-    /// Serializes reading the size and writing the process-global gauges, so concurrent local
-    /// and peer completions cannot leave an older size as the last published value.
-    publish: Mutex<()>,
     sync: OnceLock<sync::HistorySync>,
 }
 
@@ -82,7 +79,6 @@ impl CacheHistory {
             fifo: Mutex::new(VecDeque::new()),
             shards,
             retained_entries: AtomicUsize::new(0),
-            publish: Mutex::new(()),
             sync: OnceLock::new(),
         }
     }
@@ -156,13 +152,14 @@ impl CacheHistory {
         (fifo.len() != initial_len).then(|| self.stats_for_entries(fifo.len()))
     }
 
-    /// Publish the current retained size to the history gauges.
+    /// Publish the current retained size to the history gauges. The size is read under the
+    /// gauges' publication lock, so concurrent local and peer completions, or another
+    /// router's history, cannot leave an older or mixed value as the last one written.
     pub(crate) fn publish_retained(
         &self,
         metrics: &crate::kv_router::metrics::RouterRequestMetrics,
     ) {
-        let _publish = self.publish.lock();
-        metrics.set_cache_history_retained(self.stats());
+        metrics.publish_cache_history_retained(|| self.stats());
     }
 
     pub(crate) fn stats(&self) -> CacheHistoryStats {
@@ -317,6 +314,52 @@ mod tests {
             let (_, _, _, _, retained) = metrics.cache_history_values_for_test().unwrap();
             assert_eq!(retained as usize, history.stats().retained_entries);
             assert_eq!(retained, 400);
+        }
+    }
+
+    #[test]
+    fn two_histories_sharing_gauges_never_publish_a_mixed_snapshot() {
+        use crate::kv_router::metrics::{RouterRequestMetrics, test_hierarchy::IsolatedHierarchy};
+
+        let hierarchy = IsolatedHierarchy::default();
+        let metrics = temp_env::with_var(CACHE_REUSE_HISTORY_ENABLED_ENV, Some("true"), || {
+            RouterRequestMetrics::for_test(&hierarchy)
+        });
+        let gauges = |history: &CacheHistory| {
+            let stats = history.stats();
+            (
+                stats.retained_entries as i64,
+                stats.represented_tokens as i64,
+                stats.estimated_retained_bytes as i64,
+            )
+        };
+        for round in 0..20_u64 {
+            // Different block sizes make every gauge triple specific to one history.
+            let histories = [
+                Arc::new(CacheHistory::with_capacity(1_000, 16)),
+                Arc::new(CacheHistory::with_capacity(1_000, 32)),
+            ];
+            let barrier = Arc::new(Barrier::new(8));
+            std::thread::scope(|scope| {
+                for thread in 0..8_u64 {
+                    let history = histories[(thread % 2) as usize].clone();
+                    let (barrier, metrics) = (barrier.clone(), metrics.clone());
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for offset in 0..50_u64 {
+                            let hash = round * 1_000_000 + thread * 1_000 + offset;
+                            if history.record_completed([hash].into_iter()).is_some() {
+                                history.publish_retained(&metrics);
+                            }
+                        }
+                    });
+                }
+            });
+            let published = metrics.cache_history_gauges_for_test().unwrap();
+            assert!(
+                histories.iter().any(|history| gauges(history) == published),
+                "gauges {published:?} match neither history"
+            );
         }
     }
 

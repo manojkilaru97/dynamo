@@ -4790,6 +4790,68 @@ mod tests {
     use crate::protocols::common::preprocessor::MultimodalData;
     use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
 
+    fn backend_tokens(token_ids: Vec<u32>, finish: bool) -> Annotated<BackendOutput> {
+        Annotated::from_data(BackendOutput {
+            token_ids,
+            tokens: Vec::new(),
+            text: None,
+            cum_log_probs: None,
+            log_probs: None,
+            top_logprobs: None,
+            finish_reason: finish.then_some(crate::protocols::common::FinishReason::Stop),
+            stop_reason: None,
+            index: Some(0),
+            completion_usage: None,
+            disaggregated_params: None,
+            encoder_result: None,
+            worker_trace_link: None,
+            extra_args: None,
+            engine_data: None,
+            routing_data: None,
+        })
+    }
+
+    /// Output-hash capture is fed by the postprocessor stream itself, not by callers.
+    #[tokio::test]
+    async fn postprocessor_stream_feeds_output_sequence_hashes() {
+        let input = [1_u32, 2, 3];
+        let replay = crate::request_trace::replay_metrics(&input, 2).unwrap();
+        let capture = crate::request_trace::output_sequence_hash_capture(&input, &replay).unwrap();
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .unwrap();
+        let context = dynamo_runtime::pipeline::Context::new(()).context();
+        let backend = stream::iter(vec![
+            backend_tokens(vec![4, 5], false),
+            backend_tokens(vec![6], true),
+        ]);
+        let transformed = OpenAIPreprocessor::transform_postprocessor_stream_with_image_tokens(
+            backend,
+            Box::new(request.response_generator("hash-capture".to_string())),
+            context,
+            false,
+            false,
+            None,
+            Default::default(),
+            None,
+            Some(capture.clone()),
+        );
+        let _: Vec<_> = transformed.collect().await;
+        let mut expected_tokens = input.to_vec();
+        expected_tokens.extend([4, 5, 6]);
+        let expected = crate::request_trace::replay_metrics(&expected_tokens, 2)
+            .unwrap()
+            .input_sequence_hashes;
+        // Input [1,2 | 3] continues as [3,4 | 5,6]: the output adds two complete blocks.
+        assert_eq!(
+            capture.lock().unwrap().sequence_hashes(),
+            expected[1..].to_vec()
+        );
+    }
+
     fn url_entry(u: &str) -> MultimodalData {
         MultimodalData::Url(url::Url::parse(u).unwrap())
     }

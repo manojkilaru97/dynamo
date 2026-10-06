@@ -856,6 +856,9 @@ pub(crate) struct CacheHistoryMetrics {
     estimated_retained_bytes: IntGauge,
     capacity_entries: IntGauge,
     capacity_bytes: IntGauge,
+    /// Serializes "read a history's size, write the three retained gauges" across every
+    /// history sharing these process-global gauges, so the gauges always describe one history.
+    publish: Arc<parking_lot::Mutex<()>>,
 }
 
 /// Label carrying the routing phase on the cache-reuse funnel series.
@@ -1068,6 +1071,7 @@ impl RouterRequestMetrics {
                 .unwrap_or_else(|error| panic!("failed to create {suffix}: {error}"))
         };
         CacheHistoryMetrics {
+            publish: Arc::new(parking_lot::Mutex::new(())),
             observation_input_tokens_total,
             f0_tokens_total,
             f1_tokens_total,
@@ -1094,6 +1098,18 @@ impl RouterRequestMetrics {
                 "Per-router byte budget; process-global gauge reports the last initialized cache-history-enabled router",
             ),
         }
+    }
+
+    /// `(retained_entries, represented_tokens, estimated_bytes)` gauges, when F1 is enabled.
+    #[cfg(test)]
+    pub(crate) fn cache_history_gauges_for_test(&self) -> Option<(i64, i64, i64)> {
+        self.cache_history.as_ref().map(|metrics| {
+            (
+                metrics.retained_entries.get(),
+                metrics.represented_tokens.get(),
+                metrics.estimated_retained_bytes.get(),
+            )
+        })
     }
 
     /// `(f0, f1, complete, incomplete, retained_entries)` of the F1 series, when enabled.
@@ -1145,10 +1161,16 @@ impl RouterRequestMetrics {
         metrics.capacity_bytes.set(gauge(stats.capacity_bytes));
     }
 
-    pub(crate) fn set_cache_history_retained(&self, stats: CacheHistoryStats) {
+    /// Publish `stats()` of one history to the retained gauges as one unit.
+    pub(crate) fn publish_cache_history_retained(&self, stats: impl FnOnce() -> CacheHistoryStats) {
         let Some(metrics) = &self.cache_history else {
             return;
         };
+        let _publish = metrics.publish.lock();
+        Self::write_cache_history_retained(metrics, stats());
+    }
+
+    fn write_cache_history_retained(metrics: &CacheHistoryMetrics, stats: CacheHistoryStats) {
         let gauge = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
         metrics.retained_entries.set(gauge(stats.retained_entries));
         metrics
