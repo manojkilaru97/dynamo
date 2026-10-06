@@ -342,7 +342,9 @@ mod tests {
             let barrier = Arc::new(Barrier::new(8));
             std::thread::scope(|scope| {
                 for thread in 0..8_u64 {
-                    let history = histories[(thread % 2) as usize].clone();
+                    // Six writers fill the first history (300 entries), two the second (100),
+                    // so the histories' final triples differ in every gauge.
+                    let history = histories[usize::from(thread >= 6)].clone();
                     let (barrier, metrics) = (barrier.clone(), metrics.clone());
                     scope.spawn(move || {
                         barrier.wait();

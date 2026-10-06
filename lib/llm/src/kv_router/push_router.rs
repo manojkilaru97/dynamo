@@ -325,10 +325,13 @@ impl KvPushRouter {
             (self.cache_history.as_ref(), history_prompt_hashes)
         {
             guard.track_cache_history(
+                // F1's denominator is the prompt whose canonical chain the router knows: the
+                // unpadded routing sequence (a migrated multimodal retry's replayed suffix is
+                // not part of it).
                 CacheHistoryTracking::new(
                     Arc::clone(history),
                     prompt_hashes,
-                    request.routed_prompt_len() as u64,
+                    request.unpadded_routing_len() as u64,
                 ),
                 request,
                 self.chooser.block_size(),
@@ -1858,60 +1861,81 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn migrated_multimodal_retry_reports_against_the_executed_prompt() {
+        use crate::kv_router::metrics::{RouterRequestMetrics, test_hierarchy::IsolatedHierarchy};
         use crate::protocols::common::preprocessor::MmRoutingInfo;
 
         temp_env::async_with_vars(
             [(cache_history::CACHE_REUSE_HISTORY_ENABLED_ENV, Some("true"))],
             async {
-                let (router, runtime) = router(None).await;
+                let (mut router, runtime) = router(None).await;
+                let hierarchy = IsolatedHierarchy::default();
+                router.request_metrics = RouterRequestMetrics::for_test(&hierarchy);
                 let history = router.cache_history.clone().expect("history is enabled");
                 let reused = router
                     .request_metrics
                     .kv_worker_reused_tokens
                     .with_label_values(&[RequestPhase::Aggregated.as_str(), UNKNOWN_METRICS_MODEL]);
-                let before = reused.get();
-                // 20 expanded prompt tokens padded to 32; migration then appended 5 generated
-                // tokens to `token_ids` only, so the worker executes 25 prompt tokens.
-                let mut routing_token_ids: Vec<u32> = (1..=20).collect();
-                routing_token_ids.resize(32, 0);
-                let mut retry = request();
-                retry.token_ids = (1..=8).chain(200..205).collect();
-                retry.migrated_output_tokens = 5;
-                retry.mm_routing_info = Some(MmRoutingInfo {
-                    routing_token_ids,
-                    block_mm_infos: vec![None, None],
-                    expanded_prompt_len: 20,
-                });
+                let mm_request = |migrated: usize| {
+                    // 20 expanded prompt tokens padded to 32; a migration may have appended
+                    // generated tokens to `token_ids` only.
+                    let mut routing_token_ids: Vec<u32> = (1..=20).collect();
+                    routing_token_ids.resize(32, 0);
+                    let mut request = request();
+                    request.token_ids = (1..=8).chain(200..200 + migrated as u32).collect();
+                    request.migrated_output_tokens = migrated;
+                    request.mm_routing_info = Some(MmRoutingInfo {
+                        routing_token_ids,
+                        block_mm_infos: vec![None, None],
+                        expanded_prompt_len: 20,
+                    });
+                    request
+                };
+                let run = |request: PreprocessedRequest, report_prompt: u64| {
+                    let router = &router;
+                    async move {
+                        let request = Context::new(request);
+                        let (mut selection, _) = router
+                            .select_with_affinity(&request, RequestPhase::Aggregated, false)
+                            .await
+                            .unwrap();
+                        let mut guard = router
+                            .track_selection(&request, &mut selection, false)
+                            .await
+                            .unwrap();
+                        guard
+                            .on_item(&Annotated::from_data(LLMEngineOutput {
+                                token_ids: (300..330).collect(),
+                                engine_data: Some(serde_json::json!({
+                                    "kv_cache_hit": {"prompt_tokens": report_prompt, "reused_tokens": 16}
+                                })),
+                                ..Default::default()
+                            }))
+                            .await;
+                        guard.finish().await;
+                    }
+                };
+
+                let retry = mm_request(5);
                 assert_eq!(retry.unpadded_routing_len(), 20);
-                assert_eq!(
-                    retry.migrated_tokens_beyond_routing(),
-                    &[200, 201, 202, 203, 204]
-                );
+                assert_eq!(retry.migrated_tokens_beyond_routing(), &[200, 201, 202, 203, 204]);
                 assert_eq!(retry.routed_prompt_len(), 25);
-                let retry = Context::new(retry);
-                let (mut selection, _) = router
-                    .select_with_affinity(&retry, RequestPhase::Aggregated, false)
-                    .await
-                    .unwrap();
-                let mut guard = router
-                    .track_selection(&retry, &mut selection, false)
-                    .await
-                    .unwrap();
-                guard
-                    .on_item(&Annotated::from_data(LLMEngineOutput {
-                        token_ids: (300..330).collect(),
-                        engine_data: Some(serde_json::json!({
-                            "kv_cache_hit": {"prompt_tokens": 25, "reused_tokens": 16}
-                        })),
-                        ..Default::default()
-                    }))
-                    .await;
-                guard.finish().await;
-                drop(guard);
+                let before = reused.get();
+                run(retry, 25).await;
+                // F4 matches the executed 25-token prompt.
                 assert_eq!(reused.get(), before + 16);
-                // F1 counts the retry and learns its one known complete prompt block, but no
-                // output blocks (their chain would omit the replayed tokens).
+                // F1 counts the retry over its known 20-token prompt and learns its one complete
+                // prompt block, but no output blocks (their chain would omit the replayed tokens).
+                assert_eq!(
+                    router.request_metrics.cache_history_values_for_test(),
+                    Some((20, 0, 1, 0, 1))
+                );
                 assert_eq!(history.stats().retained_entries, 1);
+
+                // A repeat of the same image prompt sees that block.
+                run(mm_request(0), 20).await;
+                let (f0, f1, complete, incomplete, _) =
+                    router.request_metrics.cache_history_values_for_test().unwrap();
+                assert_eq!((f0, f1, complete, incomplete), (40, 16, 2, 0));
                 drop(router);
                 runtime.shutdown();
             },
