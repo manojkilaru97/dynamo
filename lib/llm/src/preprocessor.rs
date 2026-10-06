@@ -2973,6 +2973,7 @@ impl OpenAIPreprocessor {
             trace_finish_reason_metadata,
             mm_counts,
             None,
+            None,
         )
     }
 
@@ -2986,6 +2987,7 @@ impl OpenAIPreprocessor {
         trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
         mm_counts: MultimodalCounts,
         image_tokens: Option<usize>,
+        output_sequence_hash_capture: Option<crate::request_trace::SharedOutputSequenceHashCapture>,
     ) -> impl Stream<Item = Annotated<Resp>> + Send
     where
         S: Stream<Item = Annotated<BackendOutput>> + Send + 'static,
@@ -3013,6 +3015,8 @@ impl OpenAIPreprocessor {
             trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
             mm_counts: MultimodalCounts,
             image_tokens: Option<usize>,
+            output_sequence_hash_capture:
+                Option<crate::request_trace::SharedOutputSequenceHashCapture>,
         }
 
         let state = State {
@@ -3032,6 +3036,7 @@ impl OpenAIPreprocessor {
             trace_finish_reason_metadata,
             mm_counts,
             image_tokens,
+            output_sequence_hash_capture,
         };
 
         // transform the common response stream into a chat response stream
@@ -3091,6 +3096,9 @@ impl OpenAIPreprocessor {
                     let (chunk_tokens, isl) = if let Some(ref backend_output) = response.data {
                         let chunk_tokens = backend_output.token_ids.len();
                         inner.cumulative_output_tokens += chunk_tokens;
+                        if let Some(capture) = &inner.output_sequence_hash_capture {
+                            capture.lock().unwrap().record(&backend_output.token_ids);
+                        }
 
                         let isl = inner.response_generator.get_isl().map(|isl| isl as usize);
 
@@ -4350,6 +4358,8 @@ impl
         let trace_tokens_enabled = trace_state.is_some();
         let trace_finish_reason_metadata =
             crate::request_trace::finish_reason_metadata_handle(&trace_state);
+        let output_sequence_hash_capture =
+            crate::request_trace::output_sequence_hash_capture_handle(&trace_state);
 
         // Attach the timing tracker to the request so downstream components can record metrics
         common_request.tracker = tracker;
@@ -4412,6 +4422,7 @@ impl
             trace_finish_reason_metadata,
             mm_counts,
             image_tokens,
+            output_sequence_hash_capture,
         );
 
         // Backend generation is always streamed internally, but parser finalization
@@ -4588,6 +4599,8 @@ impl
         let trace_tokens_enabled = trace_state.is_some();
         let trace_finish_reason_metadata =
             crate::request_trace::finish_reason_metadata_handle(&trace_state);
+        let output_sequence_hash_capture =
+            crate::request_trace::output_sequence_hash_capture_handle(&trace_state);
 
         // Attach the timing tracker to the request so downstream components can record metrics
         common_request.tracker = tracker;
@@ -4619,7 +4632,7 @@ impl
 
         // transform the postprocessor stream. Legacy `/v1/completions` is
         // text-only, so multimodal counts are always zero here.
-        let stream = Self::transform_postprocessor_stream(
+        let stream = Self::transform_postprocessor_stream_with_image_tokens(
             response_stream,
             response_generator,
             context.clone(),
@@ -4627,6 +4640,8 @@ impl
             trace_tokens_enabled,
             trace_finish_reason_metadata,
             MultimodalCounts::default(),
+            None,
+            output_sequence_hash_capture,
         );
 
         let stream =
