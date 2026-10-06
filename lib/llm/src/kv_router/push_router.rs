@@ -1719,6 +1719,25 @@ mod tests {
         .await;
         assert_eq!((complete, incomplete), (0, 1));
         assert_eq!(history.stats().retained_entries, 0);
+
+        // Coalesced parallel samples: a completed choice 0 followed by an aborted choice 1
+        // (the handler forwards each completion) still leaves the attempt incomplete.
+        let (history, complete, incomplete) = run_prefill_chunks(
+            &router,
+            (1..=32).collect(),
+            vec![
+                serde_json::json!({
+                    "token_ids": [7],
+                    "index": 0,
+                    "finish_reason": "length",
+                    "disaggregated_params": {"kv_transfer_params": {"remote": 0}}
+                }),
+                serde_json::json!({"token_ids": [8], "index": 1, "finish_reason": "cancelled"}),
+            ],
+        )
+        .await;
+        assert_eq!((complete, incomplete), (0, 1));
+        assert_eq!(history.stats().retained_entries, 0);
         drop(router);
         runtime.shutdown();
     }

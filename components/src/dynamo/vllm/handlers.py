@@ -4631,7 +4631,8 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             async for res in gen:
                 logger.debug(f"kv transfer params: {res.kv_transfer_params}")
 
-                completion = res.outputs[0] if res.outputs else None
+                completions = list(res.outputs or [])
+                completion = completions[0] if completions else None
                 token_ids = completion.token_ids if completion is not None else []
 
                 # For prefill worker, only one res will be generated,
@@ -4655,16 +4656,12 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                     ),
                 }
                 if completion is not None:
-                    # Parallel samples stream as separate outputs; keep each one's
-                    # choice so the router does not join independent samples.
-                    output["index"] = completion.index
-                    # `length` (the one-token budget) still hands off to decode; any
-                    # other reason ends the request here. An engine abort becomes
-                    # `cancelled`, so the router counts the attempt as failed.
-                    if completion.finish_reason:
-                        output["finish_reason"] = normalize_finish_reason(
-                            completion.finish_reason
-                        )
+                    # Parallel samples keep their own choice so the router does not
+                    # join independent samples. `length` (the one-token budget) still
+                    # hands off to decode; any other reason ends the request here, and
+                    # an engine abort becomes `cancelled` so the router counts the
+                    # attempt as failed.
+                    output.update(self._prefill_choice_fields(completion))
                 # Parallel samples make the count unreliable; see generate_tokens.
                 kv_cache_hit = (
                     BaseWorkerHandler._kv_cache_hit_engine_data(res)
@@ -4686,6 +4683,21 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 )
 
                 yield output
+                # vLLM can coalesce several finished parallel samples into one
+                # RequestOutput; forward the others as their own choices so an abort
+                # in any of them reaches the router.
+                for extra in completions[1:]:
+                    yield {
+                        "token_ids": list(extra.token_ids),
+                        **self._prefill_choice_fields(extra),
+                    }
+
+    @staticmethod
+    def _prefill_choice_fields(completion) -> Dict[str, Any]:
+        fields: Dict[str, Any] = {"index": completion.index}
+        if completion.finish_reason:
+            fields["finish_reason"] = normalize_finish_reason(completion.finish_reason)
+        return fields
 
     def _build_disaggregated_params(
         self, kv_transfer_params, embedding_params=None, expanded_prompt_token_ids=None

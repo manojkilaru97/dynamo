@@ -2539,3 +2539,34 @@ async def test_prefill_keeps_each_parallel_sample_choice_index(monkeypatch):
         (1, [8]),
     ]
     assert all("engine_data" not in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_prefill_forwards_every_coalesced_parallel_choice(monkeypatch):
+    coalesced = mod.RequestOutput(
+        request_id="prefill-finish",
+        prompt=None,
+        prompt_token_ids=[1, 2, 3],
+        prompt_logprobs=None,
+        outputs=[
+            SimpleNamespace(index=0, token_ids=[7], finish_reason="length"),
+            SimpleNamespace(index=1, token_ids=[8], finish_reason="abort"),
+        ],
+        finished=True,
+        num_cached_tokens=0,
+    )
+    handler, request = _prefill_handler_for_outputs(monkeypatch, [coalesced], n=2)
+
+    chunks = [
+        chunk
+        async for chunk in handler._generate_token_mode(
+            request, MagicMock(), "prefill-finish"
+        )
+    ]
+
+    assert [
+        (chunk["index"], chunk["token_ids"], chunk.get("finish_reason"))
+        for chunk in chunks
+    ] == [(0, [7], "length"), (1, [8], "cancelled")]
+    assert "disaggregated_params" in chunks[0]
+    assert set(chunks[1]) == {"index", "token_ids", "finish_reason"}
