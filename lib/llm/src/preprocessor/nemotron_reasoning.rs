@@ -28,6 +28,9 @@ enum Phase {
 /// Tool-argument closers the model sometimes writes inside reasoning without ever
 /// opening a call (Super 3.5 Bug 5: `...\n</parameter>\n</function>\n</tool_call>`).
 const ORPHAN_CLOSERS: [&str; 2] = ["</parameter>", "</function>"];
+/// Call-body openers. Closers after one of these (until the next `</tool_call>`)
+/// belong to a call written inside reasoning and are never treated as residue.
+const TOOL_OPENERS: [&str; 2] = ["<function=", "<parameter="];
 /// Longest closer run held back before it is released as plain reasoning.
 const MAX_ORPHAN_CLOSER_BYTES: usize = 256;
 
@@ -36,13 +39,20 @@ struct Splitter {
     buffer: String,
     reasoning_whitespace: String,
     /// Reasoning-phase run of line-leading `</parameter>`/`</function>` (plus the
-    /// whitespace between them) held back until we know whether a line-leading
-    /// `</tool_call>` closes it. A closed run is protocol residue of a call that
-    /// was never opened and is dropped; any other continuation releases the run to
-    /// reasoning unchanged.
+    /// whitespace between them) held back until its continuation is known. A run
+    /// closed by a line-leading `</tool_call>` and followed by a protocol boundary
+    /// or EOF is residue of a call that was never opened and is dropped; any other
+    /// continuation releases the run to reasoning unchanged.
     orphan_closers: String,
-    /// `orphan_closers` ends with `</tool_call>`; dropped once its line ends.
+    /// `orphan_closers` contains its `</tool_call>`; it is dropped at the next
+    /// protocol boundary or EOF, and released by any visible character.
     orphan_closed: bool,
+    /// A closer run outgrew the holdback cap; closers stay plain text until an
+    /// ordinary visible character or a protocol boundary.
+    orphan_overflow: bool,
+    /// A `<function=`/`<parameter=` appeared in reasoning since the last
+    /// `</tool_call>`: following closers are that call's, not residue.
+    reasoning_call_open: bool,
     /// No visible reasoning character since the last newline (or stream start).
     line_start: bool,
     bypass_decided: bool,
@@ -74,6 +84,8 @@ impl Splitter {
             reasoning_whitespace: String::new(),
             orphan_closers: String::new(),
             orphan_closed: false,
+            orphan_overflow: false,
+            reasoning_call_open: false,
             line_start: true,
             bypass_decided: !inspect_bare_json,
             bypass: false,
@@ -97,6 +109,8 @@ impl Splitter {
                 "</tool_call>",
                 ORPHAN_CLOSERS[0],
                 ORPHAN_CLOSERS[1],
+                TOOL_OPENERS[0],
+                TOOL_OPENERS[1],
             ],
             Phase::Content => &["</think>", "<tool_call>", "<function="],
             Phase::ToolPreamble => &["</tool_call>", "<function="],
@@ -110,13 +124,9 @@ impl Splitter {
     /// character so trailing whitespace before a boundary is never emitted.
     fn push_reasoning_char(&mut self, reasoning: &mut String, ch: char) {
         if ch.is_whitespace() {
-            if ch == '\n' && self.orphan_closed {
-                // `</tool_call>` ended its line: the run is confirmed residue.
-                self.orphan_closers.clear();
-                self.orphan_closed = false;
-            }
             if self.orphan_closers.len() + ch.len_utf8() > MAX_ORPHAN_CLOSER_BYTES {
                 self.release_orphan_closers(reasoning);
+                self.orphan_overflow = true;
             }
             if self.orphan_closers.is_empty() {
                 self.reasoning_whitespace.push(ch);
@@ -133,14 +143,18 @@ impl Splitter {
     }
 
     /// Handle a closer marker seen in the reasoning phase. Residue of an unopened
-    /// call is line-structured like the real call syntax: every closer starts its
-    /// own line and the final `</tool_call>` ends one. Anything else (for example
-    /// an inline quoted ``</parameter></function></tool_call>``) is reasoning text.
+    /// call is line-structured like the real call syntax (every closer starts its
+    /// own line, a `</parameter>`/`</function>` run precedes `</tool_call>`) and is
+    /// followed only by whitespace and then a protocol boundary or EOF. Anything
+    /// else (inline or fenced quotations, a lone `</tool_call>`) is reasoning text.
     fn push_reasoning_closer(&mut self, reasoning: &mut String, marker: &'static str) {
         let closer = ORPHAN_CLOSERS.contains(&marker);
+        let fits = self.orphan_closers.len() + marker.len() <= MAX_ORPHAN_CLOSER_BYTES;
         let structural = self.line_start
             && !self.orphan_closed
-            && self.orphan_closers.len() + marker.len() <= MAX_ORPHAN_CLOSER_BYTES
+            && !self.orphan_overflow
+            && !self.reasoning_call_open
+            && fits
             // A lone `</tool_call>` (even the sampled control token, which is
             // also how prose spells it) is kept; only a closer run proves residue.
             && (closer || !self.orphan_closers.is_empty());
@@ -148,10 +162,19 @@ impl Splitter {
             self.orphan_closers.push_str(marker);
             self.orphan_closed = !closer;
             self.line_start = false;
-        } else {
-            for ch in marker.chars() {
-                self.push_reasoning_char(reasoning, ch);
-            }
+            return;
+        }
+        if !fits {
+            // Keep the rest of an oversized run in pass-through mode so its tail
+            // cannot be mistaken for a fresh, droppable run.
+            self.release_orphan_closers(reasoning);
+            self.orphan_overflow = true;
+        }
+        for ch in marker.chars() {
+            self.push_reasoning_char(reasoning, ch);
+        }
+        if marker == "</tool_call>" {
+            self.reasoning_call_open = false;
         }
     }
 
@@ -161,9 +184,9 @@ impl Splitter {
     fn settle_orphan_closers(&mut self, reasoning: &mut String) {
         if self.orphan_closed {
             self.orphan_closers.clear();
-            self.orphan_closed = false;
         }
         self.release_orphan_closers(reasoning);
+        self.orphan_overflow = false;
     }
 
     /// Emit a held closer run as ordinary reasoning text; its trailing whitespace
@@ -216,6 +239,17 @@ impl Splitter {
                         self.push_reasoning_closer(&mut reasoning, marker);
                         continue;
                     }
+                    if TOOL_OPENERS.contains(&marker) {
+                        // A call body written inside reasoning (no `<tool_call>`
+                        // control) stays reasoning text, closers included.
+                        cursor += marker.len();
+                        self.orphan_overflow = false;
+                        for ch in marker.chars() {
+                            self.push_reasoning_char(&mut reasoning, ch);
+                        }
+                        self.reasoning_call_open = true;
+                        continue;
+                    }
                     self.settle_orphan_closers(&mut reasoning);
                 }
                 self.phase = match (before, marker) {
@@ -251,6 +285,7 @@ impl Splitter {
             let ch = remaining.chars().next().unwrap();
             cursor += ch.len_utf8();
             if self.phase == Phase::Reasoning {
+                self.orphan_overflow &= ch.is_whitespace();
                 self.push_reasoning_char(&mut reasoning, ch);
             } else {
                 content.push(ch);
@@ -805,6 +840,66 @@ mod tests {
         let (tail, more) = parser.push("y", true);
         assert_eq!(format!("{reasoning}{tail}"), format!("x\n{run}y"));
         assert_eq!(format!("{content}{more}"), "");
+    }
+
+    #[test]
+    fn oversized_run_stays_text_through_its_closing_tags() {
+        let long = format!("x\n{}</function>\n</tool_call>", "</parameter>\n".repeat(20));
+        for tail in ["\ny", "\n", ""] {
+            let raw = format!("{long}{tail}");
+            for (reasoning, content) in split_all(&raw, &[]) {
+                assert_eq!(reasoning, raw.trim_end(), "{tail:?}");
+                assert_eq!(content, "");
+            }
+        }
+    }
+
+    #[test]
+    fn closer_lines_followed_by_more_reasoning_are_kept() {
+        for raw in [
+            "Expected suffix:\n```xml\n</parameter>\n</function>\n</tool_call>\n```\nContinue.",
+            "Expected suffix:\n~~~\n</parameter>\n</function>\n</tool_call>\n~~~",
+            "Read more.\n</parameter>\n</function>\n</tool_call>\nThen more.",
+        ] {
+            let at = raw.find("</tool_call>").unwrap();
+            for controls in [&[][..], &[(at, "</tool_call>")][..]] {
+                for (reasoning, content) in split_all(raw, controls) {
+                    assert_eq!(reasoning, raw, "{controls:?}");
+                    assert_eq!(content, "");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn call_body_written_inside_reasoning_keeps_its_closers() {
+        for raw in [
+            "Let me read it.\n<function=read>\n<parameter=file_path>\n/repo/x.js\n</parameter>\n</function>\n</tool_call>\n",
+            // Captured variant: a stray `</parameter>`, then parameters with no opener.
+            "Read from 329.\n</parameter>\n<parameter=file_path>\n/x.js\n</parameter>\n<parameter=offset>\n326\n</parameter>\n</function>\n</tool_call>\n",
+        ] {
+            let at = raw.find("</tool_call>").unwrap();
+            for controls in [&[][..], &[(at, "</tool_call>")][..]] {
+                for (reasoning, content) in split_all(raw, controls) {
+                    assert_eq!(reasoning, raw.trim_end(), "{controls:?}");
+                    assert_eq!(content, "");
+                }
+            }
+        }
+        // The in-reasoning call ends at its `</tool_call>`; later residue is dropped.
+        let raw = "<function=a>\n</function>\n</tool_call>\nMore.\n</parameter>\n</function>\n</tool_call>\n";
+        for (reasoning, _) in split_all(raw, &[]) {
+            assert_eq!(reasoning, "<function=a>\n</function>\n</tool_call>\nMore.");
+        }
+    }
+
+    #[test]
+    fn closed_run_before_end_of_reasoning_is_dropped() {
+        let raw = "Plan.\n</parameter>\n</function>\n</tool_call>\n</think>Answer";
+        for (reasoning, content) in split_all(raw, &[]) {
+            assert_eq!(reasoning, "Plan.");
+            assert_eq!(content, "Answer");
+        }
     }
 
     #[test]
