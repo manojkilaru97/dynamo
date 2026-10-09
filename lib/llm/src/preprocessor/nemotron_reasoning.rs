@@ -25,10 +25,21 @@ enum Phase {
     ToolBetween,
 }
 
+/// Tool-argument closers the model sometimes writes inside reasoning without ever
+/// opening a call (Super 3.5 Bug 5: `...\n</parameter>\n</function>\n</tool_call>`).
+const ORPHAN_CLOSERS: [&str; 2] = ["</parameter>", "</function>"];
+/// Longest closer run held back before it is released as plain reasoning.
+const MAX_ORPHAN_CLOSER_BYTES: usize = 256;
+
 struct Splitter {
     phase: Phase,
     buffer: String,
     reasoning_whitespace: String,
+    /// Reasoning-phase run of `</parameter>`/`</function>` (plus whitespace between
+    /// them) held back until we know whether a `</tool_call>` closes it. A closed
+    /// run is protocol residue of a call that was never opened and is dropped; any
+    /// other continuation releases the run to reasoning unchanged.
+    orphan_closers: String,
     bypass_decided: bool,
     bypass: bool,
     emitted_content: bool,
@@ -56,6 +67,7 @@ impl Splitter {
             },
             buffer: String::new(),
             reasoning_whitespace: String::new(),
+            orphan_closers: String::new(),
             bypass_decided: !inspect_bare_json,
             bypass: false,
             emitted_content: false,
@@ -71,13 +83,52 @@ impl Splitter {
 
     fn markers(&self) -> &'static [&'static str] {
         match self.phase {
-            Phase::Reasoning => &["<think>", "</think>", "<tool_call>"],
+            Phase::Reasoning => &[
+                "<think>",
+                "</think>",
+                "<tool_call>",
+                "</tool_call>",
+                ORPHAN_CLOSERS[0],
+                ORPHAN_CLOSERS[1],
+            ],
             Phase::Content => &["</think>", "<tool_call>", "<function="],
             Phase::ToolPreamble => &["</tool_call>", "<function="],
             Phase::ToolName => &[">", "</function>"],
             Phase::ToolArgs => &["</function>"],
             Phase::ToolBetween => &["</tool_call>", "<tool_call>", "<function="],
         }
+    }
+
+    /// Route one reasoning character, holding whitespace until the next visible
+    /// character so trailing whitespace before a boundary is never emitted.
+    fn push_reasoning_char(&mut self, reasoning: &mut String, ch: char) {
+        if ch.is_whitespace() {
+            if self.orphan_closers.len() + ch.len_utf8() > MAX_ORPHAN_CLOSER_BYTES {
+                self.release_orphan_closers(reasoning);
+            }
+            if self.orphan_closers.is_empty() {
+                self.reasoning_whitespace.push(ch);
+            } else {
+                self.orphan_closers.push(ch);
+            }
+            return;
+        }
+        self.release_orphan_closers(reasoning);
+        reasoning.push_str(&std::mem::take(&mut self.reasoning_whitespace));
+        reasoning.push(ch);
+    }
+
+    /// Emit a held closer run as ordinary reasoning text (it was not closed by
+    /// `</tool_call>`); its trailing whitespace stays pending like any other.
+    fn release_orphan_closers(&mut self, reasoning: &mut String) {
+        if self.orphan_closers.is_empty() {
+            return;
+        }
+        let run = std::mem::take(&mut self.orphan_closers);
+        let visible = run.trim_end();
+        reasoning.push_str(&std::mem::take(&mut self.reasoning_whitespace));
+        reasoning.push_str(visible);
+        self.reasoning_whitespace.push_str(&run[visible.len()..]);
     }
 
     fn push(&mut self, text: &str, finished: bool) -> (String, String) {
@@ -110,6 +161,37 @@ impl Splitter {
             }) {
                 let marker = *marker;
                 let before = self.phase;
+                if before == Phase::Reasoning {
+                    if ORPHAN_CLOSERS.contains(&marker) {
+                        // Bound the holdback: a degenerate repetition is released
+                        // as reasoning rather than stalling the stream until EOF.
+                        if self.orphan_closers.len() + marker.len() > MAX_ORPHAN_CLOSER_BYTES {
+                            self.release_orphan_closers(&mut reasoning);
+                            for ch in marker.chars() {
+                                self.push_reasoning_char(&mut reasoning, ch);
+                            }
+                        } else {
+                            self.orphan_closers.push_str(marker);
+                        }
+                        cursor += marker.len();
+                        continue;
+                    }
+                    if marker == "</tool_call>" {
+                        cursor += marker.len();
+                        // In token-aware mode this is the sampled protocol token
+                        // itself, never prose; in text mode only a closer run
+                        // proves it is residue of an unopened call.
+                        if self.token_aware || !self.orphan_closers.is_empty() {
+                            self.orphan_closers.clear();
+                        } else {
+                            for ch in marker.chars() {
+                                self.push_reasoning_char(&mut reasoning, ch);
+                            }
+                        }
+                        continue;
+                    }
+                    self.release_orphan_closers(&mut reasoning);
+                }
                 self.phase = match (before, marker) {
                     (Phase::Reasoning, "</think>") => Phase::Content,
                     (Phase::Reasoning | Phase::Content | Phase::ToolBetween, "<tool_call>") => {
@@ -143,12 +225,7 @@ impl Splitter {
             let ch = remaining.chars().next().unwrap();
             cursor += ch.len_utf8();
             if self.phase == Phase::Reasoning {
-                if ch.is_whitespace() {
-                    self.reasoning_whitespace.push(ch);
-                } else {
-                    reasoning.push_str(&std::mem::take(&mut self.reasoning_whitespace));
-                    reasoning.push(ch);
-                }
+                self.push_reasoning_char(&mut reasoning, ch);
             } else {
                 content.push(ch);
             }
@@ -157,6 +234,8 @@ impl Splitter {
         self.control_offsets.retain(|(offset, _)| *offset >= cursor);
         for (offset, _) in &mut self.control_offsets { *offset -= cursor; }
         if finished {
+            // An unclosed run is not provably protocol residue; keep it.
+            self.release_orphan_closers(&mut reasoning);
             self.reasoning_whitespace.clear();
         }
         if !self.emitted_content {
@@ -456,9 +535,237 @@ mod token_provenance_tests {
     }
 }
 
+/// Super 3.5 Bug 5 (Cognition/Devin): sampled-token replays captured from the GA
+/// endpoint stack (v64) under 1000-way concurrency, via
+/// `nvext.extra_fields=["completion_token_ids"]`. Only the generation tail is kept;
+/// each ID maps to its exact Super 3.5 tokenizer decoding.
+#[cfg(test)]
+mod bug5_sampled_replay_tests {
+    use super::*;
+    use crate::tokenizers::traits::{DecodeResult, Decoder, Encoder, Tokenizer};
+
+    const THINK: u32 = 12;
+    const END_THINK: u32 = 13;
+    const TOOL_CALL: u32 = 14;
+    const END_TOOL_CALL: u32 = 15;
+    const IM_END: u32 = 11;
+
+    /// The model wrote orphan argument closers after its last reasoning sentence,
+    /// then `</tool_call>` and EOS; it never sampled `<tool_call>`, `<function=`,
+    /// `<parameter=`, or `</think>` (774 tokens, finish_reason=stop).
+    const ORPHAN_CLOSERS_THEN_EOS: &[(u32, &str)] = &[
+        (1513, " at"), (1278, " the"), (84273, " `_"), (1689, "get"), (5198, "Path"),
+        (1096, "`"), (2254, " function"), (3879, " around"), (3110, " line"), (1032, " "),
+        (1049, "1"), (1048, "0"), (1053, "5"), (1048, "0"), (1045, "-"), (1049, "1"),
+        (1049, "1"), (1048, "0"), (1048, "0"), (1626, ".\n"), (1885, "</"),
+        (31960, "parameter"), (1561, ">\n"), (1885, "</"), (5165, "function"), (1561, ">\n"),
+        (END_TOOL_CALL, "</tool_call>"), (1010, "\n"), (IM_END, "<|im_end|>"),
+    ];
+
+    /// EOS sampled inside open reasoning (p=0.008 teacher-forced; </think> p=0.89):
+    /// no protocol token at all in 10644 tokens. The splitter must keep it reasoning.
+    const EOS_INSIDE_REASONING: &[(u32, &str)] = &[
+        (1045, "-"), (1051, "3"), (1056, "8"), (1050, "2"), (1562, " from"), (1278, " the"),
+        (3323, " file"), (1925, " one"), (2081, " more"), (2142, " time"), (1044, ","),
+        (3435, " very"), (21966, " carefully"), (1046, "."), (9246, " Let"), (1639, " me"),
+        (1344, " re"), (41412, "-read"), (1046, "."), (IM_END, "<|im_end|>"),
+    ];
+
+    struct FakeTokenizer(HashMap<u32, String>);
+
+    impl Encoder for FakeTokenizer {
+        fn encode(&self, _: &str) -> anyhow::Result<crate::tokenizers::Encoding> {
+            anyhow::bail!("decode-only test tokenizer")
+        }
+        fn encode_batch(&self, _: &[&str]) -> anyhow::Result<Vec<crate::tokenizers::Encoding>> {
+            anyhow::bail!("decode-only test tokenizer")
+        }
+    }
+
+    impl Decoder for FakeTokenizer {
+        fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<DecodeResult> {
+            let mut out = String::new();
+            for id in ids {
+                if skip_special_tokens && *id == IM_END {
+                    continue;
+                }
+                out.push_str(self.0.get(id).map(String::as_str).unwrap_or(""));
+            }
+            Ok(DecodeResult::from_decoded(out))
+        }
+    }
+
+    impl Tokenizer for FakeTokenizer {}
+
+    fn controls() -> Arc<HashMap<u32, &'static str>> {
+        Arc::new(HashMap::from([
+            (THINK, "<think>"),
+            (END_THINK, "</think>"),
+            (TOOL_CALL, "<tool_call>"),
+            (END_TOOL_CALL, "</tool_call>"),
+        ]))
+    }
+
+    /// Replay `seq` (prefixed by reasoning `lead`) through TokenAwareReasoning in
+    /// chunks of `chunk` tokens, the way DeltaGenerator feeds BackendOutput.
+    fn replay(lead: &str, seq: &[(u32, &str)], chunk: usize) -> (String, String) {
+        let mut vocab: HashMap<u32, String> =
+            seq.iter().map(|(id, s)| (*id, (*s).to_string())).collect();
+        vocab.insert(7, lead.to_string());
+        vocab.insert(IM_END, "<|im_end|>".to_string());
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(FakeTokenizer(vocab));
+        let ids: Vec<u32> = std::iter::once(7).chain(seq.iter().map(|(id, _)| *id)).collect();
+        let mut parser =
+            TokenAwareReasoning::new(tokenizer.clone(), &[], controls(), true, false, true, false, true);
+        let mut decoder = crate::tokenizers::DecodeStream::new(tokenizer, &[], true);
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for (n, part) in ids.chunks(chunk).enumerate() {
+            let mut text = String::new();
+            for &id in part {
+                text.push_str(decoder.step(id).unwrap().as_deref().unwrap_or(""));
+            }
+            let finished = (n + 1) * chunk >= ids.len();
+            let (r, c) = parser.push(0, part, &text, finished).unwrap();
+            reasoning.push_str(&r);
+            content.push_str(&c);
+        }
+        (reasoning, content)
+    }
+
+    #[test]
+    fn orphan_closers_then_eos_leave_no_tool_markup_in_reasoning() {
+        let lead = "If `path` is undefined... Let me check `_getPath`:\n\nActually let me look";
+        for chunk in 1..=ORPHAN_CLOSERS_THEN_EOS.len() + 1 {
+            let (reasoning, content) = replay(lead, ORPHAN_CLOSERS_THEN_EOS, chunk);
+            assert_eq!(
+                reasoning,
+                format!("{lead} at the `_getPath` function around line 1050-1100."),
+                "chunk={chunk}"
+            );
+            assert_eq!(content, "", "chunk={chunk}");
+        }
+    }
+
+    #[test]
+    fn orphan_closers_then_real_call_keep_the_call_for_the_tool_parser() {
+        // Same captured prefix; the model's p=0.32 alternative after `</tool_call>\n`
+        // (seen on the c256 run): it then opens a real call.
+        let mut seq = ORPHAN_CLOSERS_THEN_EOS[..ORPHAN_CLOSERS_THEN_EOS.len() - 1].to_vec();
+        seq.extend_from_slice(&[
+            (TOOL_CALL, "<tool_call>"), (1010, "\n"), (40, "<function=read>\n"),
+            (41, "<parameter=file_path>\n/repo/lib/schema.js\n</parameter>\n"),
+            (42, "</function>"), (1010, "\n"), (END_TOOL_CALL, "</tool_call>"),
+            (IM_END, "<|im_end|>"),
+        ]);
+        let call = "<tool_call>\n<function=read>\n<parameter=file_path>\n/repo/lib/schema.js\n</parameter>\n</function>\n</tool_call>";
+        for chunk in 1..=seq.len() + 1 {
+            let (reasoning, content) = replay("Reason", &seq, chunk);
+            assert_eq!(
+                reasoning,
+                "Reason at the `_getPath` function around line 1050-1100.",
+                "chunk={chunk}"
+            );
+            assert_eq!(content, call, "chunk={chunk}");
+        }
+    }
+
+    #[test]
+    fn eos_inside_reasoning_stays_reasoning() {
+        for chunk in 1..=EOS_INSIDE_REASONING.len() + 1 {
+            let (reasoning, content) = replay("Hmm", EOS_INSIDE_REASONING, chunk);
+            assert_eq!(
+                reasoning,
+                "Hmm-382 from the file one more time, very carefully. Let me re-read.",
+                "chunk={chunk}"
+            );
+            assert_eq!(content, "", "chunk={chunk}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Splitter;
+
+    fn split_all(raw: &str, token_aware_controls: &[(usize, &'static str)]) -> Vec<(String, String)> {
+        (0..=raw.len())
+            .filter(|split| raw.is_char_boundary(*split))
+            .map(|split| {
+                let mut parser = Splitter::with_options(false, true, false, true);
+                parser.token_aware = !token_aware_controls.is_empty();
+                parser.control_offsets.extend(token_aware_controls.iter().copied());
+                let a = parser.push(&raw[..split], false);
+                let b = parser.push(&raw[split..], true);
+                (format!("{}{}", a.0, b.0), format!("{}{}", a.1, b.1))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn closed_orphan_closer_run_is_dropped_from_reasoning() {
+        let raw = "Read more.\n</parameter>\n</function>\n</tool_call>\n";
+        for (reasoning, content) in split_all(raw, &[]) {
+            assert_eq!(reasoning, "Read more.");
+            assert_eq!(content, "");
+        }
+        let at = raw.find("</tool_call>").unwrap();
+        for (reasoning, content) in split_all(raw, &[(at, "</tool_call>")]) {
+            assert_eq!(reasoning, "Read more.");
+            assert_eq!(content, "");
+        }
+    }
+
+    #[test]
+    fn unclosed_or_interrupted_closer_text_stays_reasoning() {
+        for (raw, expected) in [
+            ("a </parameter> b", "a </parameter> b"),
+            ("a\n</parameter>\n</function>\n", "a\n</parameter>\n</function>"),
+            ("a\n</function> then b</tool_call>c", "a\n</function> then b</tool_call>c"),
+            ("XML ends with </tool_call> here", "XML ends with </tool_call> here"),
+        ] {
+            for (reasoning, content) in split_all(raw, &[]) {
+                assert_eq!(reasoning, expected, "{raw:?}");
+                assert_eq!(content, "", "{raw:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn token_aware_mode_only_drops_the_sampled_control_token() {
+        // Plain-text spelling (no control offset) is prose and survives; the
+        // sampled control token is protocol and is removed.
+        let raw = "says </tool_call> ok";
+        for (reasoning, _) in split_all(raw, &[(usize::MAX, "</tool_call>")]) {
+            assert_eq!(reasoning, raw);
+        }
+        for (reasoning, _) in split_all(raw, &[(5, "</tool_call>")]) {
+            assert_eq!(reasoning, "says  ok");
+        }
+    }
+
+    #[test]
+    fn degenerate_closer_repetition_is_released_not_held_until_eof() {
+        let run = "</parameter>\n".repeat(64);
+        let mut parser = Splitter::with_options(false, true, false, true);
+        let (reasoning, content) = parser.push(&format!("x\n{run}"), false);
+        // Streamed before EOF, and byte-for-byte reasoning.
+        assert!(reasoning.len() > 200, "{reasoning:?}");
+        let (tail, more) = parser.push("y", true);
+        assert_eq!(format!("{reasoning}{tail}"), format!("x\n{run}y"));
+        assert_eq!(format!("{content}{more}"), "");
+    }
+
+    #[test]
+    fn orphan_run_before_a_real_call_is_dropped_and_call_is_kept() {
+        let raw = "Plan.\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read>\n<parameter=p>\nx\n</parameter>\n</function>\n</tool_call>";
+        for (reasoning, content) in split_all(raw, &[]) {
+            assert_eq!(reasoning, "Plan.");
+            assert_eq!(
+                content,
+                "<tool_call>\n<function=read>\n<parameter=p>\nx\n</parameter>\n</function>\n</tool_call>"
+            );
+        }
+    }
 
     #[test]
     fn literal_reasoning_markers_in_tool_args_survive_all_splits() {
