@@ -35,11 +35,16 @@ struct Splitter {
     phase: Phase,
     buffer: String,
     reasoning_whitespace: String,
-    /// Reasoning-phase run of `</parameter>`/`</function>` (plus whitespace between
-    /// them) held back until we know whether a `</tool_call>` closes it. A closed
-    /// run is protocol residue of a call that was never opened and is dropped; any
-    /// other continuation releases the run to reasoning unchanged.
+    /// Reasoning-phase run of line-leading `</parameter>`/`</function>` (plus the
+    /// whitespace between them) held back until we know whether a line-leading
+    /// `</tool_call>` closes it. A closed run is protocol residue of a call that
+    /// was never opened and is dropped; any other continuation releases the run to
+    /// reasoning unchanged.
     orphan_closers: String,
+    /// `orphan_closers` ends with `</tool_call>`; dropped once its line ends.
+    orphan_closed: bool,
+    /// No visible reasoning character since the last newline (or stream start).
+    line_start: bool,
     bypass_decided: bool,
     bypass: bool,
     emitted_content: bool,
@@ -68,6 +73,8 @@ impl Splitter {
             buffer: String::new(),
             reasoning_whitespace: String::new(),
             orphan_closers: String::new(),
+            orphan_closed: false,
+            line_start: true,
             bypass_decided: !inspect_bare_json,
             bypass: false,
             emitted_content: false,
@@ -103,6 +110,11 @@ impl Splitter {
     /// character so trailing whitespace before a boundary is never emitted.
     fn push_reasoning_char(&mut self, reasoning: &mut String, ch: char) {
         if ch.is_whitespace() {
+            if ch == '\n' && self.orphan_closed {
+                // `</tool_call>` ended its line: the run is confirmed residue.
+                self.orphan_closers.clear();
+                self.orphan_closed = false;
+            }
             if self.orphan_closers.len() + ch.len_utf8() > MAX_ORPHAN_CLOSER_BYTES {
                 self.release_orphan_closers(reasoning);
             }
@@ -111,16 +123,53 @@ impl Splitter {
             } else {
                 self.orphan_closers.push(ch);
             }
+            self.line_start |= ch == '\n';
             return;
         }
         self.release_orphan_closers(reasoning);
         reasoning.push_str(&std::mem::take(&mut self.reasoning_whitespace));
         reasoning.push(ch);
+        self.line_start = false;
     }
 
-    /// Emit a held closer run as ordinary reasoning text (it was not closed by
-    /// `</tool_call>`); its trailing whitespace stays pending like any other.
+    /// Handle a closer marker seen in the reasoning phase. Residue of an unopened
+    /// call is line-structured like the real call syntax: every closer starts its
+    /// own line and the final `</tool_call>` ends one. Anything else (for example
+    /// an inline quoted ``</parameter></function></tool_call>``) is reasoning text.
+    fn push_reasoning_closer(&mut self, reasoning: &mut String, marker: &'static str) {
+        let closer = ORPHAN_CLOSERS.contains(&marker);
+        let structural = self.line_start
+            && !self.orphan_closed
+            && self.orphan_closers.len() + marker.len() <= MAX_ORPHAN_CLOSER_BYTES
+            // A lone `</tool_call>` (even the sampled control token, which is
+            // also how prose spells it) is kept; only a closer run proves residue.
+            && (closer || !self.orphan_closers.is_empty());
+        if structural {
+            self.orphan_closers.push_str(marker);
+            self.orphan_closed = !closer;
+            self.line_start = false;
+        } else {
+            for ch in marker.chars() {
+                self.push_reasoning_char(reasoning, ch);
+            }
+        }
+    }
+
+    /// Resolve a held run at a protocol boundary (`<think>`, `</think>`,
+    /// `<tool_call>`) or EOF: a run closed by `</tool_call>` is dropped, an
+    /// unclosed one is not provably residue and is released unchanged.
+    fn settle_orphan_closers(&mut self, reasoning: &mut String) {
+        if self.orphan_closed {
+            self.orphan_closers.clear();
+            self.orphan_closed = false;
+        }
+        self.release_orphan_closers(reasoning);
+    }
+
+    /// Emit a held closer run as ordinary reasoning text; its trailing whitespace
+    /// stays pending like any other.
     fn release_orphan_closers(&mut self, reasoning: &mut String) {
+        self.orphan_closed = false;
         if self.orphan_closers.is_empty() {
             return;
         }
@@ -162,35 +211,12 @@ impl Splitter {
                 let marker = *marker;
                 let before = self.phase;
                 if before == Phase::Reasoning {
-                    if ORPHAN_CLOSERS.contains(&marker) {
-                        // Bound the holdback: a degenerate repetition is released
-                        // as reasoning rather than stalling the stream until EOF.
-                        if self.orphan_closers.len() + marker.len() > MAX_ORPHAN_CLOSER_BYTES {
-                            self.release_orphan_closers(&mut reasoning);
-                            for ch in marker.chars() {
-                                self.push_reasoning_char(&mut reasoning, ch);
-                            }
-                        } else {
-                            self.orphan_closers.push_str(marker);
-                        }
+                    if marker == "</tool_call>" || ORPHAN_CLOSERS.contains(&marker) {
                         cursor += marker.len();
+                        self.push_reasoning_closer(&mut reasoning, marker);
                         continue;
                     }
-                    if marker == "</tool_call>" {
-                        cursor += marker.len();
-                        // In token-aware mode this is the sampled protocol token
-                        // itself, never prose; in text mode only a closer run
-                        // proves it is residue of an unopened call.
-                        if self.token_aware || !self.orphan_closers.is_empty() {
-                            self.orphan_closers.clear();
-                        } else {
-                            for ch in marker.chars() {
-                                self.push_reasoning_char(&mut reasoning, ch);
-                            }
-                        }
-                        continue;
-                    }
-                    self.release_orphan_closers(&mut reasoning);
+                    self.settle_orphan_closers(&mut reasoning);
                 }
                 self.phase = match (before, marker) {
                     (Phase::Reasoning, "</think>") => Phase::Content,
@@ -234,8 +260,7 @@ impl Splitter {
         self.control_offsets.retain(|(offset, _)| *offset >= cursor);
         for (offset, _) in &mut self.control_offsets { *offset -= cursor; }
         if finished {
-            // An unclosed run is not provably protocol residue; keep it.
-            self.release_orphan_closers(&mut reasoning);
+            self.settle_orphan_closers(&mut reasoning);
             self.reasoning_whitespace.clear();
         }
         if !self.emitted_content {
@@ -731,15 +756,42 @@ mod tests {
     }
 
     #[test]
-    fn token_aware_mode_only_drops_the_sampled_control_token() {
-        // Plain-text spelling (no control offset) is prose and survives; the
-        // sampled control token is protocol and is removed.
-        let raw = "says </tool_call> ok";
-        for (reasoning, _) in split_all(raw, &[(usize::MAX, "</tool_call>")]) {
+    fn lone_tool_call_closer_is_kept_in_both_modes() {
+        // The tokenizer spells prose `</tool_call>` with the control token too, so a
+        // lone closer (inline or on its own line) is never treated as residue.
+        for raw in ["says </tool_call> ok", "says\n</tool_call>\nok"] {
+            let at = raw.find("</tool_call>").unwrap();
+            for controls in [&[][..], &[(usize::MAX, "</tool_call>")][..], &[(at, "</tool_call>")][..]] {
+                for (reasoning, _) in split_all(raw, controls) {
+                    assert_eq!(reasoning, raw, "{controls:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inline_quoted_closer_sequence_is_reasoning_text() {
+        let raw = "The expected suffix is `</parameter></function></tool_call>`.";
+        let at = raw.find("</tool_call>").unwrap();
+        for controls in [&[][..], &[(at, "</tool_call>")][..]] {
+            for (reasoning, content) in split_all(raw, controls) {
+                assert_eq!(reasoning, raw, "{controls:?}");
+                assert_eq!(content, "");
+            }
+        }
+        // Same line after the closer: not a protocol boundary, keep it all.
+        let raw = "x\n</parameter>\n</function>\n</tool_call> is how it ends";
+        for (reasoning, _) in split_all(raw, &[]) {
             assert_eq!(reasoning, raw);
         }
-        for (reasoning, _) in split_all(raw, &[(5, "</tool_call>")]) {
-            assert_eq!(reasoning, "says  ok");
+    }
+
+    #[test]
+    fn closed_run_at_eof_without_trailing_newline_is_dropped() {
+        let raw = "Read more.\n</parameter>\n</function>\n</tool_call>";
+        for (reasoning, content) in split_all(raw, &[]) {
+            assert_eq!(reasoning, "Read more.");
+            assert_eq!(content, "");
         }
     }
 
