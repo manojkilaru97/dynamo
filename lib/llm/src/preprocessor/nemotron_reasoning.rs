@@ -182,16 +182,10 @@ impl Splitter {
     /// at such a boundary or at a natural stop; at a length limit or a cut stream
     /// it may be a quoted example and is kept. An unclosed run is always kept.
     fn settle_orphan_closers(&mut self, reasoning: &mut String, end: Option<&str>) {
-        // `force_nonempty_content` falls back to the reasoning text when nothing
-        // else is visible (at EOF, or at `</think>` in batch mode); never let
-        // residue removal empty that fallback. A `<tool_call>` always produces
-        // visible content.
-        let fallback_possible = match end {
-            None => true,
-            Some("</think>") => !self.streaming,
-            Some(_) => false,
-        };
-        let sole_text = fallback_possible
+        // `force_nonempty_content` falls back to the reasoning text at EOF when
+        // nothing else is visible; never let residue removal empty that fallback.
+        // (At `</think>` an answer may still follow, so the run is dropped there.)
+        let sole_text = end.is_none()
             && self.force_nonempty
             && !self.visible_content
             && reasoning.trim().is_empty()
@@ -264,11 +258,9 @@ impl Splitter {
                         }
                         continue;
                     }
-                    if marker == "<think>" {
-                        // Reasoning continues after a stray `<think>`: not an end.
-                        self.release_orphan_closers(&mut reasoning);
-                        self.closer_passthrough = false;
-                    } else {
+                    // A stray `<think>` is removed and does not end reasoning: a
+                    // held run stays held (later text releases it, an end drops it).
+                    if marker != "<think>" {
                         self.settle_orphan_closers(&mut reasoning, Some(marker));
                     }
                 }
@@ -1161,21 +1153,34 @@ mod tests {
     }
 
     #[test]
-    fn stray_think_does_not_end_reasoning_and_batch_fallback_survives_end_think() {
+    fn stray_think_neither_ends_reasoning_nor_commits_a_held_run() {
+        let tc = |raw: &str| raw.find("</tool_call>").unwrap();
+        let th = |raw: &str| raw.find("<think>").unwrap();
         // Reasoning continues after a stray `<think>`: the run is released.
         let raw = "Format:\n</parameter>\n</function>\n</tool_call>\n<think>Now continue.";
-        let at = raw.find("<think>").unwrap();
-        let tc = raw.find("</tool_call>").unwrap();
-        for (reasoning, _) in split_all(raw, &[(tc, "</tool_call>"), (at, "<think>")]) {
+        for (reasoning, _) in split_all(raw, &[(tc(raw), "</tool_call>"), (th(raw), "<think>")]) {
             assert_eq!(reasoning, "Format:\n</parameter>\n</function>\n</tool_call>\nNow continue.");
         }
-        // Batch `force_nonempty_content`: residue-only reasoning, then `</think>`
-        // and no answer: the fallback content is not emptied.
-        let raw = "</parameter>\n</function>\n</tool_call>\n</think>";
-        let mut parser = Splitter::with_options(false, true, true, false);
-        parser.natural_stop = true;
-        let (_, content) = parser.push(raw, true);
-        assert_eq!(content, "</parameter>\n</function>\n</tool_call>");
+        // Nothing visible follows before EOS: the run is still dropped.
+        let raw = "Plan.\n</parameter>\n</function>\n</tool_call>\n<think>";
+        for (reasoning, _) in split_all(raw, &[(tc(raw), "</tool_call>"), (th(raw), "<think>")]) {
+            assert_eq!(reasoning, "Plan.");
+        }
+    }
+
+    #[test]
+    fn force_nonempty_batch_drops_residue_before_an_answer() {
+        let raw = "</parameter>\n</function>\n</tool_call>\n</think>Answer";
+        for (reasoning, content) in (0..=raw.len()).map(|split| {
+            let mut parser = Splitter::with_options(false, true, true, false);
+            let a = parser.push(&raw[..split], false);
+            parser.natural_stop = true;
+            let b = parser.push(&raw[split..], true);
+            (format!("{}{}", a.0, b.0), format!("{}{}", a.1, b.1))
+        }) {
+            assert_eq!(reasoning, "");
+            assert_eq!(content, "Answer");
+        }
     }
 
     #[test]
