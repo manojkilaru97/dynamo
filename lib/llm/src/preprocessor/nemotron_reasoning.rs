@@ -182,9 +182,11 @@ impl Splitter {
     /// at a boundary or a natural stop; at a length limit or a cut stream it may
     /// be a quoted example and is kept. An unclosed run is always kept.
     fn settle_orphan_closers(&mut self, reasoning: &mut String, eof: bool) {
-        // `force_nonempty_content` falls back to the reasoning text when nothing
-        // else is visible; never let residue removal leave that fallback empty.
-        let sole_text = self.force_nonempty
+        // `force_nonempty_content` falls back to the reasoning text at EOF when
+        // nothing else is visible; never let residue removal empty that fallback.
+        // At a boundary, a call or an answer can still follow.
+        let sole_text = eof
+            && self.force_nonempty
             && !self.visible_content
             && reasoning.trim().is_empty()
             && self.reasoning_history.trim().is_empty();
@@ -821,6 +823,47 @@ mod bug5_sampled_replay_tests {
         assert_eq!(through_delta_generator(None), kept);
     }
 
+    /// Text mode (`parse_stream_with_options`): OpenAI `Stop` cannot be told
+    /// apart from a cancellation, so residue at EOF is kept; a protocol boundary
+    /// still ends reasoning and drops it.
+    #[tokio::test]
+    async fn text_mode_keeps_eof_residue_and_drops_it_at_a_boundary() {
+        use dynamo_protocols::types::FinishReason;
+        async fn run(chunks: &[(&str, Option<FinishReason>)]) -> (String, String) {
+            let mut generator = crate::protocols::openai::chat_completions::DeltaGenerator::new(
+                "m".to_string(), Default::default(), "r".to_string());
+            let input: Vec<_> = chunks
+                .iter()
+                .map(|(text, finish)| {
+                    Annotated::from_data(generator.create_choice(0, Some(text.to_string()), *finish, None))
+                })
+                .collect();
+            let output: Vec<_> =
+                parse_stream_with_options(stream::iter(input), false, true, false, true).collect().await;
+            let (mut reasoning, mut content) = (String::new(), String::new());
+            for item in output {
+                for choice in item.data.unwrap().inner.choices {
+                    reasoning.push_str(choice.delta.reasoning_content.as_deref().unwrap_or(""));
+                    if let Some(ChatCompletionMessageContent::Text(t)) = choice.delta.content {
+                        content.push_str(&t);
+                    }
+                }
+            }
+            (reasoning, content)
+        }
+        let residue = "Read more.\n</parameter>\n</function>\n</tool_call>\n";
+        for finish in [Some(FinishReason::Stop), Some(FinishReason::Length)] {
+            let (reasoning, _) = run(&[(residue, None), ("", finish)]).await;
+            assert_eq!(reasoning, residue.trim_end(), "{finish:?}");
+        }
+        let (reasoning, _) = run(&[(residue, None)]).await;
+        assert_eq!(reasoning, residue.trim_end(), "unterminated stream");
+        let (reasoning, content) =
+            run(&[(residue, None), ("</think>Answer", Some(FinishReason::Stop))]).await;
+        assert_eq!(reasoning, "Read more.");
+        assert_eq!(content, "Answer");
+    }
+
     #[test]
     fn eos_inside_reasoning_stays_reasoning() {
         for chunk in 1..=EOS_INSIDE_REASONING.len() + 1 {
@@ -844,7 +887,9 @@ mod tests {
     }
 
     /// Feed `raw` in two pieces at every char boundary; the stream then ends with
-    /// a natural stop (EOS) or not (length limit / cut stream).
+    /// a natural stop (EOS) or not (length limit / cut stream). Splitter-level:
+    /// `natural_stop` is an input here even in text mode, where production never
+    /// sets it (see `text_mode_keeps_eof_residue_and_drops_it_at_a_boundary`).
     fn split_all_ending(
         raw: &str,
         token_aware_controls: &[(usize, &'static str)],
@@ -1084,6 +1129,22 @@ mod tests {
             parser.natural_stop = true;
             let (_, content) = parser.push(raw, true);
             assert_eq!(content, raw.trim_end(), "streaming={streaming}");
+        }
+    }
+
+    #[test]
+    fn force_nonempty_still_drops_residue_before_a_real_call() {
+        let raw = "</parameter>\n</function>\n</tool_call>\n<tool_call><function=read><parameter=path>x</parameter></function></tool_call>";
+        for streaming in [true, false] {
+            let mut parser = Splitter::with_options(false, true, true, streaming);
+            parser.natural_stop = true;
+            let (reasoning, content) = parser.push(raw, true);
+            assert_eq!(reasoning, "", "streaming={streaming}");
+            assert_eq!(
+                content,
+                "<tool_call><function=read><parameter=path>x</parameter></function></tool_call>",
+                "streaming={streaming}"
+            );
         }
     }
 
