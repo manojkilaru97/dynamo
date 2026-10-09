@@ -58,7 +58,8 @@ struct Splitter {
     /// No visible character, and no indentation, since the last newline.
     line_column_zero: bool,
     /// The upcoming EOF is a natural stop (EOS or stop string), not a length
-    /// limit or a cut stream; set by the caller before the final `push`.
+    /// limit, cancellation or a cut stream; set by the caller before the final
+    /// `push`. Only the token-aware path knows this; text mode leaves it false.
     natural_stop: bool,
     bypass_decided: bool,
     bypass: bool,
@@ -181,7 +182,13 @@ impl Splitter {
     /// at a boundary or a natural stop; at a length limit or a cut stream it may
     /// be a quoted example and is kept. An unclosed run is always kept.
     fn settle_orphan_closers(&mut self, reasoning: &mut String, eof: bool) {
-        if self.orphan_closed && (!eof || self.natural_stop) {
+        // `force_nonempty_content` falls back to the reasoning text when nothing
+        // else is visible; never let residue removal leave that fallback empty.
+        let sole_text = self.force_nonempty
+            && !self.visible_content
+            && reasoning.trim().is_empty()
+            && self.reasoning_history.trim().is_empty();
+        if self.orphan_closed && (!eof || self.natural_stop) && !sole_text {
             self.orphan_closers.clear();
         }
         self.release_orphan_closers(reasoning);
@@ -543,10 +550,10 @@ where
                         String::new()
                     }
                 };
-                splitter.natural_stop = matches!(
-                    choice.finish_reason,
-                    Some(dynamo_protocols::types::FinishReason::Stop)
-                );
+                // `natural_stop` stays false here: by this point the backend's
+                // EOS/stop and a cancellation are both OpenAI `Stop`, so text mode
+                // drops closer residue only at protocol boundaries. The token-aware
+                // path (`TokenAwareReasoning`) sees the backend finish reason.
                 let (reasoning, content) = splitter.push(&text, choice.finish_reason.is_some());
                 if !reasoning.is_empty() {
                     choice
@@ -745,6 +752,73 @@ mod bug5_sampled_replay_tests {
             );
             assert_eq!(content, call, "chunk={chunk}");
         }
+    }
+
+    /// Feed the captured residue through `DeltaGenerator` one token per
+    /// `BackendOutput`, ending with `finish` (EoS carries the EOS token), or with
+    /// no finish reason followed by `flush_postprocessor` (a cut stream).
+    fn through_delta_generator(finish: Option<crate::protocols::common::FinishReason>) -> String {
+        use crate::protocols::common::FinishReason;
+        use crate::protocols::common::llm_backend::BackendOutput;
+        use crate::protocols::openai::DeltaGeneratorExt;
+        let seq = &ORPHAN_CLOSERS_THEN_EOS[..ORPHAN_CLOSERS_THEN_EOS.len() - 1];
+        let mut vocab: HashMap<u32, String> =
+            seq.iter().map(|(id, s)| (*id, (*s).to_string())).collect();
+        vocab.insert(IM_END, "<|im_end|>".to_string());
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(FakeTokenizer(vocab));
+        let mut generator = crate::protocols::openai::chat_completions::DeltaGenerator::new(
+            "m".to_string(), Default::default(), "r".to_string());
+        generator.set_nemotron_reasoning(TokenAwareReasoning::new(
+            tokenizer, &[], controls(), true, false, true, false, true));
+        let mut reasoning = String::new();
+        let n = seq.len();
+        for (i, (id, text)) in seq.iter().enumerate() {
+            let last = i + 1 == n;
+            let mut ids = vec![*id];
+            if last && matches!(finish, Some(FinishReason::EoS)) {
+                ids.push(IM_END);
+            }
+            let out = BackendOutput {
+                token_ids: ids,
+                tokens: vec![],
+                text: Some((*text).to_string()),
+                cum_log_probs: None,
+                log_probs: None,
+                top_logprobs: None,
+                finish_reason: if last { finish.clone() } else { None },
+                stop_reason: None,
+                index: Some(0),
+                completion_usage: None,
+                disaggregated_params: None,
+                worker_trace_link: None,
+                extra_args: None,
+                engine_data: None,
+                encoder_result: None,
+                routing_data: None,
+            };
+            let chunk = generator.choice_from_postprocessor(out).unwrap();
+            for choice in chunk.inner.choices {
+                reasoning.push_str(choice.delta.reasoning_content.as_deref().unwrap_or(""));
+            }
+        }
+        if let Some(chunk) = generator.flush_postprocessor().unwrap() {
+            for choice in chunk.inner.choices {
+                reasoning.push_str(choice.delta.reasoning_content.as_deref().unwrap_or(""));
+            }
+        }
+        reasoning
+    }
+
+    #[test]
+    fn delta_generator_drops_residue_only_at_a_natural_stop() {
+        use crate::protocols::common::FinishReason;
+        let clean = " at the `_getPath` function around line 1050-1100.";
+        let kept = format!("{clean}\n</parameter>\n</function>\n</tool_call>");
+        assert_eq!(through_delta_generator(Some(FinishReason::EoS)), clean);
+        assert_eq!(through_delta_generator(Some(FinishReason::Stop)), clean);
+        assert_eq!(through_delta_generator(Some(FinishReason::Length)), kept);
+        assert_eq!(through_delta_generator(Some(FinishReason::Cancelled)), kept);
+        assert_eq!(through_delta_generator(None), kept);
     }
 
     #[test]
@@ -999,6 +1073,17 @@ mod tests {
             for (reasoning, _) in split_all(raw, &[(second, "</tool_call>")]) {
                 assert_eq!(reasoning, raw.trim_end(), "{raw:?}");
             }
+        }
+    }
+
+    #[test]
+    fn force_nonempty_fallback_is_never_emptied_by_residue_removal() {
+        let raw = "</parameter>\n</function>\n</tool_call>\n";
+        for streaming in [true, false] {
+            let mut parser = Splitter::with_options(false, true, true, streaming);
+            parser.natural_stop = true;
+            let (_, content) = parser.push(raw, true);
+            assert_eq!(content, raw.trim_end(), "streaming={streaming}");
         }
     }
 
