@@ -44,8 +44,8 @@ struct Splitter {
     ///
     /// A run of `</parameter>`/`</function>` lines starting at column 0 is held
     /// in `orphan_closers`; a column-0 `</tool_call>` after it closes the run. A
-    /// closed run is dropped only when reasoning then ends: at a protocol
-    /// boundary (`<think>`, `</think>`, `<tool_call>`) or at a natural EOS/stop.
+    /// closed run is dropped only when reasoning then ends: at `</think>` or
+    /// `<tool_call>`, or at a natural EOS/stop.
     /// Any visible character, an opener, or a length/unknown end releases it.
     orphan_closers: String,
     orphan_closed: bool,
@@ -177,20 +177,26 @@ impl Splitter {
         }
     }
 
-    /// Resolve a held run where reasoning ends: at a protocol boundary
-    /// (`<think>`, `</think>`, `<tool_call>`) or at EOF. A closed run is dropped
-    /// at a boundary or a natural stop; at a length limit or a cut stream it may
-    /// be a quoted example and is kept. An unclosed run is always kept.
-    fn settle_orphan_closers(&mut self, reasoning: &mut String, eof: bool) {
-        // `force_nonempty_content` falls back to the reasoning text at EOF when
-        // nothing else is visible; never let residue removal empty that fallback.
-        // At a boundary, a call or an answer can still follow.
-        let sole_text = eof
+    /// Resolve a held run where reasoning ends: at `</think>` or `<tool_call>`
+    /// (`end = Some(marker)`) or at EOF (`end = None`). A closed run is dropped
+    /// at such a boundary or at a natural stop; at a length limit or a cut stream
+    /// it may be a quoted example and is kept. An unclosed run is always kept.
+    fn settle_orphan_closers(&mut self, reasoning: &mut String, end: Option<&str>) {
+        // `force_nonempty_content` falls back to the reasoning text when nothing
+        // else is visible (at EOF, or at `</think>` in batch mode); never let
+        // residue removal empty that fallback. A `<tool_call>` always produces
+        // visible content.
+        let fallback_possible = match end {
+            None => true,
+            Some("</think>") => !self.streaming,
+            Some(_) => false,
+        };
+        let sole_text = fallback_possible
             && self.force_nonempty
             && !self.visible_content
             && reasoning.trim().is_empty()
             && self.reasoning_history.trim().is_empty();
-        if self.orphan_closed && (!eof || self.natural_stop) && !sole_text {
+        if self.orphan_closed && (end.is_some() || self.natural_stop) && !sole_text {
             self.orphan_closers.clear();
         }
         self.release_orphan_closers(reasoning);
@@ -258,7 +264,13 @@ impl Splitter {
                         }
                         continue;
                     }
-                    self.settle_orphan_closers(&mut reasoning, false);
+                    if marker == "<think>" {
+                        // Reasoning continues after a stray `<think>`: not an end.
+                        self.release_orphan_closers(&mut reasoning);
+                        self.closer_passthrough = false;
+                    } else {
+                        self.settle_orphan_closers(&mut reasoning, Some(marker));
+                    }
                 }
                 self.phase = match (before, marker) {
                     (Phase::Reasoning, "</think>") => Phase::Content,
@@ -310,7 +322,7 @@ impl Splitter {
         self.control_offsets.retain(|(offset, _)| *offset >= cursor);
         for (offset, _) in &mut self.control_offsets { *offset -= cursor; }
         if finished {
-            self.settle_orphan_closers(&mut reasoning, true);
+            self.settle_orphan_closers(&mut reasoning, None);
             self.reasoning_whitespace.clear();
         }
         if !self.emitted_content {
@@ -1146,6 +1158,24 @@ mod tests {
                 "streaming={streaming}"
             );
         }
+    }
+
+    #[test]
+    fn stray_think_does_not_end_reasoning_and_batch_fallback_survives_end_think() {
+        // Reasoning continues after a stray `<think>`: the run is released.
+        let raw = "Format:\n</parameter>\n</function>\n</tool_call>\n<think>Now continue.";
+        let at = raw.find("<think>").unwrap();
+        let tc = raw.find("</tool_call>").unwrap();
+        for (reasoning, _) in split_all(raw, &[(tc, "</tool_call>"), (at, "<think>")]) {
+            assert_eq!(reasoning, "Format:\n</parameter>\n</function>\n</tool_call>\nNow continue.");
+        }
+        // Batch `force_nonempty_content`: residue-only reasoning, then `</think>`
+        // and no answer: the fallback content is not emptied.
+        let raw = "</parameter>\n</function>\n</tool_call>\n</think>";
+        let mut parser = Splitter::with_options(false, true, true, false);
+        parser.natural_stop = true;
+        let (_, content) = parser.push(raw, true);
+        assert_eq!(content, "</parameter>\n</function>\n</tool_call>");
     }
 
     #[test]
