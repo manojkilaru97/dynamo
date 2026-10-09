@@ -219,12 +219,15 @@ impl Splitter {
         }
         // Once one closer of a sequence is text, the rest of the sequence stays
         // text too, so a quotation is never half-dropped.
+        let line_leading = self.line.at_column_zero();
         self.release_orphan_closers(reasoning);
         self.closer_passthrough = true;
         for ch in marker.chars() {
             self.push_reasoning_char(reasoning, ch);
         }
-        if marker == "</tool_call>" {
+        // Only a line-leading `</tool_call>` ends an in-reasoning call body; one
+        // inside an argument value (`echo </tool_call>`) does not.
+        if marker == "</tool_call>" && line_leading {
             self.reasoning_call_open = false;
         }
     }
@@ -292,14 +295,20 @@ impl Splitter {
                         continue;
                     }
                     if TOOL_OPENERS.contains(&marker) {
-                        // A call body written inside reasoning (no `<tool_call>`
-                        // control) stays reasoning text, closers included.
+                        // A line-leading opener starts a call body written inside
+                        // reasoning (no `<tool_call>` control): it ends a held run
+                        // like a protocol boundary, and its own closers stay
+                        // reasoning text. An inline mention is just prose.
                         cursor += marker.len();
+                        let line_leading = self.line.at_column_zero();
+                        if line_leading {
+                            self.settle_orphan_closers(&mut reasoning, false);
+                        }
                         self.closer_passthrough = false;
                         for ch in marker.chars() {
                             self.push_reasoning_char(&mut reasoning, ch);
                         }
-                        self.reasoning_call_open = true;
+                        self.reasoning_call_open |= line_leading;
                         continue;
                     }
                     self.settle_orphan_closers(&mut reasoning, false);
@@ -988,6 +997,35 @@ mod tests {
         for (reasoning, content) in split_all(raw, &[]) {
             assert_eq!(reasoning, "```js\nx();\nLet me re-read.");
             assert_eq!(content, "<tool_call>\n<function=read>\n</function>\n</tool_call>");
+        }
+    }
+
+    #[test]
+    fn in_reasoning_call_latch_is_line_structured() {
+        // Residue, then a line-leading call body: the residue is dropped, the body kept.
+        let raw = "Plan.\n</parameter>\n</function>\n</tool_call>\n<parameter=file_path>\n/x.js\n</parameter>\n</function>\n</tool_call>\n";
+        let at = raw.find("</tool_call>").unwrap();
+        for controls in [&[][..], &[(at, "</tool_call>")][..]] {
+            for (reasoning, _) in split_all(raw, controls) {
+                assert_eq!(
+                    reasoning,
+                    "Plan.\n<parameter=file_path>\n/x.js\n</parameter>\n</function>\n</tool_call>",
+                    "{controls:?}"
+                );
+            }
+        }
+        // An inline opener mention does not disarm residue removal.
+        let raw = "Use <parameter=path> here.\nThen think.\n</parameter>\n</function>\n</tool_call>\n";
+        for (reasoning, _) in split_all(raw, &[]) {
+            assert_eq!(reasoning, "Use <parameter=path> here.\nThen think.");
+        }
+        // A `</tool_call>` inside an argument value does not end the call body.
+        let raw = "<function=exec>\n<parameter=command>\necho </tool_call>\ndone\n</parameter>\n</function>\n</tool_call>\n";
+        let at = raw.find("</tool_call>").unwrap();
+        for controls in [&[][..], &[(at, "</tool_call>")][..]] {
+            for (reasoning, _) in split_all(raw, controls) {
+                assert_eq!(reasoning, raw.trim_end(), "{controls:?}");
+            }
         }
     }
 
