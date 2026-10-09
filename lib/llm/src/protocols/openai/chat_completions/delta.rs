@@ -336,9 +336,13 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
         mut delta: crate::protocols::common::llm_backend::BackendOutput,
     ) -> anyhow::Result<NvCreateChatCompletionStreamResponse> {
         let reasoning = if let Some(parser) = &mut self.nemotron_reasoning {
+            let natural_stop = matches!(
+                delta.finish_reason,
+                Some(common::FinishReason::EoS | common::FinishReason::Stop)
+            );
             let (reasoning, content) = parser.push(
                 delta.index.unwrap_or(0), &delta.token_ids,
-                delta.text.as_deref().unwrap_or(""), delta.finish_reason.is_some(),
+                delta.text.as_deref().unwrap_or(""), delta.finish_reason.is_some(), natural_stop,
             )?;
             delta.text = (!content.is_empty()).then_some(content);
             (!reasoning.is_empty()).then_some(reasoning)
