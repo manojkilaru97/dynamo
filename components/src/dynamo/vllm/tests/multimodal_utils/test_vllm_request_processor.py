@@ -498,6 +498,42 @@ async def test_text_and_image_requests_never_touch_video_or_audio_loaders():
         processor.audio_loader.load_audio_batch.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_omni_rejects_separate_audio_with_audio_in_video():
+    processor = _audio_processor({"sampling_rate": 16000}, {"use_audio_in_video": True})
+    processor.video_loader.load_video_batch.return_value = [object()]
+
+    with pytest.raises(ValueError, match="cannot combine audio inputs"):
+        await processor.extract_multimodal_data(
+            {
+                "multi_modal_data": {
+                    "video_url": _VIDEO_ITEMS,
+                    "audio_url": [{"Url": "data:audio/wav;base64,AA"}],
+                }
+            },
+            "request-omni-mixed",
+            None,
+            None,
+        )
+    processor.audio_loader.load_audio_batch.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("sound_config", "expected"), [(None, False), ({"sampling_rate": 16000}, True)]
+)
+def test_default_video_loader_enables_royalty_free_nvdec_only_for_omni(
+    sound_config, expected
+):
+    processor = mod.VllmMultimodalRequestProcessor(
+        model="m",
+        engine_client=_engine_client(sound_config, None),
+        enable_multimodal=True,
+        image_loader=SimpleNamespace(),
+        audio_loader=SimpleNamespace(),
+    )
+    assert processor.video_loader._nvdec_royalty_free_codecs is expected
+
+
 def test_audio_in_video_policy_reads_sound_config_and_engine_default():
     assert mod._resolve_audio_in_video_policy(None) == (False, False)
     assert mod._resolve_audio_in_video_policy(

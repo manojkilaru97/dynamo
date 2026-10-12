@@ -310,6 +310,10 @@ class VllmMultimodalRequestProcessor:
         use_unified_vision_chunk: Optional[bool] = None,
         trust_remote_code: bool = False,
     ) -> None:
+        (
+            self._audio_in_video_from_bytes,
+            self._default_use_audio_in_video,
+        ) = _resolve_audio_in_video_policy(engine_client)
         self.model = model
         self.engine_client = engine_client
         self.enable_multimodal = enable_multimodal
@@ -318,9 +322,17 @@ class VllmMultimodalRequestProcessor:
         self.image_loader = image_loader or ImageLoader(
             enable_frontend_decoding=enable_frontend_decoding
         )
-        self.video_loader = video_loader or VideoLoader(
-            enable_frontend_decoding=enable_frontend_decoding
-        )
+        if video_loader is None:
+            if self._audio_in_video_from_bytes:
+                video_loader = VideoLoader(
+                    enable_frontend_decoding=enable_frontend_decoding,
+                    nvdec_royalty_free_codecs=True,
+                )
+            else:
+                video_loader = VideoLoader(
+                    enable_frontend_decoding=enable_frontend_decoding
+                )
+        self.video_loader = video_loader
         self.audio_loader = audio_loader or AudioLoader(
             enable_frontend_decoding=enable_frontend_decoding
         )
@@ -340,10 +352,6 @@ class VllmMultimodalRequestProcessor:
                 )
             )
         self.use_unified_vision_chunk = use_unified_vision_chunk
-        (
-            self._audio_in_video_from_bytes,
-            self._default_use_audio_in_video,
-        ) = _resolve_audio_in_video_policy(engine_client)
 
     def _keeps_video_bytes_for_audio(
         self, mm_processor_kwargs: Optional[dict[str, Any]]
@@ -499,6 +507,15 @@ class VllmMultimodalRequestProcessor:
                     vllm_mm_data["video"] = videos[0] if len(videos) == 1 else videos
 
             audio_items = mm_map.get(AUDIO_URL_KEY, [])
+            if keep_video_bytes and audio_items:
+                # vLLM's Nemotron processor treats any audio item as the
+                # video's own track (1:1), so separate audio cannot be mixed in.
+                raise ValueError(
+                    "A request cannot combine audio inputs with a video while "
+                    "use_audio_in_video is enabled. Send them in separate "
+                    'requests or set mm_processor_kwargs {"use_audio_in_video": '
+                    "false}."
+                )
             if audio_items:
                 audios = await self.audio_loader.load_audio_batch(audio_items)
                 if audios:

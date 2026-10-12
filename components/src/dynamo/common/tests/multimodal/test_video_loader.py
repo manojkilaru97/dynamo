@@ -355,3 +355,44 @@ async def test_load_video_batch_keep_bytes_rejects_frontend_decoded_video():
         await loader.load_video_batch(
             [{"Decoded": {"shape": [1, 2, 2, 3]}}], keep_video_bytes=True
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("codec", ["vp9", "av1", "vp8"])
+async def test_nvdec_royalty_free_codecs_opt_in_routes_to_nvdec(monkeypatch, codec):
+    loader = VideoLoader(nvdec_royalty_free_codecs=True)
+    frames = np.zeros((1, 2, 2, 3), dtype=np.uint8)
+    meta = {"fps": 4.0, "frames_indices": [0], "total_num_frames": 1}
+    monkeypatch.setattr(video_loader_module, "probe_video_codec", lambda b: codec)
+    monkeypatch.setattr(video_loader_module, "should_use_nvdec", lambda c: False)
+    monkeypatch.setattr(video_loader_module, "nvdec_available", lambda: True)
+    monkeypatch.setattr(
+        video_loader_module, "decode_video_nvdec", lambda b, n: (frames, meta)
+    )
+    media_io = _RecordingMediaIO(frames)
+
+    _, got_meta = await loader._decode_video_bytes(b"bytes", media_io)
+
+    assert got_meta == meta
+    assert media_io.calls == []
+
+
+@pytest.mark.asyncio
+async def test_nvdec_royalty_free_codecs_default_keeps_software_path(monkeypatch):
+    """Default (Super 3.5): VP9 never goes to NVDEC, as before."""
+    loader = VideoLoader()
+    frames = np.zeros((1, 2, 2, 3), dtype=np.uint8)
+    monkeypatch.setattr(video_loader_module, "probe_video_codec", lambda b: "vp9")
+    monkeypatch.setattr(video_loader_module, "should_use_nvdec", lambda c: False)
+    monkeypatch.setattr(video_loader_module, "nvdec_available", lambda: True)
+
+    def _never(*a, **k):
+        raise AssertionError("NVDEC must not be used for VP9 by default")
+
+    monkeypatch.setattr(video_loader_module, "decode_video_nvdec", _never)
+    media_io = _RecordingMediaIO(frames)
+
+    result = await loader._decode_video_bytes(b"vp9-bytes", media_io)
+
+    assert result is media_io.result
+    assert media_io.calls == [b"vp9-bytes"]

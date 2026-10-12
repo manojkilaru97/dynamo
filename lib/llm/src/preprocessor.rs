@@ -136,28 +136,12 @@ fn tool_content_part_as_user(
     })
 }
 
-/// True when the model's `config.json` declares a Nemotron Omni audio encoder,
-/// i.e. `sound_config` is a JSON object. Models without one (`null` or absent,
-/// e.g. Super 3.5 / Super 3) never enable [`normalize_input_audio_parts`].
-fn mdc_declares_audio_encoder(mdc: &ModelDeploymentCard) -> bool {
-    let Some(crate::model_card::ModelInfoType::HfConfigJson(config)) = mdc.model_info.as_ref()
-    else {
-        return false;
-    };
-    config.path().is_some_and(config_declares_audio_encoder)
-}
-
-fn config_declares_audio_encoder(config_json: &std::path::Path) -> bool {
-    crate::file_json_field::<serde_json::Value>(config_json, "sound_config")
-        .is_ok_and(|sound_config| sound_config.is_object())
-}
-
 /// Rewrite OpenAI `input_audio` parts (base64 + format) into the equivalent
 /// `audio_url` data URL, exactly as vLLM's chat parser does
 /// (`data:audio/{format};base64,{data}`), so the chat template renders the audio
 /// placeholder and the audio reaches the worker. Only called for models whose
-/// `config.json` declares an audio encoder; requests without `input_audio` parts
-/// are returned untouched.
+/// `config.json` declares an audio encoder ([`ModelInfo::declares_audio_encoder`]);
+/// requests without `input_audio` parts are returned untouched.
 fn normalize_input_audio_parts(messages: &mut [ChatCompletionRequestMessage]) -> Result<()> {
     use dynamo_protocols::types::{
         AudioUrl, ChatCompletionRequestMessageContentPartAudioUrl, InputAudioFormat,
@@ -1225,7 +1209,7 @@ impl OpenAIPreprocessor {
         };
 
         let context_length = mdc.effective_context_length();
-        let audio_input_enabled = mdc_declares_audio_encoder(&mdc);
+        let audio_input_enabled = model_info.declares_audio_encoder();
         if audio_input_enabled {
             tracing::info!(
                 model = %mdc.display_name,
@@ -4850,17 +4834,11 @@ mod strip_tests {
 mod input_audio_tests {
     use super::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessageContentPart,
-        config_declares_audio_encoder, multimodal_content_parts, normalize_input_audio_parts,
+        multimodal_content_parts, normalize_input_audio_parts,
     };
 
     fn messages(value: serde_json::Value) -> Vec<ChatCompletionRequestMessage> {
         serde_json::from_value(value).unwrap()
-    }
-
-    fn write_config(contents: &str) -> tempfile::NamedTempFile {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        std::io::Write::write_all(&mut file, contents.as_bytes()).unwrap();
-        file
     }
 
     #[test]
@@ -4960,29 +4938,6 @@ mod input_audio_tests {
         }]));
         let err = normalize_input_audio_parts(&mut msgs).unwrap_err();
         assert!(err.to_string().contains("input_audio.data"), "{err}");
-    }
-
-    #[test]
-    fn audio_encoder_gate_requires_a_sound_config_object() {
-        let omni = write_config(
-            r#"{"architectures":["NemotronH_Nano_Omni_Reasoning_V3"],"sound_config":{"sampling_rate":16000}}"#,
-        );
-        assert!(config_declares_audio_encoder(omni.path()));
-
-        // Super 3.5 ships `"sound_config": null`; Super 3 has no such key.
-        let super35 = write_config(
-            r#"{"architectures":["NemotronH_Omni_Reasoning_V3"],"sound_config":null,"vision_config":{}}"#,
-        );
-        assert!(!config_declares_audio_encoder(super35.path()));
-        let super3 =
-            write_config(r#"{"architectures":["NemotronHForCausalLM"],"model_type":"nemotron_h"}"#);
-        assert!(!config_declares_audio_encoder(super3.path()));
-        let not_object = write_config(r#"{"sound_config":true}"#);
-        assert!(!config_declares_audio_encoder(not_object.path()));
-
-        assert!(!config_declares_audio_encoder(std::path::Path::new(
-            "/nonexistent/omni67/config.json"
-        )));
     }
 }
 

@@ -37,6 +37,7 @@ from dynamo.common.multimodal.media_source import (
 )
 from dynamo.common.multimodal.nvdec_decoder import (
     decode_video_nvdec,
+    nvdec_available,
     probe_video_codec,
     should_use_nvdec,
 )
@@ -46,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 URL_VARIANT_KEY: Final = "Url"
+_NVDEC_ROYALTY_FREE_CODECS: Final = frozenset({"vp8", "vp9", "av1"})
 DECODED_VARIANT_KEY: Final = "Decoded"
 
 
@@ -104,7 +106,14 @@ class VideoLoader:
         num_frames: int = NUM_FRAMES_DEFAULT,
         enable_frontend_decoding: bool = False,
         url_policy: UrlValidationPolicy | None = None,
+        nvdec_royalty_free_codecs: bool = False,
     ) -> None:
+        """``nvdec_royalty_free_codecs`` also routes VP8/VP9/AV1 to NVDEC.
+
+        The codec-compliant images ship no software decoder for them, so without
+        it those clips fail. Off by default; enabled only for Nemotron Omni.
+        """
+        self._nvdec_royalty_free_codecs = nvdec_royalty_free_codecs
         self._http_timeout = int(http_timeout)
         self._num_frames = num_frames
         self._enable_frontend_decoding = enable_frontend_decoding
@@ -193,7 +202,11 @@ class VideoLoader:
         already ran here.
         """
         codec = probe_video_codec(content)
-        if should_use_nvdec(codec):
+        if should_use_nvdec(codec) or (
+            self._nvdec_royalty_free_codecs
+            and codec in _NVDEC_ROYALTY_FREE_CODECS
+            and nvdec_available()
+        ):
             try:
                 return await asyncio.to_thread(
                     decode_video_nvdec, content, self._num_frames

@@ -1788,6 +1788,12 @@ pub trait ModelInfo: Send + Sync {
     /// Vocabulary size
     /// TODO: This is only used in a single test, no other code. Remove?
     fn vocab_size(&self) -> Option<usize>;
+
+    /// Whether `config.json` declares a Nemotron Omni audio encoder
+    /// (`sound_config` is an object). False for every other model.
+    fn declares_audio_encoder(&self) -> bool {
+        false
+    }
 }
 
 impl ModelInfoType {
@@ -1816,6 +1822,86 @@ struct HFConfig {
 
     // Sometimes it's inside HFTextConfig, sometimes it's here
     eos_token_id: Option<serde_json::Value>,
+
+    /// Nemotron Omni audio encoder. Only its presence as an object is
+    /// recorded; any other value (absent, `null`, scalar) means no encoder.
+    #[serde(default, skip_serializing)]
+    sound_config: AudioEncoderMarker,
+}
+
+/// `true` when the field holds a JSON object. Accepts every JSON5 value
+/// (including nested `Infinity`/`NaN`) so it can never fail the config load.
+#[derive(Debug, Clone, Copy, Default)]
+struct AudioEncoderMarker(bool);
+
+impl<'de> Deserialize<'de> for AudioEncoderMarker {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MarkerVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for MarkerVisitor {
+            type Value = AudioEncoderMarker;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("any JSON value")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(AudioEncoderMarker(true))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(AudioEncoderMarker(false))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(AudioEncoderMarker(false))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(AudioEncoderMarker(false))
+            }
+
+            fn visit_some<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                deserializer.deserialize_any(MarkerVisitor)
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(AudioEncoderMarker(false))
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(AudioEncoderMarker(false))
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(AudioEncoderMarker(false))
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(AudioEncoderMarker(false))
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(AudioEncoderMarker(false))
+            }
+        }
+
+        deserializer.deserialize_any(MarkerVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2104,6 +2190,10 @@ impl ModelInfo for HFConfig {
     fn vocab_size(&self) -> Option<usize> {
         self.text_config.as_ref().unwrap().vocab_size
     }
+
+    fn declares_audio_encoder(&self) -> bool {
+        self.sound_config.0
+    }
 }
 
 impl ModelInfoType {
@@ -2356,6 +2446,42 @@ mod tests {
         dynamo_runtime::logging::init();
         let path = "tests/data/sample-models/NVIDIA-Nemotron-Nano-12B-v2-Base/config.json";
         let _ = HFConfig::from_json_file(path).unwrap();
+    }
+
+    /// Gate for Nemotron Omni `input_audio` handling: only an object-valued
+    /// `sound_config` declares an audio encoder. Super 3.5 ships
+    /// `"sound_config": null` and Super 3 has none; neither may enable it, and no
+    /// value may fail the (JSON5, `Infinity`-tolerant) config load.
+    #[test]
+    fn test_config_json_declares_audio_encoder_only_for_sound_config_object() {
+        let base = std::fs::read_to_string(
+            "tests/data/sample-models/NVIDIA-Nemotron-Nano-12B-v2-Base/config.json",
+        )
+        .unwrap();
+        assert!(base.contains("Infinity"));
+        let cases = [
+            (None, false),
+            (Some(r#"{"sampling_rate": 16000, "limit": Infinity}"#), true),
+            (Some("{}"), true),
+            (Some("null"), false),
+            (Some(r#""parakeet""#), false),
+            (Some("[1, 2]"), false),
+            (Some("true"), false),
+        ];
+        for (sound_config, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let contents = match sound_config {
+                None => base.clone(),
+                Some(value) => base.replacen('{', &format!("{{\n  \"sound_config\": {value},"), 1),
+            };
+            std::fs::write(dir.path().join("config.json"), contents).unwrap();
+            let config = HFConfig::from_json_file(dir.path().join("config.json")).unwrap();
+            assert_eq!(
+                config.declares_audio_encoder(),
+                expected,
+                "sound_config = {sound_config:?}"
+            );
+        }
     }
 
     /// Qwen3.5 models have text_config.eos_token_id = 248044 (<|endoftext|>) but the
