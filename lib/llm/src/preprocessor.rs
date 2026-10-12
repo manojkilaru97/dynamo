@@ -136,6 +136,73 @@ fn tool_content_part_as_user(
     })
 }
 
+/// True when the model's `config.json` declares a Nemotron Omni audio encoder,
+/// i.e. `sound_config` is a JSON object. Models without one (`null` or absent,
+/// e.g. Super 3.5 / Super 3) never enable [`normalize_input_audio_parts`].
+fn mdc_declares_audio_encoder(mdc: &ModelDeploymentCard) -> bool {
+    let Some(crate::model_card::ModelInfoType::HfConfigJson(config)) = mdc.model_info.as_ref()
+    else {
+        return false;
+    };
+    config.path().is_some_and(config_declares_audio_encoder)
+}
+
+fn config_declares_audio_encoder(config_json: &std::path::Path) -> bool {
+    crate::file_json_field::<serde_json::Value>(config_json, "sound_config")
+        .is_ok_and(|sound_config| sound_config.is_object())
+}
+
+/// Rewrite OpenAI `input_audio` parts (base64 + format) into the equivalent
+/// `audio_url` data URL, exactly as vLLM's chat parser does
+/// (`data:audio/{format};base64,{data}`), so the chat template renders the audio
+/// placeholder and the audio reaches the worker. Only called for models whose
+/// `config.json` declares an audio encoder; requests without `input_audio` parts
+/// are returned untouched.
+fn normalize_input_audio_parts(messages: &mut [ChatCompletionRequestMessage]) -> Result<()> {
+    use dynamo_protocols::types::{
+        AudioUrl, ChatCompletionRequestMessageContentPartAudioUrl, InputAudioFormat,
+    };
+
+    for message in messages.iter_mut() {
+        let ChatCompletionRequestMessage::User(user) = message else {
+            continue;
+        };
+        let ChatCompletionRequestUserMessageContent::Array(parts) = &mut user.content else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            let ChatCompletionRequestUserMessageContentPart::InputAudio(audio) = part else {
+                continue;
+            };
+            let data = audio.input_audio.data.trim();
+            if data.is_empty() {
+                return Err(invalid_argument_error(
+                    "input_audio.data must be non-empty base64-encoded audio",
+                ));
+            }
+            let format = match audio.input_audio.format {
+                InputAudioFormat::Wav => "wav",
+                InputAudioFormat::Mp3 => "mp3",
+            };
+            let url =
+                url::Url::parse(&format!("data:audio/{format};base64,{data}")).map_err(|err| {
+                    invalid_argument_error(format!(
+                        "input_audio.data is not a valid data payload: {err}"
+                    ))
+                })?;
+            #[allow(deprecated)]
+            let audio_url = AudioUrl { url, uuid: None };
+            *part = ChatCompletionRequestUserMessageContentPart::AudioUrl(
+                ChatCompletionRequestMessageContentPartAudioUrl {
+                    audio_url: Some(audio_url),
+                    uuid: None,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
 enum MultimodalContentPart<'a> {
     User(&'a ChatCompletionRequestUserMessageContentPart),
     Tool(&'a ChatCompletionRequestToolMessageContentPart),
@@ -688,6 +755,9 @@ pub struct OpenAIPreprocessor {
     kv_cache_block_size: usize,
     tool_call_parser: Option<String>,
     media_loader: Option<MediaLoader>,
+    /// `config.json` declares an audio encoder (Nemotron Omni `sound_config`).
+    /// Enables `input_audio` normalization; false for every other model.
+    audio_input_enabled: bool,
     /// Max context length (in tokens) this model can handle, from ModelDeploymentCard
     context_length: u32,
     /// Per-image token-count engine. `None` when the feature is disabled, the
@@ -1155,6 +1225,13 @@ impl OpenAIPreprocessor {
         };
 
         let context_length = mdc.effective_context_length();
+        let audio_input_enabled = mdc_declares_audio_encoder(&mdc);
+        if audio_input_enabled {
+            tracing::info!(
+                model = %mdc.display_name,
+                "config.json declares an audio encoder; input_audio parts are normalized to audio_url"
+            );
+        }
 
         let media_loader = match mdc.media_decoder {
             Some(media_decoder) => Some(MediaLoader::new(media_decoder, mdc.media_fetcher)?),
@@ -1307,6 +1384,7 @@ impl OpenAIPreprocessor {
             kv_cache_block_size,
             tool_call_parser,
             media_loader,
+            audio_input_enabled,
             context_length,
             #[cfg(feature = "mm-routing")]
             image_token_counter,
@@ -4316,6 +4394,9 @@ impl
             &mut request,
             self.runtime_config.reasoning_parser.as_deref(),
         );
+        if self.audio_input_enabled {
+            normalize_input_audio_parts(&mut request.inner.messages)?;
+        }
 
         // create a response generator
         let response_generator = request.response_generator(context.id().to_string());
@@ -4762,6 +4843,146 @@ mod strip_tests {
         let mut messages = serde_json::json!([]);
         OpenAIPreprocessor::strip_inline_data_urls(&mut messages);
         assert_eq!(messages, serde_json::json!([]));
+    }
+}
+
+#[cfg(test)]
+mod input_audio_tests {
+    use super::{
+        ChatCompletionRequestMessage, ChatCompletionRequestUserMessageContentPart,
+        config_declares_audio_encoder, multimodal_content_parts, normalize_input_audio_parts,
+    };
+
+    fn messages(value: serde_json::Value) -> Vec<ChatCompletionRequestMessage> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn write_config(contents: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, contents.as_bytes()).unwrap();
+        file
+    }
+
+    #[test]
+    fn input_audio_wav_and_mp3_become_audio_url_data_urls() {
+        let mut msgs = messages(serde_json::json!([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Transcribe."},
+                {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}},
+                {"type": "input_audio", "input_audio": {"data": "SUQz", "format": "mp3"}}
+            ]
+        }]));
+        normalize_input_audio_parts(&mut msgs).unwrap();
+
+        let serialized = serde_json::to_value(&msgs).unwrap();
+        let parts = serialized[0]["content"].as_array().unwrap();
+        assert_eq!(
+            parts[0],
+            serde_json::json!({"type": "text", "text": "Transcribe."})
+        );
+        assert_eq!(parts[1]["type"], "audio_url");
+        assert_eq!(
+            parts[1]["audio_url"]["url"],
+            "data:audio/wav;base64,UklGRg=="
+        );
+        assert_eq!(parts[2]["type"], "audio_url");
+        assert_eq!(parts[2]["audio_url"]["url"], "data:audio/mp3;base64,SUQz");
+
+        let media: Vec<_> = multimodal_content_parts(&msgs[0])
+            .unwrap()
+            .filter_map(|part| part.media_info())
+            .map(|(kind, url, _)| (kind, url.unwrap().to_string()))
+            .collect();
+        assert_eq!(
+            media,
+            vec![
+                ("audio_url", "data:audio/wav;base64,UklGRg==".to_string()),
+                ("audio_url", "data:audio/mp3;base64,SUQz".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn input_audio_is_not_media_without_normalization() {
+        // The pre-existing (gate-off) behavior that Super 3.5 / Super 3 keep:
+        // an `input_audio` part contributes no multimodal data.
+        let msgs = messages(serde_json::json!([{
+            "role": "user",
+            "content": [
+                {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}
+            ]
+        }]));
+        assert!(
+            multimodal_content_parts(&msgs[0])
+                .unwrap()
+                .all(|part| part.media_info().is_none())
+        );
+        assert!(matches!(
+            multimodal_content_parts(&msgs[0])
+                .unwrap()
+                .next()
+                .unwrap()
+                .as_user()
+                .as_ref(),
+            ChatCompletionRequestUserMessageContentPart::InputAudio(_)
+        ));
+    }
+
+    #[test]
+    fn requests_without_input_audio_are_unchanged() {
+        let original = serde_json::json!([
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "plain text"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Describe."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                {"type": "video_url", "video_url": {"url": "https://example.com/clip.mp4"}},
+                {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,UklGRg=="}}
+            ]},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"}
+        ]);
+        let mut msgs = messages(original.clone());
+        let before = serde_json::to_value(&msgs).unwrap();
+        normalize_input_audio_parts(&mut msgs).unwrap();
+        assert_eq!(serde_json::to_value(&msgs).unwrap(), before);
+    }
+
+    #[test]
+    fn empty_input_audio_data_is_rejected() {
+        let mut msgs = messages(serde_json::json!([{
+            "role": "user",
+            "content": [{"type": "input_audio", "input_audio": {"data": "  ", "format": "wav"}}]
+        }]));
+        let err = normalize_input_audio_parts(&mut msgs).unwrap_err();
+        assert!(err.to_string().contains("input_audio.data"), "{err}");
+    }
+
+    #[test]
+    fn audio_encoder_gate_requires_a_sound_config_object() {
+        let omni = write_config(
+            r#"{"architectures":["NemotronH_Nano_Omni_Reasoning_V3"],"sound_config":{"sampling_rate":16000}}"#,
+        );
+        assert!(config_declares_audio_encoder(omni.path()));
+
+        // Super 3.5 ships `"sound_config": null`; Super 3 has no such key.
+        let super35 = write_config(
+            r#"{"architectures":["NemotronH_Omni_Reasoning_V3"],"sound_config":null,"vision_config":{}}"#,
+        );
+        assert!(!config_declares_audio_encoder(super35.path()));
+        let super3 =
+            write_config(r#"{"architectures":["NemotronHForCausalLM"],"model_type":"nemotron_h"}"#);
+        assert!(!config_declares_audio_encoder(super3.path()));
+        let not_object = write_config(r#"{"sound_config":true}"#);
+        assert!(!config_declares_audio_encoder(not_object.path()));
+
+        assert!(!config_declares_audio_encoder(std::path::Path::new(
+            "/nonexistent/omni67/config.json"
+        )));
     }
 }
 

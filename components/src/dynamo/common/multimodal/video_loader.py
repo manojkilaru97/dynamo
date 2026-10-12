@@ -86,6 +86,15 @@ def _require_vllm_video_media() -> tuple[Any, Any, Any]:
     return MediaConnector, VideoMediaIO, ImageMediaIO
 
 
+def _with_original_video_bytes(
+    decoded: Any, content: bytes
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    frames, metadata = decoded
+    metadata = dict(metadata)
+    metadata["original_video_bytes"] = content
+    return frames, metadata
+
+
 class VideoLoader:
     NUM_FRAMES_DEFAULT = int(os.environ.get("DYN_MM_VIDEO_NUM_FRAMES", "32"))
 
@@ -126,7 +135,7 @@ class VideoLoader:
         )
 
     async def _load_video_with_vllm(
-        self, video_url: str
+        self, video_url: str, keep_video_bytes: bool = False
     ) -> tuple[np.ndarray, Dict[str, Any]]:
         normalized_url = await validate_media_url(video_url, self._url_policy)
         media_io = self._create_vllm_video_io()
@@ -143,7 +152,10 @@ class VideoLoader:
             # runtime images purge the software decode wheels (opencv/av/decord/
             # torchcodec) for codec compliance, so that fallback only resolves
             # where a decoder has been installed separately.
-            return await self._decode_video_bytes(content, media_io)
+            decoded = await self._decode_video_bytes(content, media_io)
+            if keep_video_bytes:
+                return _with_original_video_bytes(decoded, content)
+            return decoded
 
         # file:// and data: never touch the network, but they still deserve
         # hardware decode: without this they reach only the software decoder,
@@ -153,8 +165,15 @@ class VideoLoader:
         # connector below uses, so this adds no local-read surface.
         if is_local_media_url(normalized_url):
             content = await read_local_media_bytes(normalized_url, self._url_policy)
-            return await self._decode_video_bytes(content, media_io)
+            decoded = await self._decode_video_bytes(content, media_io)
+            if keep_video_bytes:
+                return _with_original_video_bytes(decoded, content)
+            return decoded
 
+        if keep_video_bytes:
+            raise ValueError(
+                "Audio-in-video requires an http(s), data: or file:// video URL."
+            )
         connector = self._get_vllm_media_connector()
         return await connector.load_from_url_async(
             normalized_url, media_io, fetch_timeout=self._http_timeout
@@ -192,9 +211,19 @@ class VideoLoader:
                 "vllm", "opencv-python-headless", "cv2", codec, cause=str(exc)
             ) from exc
 
-    async def load_video(self, video_url: str) -> tuple[np.ndarray, Dict[str, Any]]:
+    async def load_video(
+        self, video_url: str, keep_video_bytes: bool = False
+    ) -> tuple[np.ndarray, Dict[str, Any]]:
+        """Load and decode a video.
+
+        ``keep_video_bytes`` adds the encoded source to the metadata as
+        ``original_video_bytes``, the contract vLLM's Nemotron Omni processor
+        uses to extract the audio track when ``use_audio_in_video`` is on.
+        """
         try:
-            frames, metadata = await self._load_video_with_vllm(video_url)
+            frames, metadata = await self._load_video_with_vllm(
+                video_url, keep_video_bytes
+            )
             if frames.size == 0:
                 raise ValueError(
                     f"Failed to extract video frames from {video_url}. Decoded clip is empty."
@@ -237,15 +266,24 @@ class VideoLoader:
     async def load_video_batch(
         self,
         video_mm_items: List[Dict[str, Any]],
+        keep_video_bytes: bool = False,
     ) -> List[tuple[np.ndarray, Dict[str, Any]]]:
         video_futures: List[Awaitable[tuple[np.ndarray, Dict[str, Any]]]] = []
 
         for item in video_mm_items:
             if isinstance(item, dict) and URL_VARIANT_KEY in item:
                 url = item[URL_VARIANT_KEY]
-                video_futures.append(self.load_video(url))
+                if keep_video_bytes:
+                    video_futures.append(self.load_video(url, keep_video_bytes=True))
+                else:
+                    video_futures.append(self.load_video(url))
                 logger.debug("Preparing to load video from URL: %s...", url[:80])
             elif isinstance(item, dict) and DECODED_VARIANT_KEY in item:
+                if keep_video_bytes:
+                    raise ValueError(
+                        "Audio-in-video requires URL video inputs; frontend-decoded "
+                        "video frames do not carry the source audio track."
+                    )
                 if self._enable_frontend_decoding:
                     metadata = item[DECODED_VARIANT_KEY]
                     video_futures.append(self._load_decoded_video(metadata))

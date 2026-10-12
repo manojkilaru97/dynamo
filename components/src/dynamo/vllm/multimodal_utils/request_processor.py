@@ -247,6 +247,28 @@ def compute_mm_uuids(
     return {modality: uuids}
 
 
+def _resolve_audio_in_video_policy(engine_client: Any) -> tuple[bool, bool]:
+    """Return ``(extracts_audio_from_video_bytes, default_use_audio_in_video)``.
+
+    The first flag is True only for models whose HF config declares a Nemotron
+    Omni audio encoder (``sound_config``); vLLM's Nemotron processor then pulls
+    the audio track out of ``original_video_bytes`` itself. The second is the
+    engine-level ``--mm-processor-kwargs`` ``use_audio_in_video`` default.
+    """
+    model_config = getattr(
+        getattr(engine_client, "vllm_config", None), "model_config", None
+    )
+    hf_config = getattr(model_config, "hf_config", None)
+    if getattr(hf_config, "sound_config", None) is None:
+        return False, False
+    mm_config = getattr(model_config, "multimodal_config", None)
+    engine_kwargs = getattr(mm_config, "mm_processor_kwargs", None)
+    default = isinstance(engine_kwargs, dict) and bool(
+        engine_kwargs.get("use_audio_in_video", False)
+    )
+    return True, default
+
+
 def get_mm_processor_kwargs(request: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Read processor kwargs from the canonical or router-compatible location."""
     value = request.get("mm_processor_kwargs")
@@ -318,6 +340,28 @@ class VllmMultimodalRequestProcessor:
                 )
             )
         self.use_unified_vision_chunk = use_unified_vision_chunk
+        (
+            self._audio_in_video_from_bytes,
+            self._default_use_audio_in_video,
+        ) = _resolve_audio_in_video_policy(engine_client)
+
+    def _keeps_video_bytes_for_audio(
+        self, mm_processor_kwargs: Optional[dict[str, Any]]
+    ) -> bool:
+        """Whether this request's videos must carry their encoded bytes.
+
+        Only Nemotron Omni models (an HF ``sound_config``) extract the audio
+        track inside vLLM's processor, from ``original_video_bytes``. The
+        effective ``use_audio_in_video`` follows vLLM's own merge: a
+        per-request value overrides the engine ``--mm-processor-kwargs``
+        default. Models without an audio encoder always return False and keep
+        the pre-existing per-request extraction below unchanged.
+        """
+        if not self._audio_in_video_from_bytes:
+            return False
+        if mm_processor_kwargs and "use_audio_in_video" in mm_processor_kwargs:
+            return bool(mm_processor_kwargs["use_audio_in_video"])
+        return self._default_use_audio_in_video
 
     @staticmethod
     def _multimodal_disabled_error() -> ValueError:
@@ -441,8 +485,16 @@ class VllmMultimodalRequestProcessor:
                         )
 
             video_items = mm_map.get(VIDEO_URL_KEY, [])
+            keep_video_bytes = bool(video_items) and self._keeps_video_bytes_for_audio(
+                mm_processor_kwargs
+            )
             if video_items:
-                videos = await self.video_loader.load_video_batch(video_items)
+                if keep_video_bytes:
+                    videos = await self.video_loader.load_video_batch(
+                        video_items, keep_video_bytes=True
+                    )
+                else:
+                    videos = await self.video_loader.load_video_batch(video_items)
                 if videos:
                     vllm_mm_data["video"] = videos[0] if len(videos) == 1 else videos
 
@@ -454,6 +506,7 @@ class VllmMultimodalRequestProcessor:
 
             if (
                 video_items
+                and not keep_video_bytes
                 and mm_processor_kwargs
                 and mm_processor_kwargs.get("use_audio_in_video", False)
             ):

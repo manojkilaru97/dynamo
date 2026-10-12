@@ -290,3 +290,68 @@ async def test_load_video_preserves_missing_decoder_error(monkeypatch):
         await loader.load_video("https://example.com/x.mp4")
 
     assert exc_info.value is err
+
+
+@pytest.mark.asyncio
+async def test_load_video_without_keep_bytes_leaves_metadata_untouched(monkeypatch):
+    """The default (Super 3.5 / non-audio models) contract: no source bytes."""
+    loader = VideoLoader(url_policy=UrlValidationPolicy())
+    frames = np.zeros((1, 2, 2, 3), dtype=np.uint8)
+    metadata = {"fps": 4.0, "frames_indices": [0], "total_num_frames": 1}
+    loader._decode_video_bytes = AsyncMock(  # type: ignore[method-assign]
+        return_value=(frames, metadata)
+    )
+
+    _, loaded_metadata = await loader.load_video("data:video/mp4;base64,Zm9vYmFy")
+
+    assert loaded_metadata == metadata
+    assert "original_video_bytes" not in loaded_metadata
+    loader._decode_video_bytes.assert_awaited_once()
+    assert loader._decode_video_bytes.await_args.args[0] == b"foobar"
+
+
+@pytest.mark.asyncio
+async def test_load_video_keep_bytes_attaches_original_video_bytes():
+    loader = VideoLoader(url_policy=UrlValidationPolicy())
+    frames = np.zeros((1, 2, 2, 3), dtype=np.uint8)
+    metadata = {"fps": 4.0, "frames_indices": [0], "total_num_frames": 1}
+    loader._decode_video_bytes = AsyncMock(  # type: ignore[method-assign]
+        return_value=(frames, metadata)
+    )
+
+    _, loaded_metadata = await loader.load_video(
+        "data:video/webm;base64,Zm9vYmFy", keep_video_bytes=True
+    )
+
+    assert loaded_metadata["original_video_bytes"] == b"foobar"
+    assert {
+        k: v for k, v in loaded_metadata.items() if k != "original_video_bytes"
+    } == (metadata)
+    assert "original_video_bytes" not in metadata  # decoder output not mutated
+
+
+@pytest.mark.asyncio
+async def test_load_video_batch_forwards_keep_bytes_only_when_requested():
+    loader = VideoLoader()
+    video = (np.zeros((1, 2, 2, 3), dtype=np.uint8), {"fps": 2.0})
+    loader.load_video = AsyncMock(return_value=video)  # type: ignore[method-assign]
+    items = [{"Url": "https://example.com/one.mp4"}]
+
+    await loader.load_video_batch(items)
+    loader.load_video.assert_awaited_once_with("https://example.com/one.mp4")
+
+    loader.load_video.reset_mock()
+    await loader.load_video_batch(items, keep_video_bytes=True)
+    loader.load_video.assert_awaited_once_with(
+        "https://example.com/one.mp4", keep_video_bytes=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_load_video_batch_keep_bytes_rejects_frontend_decoded_video():
+    loader = VideoLoader()
+
+    with pytest.raises(ValueError, match="frontend-decoded"):
+        await loader.load_video_batch(
+            [{"Decoded": {"shape": [1, 2, 2, 3]}}], keep_video_bytes=True
+        )

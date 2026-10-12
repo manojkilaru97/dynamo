@@ -342,6 +342,175 @@ async def test_audio_in_video_rejects_unusable_audio(video_item, audio_error, me
         )
 
 
+def _engine_client(sound_config, engine_mm_processor_kwargs):
+    return SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(sound_config=sound_config),
+                multimodal_config=SimpleNamespace(
+                    mm_processor_kwargs=engine_mm_processor_kwargs
+                ),
+            )
+        )
+    )
+
+
+def _audio_processor(sound_config, engine_mm_processor_kwargs):
+    return mod.VllmMultimodalRequestProcessor(
+        model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+        engine_client=_engine_client(sound_config, engine_mm_processor_kwargs),
+        enable_multimodal=True,
+        image_loader=SimpleNamespace(load_image_batch=AsyncMock(return_value=[])),
+        video_loader=SimpleNamespace(load_video_batch=AsyncMock(return_value=[])),
+        audio_loader=SimpleNamespace(
+            load_audio_batch=AsyncMock(return_value=[]),
+            load_audio=AsyncMock(return_value=None),
+        ),
+        use_unified_vision_chunk=False,
+    )
+
+
+_VIDEO_ITEMS = [{"Url": "data:video/mp4;base64,AAAA"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("engine_kwargs", "request_kwargs"),
+    [
+        ({"use_audio_in_video": True}, None),
+        ({"use_audio_in_video": True}, {}),
+        ({"use_audio_in_video": True}, {"use_audio_in_video": True}),
+        (None, {"use_audio_in_video": True}),
+        ({"use_audio_in_video": False}, {"use_audio_in_video": True}),
+    ],
+)
+async def test_omni_audio_in_video_keeps_video_bytes_for_vllm(
+    engine_kwargs, request_kwargs
+):
+    """Nemotron Omni: vLLM extracts the track from ``original_video_bytes``.
+
+    The engine ``--mm-processor-kwargs`` default applies unless the request
+    overrides it, and Dynamo must not pre-populate audio itself (a silent video
+    would otherwise fail and the 1:1 audio/video pairing would break).
+    """
+    processor = _audio_processor({"sampling_rate": 16000}, engine_kwargs)
+    video = object()
+    processor.video_loader.load_video_batch.return_value = [video]
+
+    result = await processor.extract_multimodal_data(
+        {"multi_modal_data": {"video_url": _VIDEO_ITEMS}},
+        "request-omni-video",
+        None,
+        request_kwargs,
+    )
+
+    assert result == {"video": video}
+    processor.video_loader.load_video_batch.assert_awaited_once_with(
+        _VIDEO_ITEMS, keep_video_bytes=True
+    )
+    processor.audio_loader.load_audio.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("engine_kwargs", "request_kwargs"),
+    [
+        (None, None),
+        ({}, None),
+        ({"use_audio_in_video": False}, None),
+        ({"use_audio_in_video": True}, {"use_audio_in_video": False}),
+    ],
+)
+async def test_omni_without_audio_in_video_loads_video_unchanged(
+    engine_kwargs, request_kwargs
+):
+    processor = _audio_processor({"sampling_rate": 16000}, engine_kwargs)
+    video = object()
+    processor.video_loader.load_video_batch.return_value = [video]
+
+    result = await processor.extract_multimodal_data(
+        {"multi_modal_data": {"video_url": _VIDEO_ITEMS}},
+        "request-omni-visual-only",
+        None,
+        request_kwargs,
+    )
+
+    assert result == {"video": video}
+    processor.video_loader.load_video_batch.assert_awaited_once_with(_VIDEO_ITEMS)
+    processor.audio_loader.load_audio.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine_kwargs", [None, {}, {"use_audio_in_video": True}])
+async def test_models_without_sound_config_keep_preexisting_video_path(engine_kwargs):
+    """Super 3.5 (``sound_config: null``) / Super 3: no byte retention, ever.
+
+    Even a per-request ``use_audio_in_video`` takes the pre-existing Dynamo
+    extraction path, exactly as before this change.
+    """
+    processor = _audio_processor(None, engine_kwargs)
+    video, audio = object(), object()
+    processor.video_loader.load_video_batch.return_value = [video]
+    processor.audio_loader.load_audio.return_value = audio
+
+    plain = await processor.extract_multimodal_data(
+        {"multi_modal_data": {"video_url": _VIDEO_ITEMS}},
+        "request-super-video",
+        None,
+        None,
+    )
+    assert plain == {"video": video}
+    processor.video_loader.load_video_batch.assert_awaited_once_with(_VIDEO_ITEMS)
+    processor.audio_loader.load_audio.assert_not_awaited()
+
+    processor.video_loader.load_video_batch.reset_mock()
+    with_audio = await processor.extract_multimodal_data(
+        {"multi_modal_data": {"video_url": _VIDEO_ITEMS}},
+        "request-super-video-audio",
+        None,
+        {"use_audio_in_video": True},
+    )
+    assert with_audio == {"video": video, "audio": audio}
+    processor.video_loader.load_video_batch.assert_awaited_once_with(_VIDEO_ITEMS)
+    processor.audio_loader.load_audio.assert_awaited_once_with(_VIDEO_ITEMS[0]["Url"])
+
+
+@pytest.mark.asyncio
+async def test_text_and_image_requests_never_touch_video_or_audio_loaders():
+    for sound_config in (None, {"sampling_rate": 16000}):
+        processor = _audio_processor(sound_config, {"use_audio_in_video": True})
+        image = Image.new("RGB", (1, 1))
+        processor.image_loader.load_image_batch.return_value = [image]
+
+        assert (
+            await processor.extract_multimodal_data({}, "request-text", None, None)
+            is None
+        )
+        result = await processor.extract_multimodal_data(
+            {"multi_modal_data": {"image_url": [{"Url": "data:image/png;base64,AA"}]}},
+            "request-image",
+            None,
+            None,
+        )
+        assert result == {"image": image}
+        processor.video_loader.load_video_batch.assert_not_awaited()
+        processor.audio_loader.load_audio.assert_not_awaited()
+        processor.audio_loader.load_audio_batch.assert_not_awaited()
+
+
+def test_audio_in_video_policy_reads_sound_config_and_engine_default():
+    assert mod._resolve_audio_in_video_policy(None) == (False, False)
+    assert mod._resolve_audio_in_video_policy(
+        _engine_client(None, {"use_audio_in_video": True})
+    ) == (False, False)
+    assert mod._resolve_audio_in_video_policy(
+        _engine_client({"sampling_rate": 16000}, {"use_audio_in_video": True})
+    ) == (True, True)
+    assert mod._resolve_audio_in_video_policy(
+        _engine_client({"sampling_rate": 16000}, None)
+    ) == (True, False)
+
+
 def test_build_tokens_prompt_forwards_hashes_kwargs_and_vision_chunk():
     processor = _processor(unified_vision_chunk=True)
     mm_data = {"vision_chunk": {"type": "image", "image": object(), "uuid": None}}
