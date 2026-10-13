@@ -176,6 +176,41 @@ impl OutputStopBuffer {
         matched
     }
 
+    /// Final chunk whose text is Dynamo's own decoded text for a stop the
+    /// decoder matched. That text already ends exactly at the match (hidden:
+    /// before it; visible: after it); `retract` is how many bytes of earlier
+    /// returned text belong to a hidden match. Only those bytes, which are
+    /// always withheld, are dropped, so a false prefix before the match and
+    /// text before an occurrence ignored for `min_tokens` survive.
+    fn apply_decoded_stop(
+        &mut self,
+        text: Option<String>,
+        include: bool,
+        retract: usize,
+        sequence: &str,
+    ) -> Option<String> {
+        if self.patterns.is_empty() {
+            return text;
+        }
+        self.pending.push_str(text.as_deref().unwrap_or_default());
+        if !include && retract > 0 {
+            let split = self.pending.len().checked_sub(retract).filter(|&split| {
+                self.pending.is_char_boundary(split)
+                    && sequence
+                        .as_bytes()
+                        .starts_with(&self.pending.as_bytes()[split..])
+            });
+            if let Some(split) = split {
+                self.pending.truncate(split);
+            } else {
+                // Not the withheld match prefix (should not happen): fall back to
+                // the engine-text rule.
+                return self.apply(None, true, Some((sequence, include)));
+            }
+        }
+        (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
+    }
+
     fn apply(
         &mut self,
         text: Option<String>,
@@ -474,16 +509,28 @@ impl
                         data.finish_reason = finish_reason;
                         data.stop_reason = stop_reason.or(data.stop_reason);
                     }
+                    let engine_selected = engine_text.as_deref().is_some_and(|text| !text.is_empty());
                     let selected_text = select_output_text(state.skip_special_tokens, engine_text, text);
-                    let matched = match &result.stop_trigger {
+                    let decoder_stop = match &result.stop_trigger {
                         Some(StopTrigger::HiddenStopSequenceDetected(sequence)) => Some((sequence.as_str(), false)),
                         Some(StopTrigger::VisibleStopSequenceDetected(sequence)) => Some((sequence.as_str(), true)),
-                        _ => match &data.stop_reason {
-                            Some(StopReason::String(sequence)) => Some((sequence.as_str(), decoder.include_stop_text)),
-                            _ => None,
-                        },
+                        _ => None,
                     };
-                    data.text = decoder.output_stop_buffer.apply(selected_text, data.finish_reason.is_some(), matched);
+                    data.text = match decoder_stop {
+                        Some((sequence, include)) if !engine_selected => decoder.output_stop_buffer.apply_decoded_stop(
+                            selected_text,
+                            include,
+                            result.stop_retract_bytes,
+                            sequence,
+                        ),
+                        _ => {
+                            let matched = decoder_stop.or_else(|| match &data.stop_reason {
+                                Some(StopReason::String(sequence)) => Some((sequence.as_str(), decoder.include_stop_text)),
+                                _ => None,
+                            });
+                            decoder.output_stop_buffer.apply(selected_text, data.finish_reason.is_some(), matched)
+                        }
+                    };
                     data.tokens = Some(tokens);
 
                     // Per-entry decode is O(positions * top_k) per delta. Bounded in
@@ -642,6 +689,9 @@ pub enum StopTrigger {
 pub struct StepResult {
     pub token: Option<String>,
     pub stop_trigger: Option<StopTrigger>,
+    /// Hidden stop sequence only: bytes of previously returned text that are
+    /// the start of the matched occurrence.
+    pub stop_retract_bytes: usize,
 }
 
 impl StepResult {
@@ -649,6 +699,7 @@ impl StepResult {
         Self {
             token,
             stop_trigger: None,
+            stop_retract_bytes: 0,
         }
     }
 
@@ -656,6 +707,7 @@ impl StepResult {
         Self {
             token,
             stop_trigger: Some(stop_trigger),
+            stop_retract_bytes: 0,
         }
     }
 }
@@ -664,6 +716,7 @@ impl StepResult {
 pub struct SeqResult {
     pub tokens: Vec<Option<String>>,       // Individual decoded tokens
     pub text: Option<String>,              // Combined decoded text
+    pub stop_retract_bytes: usize,         // See StepResult::stop_retract_bytes
     pub stop_trigger: Option<StopTrigger>, // Reason for stopping generation, if any
 }
 
@@ -804,10 +857,12 @@ impl Decoder {
                     } else {
                         "".to_string()
                     };
-                    return Ok(StepResult::with_stop_trigger(
+                    let mut result = StepResult::with_stop_trigger(
                         Some(partial_token),
                         StopTrigger::HiddenStopSequenceDetected(seq.to_string()),
-                    ));
+                    );
+                    result.stop_retract_bytes = pre_append.saturating_sub(offset);
+                    return Ok(result);
                 }
             }
 
@@ -845,6 +900,7 @@ impl Decoder {
             let StepResult {
                 token,
                 stop_trigger,
+                stop_retract_bytes,
             } = self.step(*token_id)?;
 
             // Always include token text (for visible stops, the stop string is already in the token)
@@ -858,6 +914,7 @@ impl Decoder {
                 return Ok(SeqResult {
                     tokens,
                     text,
+                    stop_retract_bytes,
                     stop_trigger: Some(stop_trigger),
                 });
             }
@@ -866,6 +923,7 @@ impl Decoder {
         Ok(SeqResult {
             tokens,
             text,
+            stop_retract_bytes: 0,
             stop_trigger: None,
         })
     }
@@ -1040,6 +1098,172 @@ mod tests {
             select_output_text(true, Some("<tool_call>".to_string()), Some("x".to_string())),
             Some("<tool_call>".to_string())
         );
+    }
+
+    /// Fixed-vocabulary tokenizer: token id `i` decodes to `vocab[i]`.
+    struct VocabTokenizer(Vec<String>);
+
+    impl traits::Encoder for VocabTokenizer {
+        fn encode(&self, _input: &str) -> anyhow::Result<crate::tokenizers::Encoding> {
+            Ok(crate::tokenizers::Encoding::Sp(vec![]))
+        }
+        fn encode_batch(
+            &self,
+            _inputs: &[&str],
+        ) -> anyhow::Result<Vec<crate::tokenizers::Encoding>> {
+            Ok(vec![])
+        }
+    }
+
+    impl traits::Decoder for VocabTokenizer {
+        fn decode(
+            &self,
+            token_ids: &[TokenIdType],
+            _skip_special_tokens: bool,
+        ) -> anyhow::Result<traits::DecodeResult> {
+            Ok(traits::DecodeResult::Complete(
+                token_ids
+                    .iter()
+                    .map(|id| self.0[*id as usize].as_str())
+                    .collect(),
+            ))
+        }
+    }
+
+    impl traits::Tokenizer for VocabTokenizer {}
+
+    /// Drive `Decoder` + its stop buffer the way the backend does for an
+    /// engine that sends token ids only (vLLM): returns the client-visible text.
+    fn decoded_output(
+        vocab: &[&str],
+        chunks: &[&[TokenIdType]],
+        stop: &str,
+        include: bool,
+        min_tokens: Option<u32>,
+    ) -> String {
+        let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(VocabTokenizer(
+            vocab.iter().map(|s| s.to_string()).collect(),
+        ));
+        let decode_stream = crate::tokenizers::DecodeStream::new(tokenizer, &[], false);
+        let stop_conditions = StopConditions {
+            stop: Some(vec![stop.to_string()]),
+            min_tokens,
+            ..Default::default()
+        };
+        let mut decoder = Decoder::new(decode_stream, stop_conditions, include, None);
+        let mut out = String::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let result = decoder.process_token_ids(chunk).unwrap();
+            let terminal = index + 1 == chunks.len();
+            let text = match &result.stop_trigger {
+                Some(StopTrigger::HiddenStopSequenceDetected(seq))
+                | Some(StopTrigger::VisibleStopSequenceDetected(seq)) => {
+                    let text = decoder.output_stop_buffer.apply_decoded_stop(
+                        result.text,
+                        include,
+                        result.stop_retract_bytes,
+                        seq,
+                    );
+                    out.push_str(text.as_deref().unwrap_or_default());
+                    return out;
+                }
+                _ => decoder
+                    .output_stop_buffer
+                    .apply(result.text, terminal, None),
+            };
+            out.push_str(text.as_deref().unwrap_or_default());
+        }
+        out
+    }
+
+    #[test]
+    fn test_decoded_stop_keeps_false_prefix_before_single_token_stop() {
+        let vocab = ["", "ALPHA ", "ST", "STOP", " OMEGA", "x", "<", "</think>"];
+        assert_eq!(
+            decoded_output(&vocab, &[&[1, 2], &[3, 4]], "STOP", false, None),
+            "ALPHA ST"
+        );
+        assert_eq!(
+            decoded_output(&vocab, &[&[1, 2, 3, 4]], "STOP", false, None),
+            "ALPHA ST"
+        );
+        assert_eq!(
+            decoded_output(&vocab, &[&[1, 2], &[3]], "STOP", true, None),
+            "ALPHA STSTOP"
+        );
+        assert_eq!(
+            decoded_output(&vocab, &[&[5, 6], &[7]], "</think>", false, None),
+            "x<"
+        );
+    }
+
+    #[test]
+    fn test_decoded_stop_self_overlapping_sequence() {
+        // Live Super 3.5 tokenization of "ALPHA abababc OMEGA" (MTP batches 4 tokens).
+        let vocab = ["", "AL", "PHA", " ab", "ab", "abc", " O"];
+        for chunks in [
+            &[&[1][..], &[2, 3, 4, 5][..]][..],
+            &[&[1][..], &[2][..], &[3][..], &[4][..], &[5, 6][..]][..],
+            &[&[1, 2, 3][..], &[4, 5, 6][..]][..],
+        ] {
+            assert_eq!(
+                decoded_output(&vocab, chunks, "ababc", false, None),
+                "ALPHA ab"
+            );
+            assert_eq!(
+                decoded_output(&vocab, chunks, "ababc", true, None),
+                "ALPHA abababc"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decoded_stop_ignores_occurrence_below_min_tokens_in_one_batch() {
+        let vocab = ["", "STOP", "there"];
+        assert_eq!(
+            decoded_output(&vocab, &[&[1, 2, 1, 2]], "STOP", false, Some(3)),
+            "STOPthere"
+        );
+        assert_eq!(
+            decoded_output(&vocab, &[&[1, 2, 1, 2]], "STOP", true, Some(3)),
+            "STOPthereSTOP"
+        );
+    }
+
+    #[test]
+    fn test_decoded_stop_every_split_char_tokens() {
+        let cases = [
+            ("ALPHA STOP OMEGA", "STOP", "ALPHA ", "ALPHA STOP"),
+            ("x abababc y", "ababc", "x ab", "x abababc"),
+            ("a 你好 b", "你好", "a ", "a 你好"),
+            ("ALPHA STAR ST", "STOP", "ALPHA STAR ST", "ALPHA STAR ST"),
+        ];
+        for (all, stop, hidden, visible) in cases {
+            let vocab: Vec<String> = std::iter::once(String::new())
+                .chain(all.chars().map(String::from))
+                .collect();
+            let vocab: Vec<&str> = vocab.iter().map(String::as_str).collect();
+            let ids: Vec<TokenIdType> = (1..vocab.len() as TokenIdType).collect();
+            for split in 1..ids.len() {
+                let chunks = [&ids[..split], &ids[split..]];
+                assert_eq!(
+                    decoded_output(&vocab, &chunks, stop, false, None),
+                    hidden,
+                    "{all} @{split}"
+                );
+                assert_eq!(
+                    decoded_output(&vocab, &chunks, stop, true, None),
+                    visible,
+                    "{all} @{split}"
+                );
+            }
+            let singles: Vec<&[TokenIdType]> = ids.chunks(1).collect();
+            assert_eq!(
+                decoded_output(&vocab, &singles, stop, false, None),
+                hidden,
+                "{all} singles"
+            );
+        }
     }
 
     /// A mock tokenizer that always returns Err from decode().
