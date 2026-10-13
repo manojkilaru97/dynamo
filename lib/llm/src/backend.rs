@@ -16,7 +16,7 @@
 //! hidden stop condition matches, which can be handled in the response stream rather than the backend.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Instant,
 };
@@ -76,6 +76,34 @@ struct DecoderUnfoldState {
     /// (e.g. SGLang with --skip-tokenizer-init forcibly drops it).
     tokenizer: Tokenizer,
     skip_special_tokens: bool,
+    /// Outputs to emit before reading the upstream stream again.
+    queued: VecDeque<Annotated<LLMEngineOutput>>,
+    /// The upstream stream returned `None`.
+    upstream_done: bool,
+}
+
+impl DecoderUnfoldState {
+    /// Release text withheld as a possible stop prefix of every unfinished
+    /// choice, as text-only outputs. Used when the upstream stream fails or
+    /// ends without a finish: the text was generated, and a migrated retry
+    /// starts a new decoder that cannot complete the stop.
+    fn release_withheld(&mut self) -> VecDeque<Annotated<LLMEngineOutput>> {
+        let mut indices: Vec<u32> = self.decoders.keys().copied().collect();
+        indices.sort_unstable();
+        indices
+            .into_iter()
+            .filter(|index| !self.finished_choices.contains(index))
+            .filter_map(|index| {
+                let decoder = self.decoders.get_mut(&index)?;
+                let text = decoder.output_stop_buffer.apply(None, true, None)?;
+                Some(Annotated::from_data(LLMEngineOutput {
+                    text: Some(text),
+                    index: Some(index),
+                    ..Default::default()
+                }))
+            })
+            .collect()
+    }
 }
 
 struct DecoderParams {
@@ -309,6 +337,8 @@ impl Backend {
             finished: false,
             tokenizer: tokenizer.clone(),
             skip_special_tokens: params.skip_special_tokens,
+            queued: VecDeque::new(),
+            upstream_done: false,
         })
     }
 }
@@ -335,8 +365,11 @@ impl
         let state = self.decoder(next_stream, decoder_params)?;
 
         let processed_stream = stream::unfold(state, |mut state| async move {
+            if let Some(output) = state.queued.pop_front() {
+                return Some((output, state));
+            }
             // If we've already detected a local stop condition, end the stream
-            if state.finished {
+            if state.finished || state.upstream_done {
                 return None;
             }
 
@@ -347,6 +380,16 @@ impl
 
                     // events are pass thru
                     if output.is_event() || output.data.is_none() {
+                        // A stream error (e.g. a worker disconnect that migration
+                        // retries on a new Backend) first releases withheld text.
+                        if output.error.is_some() || output.is_error() {
+                            let mut queued = state.release_withheld();
+                            if let Some(first) = queued.pop_front() {
+                                queued.push_back(output);
+                                state.queued = queued;
+                                return Some((first, state));
+                            }
+                        }
                         return Some((output, state));
                     }
 
@@ -376,14 +419,14 @@ impl
                             }
                         }
                         let mut output = output;
-                        if let Some(data) = &mut output.data {
-                            if let Some(decoder) = state.decoders.get_mut(&choice_idx) {
-                                let matched = match &data.stop_reason {
-                                    Some(StopReason::String(sequence)) => Some((sequence.as_str(), decoder.include_stop_text)),
-                                    _ => None,
-                                };
-                                data.text = decoder.output_stop_buffer.apply(data.text.take(), data.finish_reason.is_some(), matched);
-                            }
+                        if let Some(data) = &mut output.data
+                            && let Some(decoder) = state.decoders.get_mut(&choice_idx)
+                        {
+                            let matched = match &data.stop_reason {
+                                Some(StopReason::String(sequence)) => Some((sequence.as_str(), decoder.include_stop_text)),
+                                _ => None,
+                            };
+                            data.text = decoder.output_stop_buffer.apply(data.text.take(), data.finish_reason.is_some(), matched);
                         }
                         return Some((output, state));
                     }
@@ -524,7 +567,7 @@ impl
                             sequence,
                         ),
                         _ => {
-                            let matched = decoder_stop.or_else(|| match &data.stop_reason {
+                            let matched = decoder_stop.or(match &data.stop_reason {
                                 Some(StopReason::String(sequence)) => Some((sequence.as_str(), decoder.include_stop_text)),
                                 _ => None,
                             });
@@ -565,7 +608,12 @@ impl
                     Some((output, state))
                 }
 
-                None => None,
+                None => {
+                    state.upstream_done = true;
+                    state.queued = state.release_withheld();
+                    let first = state.queued.pop_front()?;
+                    Some((first, state))
+                }
             }
         })
         .fuse();
@@ -1264,6 +1312,121 @@ mod tests {
                 "{all} singles"
             );
         }
+    }
+
+    struct ScriptedEngine(std::sync::Mutex<Option<Vec<Annotated<LLMEngineOutput>>>>);
+
+    #[async_trait]
+    impl
+        dynamo_runtime::pipeline::AsyncEngine<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<LLMEngineOutput>>,
+            anyhow::Error,
+        > for ScriptedEngine
+    {
+        async fn generate(
+            &self,
+            _request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
+            let items = self.0.lock().unwrap().take().unwrap();
+            let context = Arc::new(dynamo_runtime::pipeline::context::Controller::new(
+                "stop-buffer-test".to_string(),
+            ));
+            Ok(ResponseStream::new(Box::pin(stream::iter(items)), context))
+        }
+    }
+
+    /// Client-visible (text, token_ids, is_error) items for a token-id-only engine.
+    async fn backend_items(
+        upstream: Vec<Annotated<LLMEngineOutput>>,
+    ) -> Vec<(Option<String>, Vec<TokenIdType>, bool)> {
+        let vocab = ["", "ALPHA ", "ST", "OP"];
+        let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(VocabTokenizer(
+            vocab.iter().map(|s| s.to_string()).collect(),
+        ));
+        let backend = Backend::from_tokenizer(Tokenizer::from(tokenizer));
+        let request = PreprocessedRequest::builder()
+            .model("mock".to_string())
+            .token_ids(vec![])
+            .stop_conditions(StopConditions {
+                stop: Some(vec!["STOP".to_string()]),
+                ..Default::default()
+            })
+            .sampling_options(Default::default())
+            .output_options(Default::default())
+            .eos_token_ids(vec![])
+            .annotations(vec![])
+            .build()
+            .unwrap();
+        let next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
+            Arc::new(ScriptedEngine(std::sync::Mutex::new(Some(upstream))));
+        let stream = Operator::<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<BackendOutput>>,
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<LLMEngineOutput>>,
+        >::generate(
+            &*backend,
+            dynamo_runtime::pipeline::Context::new(request),
+            next,
+        )
+        .await
+        .unwrap();
+        stream
+            .map(|item| {
+                let is_error = item.is_error();
+                let (text, ids) = item
+                    .data
+                    .map(|data| (data.text, data.token_ids))
+                    .unwrap_or_default();
+                (text, ids, is_error)
+            })
+            .collect()
+            .await
+    }
+
+    fn engine_chunk(token_ids: Vec<TokenIdType>) -> Annotated<LLMEngineOutput> {
+        Annotated::from_data(LLMEngineOutput {
+            token_ids,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn test_withheld_stop_prefix_released_before_stream_error() {
+        let items = backend_items(vec![
+            engine_chunk(vec![1, 2]),
+            Annotated::from_error("disconnected"),
+        ])
+        .await;
+        assert_eq!(
+            items,
+            vec![
+                (Some("ALPHA ".to_string()), vec![1, 2], false),
+                (Some("ST".to_string()), vec![], false),
+                (None, vec![], true),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_withheld_stop_prefix_released_at_unfinished_end_of_stream() {
+        let items = backend_items(vec![engine_chunk(vec![1, 2])]).await;
+        assert_eq!(
+            items,
+            vec![
+                (Some("ALPHA ".to_string()), vec![1, 2], false),
+                (Some("ST".to_string()), vec![], false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_completed_stop_releases_nothing_extra() {
+        let items = backend_items(vec![engine_chunk(vec![1, 2]), engine_chunk(vec![3])]).await;
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], (Some("ALPHA ".to_string()), vec![1, 2], false));
+        assert_eq!((items[1].0.clone(), items[1].2), (None, false));
     }
 
     /// A mock tokenizer that always returns Err from decode().
