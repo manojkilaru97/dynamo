@@ -97,6 +97,23 @@ fn apply_with(
     Ok(true)
 }
 
+/// The final prompt tokens leave reasoning open: the last `<think>` control token is
+/// at most two tokens (e.g. a newline) from the end and no reasoning-end token
+/// follows it. Checked on the token ids actually sent to the engine, which can
+/// differ from the rendered messages (e.g. `nvext.token_data`).
+pub(crate) fn prompt_tokens_leave_reasoning_open(
+    token_ids: &[u32],
+    think_id: u32,
+    end_ids: &[u32],
+) -> bool {
+    token_ids
+        .iter()
+        .rposition(|&t| t == think_id)
+        .is_some_and(|pos| {
+            pos + 3 >= token_ids.len() && !token_ids[pos + 1..].iter().any(|t| end_ids.contains(t))
+        })
+}
+
 /// Request migration replays generated tokens as prompt. Once a reasoning-end
 /// token has been generated, drop the opt-in so the new worker does not mask
 /// stop tokens for the rest of the turn.
@@ -235,6 +252,18 @@ mod tests {
         let mut none = None;
         release_on_generated(&mut none, &[13]);
         assert_eq!(none, None);
+    }
+
+    #[test]
+    fn prompt_tokens_decide_open_reasoning() {
+        let open = |ids: &[u32]| prompt_tokens_leave_reasoning_open(ids, 12, &END_IDS);
+        assert!(open(&[1, 12]));
+        assert!(open(&[1, 12, 1010]));
+        assert!(!open(&[1, 12, 13]));
+        assert!(!open(&[1, 12, 1010, 14]));
+        assert!(!open(&[1, 12, 1010, 500, 501]));
+        assert!(!open(&[1, 2, 3]));
+        assert!(!open(&[]));
     }
 
     #[test]

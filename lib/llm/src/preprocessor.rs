@@ -4498,16 +4498,25 @@ impl
         let mut response_generator = Box::new(response_generator);
         if let Some(encoder) = &self.user_data_encoder {
             let (thinking, _) = self.reasoning_stream_modes(&request, uses_tool_call_structural_tag);
+            let control_id = |marker: &str| {
+                encoder.controls.iter().find(|(_, m)| **m == marker).map(|(id, _)| *id)
+            };
             let reasoning_end_ids: Vec<u32> = no_eos_in_reasoning::REASONING_END_MARKERS
                 .iter()
-                .filter_map(|marker| {
-                    encoder.controls.iter().find(|(_, m)| *m == marker).map(|(id, _)| *id)
-                })
+                .filter_map(|marker| control_id(marker))
                 .collect();
+            let prompt_leaves_reasoning_open = prompt_injected_reasoning
+                && control_id("<think>").is_some_and(|think_id| {
+                    no_eos_in_reasoning::prompt_tokens_leave_reasoning_open(
+                        &common_request.token_ids,
+                        think_id,
+                        &reasoning_end_ids,
+                    )
+                });
             no_eos_in_reasoning::apply(
                 &request,
                 thinking,
-                prompt_injected_reasoning,
+                prompt_leaves_reasoning_open,
                 &reasoning_end_ids,
                 &mut common_request.extra_args,
             )?;
