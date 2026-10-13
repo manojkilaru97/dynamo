@@ -366,6 +366,10 @@ where
             self.request.token_ids.push(*token_id);
         }
         self.request.migrated_output_tokens += token_ids.len();
+        crate::preprocessor::no_eos_in_reasoning::release_on_generated(
+            &mut self.request.extra_args,
+            token_ids,
+        );
     }
 
     /// Returns `true` if the tracked request token length plus `new_output_len`
@@ -1520,6 +1524,59 @@ mod tests {
         );
         // Recorded so routing can tell which trailing tokens a multimodal buffer lacks.
         assert_eq!(retry_manager.request.migrated_output_tokens, 3);
+    }
+
+    /// A migrated request replays generated tokens as prompt; once `</think>` or
+    /// `<tool_call>` was generated, the Super 3.5 no-EOS-in-reasoning opt-in is dropped.
+    #[tokio::test]
+    async fn test_retry_manager_releases_no_eos_in_reasoning_after_reasoning_end() {
+        for (tokens, released) in [(vec![200u32, 13, 201], true), (vec![200, 201, 202], false)] {
+            let mut request = create_mock_request(10);
+            request.extra_args = Some(serde_json::json!({
+                "nemotron_block_eos_in_reasoning": [13, 14],
+            }));
+            let next_generate: ServerStreamingEngine<
+                PreprocessedRequest,
+                Annotated<BackendOutput>,
+            > = Arc::new(TokenListEngine(tokens.clone()));
+            let mut retry_manager = RetryManager::build(
+                Arc::new(Controller::new(uuid::Uuid::new_v4().to_string())),
+                BTreeMap::new(),
+                request,
+                next_generate,
+                1,
+                None,
+                Arc::new(TEST_MODEL.to_string()),
+                Arc::new(Metrics::new()),
+                None,
+            )
+            .await
+            .expect("Failed to build RetryManager");
+            while retry_manager.next().await.is_some() {}
+            let flagged = retry_manager
+                .request
+                .extra_args
+                .as_ref()
+                .and_then(|args| args.get("nemotron_block_eos_in_reasoning"))
+                .is_some();
+            assert_eq!(flagged, !released, "{tokens:?}");
+        }
+    }
+
+    struct TokenListEngine(Vec<u32>);
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, anyhow::Error>
+        for TokenListEngine
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<BackendOutput>>> {
+            let ctx = request.context();
+            let responses: Vec<_> = self.0.iter().map(|&t| create_mock_output(t)).collect();
+            Ok(ResponseStream::new(Box::pin(stream::iter(responses)), ctx))
+        }
     }
 
     /// 2-hop migration: A → fail → B → fail → C. Each retry's

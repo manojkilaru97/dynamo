@@ -15,7 +15,7 @@
 pub mod lightseek_mm;
 pub mod media;
 pub(crate) mod nemotron_reasoning;
-mod no_eos_in_reasoning;
+pub(crate) mod no_eos_in_reasoning;
 pub mod prompt;
 pub mod speculative_prefill;
 mod structural_tag;
@@ -4498,10 +4498,17 @@ impl
         let mut response_generator = Box::new(response_generator);
         if let Some(encoder) = &self.user_data_encoder {
             let (thinking, _) = self.reasoning_stream_modes(&request, uses_tool_call_structural_tag);
+            let reasoning_end_ids: Vec<u32> = no_eos_in_reasoning::REASONING_END_MARKERS
+                .iter()
+                .filter_map(|marker| {
+                    encoder.controls.iter().find(|(_, m)| *m == marker).map(|(id, _)| *id)
+                })
+                .collect();
             no_eos_in_reasoning::apply(
                 &request,
                 thinking,
                 prompt_injected_reasoning,
+                &reasoning_end_ids,
                 &mut common_request.extra_args,
             )?;
             let guided = Self::has_structured_response_format(&request) || matches!(

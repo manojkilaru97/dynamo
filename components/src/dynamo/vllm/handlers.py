@@ -870,15 +870,18 @@ def build_sampling_params(
     _apply_max_output_tokens_cap(sampling_params)
 
     # Super 3.5: the frontend opts tool-using thinking requests into vLLM's
-    # stop-token mask while reasoning is open. Only the frontend can set this
-    # top-level key; client passthrough lives under "nvext"/"sampling_options".
-    if (
-        isinstance(extra_args, dict)
-        and extra_args.get(_NO_EOS_IN_REASONING_ARG) is True
-    ):
+    # stop-token mask while reasoning is open; the value lists the
+    # reasoning-end token ids. Only the frontend can set this top-level key;
+    # client passthrough lives under "nvext"/"sampling_options".
+    no_eos_value = (
+        extra_args.get(_NO_EOS_IN_REASONING_ARG)
+        if isinstance(extra_args, dict)
+        else None
+    )
+    if _is_token_id_list(no_eos_value):
         sampling_params.extra_args = {
             **(sampling_params.extra_args or {}),
-            _NO_EOS_IN_REASONING_ARG: True,
+            _NO_EOS_IN_REASONING_ARG: list(no_eos_value),
         }
 
     # Dynamo's internal token path consumes disjoint token deltas. This mirrors
@@ -888,6 +891,14 @@ def build_sampling_params(
     sampling_params.output_kind = _DELTA_REQUEST_OUTPUT_KIND
 
     return sampling_params
+
+
+def _is_token_id_list(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(i, int) and not isinstance(i, bool) for i in value)
+    )
 
 
 def _configured_max_output_tokens_env() -> int | None:

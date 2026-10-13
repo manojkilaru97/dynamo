@@ -117,7 +117,6 @@ def test_build_sampling_params_forces_delta_token_mode():
     assert sampling_params.output_kind == RequestOutputKind.DELTA
 
 
-
 def _request_with_extra_args(extra_args):
     return {
         "token_ids": [1, 2, 3],
@@ -131,11 +130,20 @@ def _request_with_extra_args(extra_args):
 def test_build_sampling_params_forwards_no_eos_in_reasoning_opt_in():
     key = "nemotron_block_eos_in_reasoning"
     sampling_params = build_sampling_params(
-        _request_with_extra_args({key: True}), default_sampling_params={}
+        _request_with_extra_args({key: [13, 14]}), default_sampling_params={}
     )
-    assert sampling_params.extra_args == {key: True}
+    assert sampling_params.extra_args == {key: [13, 14]}
 
-    for extra_args in (None, {}, {key: False}, {key: [13, 14]}, {"nvext": {key: True}}):
+    for extra_args in (
+        None,
+        {},
+        {key: False},
+        {key: True},
+        {key: []},
+        {key: [True]},
+        {key: "13"},
+        {"nvext": {key: [13, 14]}},
+    ):
         sampling_params = build_sampling_params(
             _request_with_extra_args(extra_args), default_sampling_params={}
         )
