@@ -166,6 +166,11 @@ fn normalize_input_audio_parts(messages: &mut [ChatCompletionRequestMessage]) ->
                     "input_audio.data must be non-empty base64-encoded audio",
                 ));
             }
+            if !is_valid_base64_payload(data) {
+                return Err(invalid_argument_error(
+                    "input_audio.data is not valid base64-encoded audio",
+                ));
+            }
             let format = match audio.input_audio.format {
                 InputAudioFormat::Wav => "wav",
                 InputAudioFormat::Mp3 => "mp3",
@@ -187,6 +192,22 @@ fn normalize_input_audio_parts(messages: &mut [ChatCompletionRequestMessage]) ->
         }
     }
     Ok(rewrote)
+}
+
+/// Standard-alphabet base64, padding optional, ASCII whitespace ignored.
+fn is_valid_base64_payload(data: &str) -> bool {
+    use base64::Engine as _;
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    const LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    if data.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        let compact: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        LENIENT.decode(compact).is_ok()
+    } else {
+        LENIENT.decode(data).is_ok()
+    }
 }
 
 fn normalize_input_audio_request(request: &mut NvCreateChatCompletionRequest) -> Result<bool> {
@@ -4983,6 +5004,28 @@ mod input_audio_tests {
             text.nvext.as_ref().unwrap().token_data.as_deref(),
             Some(&[1, 2, 3][..])
         );
+    }
+
+    #[test]
+    fn malformed_input_audio_base64_is_a_client_error() {
+        for data in ["A", "not base64!", "UklGR===="] {
+            let mut msgs = messages(serde_json::json!([{
+                "role": "user",
+                "content": [{"type": "input_audio", "input_audio": {"data": data, "format": "wav"}}]
+            }]));
+            let err = normalize_input_audio_parts(&mut msgs).unwrap_err();
+            assert!(
+                err.to_string().contains("not valid base64"),
+                "{data}: {err}"
+            );
+        }
+        for data in ["UklGRg==", "UklGRg", "UklG\nRg=="] {
+            let mut msgs = messages(serde_json::json!([{
+                "role": "user",
+                "content": [{"type": "input_audio", "input_audio": {"data": data, "format": "wav"}}]
+            }]));
+            assert!(normalize_input_audio_parts(&mut msgs).unwrap(), "{data}");
+        }
     }
 
     #[test]
