@@ -88,21 +88,69 @@ impl DecoderUnfoldState {
     /// ends without a finish: the text was generated, and a migrated retry
     /// starts a new decoder that cannot complete the stop.
     fn release_withheld(&mut self) -> VecDeque<Annotated<LLMEngineOutput>> {
-        let mut indices: Vec<u32> = self.decoders.keys().copied().collect();
+        let mut indices: Vec<u32> = self
+            .decoders
+            .keys()
+            .copied()
+            .filter(|index| !self.finished_choices.contains(index))
+            .collect();
         indices.sort_unstable();
         indices
             .into_iter()
-            .filter(|index| !self.finished_choices.contains(index))
-            .filter_map(|index| {
-                let decoder = self.decoders.get_mut(&index)?;
-                let text = decoder.output_stop_buffer.apply(None, true, None)?;
-                Some(Annotated::from_data(LLMEngineOutput {
-                    text: Some(text),
-                    index: Some(index),
-                    ..Default::default()
-                }))
-            })
+            .filter_map(|index| self.release_choice(index))
             .collect()
+    }
+
+    fn release_choice(&mut self, index: u32) -> Option<Annotated<LLMEngineOutput>> {
+        let decoder = self.decoders.get_mut(&index)?;
+        let text = decoder.output_stop_buffer.apply(None, true, None)?;
+        Some(Annotated::from_data(LLMEngineOutput {
+            text: Some(text),
+            index: Some(index),
+            ..Default::default()
+        }))
+    }
+
+    /// Downstream, an error finish fails the response without emitting its
+    /// delta text. Emit that text (when it went through the stop buffer,
+    /// `buffered_text`) and every choice's withheld text first.
+    fn release_before_error_finish(
+        &mut self,
+        mut output: Annotated<LLMEngineOutput>,
+        buffered_text: bool,
+    ) -> Annotated<LLMEngineOutput> {
+        let Some(data) = output.data.as_mut() else {
+            return output;
+        };
+        if !matches!(data.finish_reason, Some(FinishReason::Error(_))) {
+            return output;
+        }
+        let mut queued = VecDeque::new();
+        if let Some(text) = buffered_text
+            .then(|| data.text.take())
+            .flatten()
+            .filter(|text| !text.is_empty())
+        {
+            queued.push_back(Annotated::from_data(LLMEngineOutput {
+                text: Some(text),
+                index: data.index,
+                ..Default::default()
+            }));
+        }
+        let mut indices: Vec<u32> = self.decoders.keys().copied().collect();
+        indices.sort_unstable();
+        queued.extend(
+            indices
+                .into_iter()
+                .filter_map(|index| self.release_choice(index)),
+        );
+        let Some(first) = queued.pop_front() else {
+            return output;
+        };
+        queued.push_back(output);
+        queued.append(&mut self.queued);
+        self.queued = queued;
+        first
     }
 }
 
@@ -428,6 +476,7 @@ impl
                             };
                             data.text = decoder.output_stop_buffer.apply(data.text.take(), data.finish_reason.is_some(), matched);
                         }
+                        let output = state.release_before_error_finish(output, true);
                         return Some((output, state));
                     }
 
@@ -459,6 +508,7 @@ impl
                                 data.finish_reason =
                                     Some(FinishReason::Error(format!("decode error: {e}")));
                             }
+                            let output = state.release_before_error_finish(output, false);
                             return Some((output, state));
                         }
                     };
@@ -605,6 +655,7 @@ impl
 
                     output.data = Some(data);
 
+                    let output = state.release_before_error_finish(output, true);
                     Some((output, state))
                 }
 
@@ -1405,6 +1456,23 @@ mod tests {
                 (Some("ALPHA ".to_string()), vec![1, 2], false),
                 (Some("ST".to_string()), vec![], false),
                 (None, vec![], true),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_withheld_stop_prefix_released_before_engine_error_finish() {
+        let items = backend_items(vec![
+            engine_chunk(vec![1, 2]),
+            Annotated::from_data(LLMEngineOutput::error("boom".to_string())),
+        ])
+        .await;
+        assert_eq!(
+            items,
+            vec![
+                (Some("ALPHA ".to_string()), vec![1, 2], false),
+                (Some("ST".to_string()), vec![], false),
+                (None, vec![], false),
             ]
         );
     }
