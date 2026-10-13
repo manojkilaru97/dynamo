@@ -371,6 +371,34 @@ class VllmMultimodalRequestProcessor:
             return bool(mm_processor_kwargs["use_audio_in_video"])
         return self._default_use_audio_in_video
 
+    async def _load_audio_inputs_as_client_data(
+        self, audio_items: list[Any]
+    ) -> list[Any]:
+        """Audio-capable models only: undecodable audio is a client error (400).
+
+        The image decodes WAV/MP3/FLAC/Ogg with libsndfile and ships no PyAV, so
+        bytes libsndfile rejects surface as a "missing decoder" error or an
+        untyped batch error (HTTP 500). For a model that accepts audio those
+        are bad inputs, not deployment faults.
+        """
+        from dynamo.common.http import HttpStatusError
+        from dynamo.common.http.url_validator import UrlValidationError
+        from dynamo.common.multimodal.codec_errors import MissingMediaDecoderError
+
+        try:
+            return await self.audio_loader.load_audio_batch(audio_items)
+        except (UrlValidationError, HttpStatusError, ValueError):
+            raise
+        except MissingMediaDecoderError as exc:
+            raise ValueError(
+                "The audio input could not be decoded. Send WAV, MP3, FLAC or Ogg "
+                "(Vorbis/Opus) audio."
+            ) from exc
+        except Exception as exc:
+            if type(exc) is not Exception:
+                raise
+            raise ValueError(f"The audio input could not be decoded: {exc}") from exc
+
     @staticmethod
     def _multimodal_disabled_error() -> ValueError:
         return ValueError(
@@ -517,7 +545,10 @@ class VllmMultimodalRequestProcessor:
 
             audio_items = mm_map.get(AUDIO_URL_KEY, [])
             if audio_items:
-                audios = await self.audio_loader.load_audio_batch(audio_items)
+                if self._audio_in_video_from_bytes:
+                    audios = await self._load_audio_inputs_as_client_data(audio_items)
+                else:
+                    audios = await self.audio_loader.load_audio_batch(audio_items)
                 if audios:
                     vllm_mm_data["audio"] = audios[0] if len(audios) == 1 else audios
 

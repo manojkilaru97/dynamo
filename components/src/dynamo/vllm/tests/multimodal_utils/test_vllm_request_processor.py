@@ -535,6 +535,47 @@ def test_default_video_loader_enables_royalty_free_nvdec_only_for_omni(
     assert processor.video_loader._nvdec_royalty_free_codecs is expected
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        Exception("Failed to load audio from data:audio/wav...: bad header\n"),
+        "missing-decoder",
+    ],
+)
+async def test_omni_undecodable_audio_input_is_a_client_error(failure):
+    from dynamo.common.multimodal.codec_errors import audio_decoder_missing
+
+    if failure == "missing-decoder":
+        failure = audio_decoder_missing("vllm", cause="No module named 'av'")
+    processor = _audio_processor({"sampling_rate": 16000}, {"use_audio_in_video": True})
+    processor.audio_loader.load_audio_batch.side_effect = failure
+
+    with pytest.raises(ValueError, match="could not be decoded"):
+        await processor.extract_multimodal_data(
+            {"multi_modal_data": {"audio_url": [{"Url": "data:audio/wav;base64,AA"}]}},
+            "request-omni-bad-audio",
+            None,
+            None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_models_without_sound_config_keep_audio_errors_unchanged():
+    processor = _audio_processor(None, None)
+    failure = Exception("Failed to load audio from data:audio/wav...: bad header\n")
+    processor.audio_loader.load_audio_batch.side_effect = failure
+
+    with pytest.raises(Exception) as raised:
+        await processor.extract_multimodal_data(
+            {"multi_modal_data": {"audio_url": [{"Url": "data:audio/wav;base64,AA"}]}},
+            "request-super-bad-audio",
+            None,
+            None,
+        )
+    assert raised.value is failure
+
+
 def test_audio_in_video_policy_reads_sound_config_and_engine_default():
     assert mod._resolve_audio_in_video_policy(None) == (False, False)
     assert mod._resolve_audio_in_video_policy(
