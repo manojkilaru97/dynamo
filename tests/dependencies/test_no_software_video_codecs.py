@@ -228,12 +228,51 @@ def _assert_bundled_libavcodecs_carry_no_software_codecs() -> None:
         )
 
 
+# The one recorded exception: Nemotron Omni audio-in-video decodes AAC (and other
+# non-Opus) tracks through a private, audio-only, LGPL FFmpeg CLI that vLLM runs
+# as a subprocess for sound_config models only. It is invisible to the PATH and
+# sys.path probes above, so pin its exact capability surface here.
+_OMNI_AUDIO_CLI = "/opt/nvidia/omni-audio/bin/ffmpeg"
+_OMNI_AUDIO_SURFACES = {
+    "decoders": {
+        "aac", "flac", "mp3float", "opus", "vorbis",
+        "pcm_alaw", "pcm_f32be", "pcm_f32le", "pcm_f64be", "pcm_f64le",
+        "pcm_mulaw", "pcm_s16be", "pcm_s16le", "pcm_s24be", "pcm_s24le",
+        "pcm_s32be", "pcm_s32le", "pcm_s8", "pcm_u8",
+    },
+    "encoders": {"pcm_f32le"},
+    "demuxers": {"matroska,webm", "mov,mp4,m4a,3gp,3g2,mj2"},
+    "muxers": {"f32le"},
+}  # fmt: skip
+
+
+def _listed_names(exe: str, surface: str) -> set[str]:
+    """Names in an ``ffmpeg -<surface>`` table (the rows after its legend)."""
+    lines = _surface(exe, surface).splitlines()
+    body = [ln for ln in lines[1:] if ln.strip()]
+    separator = next(i for i, ln in enumerate(body) if set(ln.strip()) == {"-"})
+    rows = [ln.split() for ln in body[separator + 1 :]]
+    return {fields[1] for fields in rows if len(fields) >= 2}
+
+
+def _assert_omni_audio_cli_is_audio_only() -> None:
+    if not os.path.exists(_OMNI_AUDIO_CLI):
+        return
+    for surface, expected in _OMNI_AUDIO_SURFACES.items():
+        actual = _listed_names(_OMNI_AUDIO_CLI, surface)
+        assert actual == expected, (
+            f"{_OMNI_AUDIO_CLI} -{surface} changed: unexpected "
+            f"{sorted(actual - expected)}, missing {sorted(expected - actual)}"
+        )
+
+
 def _check_image() -> None:
     surfaces = _surfaces()
     _assert_required_codecs_present(surfaces)
     _assert_no_software_codecs(surfaces)
     _assert_python_carriers_absent()
     _assert_bundled_libavcodecs_carry_no_software_codecs()
+    _assert_omni_audio_cli_is_audio_only()
 
 
 # One entry point per image. Each carries a single framework marker so it runs in
