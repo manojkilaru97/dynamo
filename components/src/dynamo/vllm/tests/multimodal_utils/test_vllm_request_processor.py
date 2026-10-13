@@ -584,6 +584,22 @@ async def test_omni_audio_input_errors_are_typed_by_cause(failure, expected):
 
 
 @pytest.mark.asyncio
+async def test_omni_audio_input_over_the_duration_limit_says_so():
+    processor = _audio_processor({"sampling_rate": 16000}, None)
+    processor.audio_loader.load_audio.side_effect = _decode_failure(
+        ValueError("Audio exceeds maximum allowed duration of 600s (file 700s).")
+    )
+    with pytest.raises(ValueError, match="send a shorter clip") as raised:
+        await processor.extract_multimodal_data(
+            {"multi_modal_data": {"audio_url": [{"Url": "data:audio/wav;base64,AA"}]}},
+            "request-omni-long-audio",
+            None,
+            None,
+        )
+    assert "could not be decoded" not in str(raised.value)
+
+
+@pytest.mark.asyncio
 async def test_omni_audio_inputs_load_in_order():
     processor = _audio_processor({"sampling_rate": 16000}, None)
     first, second = object(), object()

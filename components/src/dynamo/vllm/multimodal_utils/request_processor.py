@@ -420,6 +420,12 @@ class VllmMultimodalRequestProcessor:
                 ) from result
             if isinstance(result, ValueError):
                 detail = str(cause) if cause is not None else ""
+                if "maximum allowed duration" in detail:
+                    raise ValueError(
+                        "The audio input exceeds this server's maximum audio "
+                        "duration (VLLM_MAX_AUDIO_DECODE_DURATION_S); send a "
+                        "shorter clip."
+                    ) from result
                 if not detail or "data:" in detail or len(detail) > 300:
                     detail = "invalid, unsupported or empty audio"
                 raise ValueError(
