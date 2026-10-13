@@ -160,13 +160,21 @@ fn normalize_input_audio_parts(messages: &mut [ChatCompletionRequestMessage]) ->
                 continue;
             };
             rewrote = true;
-            let data = audio.input_audio.data.trim();
+            // Base64 transports may wrap or pad with whitespace; strip all of it
+            // so the data URL carries exactly the base64 the worker decodes
+            // (the URL parser would percent-encode spaces into the payload).
+            let data: String = audio
+                .input_audio
+                .data
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
             if data.is_empty() {
                 return Err(invalid_argument_error(
                     "input_audio.data must be non-empty base64-encoded audio",
                 ));
             }
-            if !is_valid_base64_payload(data) {
+            if !is_valid_base64_payload(&data) {
                 return Err(invalid_argument_error(
                     "input_audio.data is not valid base64-encoded audio",
                 ));
@@ -194,7 +202,7 @@ fn normalize_input_audio_parts(messages: &mut [ChatCompletionRequestMessage]) ->
     Ok(rewrote)
 }
 
-/// Standard-alphabet base64, padding optional, ASCII whitespace ignored.
+/// Standard-alphabet base64 without whitespace, padding optional.
 fn is_valid_base64_payload(data: &str) -> bool {
     use base64::Engine as _;
     use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
@@ -202,12 +210,7 @@ fn is_valid_base64_payload(data: &str) -> bool {
         &base64::alphabet::STANDARD,
         GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
     );
-    if data.bytes().any(|byte| byte.is_ascii_whitespace()) {
-        let compact: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-        LENIENT.decode(compact).is_ok()
-    } else {
-        LENIENT.decode(data).is_ok()
-    }
+    LENIENT.decode(data).is_ok()
 }
 
 fn normalize_input_audio_request(request: &mut NvCreateChatCompletionRequest) -> Result<bool> {
@@ -5019,12 +5022,22 @@ mod input_audio_tests {
                 "{data}: {err}"
             );
         }
-        for data in ["UklGRg==", "UklGRg", "UklG\nRg=="] {
+        for data in ["UklGRg==", "UklGRg", "UklG\nRg==", "Uk lG\tRg\u{c}==\r\n"] {
             let mut msgs = messages(serde_json::json!([{
                 "role": "user",
                 "content": [{"type": "input_audio", "input_audio": {"data": data, "format": "wav"}}]
             }]));
-            assert!(normalize_input_audio_parts(&mut msgs).unwrap(), "{data}");
+            assert!(normalize_input_audio_parts(&mut msgs).unwrap(), "{data:?}");
+            let url = serde_json::to_value(&msgs).unwrap()[0]["content"][0]["audio_url"]["url"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let expected = if data == "UklGRg" {
+                "UklGRg"
+            } else {
+                "UklGRg=="
+            };
+            assert_eq!(url, format!("data:audio/wav;base64,{expected}"), "{data:?}");
         }
     }
 
