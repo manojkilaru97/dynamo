@@ -124,6 +124,104 @@ fn select_output_text(
     engine_text.or(decoded_text)
 }
 
+/// Withhold only text that can still complete a configured stop string. The
+/// engine's text remains authoritative; token decoding decides when a stop
+/// actually matches, including min_tokens and visible/hidden stop semantics.
+struct OutputStopBuffer {
+    patterns: Vec<(Vec<u8>, Vec<usize>)>,
+    pending: String,
+}
+
+impl OutputStopBuffer {
+    fn new(sequences: impl Iterator<Item = String>) -> Self {
+        let patterns = sequences
+            .filter(|sequence| !sequence.is_empty())
+            .map(|sequence| {
+                let bytes = sequence.into_bytes();
+                let mut prefixes = vec![0; bytes.len()];
+                for index in 1..bytes.len() {
+                    let mut matched = prefixes[index - 1];
+                    while matched > 0 && bytes[index] != bytes[matched] {
+                        matched = prefixes[matched - 1];
+                    }
+                    if bytes[index] == bytes[matched] {
+                        matched += 1;
+                    }
+                    prefixes[index] = matched;
+                }
+                (bytes, prefixes)
+            })
+            .collect();
+        Self {
+            patterns,
+            pending: String::new(),
+        }
+    }
+
+    fn suffix_len(text: &str, pattern: &[u8], prefixes: &[usize]) -> usize {
+        let mut matched = 0;
+        for byte in text.bytes() {
+            while matched > 0 && byte != pattern[matched] {
+                matched = prefixes[matched - 1];
+            }
+            if byte == pattern[matched] {
+                matched += 1;
+            }
+            // A complete string without a decoder stop was below min_tokens;
+            // do not hide it. Keep only a proper prefix for the next step.
+            if matched == pattern.len() {
+                matched = prefixes[matched - 1];
+            }
+        }
+        matched
+    }
+
+    fn apply(
+        &mut self,
+        text: Option<String>,
+        terminal: bool,
+        matched_stop: Option<(&str, bool)>,
+    ) -> Option<String> {
+        if self.patterns.is_empty() {
+            return text;
+        }
+        self.pending.push_str(text.as_deref().unwrap_or_default());
+        if let Some((sequence, include)) = matched_stop {
+            if let Some(start) = self.pending.find(sequence) {
+                let end = start + if include { sequence.len() } else { 0 };
+                self.pending.truncate(end);
+            } else if !include {
+                // Engines that already removed the matched string can end on
+                // an empty delta. Discard only its previously withheld prefix.
+                if let Some((pattern, prefixes)) = self
+                    .patterns
+                    .iter()
+                    .find(|(pattern, _)| pattern.as_slice() == sequence.as_bytes())
+                {
+                    let held = Self::suffix_len(&self.pending, pattern, prefixes);
+                    self.pending.truncate(self.pending.len() - held);
+                }
+            }
+            return (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending));
+        }
+        if terminal {
+            // EOS/length is not a complete string stop: release a false prefix.
+            return (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending));
+        }
+        let held = self
+            .patterns
+            .iter()
+            .map(|(pattern, prefixes)| Self::suffix_len(&self.pending, pattern, prefixes))
+            .max()
+            .unwrap_or(0);
+        let split = self.pending.len() - held;
+        debug_assert!(self.pending.is_char_boundary(split));
+        let tail = self.pending.split_off(split);
+        let ready = std::mem::replace(&mut self.pending, tail);
+        (!ready.is_empty()).then_some(ready)
+    }
+}
+
 impl Backend {
     pub fn from_tokenizer(tokenizer: Tokenizer) -> Arc<Self> {
         Arc::new(Self {
@@ -219,6 +317,7 @@ impl
 
                     let data = output.data.as_ref().unwrap();
                     let choice_idx = data.index.unwrap_or(0);
+                    let expected_choices = state.decoders.len();
                     let engine_text = if !state.validate_engine_decode {
                         match data.text.as_ref() {
                             // vLLM may emit an empty decoded string for chunks whose
@@ -237,8 +336,18 @@ impl
                         // through Dynamo's decoder state.
                         if data.finish_reason.is_some() {
                             state.finished_choices.insert(choice_idx);
-                            if state.finished_choices.len() >= state.decoders.len() {
+                            if state.finished_choices.len() >= expected_choices {
                                 state.finished = true;
+                            }
+                        }
+                        let mut output = output;
+                        if let Some(data) = &mut output.data {
+                            if let Some(decoder) = state.decoders.get_mut(&choice_idx) {
+                                let matched = match &data.stop_reason {
+                                    Some(StopReason::String(sequence)) => Some((sequence.as_str(), decoder.include_stop_text)),
+                                    _ => None,
+                                };
+                                data.text = decoder.output_stop_buffer.apply(data.text.take(), data.finish_reason.is_some(), matched);
                             }
                         }
                         return Some((output, state));
@@ -247,7 +356,7 @@ impl
                     let Some(decoder) = state.decoders.get_mut(&choice_idx) else {
                         tracing::error!(
                             "engine emitted choice index {choice_idx}, but only {} choices were requested",
-                            state.decoders.len()
+                            expected_choices
                         );
                         let mut output = output;
                         if let Some(data) = &mut output.data {
@@ -263,7 +372,7 @@ impl
                         Err(e) => {
                             tracing::error!("Failed to process token_ids for choice {choice_idx}: {e}");
                             state.finished_choices.insert(choice_idx);
-                            if state.finished_choices.len() >= state.decoders.len() {
+                            if state.finished_choices.len() >= expected_choices {
                                 state.stream.context().stop_generating();
                                 state.finished = true;
                             }
@@ -324,7 +433,7 @@ impl
                     // Once all expected choices are finished, stop the upstream generator.
                     if finish_reason.is_some() && data.finish_reason.is_none() {
                         state.finished_choices.insert(choice_idx);
-                        if state.finished_choices.len() >= state.decoders.len() {
+                        if state.finished_choices.len() >= expected_choices {
                             state.stream.context().stop_generating();
                             state.finished = true;
                         }
@@ -365,9 +474,16 @@ impl
                         data.finish_reason = finish_reason;
                         data.stop_reason = stop_reason.or(data.stop_reason);
                     }
-                    let selected_text =
-                        select_output_text(state.skip_special_tokens, engine_text, text);
-                    data.text = selected_text;
+                    let selected_text = select_output_text(state.skip_special_tokens, engine_text, text);
+                    let matched = match &result.stop_trigger {
+                        Some(StopTrigger::HiddenStopSequenceDetected(sequence)) => Some((sequence.as_str(), false)),
+                        Some(StopTrigger::VisibleStopSequenceDetected(sequence)) => Some((sequence.as_str(), true)),
+                        _ => match &data.stop_reason {
+                            Some(StopReason::String(sequence)) => Some((sequence.as_str(), decoder.include_stop_text)),
+                            _ => None,
+                        },
+                    };
+                    data.text = decoder.output_stop_buffer.apply(selected_text, data.finish_reason.is_some(), matched);
                     data.tokens = Some(tokens);
 
                     // Per-entry decode is O(positions * top_k) per delta. Bounded in
@@ -473,6 +589,8 @@ impl
 #[allow(dead_code)]
 pub struct Decoder {
     decode_stream: DecodeStream,
+    output_stop_buffer: OutputStopBuffer,
+    include_stop_text: bool,
     tracker: Option<Arc<RequestTracker>>,
 
     // do not trigger stop conditions until at least this many tokens have been generated
@@ -596,6 +714,13 @@ impl Decoder {
 
         Self {
             decode_stream,
+            output_stop_buffer: OutputStopBuffer::new(
+                hidden_stop_sequences
+                    .iter()
+                    .chain(&visible_stop_sequences)
+                    .cloned(),
+            ),
+            include_stop_text: include_stop_str_in_output,
             tracker,
             hidden_stop_ids,
             visible_stop_ids,
@@ -770,6 +895,122 @@ mod tests {
     use super::*;
     use crate::tokenizers::traits;
     use std::sync::Arc;
+
+    fn output_stop_buffer(sequence: &str) -> OutputStopBuffer {
+        OutputStopBuffer::new(std::iter::once(sequence.to_owned()))
+    }
+
+    #[test]
+    fn test_output_stop_buffer_excludes_hidden_sequence_at_every_split() {
+        for (prefix, sequence) in [("ALPHA ", "STOP"), ("answer: ", "你好"), ("x ", "ababab")] {
+            let all = format!("{prefix}{sequence} ignored");
+            for (split, _) in all
+                .char_indices()
+                .take_while(|(split, _)| *split < prefix.len() + sequence.len())
+            {
+                let mut buffer = output_stop_buffer(sequence);
+                let first = buffer
+                    .apply(Some(all[..split].to_owned()), false, None)
+                    .unwrap_or_default();
+                let second = buffer
+                    .apply(Some(all[split..].to_owned()), true, Some((sequence, false)))
+                    .unwrap_or_default();
+                assert_eq!(
+                    format!("{first}{second}"),
+                    prefix,
+                    "split {split}: {sequence}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_output_stop_buffer_releases_false_prefix_on_terminal_chunk() {
+        let mut buffer = output_stop_buffer("STOP");
+        assert_eq!(
+            buffer
+                .apply(Some("ALPHA ST".into()), false, None)
+                .as_deref(),
+            Some("ALPHA ")
+        );
+        assert_eq!(buffer.apply(None, true, None).as_deref(), Some("ST"));
+    }
+
+    #[test]
+    fn test_output_stop_buffer_handles_engine_removed_stop() {
+        let mut buffer = output_stop_buffer("STOP");
+        assert_eq!(
+            buffer
+                .apply(Some("ALPHA ST".into()), false, None)
+                .as_deref(),
+            Some("ALPHA ")
+        );
+        assert_eq!(
+            buffer.apply(Some(String::new()), true, Some(("STOP", false))),
+            None
+        );
+    }
+
+    #[test]
+    fn test_output_stop_buffer_includes_visible_stop_without_trailing_text() {
+        let mut buffer = output_stop_buffer("STOP");
+        let first = buffer.apply(Some("ALPHA ST".into()), false, None).unwrap();
+        let last = buffer
+            .apply(Some("OP OMEGA".into()), true, Some(("STOP", true)))
+            .unwrap();
+        assert_eq!(format!("{first}{last}"), "ALPHA STOP");
+    }
+
+    #[test]
+    fn test_output_stop_buffer_preserves_full_stop_below_min_tokens() {
+        let mut buffer = output_stop_buffer("STOP");
+        assert_eq!(
+            buffer.apply(Some("STOP".into()), false, None).as_deref(),
+            Some("STOP")
+        );
+        assert_eq!(buffer.apply(None, true, None), None);
+    }
+
+    #[test]
+    fn test_output_stop_buffer_preserves_non_matching_text_and_markers() {
+        let mut buffer = output_stop_buffer("STOP");
+        assert_eq!(
+            buffer
+                .apply(Some("<think>ST".into()), false, None)
+                .as_deref(),
+            Some("<think>")
+        );
+        assert_eq!(
+            buffer
+                .apply(Some("able</think><tool_call>".into()), false, None)
+                .as_deref(),
+            Some("STable</think><tool_call>")
+        );
+        assert_eq!(buffer.apply(None, true, None), None);
+    }
+
+    #[test]
+    fn test_output_stop_buffer_isolates_choices() {
+        let mut first = output_stop_buffer("STOP");
+        let mut second = output_stop_buffer("STOP");
+        assert_eq!(first.apply(Some("ST".into()), false, None), None);
+        assert_eq!(
+            second.apply(Some("OP".into()), false, None).as_deref(),
+            Some("OP")
+        );
+        assert_eq!(first.apply(None, true, None).as_deref(), Some("ST"));
+    }
+
+    #[test]
+    fn test_output_stop_buffer_no_stops_preserves_engine_text() {
+        let mut buffer = OutputStopBuffer::new(std::iter::empty());
+        assert_eq!(
+            buffer
+                .apply(Some("<tool_call>".into()), false, None)
+                .as_deref(),
+            Some("<tool_call>")
+        );
+    }
 
     #[test]
     fn test_char_boundary_drain() {
