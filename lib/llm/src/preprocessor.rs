@@ -142,11 +142,12 @@ fn tool_content_part_as_user(
 /// placeholder and the audio reaches the worker. Only called for models whose
 /// `config.json` declares an audio encoder ([`ModelInfo::declares_audio_encoder`]);
 /// requests without `input_audio` parts are returned untouched.
-fn normalize_input_audio_parts(messages: &mut [ChatCompletionRequestMessage]) -> Result<()> {
+fn normalize_input_audio_parts(messages: &mut [ChatCompletionRequestMessage]) -> Result<bool> {
     use dynamo_protocols::types::{
         AudioUrl, ChatCompletionRequestMessageContentPartAudioUrl, InputAudioFormat,
     };
 
+    let mut rewrote = false;
     for message in messages.iter_mut() {
         let ChatCompletionRequestMessage::User(user) = message else {
             continue;
@@ -158,6 +159,7 @@ fn normalize_input_audio_parts(messages: &mut [ChatCompletionRequestMessage]) ->
             let ChatCompletionRequestUserMessageContentPart::InputAudio(audio) = part else {
                 continue;
             };
+            rewrote = true;
             let data = audio.input_audio.data.trim();
             if data.is_empty() {
                 return Err(invalid_argument_error(
@@ -184,7 +186,21 @@ fn normalize_input_audio_parts(messages: &mut [ChatCompletionRequestMessage]) ->
             );
         }
     }
-    Ok(())
+    Ok(rewrote)
+}
+
+fn normalize_input_audio_request(request: &mut NvCreateChatCompletionRequest) -> Result<bool> {
+    if !normalize_input_audio_parts(&mut request.inner.messages)? {
+        return Ok(false);
+    }
+    if let Some(nvext) = request.nvext.as_mut()
+        && nvext.token_data.take().is_some()
+    {
+        tracing::warn!(
+            "dropping nvext.token_data: it was computed before input_audio normalization"
+        );
+    }
+    Ok(true)
 }
 
 enum MultimodalContentPart<'a> {
@@ -1791,6 +1807,21 @@ impl OpenAIPreprocessor {
         let before = hidden_eos_token_ids.len();
         hidden_eos_token_ids.retain(|token_id| token_id != marker_token_id);
         hidden_eos_token_ids.len() != before
+    }
+
+    /// Nemotron Omni only (see [`ModelInfo::declares_audio_encoder`]): rewrite
+    /// `input_audio` parts to `audio_url` data URLs before rendering. Returns
+    /// whether anything changed. Pre-computed `nvext.token_data` was rendered
+    /// from the un-normalized messages (no audio placeholder), so it is dropped
+    /// and the normalized prompt is tokenized instead.
+    pub fn normalize_input_audio(
+        &self,
+        request: &mut NvCreateChatCompletionRequest,
+    ) -> Result<bool> {
+        if !self.audio_input_enabled {
+            return Ok(false);
+        }
+        normalize_input_audio_request(request)
     }
 
     pub fn apply_template<
@@ -4378,9 +4409,7 @@ impl
             &mut request,
             self.runtime_config.reasoning_parser.as_deref(),
         );
-        if self.audio_input_enabled {
-            normalize_input_audio_parts(&mut request.inner.messages)?;
-        }
+        self.normalize_input_audio(&mut request)?;
 
         // create a response generator
         let response_generator = request.response_generator(context.id().to_string());
@@ -4851,7 +4880,7 @@ mod input_audio_tests {
                 {"type": "input_audio", "input_audio": {"data": "SUQz", "format": "mp3"}}
             ]
         }]));
-        normalize_input_audio_parts(&mut msgs).unwrap();
+        assert!(normalize_input_audio_parts(&mut msgs).unwrap());
 
         let serialized = serde_json::to_value(&msgs).unwrap();
         let parts = serialized[0]["content"].as_array().unwrap();
@@ -4926,8 +4955,34 @@ mod input_audio_tests {
         ]);
         let mut msgs = messages(original.clone());
         let before = serde_json::to_value(&msgs).unwrap();
-        normalize_input_audio_parts(&mut msgs).unwrap();
+        assert!(!normalize_input_audio_parts(&mut msgs).unwrap());
         assert_eq!(serde_json::to_value(&msgs).unwrap(), before);
+    }
+
+    #[test]
+    fn stale_token_data_is_dropped_only_when_input_audio_was_rewritten() {
+        use super::{NvCreateChatCompletionRequest, normalize_input_audio_request};
+        let request = |content: serde_json::Value| -> NvCreateChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": content}],
+                "nvext": {"token_data": [1, 2, 3]}
+            }))
+            .unwrap()
+        };
+
+        let mut audio = request(serde_json::json!([
+            {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}
+        ]));
+        assert!(normalize_input_audio_request(&mut audio).unwrap());
+        assert!(audio.nvext.as_ref().unwrap().token_data.is_none());
+
+        let mut text = request(serde_json::json!("hello"));
+        assert!(!normalize_input_audio_request(&mut text).unwrap());
+        assert_eq!(
+            text.nvext.as_ref().unwrap().token_data.as_deref(),
+            Some(&[1, 2, 3][..])
+        );
     }
 
     #[test]

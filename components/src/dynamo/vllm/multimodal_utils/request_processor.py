@@ -496,6 +496,15 @@ class VllmMultimodalRequestProcessor:
             keep_video_bytes = bool(video_items) and self._keeps_video_bytes_for_audio(
                 mm_processor_kwargs
             )
+            if keep_video_bytes and mm_map.get(AUDIO_URL_KEY):
+                # vLLM's Nemotron processor treats any audio item as the
+                # video's own track (1:1), so separate audio cannot be mixed in.
+                raise ValueError(
+                    "A request cannot combine audio inputs with a video while "
+                    "use_audio_in_video is enabled. Send them in separate "
+                    'requests or set mm_processor_kwargs {"use_audio_in_video": '
+                    "false}."
+                )
             if video_items:
                 if keep_video_bytes:
                     videos = await self.video_loader.load_video_batch(
@@ -507,15 +516,6 @@ class VllmMultimodalRequestProcessor:
                     vllm_mm_data["video"] = videos[0] if len(videos) == 1 else videos
 
             audio_items = mm_map.get(AUDIO_URL_KEY, [])
-            if keep_video_bytes and audio_items:
-                # vLLM's Nemotron processor treats any audio item as the
-                # video's own track (1:1), so separate audio cannot be mixed in.
-                raise ValueError(
-                    "A request cannot combine audio inputs with a video while "
-                    "use_audio_in_video is enabled. Send them in separate "
-                    'requests or set mm_processor_kwargs {"use_audio_in_video": '
-                    "false}."
-                )
             if audio_items:
                 audios = await self.audio_loader.load_audio_batch(audio_items)
                 if audios:

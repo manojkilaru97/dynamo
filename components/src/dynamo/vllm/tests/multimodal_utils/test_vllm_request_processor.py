@@ -516,6 +516,7 @@ async def test_omni_rejects_separate_audio_with_audio_in_video():
             None,
         )
     processor.audio_loader.load_audio_batch.assert_not_awaited()
+    processor.video_loader.load_video_batch.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

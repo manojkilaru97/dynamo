@@ -1291,7 +1291,7 @@ unsafe fn preprocess_request(
         ));
     }
 
-    let request: NvCreateChatCompletionRequest = match serde_json::from_value(request_json) {
+    let mut request: NvCreateChatCompletionRequest = match serde_json::from_value(request_json) {
         Ok(req) => req,
         Err(e) => {
             tracing::error!(error = ?e, "Failed to parse chat completion request JSON");
@@ -1303,6 +1303,11 @@ unsafe fn preprocess_request(
     let strict_priority = extract_strict_priority(request.nvext.as_ref());
     let cache_namespace = request_cache_salt(&request).map(str::to_owned);
     let routing_constraints = extract_routing_constraints(request.nvext.as_ref());
+
+    if let Err(e) = preprocessor.normalize_input_audio(&mut request) {
+        tracing::error!(error = ?e, "Failed to normalize input_audio parts");
+        return Err(QueryRouterResult::ErrInvalidParam);
+    }
 
     let formatted_prompt = match preprocessor.apply_template(&request) {
         Ok(Some(prompt)) => prompt,
