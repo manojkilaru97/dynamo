@@ -111,32 +111,33 @@ impl DecoderUnfoldState {
         }))
     }
 
-    /// Downstream, an error finish fails the response without emitting its
-    /// delta text. Emit that text (when it went through the stop buffer,
-    /// `buffered_text`) and every choice's withheld text first.
+    /// Downstream, an error finish fails the response without emitting that
+    /// delta. Emit text withheld before it first, as text-only outputs backed by
+    /// earlier token ids: `withheld` (the erroring choice's buffer, taken before
+    /// its final delta was applied) and every other choice's buffer. The error
+    /// output itself is forwarded unchanged.
     fn release_before_error_finish(
         &mut self,
-        mut output: Annotated<LLMEngineOutput>,
-        buffered_text: bool,
+        output: Annotated<LLMEngineOutput>,
+        withheld: Option<(u32, String)>,
     ) -> Annotated<LLMEngineOutput> {
-        let Some(data) = output.data.as_mut() else {
-            return output;
-        };
-        if !matches!(data.finish_reason, Some(FinishReason::Error(_))) {
+        let is_error_finish = output
+            .data
+            .as_ref()
+            .is_some_and(|data| matches!(data.finish_reason, Some(FinishReason::Error(_))));
+        if !is_error_finish {
             return output;
         }
-        let mut queued = VecDeque::new();
-        if let Some(text) = buffered_text
-            .then(|| data.text.take())
-            .flatten()
-            .filter(|text| !text.is_empty())
-        {
-            queued.push_back(Annotated::from_data(LLMEngineOutput {
-                text: Some(text),
-                index: data.index,
-                ..Default::default()
-            }));
-        }
+        let mut queued: VecDeque<_> = withheld
+            .map(|(index, text)| {
+                Annotated::from_data(LLMEngineOutput {
+                    text: Some(text),
+                    index: Some(index),
+                    ..Default::default()
+                })
+            })
+            .into_iter()
+            .collect();
         let mut indices: Vec<u32> = self.decoders.keys().copied().collect();
         indices.sort_unstable();
         queued.extend(
@@ -287,6 +288,11 @@ impl OutputStopBuffer {
         (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
     }
 
+    /// Take the withheld text (released as is).
+    fn take_pending(&mut self) -> Option<String> {
+        (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
+    }
+
     fn apply(
         &mut self,
         text: Option<String>,
@@ -428,8 +434,10 @@ impl
 
                     // events are pass thru
                     if output.is_event() || output.data.is_none() {
-                        // A stream error (e.g. a worker disconnect that migration
-                        // retries on a new Backend) first releases withheld text.
+                        // A stream error ends the response downstream (the HTTP
+                        // stream stops at the first error) or, for a worker
+                        // disconnect, migration retries on a new Backend. Release
+                        // withheld text before it.
                         if output.error.is_some() || output.is_error() {
                             let mut queued = state.release_withheld();
                             if let Some(first) = queued.pop_front() {
@@ -467,16 +475,20 @@ impl
                             }
                         }
                         let mut output = output;
+                        let mut withheld = None;
                         if let Some(data) = &mut output.data
                             && let Some(decoder) = state.decoders.get_mut(&choice_idx)
                         {
+                            if matches!(data.finish_reason, Some(FinishReason::Error(_))) {
+                                withheld = decoder.output_stop_buffer.take_pending().map(|text| (choice_idx, text));
+                            }
                             let matched = match &data.stop_reason {
                                 Some(StopReason::String(sequence)) => Some((sequence.as_str(), decoder.include_stop_text)),
                                 _ => None,
                             };
                             data.text = decoder.output_stop_buffer.apply(data.text.take(), data.finish_reason.is_some(), matched);
                         }
-                        let output = state.release_before_error_finish(output, true);
+                        let output = state.release_before_error_finish(output, withheld);
                         return Some((output, state));
                     }
 
@@ -491,6 +503,7 @@ impl
                                 "invalid choice index {choice_idx}"
                             )));
                         }
+                        let output = state.release_before_error_finish(output, None);
                         return Some((output, state));
                     };
 
@@ -508,7 +521,7 @@ impl
                                 data.finish_reason =
                                     Some(FinishReason::Error(format!("decode error: {e}")));
                             }
-                            let output = state.release_before_error_finish(output, false);
+                            let output = state.release_before_error_finish(output, None);
                             return Some((output, state));
                         }
                     };
@@ -602,6 +615,10 @@ impl
                         data.finish_reason = finish_reason;
                         data.stop_reason = stop_reason.or(data.stop_reason);
                     }
+                    let withheld = matches!(data.finish_reason, Some(FinishReason::Error(_)))
+                        .then(|| decoder.output_stop_buffer.take_pending())
+                        .flatten()
+                        .map(|text| (choice_idx, text));
                     let engine_selected = engine_text.as_deref().is_some_and(|text| !text.is_empty());
                     let selected_text = select_output_text(state.skip_special_tokens, engine_text, text);
                     let decoder_stop = match &result.stop_trigger {
@@ -655,7 +672,7 @@ impl
 
                     output.data = Some(data);
 
-                    let output = state.release_before_error_finish(output, true);
+                    let output = state.release_before_error_finish(output, withheld);
                     Some((output, state))
                 }
 
@@ -1391,7 +1408,7 @@ mod tests {
     async fn backend_items(
         upstream: Vec<Annotated<LLMEngineOutput>>,
     ) -> Vec<(Option<String>, Vec<TokenIdType>, bool)> {
-        let vocab = ["", "ALPHA ", "ST", "OP"];
+        let vocab = ["", "ALPHA ", "ST", "OP", "X"];
         let tokenizer: Arc<dyn traits::Tokenizer> = Arc::new(VocabTokenizer(
             vocab.iter().map(|s| s.to_string()).collect(),
         ));
@@ -1443,11 +1460,35 @@ mod tests {
         })
     }
 
+    fn disconnect() -> Annotated<LLMEngineOutput> {
+        let mut item = Annotated::from_error("disconnected");
+        item.error = Some(
+            dynamo_runtime::error::DynamoError::builder()
+                .error_type(dynamo_runtime::error::ErrorType::Disconnected)
+                .message("worker disconnected")
+                .build(),
+        );
+        item
+    }
+
     #[tokio::test]
     async fn test_withheld_stop_prefix_released_before_stream_error() {
+        let items = backend_items(vec![engine_chunk(vec![1, 2]), disconnect()]).await;
+        assert_eq!(
+            items,
+            vec![
+                (Some("ALPHA ".to_string()), vec![1, 2], false),
+                (Some("ST".to_string()), vec![], false),
+                (None, vec![], true),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_withheld_stop_prefix_released_before_non_migratable_error() {
         let items = backend_items(vec![
             engine_chunk(vec![1, 2]),
-            Annotated::from_error("disconnected"),
+            Annotated::from_error("bad frame"),
         ])
         .await;
         assert_eq!(
@@ -1456,6 +1497,41 @@ mod tests {
                 (Some("ALPHA ".to_string()), vec![1, 2], false),
                 (Some("ST".to_string()), vec![], false),
                 (None, vec![], true),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_finish_with_tokens_keeps_its_own_text_and_ids() {
+        let mut error = LLMEngineOutput::error("boom".to_string());
+        error.token_ids = vec![4];
+        let items =
+            backend_items(vec![engine_chunk(vec![1, 2]), Annotated::from_data(error)]).await;
+        assert_eq!(
+            items,
+            vec![
+                (Some("ALPHA ".to_string()), vec![1, 2], false),
+                (Some("ST".to_string()), vec![], false),
+                (Some("X".to_string()), vec![4], false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_withheld_stop_prefix_released_before_invalid_choice_error() {
+        let stray = LLMEngineOutput {
+            token_ids: vec![4],
+            index: Some(1),
+            ..Default::default()
+        };
+        let items =
+            backend_items(vec![engine_chunk(vec![1, 2]), Annotated::from_data(stray)]).await;
+        assert_eq!(
+            items,
+            vec![
+                (Some("ALPHA ".to_string()), vec![1, 2], false),
+                (Some("ST".to_string()), vec![], false),
+                (None, vec![4], false),
             ]
         );
     }
