@@ -140,6 +140,8 @@ BYPASS_REMOTE_PREFILL_ANNOTATION = "x-bypass-remote-prefill"
 
 _GENERATE_REASONING_SUPPORT_CACHE_ATTR = "_dynamo_generate_reasoning_support"
 _DELTA_REQUEST_OUTPUT_KIND = RequestOutputKind.DELTA
+# Matches vllm.v1.sample.no_eos_in_reasoning.NO_EOS_IN_REASONING_KEY.
+_NO_EOS_IN_REASONING_ARG = "nemotron_block_eos_in_reasoning"
 _RL_INIT_WEIGHTS_TIMEOUT_ENV = "DYN_RL_INIT_WEIGHTS_TIMEOUT_S"
 _RL_INIT_WEIGHTS_TIMEOUT_DEFAULT_S = 30.0
 _LORA_LOCK_STRIPES = 64
@@ -866,6 +868,18 @@ def build_sampling_params(
         configured_default = default_sampling_params.get("max_tokens", dynamic_default)
         sampling_params.max_tokens = min(configured_default, dynamic_default)
     _apply_max_output_tokens_cap(sampling_params)
+
+    # Super 3.5: the frontend opts tool-using thinking requests into vLLM's
+    # stop-token mask while reasoning is open. Only the frontend can set this
+    # top-level key; client passthrough lives under "nvext"/"sampling_options".
+    if (
+        isinstance(extra_args, dict)
+        and extra_args.get(_NO_EOS_IN_REASONING_ARG) is True
+    ):
+        sampling_params.extra_args = {
+            **(sampling_params.extra_args or {}),
+            _NO_EOS_IN_REASONING_ARG: True,
+        }
 
     # Dynamo's internal token path consumes disjoint token deltas. This mirrors
     # the SGLang integration and lets vLLM's stream_interval gate reduce backend

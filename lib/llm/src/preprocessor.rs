@@ -15,6 +15,7 @@
 pub mod lightseek_mm;
 pub mod media;
 pub(crate) mod nemotron_reasoning;
+mod no_eos_in_reasoning;
 pub mod prompt;
 pub mod speculative_prefill;
 mod structural_tag;
@@ -4497,6 +4498,12 @@ impl
         let mut response_generator = Box::new(response_generator);
         if let Some(encoder) = &self.user_data_encoder {
             let (thinking, _) = self.reasoning_stream_modes(&request, uses_tool_call_structural_tag);
+            no_eos_in_reasoning::apply(
+                &request,
+                thinking,
+                prompt_injected_reasoning,
+                &mut common_request.extra_args,
+            )?;
             let guided = Self::has_structured_response_format(&request) || matches!(
                 request.inner.tool_choice,
                 Some(ChatCompletionToolChoiceOption::Required) | Some(ChatCompletionToolChoiceOption::Named(_))
