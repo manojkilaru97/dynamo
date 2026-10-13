@@ -379,25 +379,55 @@ class VllmMultimodalRequestProcessor:
         The image decodes WAV/MP3/FLAC/Ogg with libsndfile and ships no PyAV, so
         bytes libsndfile rejects surface as a "missing decoder" error or an
         untyped batch error (HTTP 500). For a model that accepts audio those
-        are bad inputs, not deployment faults.
+        are bad inputs. Fetch failures keep their server-error handling, and the
+        client message never echoes the (possibly multi-MB) data URL.
         """
-        from dynamo.common.http import HttpStatusError
+        import asyncio
+
+        from dynamo.common.http import HttpError, HttpStatusError
         from dynamo.common.http.url_validator import UrlValidationError
         from dynamo.common.multimodal.codec_errors import MissingMediaDecoderError
 
-        try:
+        if not all(
+            isinstance(item, dict) and URL_VARIANT_KEY in item for item in audio_items
+        ):
             return await self.audio_loader.load_audio_batch(audio_items)
-        except (UrlValidationError, HttpStatusError, ValueError):
-            raise
-        except MissingMediaDecoderError as exc:
-            raise ValueError(
-                "The audio input could not be decoded. Send WAV, MP3, FLAC or Ogg "
-                "(Vorbis/Opus) audio."
-            ) from exc
-        except Exception as exc:
-            if type(exc) is not Exception:
-                raise
-            raise ValueError(f"The audio input could not be decoded: {exc}") from exc
+
+        results = await asyncio.gather(
+            *(
+                self.audio_loader.load_audio(item[URL_VARIANT_KEY])
+                for item in audio_items
+            ),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+        for result in results:
+            if not isinstance(result, BaseException):
+                continue
+            if isinstance(result, (UrlValidationError, HttpStatusError)):
+                raise result
+            cause = result.__cause__
+            if isinstance(result, HttpError) or isinstance(cause, HttpError):
+                raise RuntimeError(
+                    f"Failed to fetch an audio input: {type(cause or result).__name__}"
+                ) from result
+            if isinstance(result, MissingMediaDecoderError):
+                raise ValueError(
+                    "The audio input could not be decoded. Send WAV, MP3, FLAC or "
+                    "Ogg (Vorbis/Opus) audio."
+                ) from result
+            if isinstance(result, ValueError):
+                detail = str(cause) if cause is not None else ""
+                if not detail or "data:" in detail or len(detail) > 300:
+                    detail = "invalid, unsupported or empty audio"
+                raise ValueError(
+                    f"The audio input could not be decoded ({detail}). Send WAV, "
+                    "MP3, FLAC or Ogg (Vorbis/Opus) audio."
+                ) from result
+            raise result
+        return list(results)
 
     @staticmethod
     def _multimodal_disabled_error() -> ValueError:

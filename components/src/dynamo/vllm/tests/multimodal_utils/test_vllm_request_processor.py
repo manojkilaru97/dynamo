@@ -535,29 +535,66 @@ def test_default_video_loader_enables_royalty_free_nvdec_only_for_omni(
     assert processor.video_loader._nvdec_royalty_free_codecs is expected
 
 
+def _decode_failure(cause: BaseException) -> ValueError:
+    err = ValueError("Failed to load audio from data:audio/wav;base64,UklGRg==: x")
+    err.__cause__ = cause
+    return err
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "failure",
+    ("failure", "expected"),
     [
-        Exception("Failed to load audio from data:audio/wav...: bad header\n"),
-        "missing-decoder",
+        (_decode_failure(ValueError("Invalid or unsupported audio file.")), ValueError),
+        ("missing-decoder", ValueError),
+        ("timeout", RuntimeError),
+        ("connection", RuntimeError),
+        ("status", "HttpStatusError"),
     ],
 )
-async def test_omni_undecodable_audio_input_is_a_client_error(failure):
+async def test_omni_audio_input_errors_are_typed_by_cause(failure, expected):
+    from dynamo.common.http import (
+        HttpConnectionError,
+        HttpStatusError,
+        HttpTimeoutError,
+    )
     from dynamo.common.multimodal.codec_errors import audio_decoder_missing
 
-    if failure == "missing-decoder":
-        failure = audio_decoder_missing("vllm", cause="No module named 'av'")
+    failure = {
+        "missing-decoder": audio_decoder_missing("vllm", cause="No module 'av'"),
+        "timeout": _decode_failure(HttpTimeoutError("slow origin")),
+        "connection": _decode_failure(HttpConnectionError("reset")),
+        "status": HttpStatusError(503, "Service Unavailable", "https://x/a.wav"),
+    }.get(failure, failure)
     processor = _audio_processor({"sampling_rate": 16000}, {"use_audio_in_video": True})
-    processor.audio_loader.load_audio_batch.side_effect = failure
+    processor.audio_loader.load_audio.side_effect = failure
+    request = {"multi_modal_data": {"audio_url": [{"Url": "data:audio/wav;base64,AA"}]}}
 
-    with pytest.raises(ValueError, match="could not be decoded"):
+    with pytest.raises(Exception) as raised:
         await processor.extract_multimodal_data(
-            {"multi_modal_data": {"audio_url": [{"Url": "data:audio/wav;base64,AA"}]}},
-            "request-omni-bad-audio",
-            None,
-            None,
+            request, "request-omni-audio", None, None
         )
+
+    if expected == "HttpStatusError":
+        assert raised.value is failure
+    else:
+        assert type(raised.value) is expected
+        assert "data:" not in str(raised.value)
+    processor.audio_loader.load_audio_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_omni_audio_inputs_load_in_order():
+    processor = _audio_processor({"sampling_rate": 16000}, None)
+    first, second = object(), object()
+    processor.audio_loader.load_audio.side_effect = [first, second]
+    result = await processor.extract_multimodal_data(
+        {"multi_modal_data": {"audio_url": [{"Url": "data:a"}, {"Url": "data:b"}]}},
+        "request-omni-audio-order",
+        None,
+        None,
+    )
+    assert result == {"audio": [first, second]}
 
 
 @pytest.mark.asyncio
