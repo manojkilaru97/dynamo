@@ -163,7 +163,7 @@ fn normalize_input_audio_parts(messages: &mut [ChatCompletionRequestMessage]) ->
             // Base64 transports may wrap or pad with whitespace; strip all of it
             // so the data URL carries exactly the base64 the worker decodes
             // (the URL parser would percent-encode spaces into the payload).
-            let data: String = audio
+            let mut data: String = audio
                 .input_audio
                 .data
                 .chars()
@@ -179,6 +179,10 @@ fn normalize_input_audio_parts(messages: &mut [ChatCompletionRequestMessage]) ->
                     "input_audio.data is not valid base64-encoded audio",
                 ));
             }
+            // The worker's decoder requires canonical padding; restore it.
+            let unpadded = data.trim_end_matches('=').len();
+            data.truncate(unpadded);
+            data.extend(std::iter::repeat_n('=', (4 - unpadded % 4) % 4));
             let format = match audio.input_audio.format {
                 InputAudioFormat::Wav => "wav",
                 InputAudioFormat::Mp3 => "mp3",
@@ -5022,7 +5026,13 @@ mod input_audio_tests {
                 "{data}: {err}"
             );
         }
-        for data in ["UklGRg==", "UklGRg", "UklG\nRg==", "Uk lG\tRg\u{c}==\r\n"] {
+        for data in [
+            "UklGRg==",
+            "UklGRg",
+            "UklGRg=",
+            "UklG\nRg==",
+            "Uk lG\tRg\u{c}==\r\n",
+        ] {
             let mut msgs = messages(serde_json::json!([{
                 "role": "user",
                 "content": [{"type": "input_audio", "input_audio": {"data": data, "format": "wav"}}]
@@ -5032,12 +5042,7 @@ mod input_audio_tests {
                 .as_str()
                 .unwrap()
                 .to_string();
-            let expected = if data == "UklGRg" {
-                "UklGRg"
-            } else {
-                "UklGRg=="
-            };
-            assert_eq!(url, format!("data:audio/wav;base64,{expected}"), "{data:?}");
+            assert_eq!(url, "data:audio/wav;base64,UklGRg==", "{data:?}");
         }
     }
 
