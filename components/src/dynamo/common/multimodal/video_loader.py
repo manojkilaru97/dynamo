@@ -88,16 +88,18 @@ def _require_vllm_video_media() -> tuple[Any, Any, Any]:
     return MediaConnector, VideoMediaIO, ImageMediaIO
 
 
-def _nvdec_can_decode_royalty_free(codec: str, content: bytes) -> bool:
-    """Whether NVDEC can decode this VP8/VP9/AV1 stream without crashing.
+def _nvdec_safe_for_omni(codec: str | None, content: bytes) -> bool:
+    """Whether NVDEC can decode this clip without crashing the process.
 
-    PyNvVideoCodec segfaults the process on VP9 profiles 1/3 instead of raising,
-    so the profile is checked before any NVDEC call. Imported lazily: only the
-    Nemotron Omni loader routes these codecs to NVDEC.
+    PyNvVideoCodec segfaults instead of raising on VP9 profiles 1/3 and on VP9
+    read from MP4, and Omni routes VP8/VP9/AV1 to NVDEC, so the real video
+    tracks are checked first. A VP8/VP9/AV1 hint fails closed; an H.264/HEVC
+    hint is only refused when a VP8/VP9/AV1 track is positively unsafe.
+    Imported lazily: only the Nemotron Omni loader runs this check.
     """
     from dynamo.common.multimodal.nvdec_stream_caps import unsupported_reason
 
-    reason = unsupported_reason(codec, content)
+    reason = unsupported_reason(content, strict=codec in _NVDEC_ROYALTY_FREE_CODECS)
     if reason is not None:
         logger.warning("Not decoding a %s clip on NVDEC: %s", codec, reason)
     return reason is None
@@ -217,12 +219,14 @@ class VideoLoader:
         already ran here.
         """
         codec = probe_video_codec(content)
-        if should_use_nvdec(codec) or (
+        use_nvdec = should_use_nvdec(codec) or (
             self._nvdec_royalty_free_codecs
             and codec in _NVDEC_ROYALTY_FREE_CODECS
             and nvdec_available()
-            and _nvdec_can_decode_royalty_free(codec, content)
-        ):
+        )
+        if use_nvdec and self._nvdec_royalty_free_codecs:
+            use_nvdec = await asyncio.to_thread(_nvdec_safe_for_omni, codec, content)
+        if use_nvdec:
             try:
                 return await asyncio.to_thread(
                     decode_video_nvdec, content, self._num_frames
