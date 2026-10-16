@@ -161,7 +161,22 @@ def test_vp9_matroska_all_420_is_decodable(monkeypatch):
     ]
     state = fake_nvc(monkeypatch, packets=packets)
     assert unsupported_reason(b"x", strict=True) is None
-    assert state["demuxer"].demuxed == len(packets) + 1  # read to the end
+    # Read to the end: the end is three empty reads in a row.
+    assert state["demuxer"].demuxed == len(packets) + caps._EOF_EMPTY_READS
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_empty_packet_mid_stream_is_not_end_of_stream(monkeypatch, strict):
+    """An empty block must not end the scan before a later profile-1 frame."""
+    fake_nvc(monkeypatch, packets=[frame(KEY[0]), b"", b"", frame(KEY[1])])
+    assert "profile 1" in unsupported_reason(b"x", strict=strict)
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_unsafe_superframe_in_a_later_packet_is_rejected(monkeypatch, strict):
+    hidden = superframe(frame(INTER[0]), frame(INTER[1]), frame(INTER[0]))
+    fake_nvc(monkeypatch, packets=[frame(KEY[0]), frame(INTER[0]), hidden])
+    assert "profile 1" in unsupported_reason(b"x", strict=strict)
 
 
 @pytest.mark.parametrize("strict", [True, False])
@@ -186,12 +201,25 @@ def test_av1_is_rejected(monkeypatch, strict):
     assert "AV1" in unsupported_reason(b"x", strict=strict)
 
 
-@pytest.mark.parametrize("codec", ["H264", "HEVC", "VP8"])
+@pytest.mark.parametrize("codec", ["H264", "HEVC"])
+@pytest.mark.parametrize(
+    "container", ["avi", "mov,mp4,m4a,3gp,3g2,mj2", "matroska,webm"]
+)
 @pytest.mark.parametrize("strict", [True, False])
-def test_other_codecs_keep_nvdec(monkeypatch, codec, strict):
-    state = fake_nvc(monkeypatch, codec=codec, container="avi", packets=[b"\x00" * 8])
+def test_h264_hevc_keep_nvdec(monkeypatch, codec, container, strict):
+    state = fake_nvc(
+        monkeypatch, codec=codec, container=container, packets=[b"\x00" * 8]
+    )
     assert unsupported_reason(b"x", strict=strict) is None
     assert state["demuxer"].demuxed == 0  # packets are only read for VP9
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_vp8_only_from_matroska(monkeypatch, strict):
+    fake_nvc(monkeypatch, codec="VP8", container="matroska,webm")
+    assert unsupported_reason(b"x", strict=strict) is None
+    fake_nvc(monkeypatch, codec="VP8", container="mov,mp4,m4a,3gp,3g2,mj2")
+    assert "Matroska" in unsupported_reason(b"x", strict=strict)
 
 
 def test_unopenable_stream_fails_closed_only_when_strict(monkeypatch):
@@ -212,5 +240,6 @@ def test_vp9_demux_error_is_rejected(monkeypatch):
 
 def test_vp9_packet_budget_is_enforced(monkeypatch):
     monkeypatch.setattr(caps, "_MAX_PACKETS", 4)
-    fake_nvc(monkeypatch, packets=[frame(KEY[0])] * 10)
+    state = fake_nvc(monkeypatch, packets=[frame(KEY[0])] * 10, fail_after=4)
     assert "too long" in unsupported_reason(b"x", strict=False)
+    assert state["demuxer"].demuxed == 4  # a fifth Demux() call would raise

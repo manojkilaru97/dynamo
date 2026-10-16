@@ -546,12 +546,19 @@ def test_default_loader_never_imports_the_omni_check():
         import asyncio, sys
         import dynamo.common.multimodal.video_loader as vl
 
+        decoded = []
+        vl.nvdec_available = lambda: True
+        vl.should_use_nvdec = lambda codec: codec in ("h264", "hevc")
+        vl.decode_video_nvdec = lambda data, n: decoded.append(data) or ("nvdec", {})
+
         class MediaIO:
             def load_bytes(self, content):
                 return ("software", content)
 
-        for data in (b"V_VP9" + bytes(64), b"avc1" + bytes(64), b"vp09" + bytes(64)):
+        clips = (b"avc1" + bytes(64), b"hvc1" + bytes(64), b"V_VP9" + bytes(64))
+        for data in clips:
             asyncio.run(vl.VideoLoader()._decode_video_bytes(data, MediaIO()))
+        assert decoded == list(clips[:2]), decoded  # H.264/HEVC took the NVDEC branch
         assert "dynamo.common.multimodal.nvdec_stream_caps" not in sys.modules
         print("ok")
         """

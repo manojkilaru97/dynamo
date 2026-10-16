@@ -21,9 +21,10 @@ VP9 inspects the uncompressed header of every frame in every packet it yields
 cannot hit the crash. Rules:
 
 * VP9: Matroska/WebM only, every frame profile 0 or 2 (4:2:0).
+* VP8: Matroska/WebM only (VP8/VP9 from MP4 is outside what was measured safe).
 * AV1: refused. NVDEC never decodes AV1 through PyNvVideoCodec 2.2.x on these
   images (it raises), so this only skips a doomed attempt.
-* Everything else (H.264, HEVC, VP8, ...): unchanged routing.
+* Everything else (H.264, HEVC, ...): unchanged routing.
 
 With ``strict`` (a VP8/VP9/AV1 byte-marker hint) a stream the demuxer cannot
 open is refused; without it (an H.264/HEVC hint) it is left to the decoder,
@@ -36,8 +37,11 @@ import ctypes
 import tempfile
 
 _NVDEC_VP9_PROFILES = frozenset({0, 2})
-# Far above any real clip (about 9 hours at 30 fps); bounds a crafted input.
-_MAX_PACKETS = 1_000_000
+# About 1.8 hours at 30 fps; bounds the work a crafted input can cause.
+_MAX_PACKETS = 200_000
+# A zero-length read is not proof of end of stream (an empty block, or a read
+# error the demuxer resyncs past), so keep reading until several in a row.
+_EOF_EMPTY_READS = 3
 
 
 class _Unsupported(Exception):
@@ -64,10 +68,14 @@ def unsupported_reason(data: bytes, strict: bool) -> str | None:
             )
         if codec == nvc.cudaVideoCodec.AV1:
             return "AV1 is not decodable through PyNvVideoCodec on this image"
-        if codec != nvc.cudaVideoCodec.VP9:
+        if codec not in (nvc.cudaVideoCodec.VP9, nvc.cudaVideoCodec.VP8):
             return None
         if not container.startswith("matroska"):
-            return f"VP9 in {container or 'an unknown container'}; PyNvVideoCodec decodes VP9 safely only from Matroska/WebM"
+            name = "VP9" if codec == nvc.cudaVideoCodec.VP9 else "VP8"
+            where = container or "an unknown container"
+            return f"{name} in {where}; decoded on NVDEC only from Matroska/WebM"
+        if codec == nvc.cudaVideoCodec.VP8:
+            return None
         try:
             frames = _check_vp9_packets(demuxer)
         except _Unsupported as exc:
@@ -79,12 +87,16 @@ def unsupported_reason(data: bytes, strict: bool) -> str | None:
 
 def _check_vp9_packets(demuxer) -> int:
     """Check every frame header of every packet the demuxer yields."""
-    frames = 0
+    frames = empty = 0
     for _ in range(_MAX_PACKETS):
         packet = demuxer.Demux()
         size = packet.bsl
         if not size:
-            return frames
+            empty += 1
+            if empty >= _EOF_EMPTY_READS:
+                return frames
+            continue
+        empty = 0
         frames += check_vp9_packet(ctypes.string_at(packet.bsl_data, size))
     raise _Unsupported("VP9 stream too long to inspect")
 
