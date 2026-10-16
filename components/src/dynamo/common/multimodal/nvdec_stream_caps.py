@@ -93,8 +93,10 @@ def check_vp9_packet(data: bytes) -> int:
     """Check each frame header in one VP9 packet; return the frame count.
 
     A superframe ends with an index whose first and last bytes are the same
-    marker 0b110xxxxx (VP9 spec, Annex B). An index whose sizes do not fit is
-    not a superframe; decoders then read the packet as a single frame.
+    marker 0b110xxxxx (VP9 spec, Annex B). libvpx walks such an index entry by
+    entry and decodes every frame that fits, so an index whose sizes do not
+    fit is refused rather than read as one frame. Encoders pad any frame whose
+    last byte merely looks like a marker, so valid streams never hit this.
     """
     if not data:
         raise _Unsupported("empty VP9 packet")
@@ -109,12 +111,14 @@ def check_vp9_packet(data: bytes) -> int:
                 int.from_bytes(index[i * width : (i + 1) * width], "little")
                 for i in range(count)
             ]
-            if all(sizes) and sum(sizes) <= len(data) - index_len:
-                pos = 0
-                for size in sizes:
+            if not any(sizes) or sum(sizes) > len(data) - index_len:
+                raise _Unsupported("invalid VP9 superframe index")
+            pos = 0
+            for size in sizes:
+                if size:
                     _check_vp9_frame_byte(data[pos])
-                    pos += size
-                return count
+                pos += size
+            return count
     _check_vp9_frame_byte(data[0])
     return 1
 

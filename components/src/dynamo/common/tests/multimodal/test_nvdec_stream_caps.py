@@ -114,8 +114,34 @@ def test_every_superframe_frame_is_checked(width):
         check_vp9_packet(hidden)
 
 
-def test_index_lookalike_that_does_not_fit_is_a_single_frame():
-    assert check_vp9_packet(frame(KEY[0], 6) + bytes([0xC1, 0xFF, 0xFF, 0xC1])) == 1
+def test_superframe_zero_size_entries_are_skipped():
+    data = superframe(frame(KEY[0]), frame(INTER[0]))
+    # Rewrite the index as (n0, 0, n1): every non-empty frame is still checked.
+    marker = 0xC2
+    body = frame(KEY[0]) + frame(INTER[1])
+    bad = body + bytes([marker, 12, 0, 12, marker])
+    with pytest.raises(caps._Unsupported, match="profile 1"):
+        check_vp9_packet(bad)
+    assert check_vp9_packet(data) == 2
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        bytes([0xC1, 0xFF, 0xFF, 0xC1]),  # sizes overflow the payload
+        bytes([0xC1, 0x00, 0x00, 0xC1]),  # all entries empty
+    ],
+)
+def test_inconsistent_superframe_index_fails_closed(index):
+    """libvpx decodes the entries that fit; never fall back to one frame."""
+    with pytest.raises(caps._Unsupported, match="superframe index"):
+        check_vp9_packet(frame(KEY[0], 6) + index)
+
+
+def test_overflowing_index_cannot_hide_a_profile1_frame():
+    body = frame(KEY[0]) + frame(KEY[1])
+    with pytest.raises(caps._Unsupported):
+        check_vp9_packet(body + bytes([0xCA, 12, 0, 12, 0, 0xFF, 0xFF, 0xCA]))
 
 
 @pytest.mark.parametrize("data", [b"", frame(0x00), frame(0x40)])

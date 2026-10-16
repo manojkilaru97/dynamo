@@ -92,14 +92,17 @@ def _nvdec_safe_for_omni(codec: str | None, content: bytes) -> bool:
     """Whether NVDEC can decode this clip without crashing the process.
 
     PyNvVideoCodec segfaults instead of raising on VP9 profiles 1/3 and on VP9
-    read from MP4, and Omni routes VP8/VP9/AV1 to NVDEC, so the real video
-    tracks are checked first. A VP8/VP9/AV1 hint fails closed; an H.264/HEVC
-    hint is only refused when a VP8/VP9/AV1 track is positively unsafe.
-    Imported lazily: only the Nemotron Omni loader runs this check.
+    read from MP4, and Omni routes VP8/VP9/AV1 to NVDEC, so PyNvVideoCodec's
+    demuxer is asked first (see ``nvdec_stream_caps``). Any error in the check
+    itself fails closed. Imported lazily: only the Nemotron Omni loader runs
+    this check.
     """
-    from dynamo.common.multimodal.nvdec_stream_caps import unsupported_reason
+    try:
+        from dynamo.common.multimodal.nvdec_stream_caps import unsupported_reason
 
-    reason = unsupported_reason(content, strict=codec in _NVDEC_ROYALTY_FREE_CODECS)
+        reason = unsupported_reason(content, strict=codec in _NVDEC_ROYALTY_FREE_CODECS)
+    except Exception as exc:  # noqa: BLE001 - e.g. a full /tmp; fail closed
+        reason = f"safety check failed ({type(exc).__name__}: {exc})"
     if reason is not None:
         logger.warning("Not decoding a %s clip on NVDEC: %s", codec, reason)
     return reason is None

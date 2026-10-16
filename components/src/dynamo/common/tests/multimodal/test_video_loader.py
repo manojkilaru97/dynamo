@@ -456,6 +456,28 @@ async def test_omni_vp9_in_mp4_never_reaches_nvdec(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_omni_check_error_fails_closed(monkeypatch):
+    """An error inside the check (e.g. a full /tmp) must not reach NVDEC."""
+    decode, frames, _ = _nvdec_mock(monkeypatch)
+    monkeypatch.setattr(video_loader_module, "probe_video_codec", lambda b: "h264")
+    monkeypatch.setattr(video_loader_module, "should_use_nvdec", lambda c: True)
+    import dynamo.common.multimodal.nvdec_stream_caps as caps
+
+    def broken(data, strict):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(caps, "unsupported_reason", broken)
+    media_io = _RecordingMediaIO(frames)
+
+    result = await VideoLoader(nvdec_royalty_free_codecs=True)._decode_video_bytes(
+        b"clip", media_io
+    )
+
+    decode.assert_not_called()
+    assert result is media_io.result
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("profile", [0, 2])
 async def test_omni_vp9_420_profile_still_uses_nvdec(monkeypatch, profile):
     decode, frames, meta = _nvdec_mock(monkeypatch)
