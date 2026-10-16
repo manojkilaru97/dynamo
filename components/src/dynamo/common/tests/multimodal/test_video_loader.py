@@ -367,6 +367,9 @@ async def test_nvdec_royalty_free_codecs_opt_in_routes_to_nvdec(monkeypatch, cod
     monkeypatch.setattr(video_loader_module, "should_use_nvdec", lambda c: False)
     monkeypatch.setattr(video_loader_module, "nvdec_available", lambda: True)
     monkeypatch.setattr(
+        video_loader_module, "_nvdec_can_decode_royalty_free", lambda c, b: True
+    )
+    monkeypatch.setattr(
         video_loader_module, "decode_video_nvdec", lambda b, n: (frames, meta)
     )
     media_io = _RecordingMediaIO(frames)
@@ -375,6 +378,111 @@ async def test_nvdec_royalty_free_codecs_opt_in_routes_to_nvdec(monkeypatch, cod
 
     assert got_meta == meta
     assert media_io.calls == []
+
+
+def _webm_vp9(profile: int) -> bytes:
+    """Minimal WebM: one V_VP9 track and one block with a VP9 frame header."""
+
+    def el(eid: int, payload: bytes) -> bytes:
+        ident = eid.to_bytes((eid.bit_length() + 7) // 8, "big")
+        return ident + (0x10000000 | len(payload)).to_bytes(4, "big") + payload
+
+    header = 0b10 << 6 | (profile & 1) << 5 | (profile >> 1) << 4
+    track = el(0xAE, el(0xD7, b"\x01") + el(0x86, b"V_VP9"))
+    block = el(0xA3, b"\x81\x00\x00\x80" + bytes([header]) + b"\x00" * 8)
+    segment = el(0x18538067, el(0x1654AE6B, track) + el(0x1F43B675, block))
+    return el(0x1A45DFA3, el(0x4282, b"webm")) + segment
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", [1, 3])
+async def test_omni_vp9_non_420_profile_never_reaches_nvdec(monkeypatch, profile):
+    """PyNvVideoCodec segfaults the worker on VP9 profiles 1/3 (4:2:2/4:4:4)."""
+    loader = VideoLoader(nvdec_royalty_free_codecs=True)
+    monkeypatch.setattr(video_loader_module, "nvdec_available", lambda: True)
+
+    def _never(*a, **k):
+        raise AssertionError("NVDEC must not decode a VP9 profile 1/3 stream")
+
+    monkeypatch.setattr(video_loader_module, "decode_video_nvdec", _never)
+    frames = np.zeros((1, 2, 2, 3), dtype=np.uint8)
+    media_io = _RecordingMediaIO(frames)
+    data = _webm_vp9(profile)
+
+    result = await loader._decode_video_bytes(data, media_io)
+
+    assert result is media_io.result  # software path (a 400 on stripped images)
+    assert media_io.calls == [data]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", [0, 2])
+async def test_omni_vp9_420_profile_still_uses_nvdec(monkeypatch, profile):
+    loader = VideoLoader(nvdec_royalty_free_codecs=True)
+    frames = np.zeros((1, 2, 2, 3), dtype=np.uint8)
+    meta = {"fps": 4.0, "frames_indices": [0], "total_num_frames": 1}
+    monkeypatch.setattr(video_loader_module, "nvdec_available", lambda: True)
+    monkeypatch.setattr(
+        video_loader_module, "decode_video_nvdec", lambda b, n: (frames, meta)
+    )
+    media_io = _RecordingMediaIO(frames)
+
+    _, got_meta = await loader._decode_video_bytes(_webm_vp9(profile), media_io)
+
+    assert got_meta == meta
+    assert media_io.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("codec", ["h264", "hevc", "vp9", "vp8", "av1", None])
+async def test_default_loader_never_runs_the_royalty_free_check(monkeypatch, codec):
+    """Super 3.5 / Super 3 (default loader): the Omni-only check is unreachable."""
+    import sys
+
+    sys.modules.pop("dynamo.common.multimodal.nvdec_stream_caps", None)
+    loader = VideoLoader()
+    frames = np.zeros((1, 2, 2, 3), dtype=np.uint8)
+    meta = {"fps": 4.0, "frames_indices": [0], "total_num_frames": 1}
+    monkeypatch.setattr(video_loader_module, "probe_video_codec", lambda b: codec)
+    monkeypatch.setattr(video_loader_module, "nvdec_available", lambda: True)
+    monkeypatch.setattr(
+        video_loader_module, "should_use_nvdec", lambda c: c in ("h264", "hevc")
+    )
+
+    def _never(*a, **k):
+        raise AssertionError("the Omni-only check must not run for the default loader")
+
+    monkeypatch.setattr(video_loader_module, "_nvdec_can_decode_royalty_free", _never)
+    monkeypatch.setattr(
+        video_loader_module, "decode_video_nvdec", lambda b, n: (frames, meta)
+    )
+    media_io = _RecordingMediaIO(frames)
+
+    await loader._decode_video_bytes(b"bytes", media_io)
+
+    assert "dynamo.common.multimodal.nvdec_stream_caps" not in sys.modules
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("codec", ["h264", "hevc"])
+async def test_omni_h264_hevc_skip_the_royalty_free_check(monkeypatch, codec):
+    loader = VideoLoader(nvdec_royalty_free_codecs=True)
+    frames = np.zeros((1, 2, 2, 3), dtype=np.uint8)
+    meta = {"fps": 4.0, "frames_indices": [0], "total_num_frames": 1}
+    monkeypatch.setattr(video_loader_module, "probe_video_codec", lambda b: codec)
+    monkeypatch.setattr(video_loader_module, "should_use_nvdec", lambda c: True)
+
+    def _never(*a, **k):
+        raise AssertionError("H.264/HEVC routing is unchanged")
+
+    monkeypatch.setattr(video_loader_module, "_nvdec_can_decode_royalty_free", _never)
+    monkeypatch.setattr(
+        video_loader_module, "decode_video_nvdec", lambda b, n: (frames, meta)
+    )
+
+    _, got_meta = await loader._decode_video_bytes(b"bytes", _RecordingMediaIO(frames))
+
+    assert got_meta == meta
 
 
 @pytest.mark.asyncio

@@ -88,6 +88,21 @@ def _require_vllm_video_media() -> tuple[Any, Any, Any]:
     return MediaConnector, VideoMediaIO, ImageMediaIO
 
 
+def _nvdec_can_decode_royalty_free(codec: str, content: bytes) -> bool:
+    """Whether NVDEC can decode this VP8/VP9/AV1 stream without crashing.
+
+    PyNvVideoCodec segfaults the process on VP9 profiles 1/3 instead of raising,
+    so the profile is checked before any NVDEC call. Imported lazily: only the
+    Nemotron Omni loader routes these codecs to NVDEC.
+    """
+    from dynamo.common.multimodal.nvdec_stream_caps import unsupported_reason
+
+    reason = unsupported_reason(codec, content)
+    if reason is not None:
+        logger.warning("Not decoding a %s clip on NVDEC: %s", codec, reason)
+    return reason is None
+
+
 def _with_original_video_bytes(
     decoded: Any, content: bytes
 ) -> tuple[np.ndarray, Dict[str, Any]]:
@@ -206,6 +221,7 @@ class VideoLoader:
             self._nvdec_royalty_free_codecs
             and codec in _NVDEC_ROYALTY_FREE_CODECS
             and nvdec_available()
+            and _nvdec_can_decode_royalty_free(codec, content)
         ):
             try:
                 return await asyncio.to_thread(
