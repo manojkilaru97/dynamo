@@ -378,21 +378,39 @@ async def test_nvdec_royalty_free_codecs_opt_in_routes_to_nvdec(monkeypatch, cod
     assert media_io.calls == []
 
 
-def _el(eid: int, payload: bytes) -> bytes:
-    ident = eid.to_bytes((eid.bit_length() + 7) // 8, "big")
-    return ident + (0x10000000 | len(payload)).to_bytes(4, "big") + payload
-
-
-def _webm(codec_id: bytes, first: int, extra_frame: bytes = b"") -> bytes:
-    """Minimal WebM: one video track and one block whose frame starts with ``first``."""
-    track = _el(0xAE, _el(0xD7, b"\x01") + _el(0x83, b"\x01") + _el(0x86, codec_id))
-    block = _el(0xA3, b"\x81\x00\x00\x80" + bytes([first]) + extra_frame + b"\x10" * 8)
-    segment = _el(0x18538067, _el(0x1654AE6B, track) + _el(0x1F43B675, block))
-    return _el(0x1A45DFA3, _el(0x4282, b"webm")) + segment
-
-
 # First byte of a libvpx VP9 keyframe per profile.
 _VP9_KEYFRAME = {0: 0x82, 1: 0xA2, 2: 0x92, 3: 0xB1}
+
+
+def _fake_demuxer(monkeypatch, codec, container="matroska,webm", packets=()):
+    """Install a fake PyNvVideoCodec whose demuxer reports ``codec``/``packets``."""
+    import ctypes
+    import sys
+    import types
+
+    mod = types.ModuleType("PyNvVideoCodec")
+    mod.cudaVideoCodec = types.SimpleNamespace(
+        VP9="VP9", AV1="AV1", H264="H264", HEVC="HEVC", VP8="VP8"
+    )
+    queue = list(packets)
+
+    class Packet:
+        def __init__(self, data):
+            self._buf = ctypes.create_string_buffer(data, len(data))
+            self.bsl, self.bsl_data = len(data), ctypes.addressof(self._buf)
+
+    class Demuxer:
+        def GetNvCodecId(self):
+            return codec
+
+        def GetContainerName(self):
+            return container
+
+        def Demux(self):
+            return Packet(queue.pop(0) if queue else b"")
+
+    mod.CreateDemuxer = lambda path: Demuxer()
+    monkeypatch.setitem(sys.modules, "PyNvVideoCodec", mod)
 
 
 def _nvdec_mock(monkeypatch):
@@ -405,31 +423,34 @@ def _nvdec_mock(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hint", ["vp9", "h264"])
 @pytest.mark.parametrize("profile", [1, 3])
-async def test_omni_vp9_non_420_profile_never_reaches_nvdec(monkeypatch, profile):
-    """PyNvVideoCodec segfaults the worker on VP9 profiles 1/3 (4:2:2/4:4:4)."""
+async def test_omni_vp9_non_420_profile_never_reaches_nvdec(monkeypatch, hint, profile):
+    """PyNvVideoCodec segfaults the worker on VP9 profiles 1/3 (4:2:2/4:4:4),
+    also when stray bytes make the byte probe say H.264."""
     decode, frames, _ = _nvdec_mock(monkeypatch)
+    monkeypatch.setattr(video_loader_module, "probe_video_codec", lambda b: hint)
+    monkeypatch.setattr(video_loader_module, "should_use_nvdec", lambda c: c == "h264")
+    _fake_demuxer(monkeypatch, "VP9", packets=[bytes([_VP9_KEYFRAME[profile]]) * 8])
     loader = VideoLoader(nvdec_royalty_free_codecs=True)
     media_io = _RecordingMediaIO(frames)
-    data = _webm(b"V_VP9", _VP9_KEYFRAME[profile])
 
-    result = await loader._decode_video_bytes(data, media_io)
+    result = await loader._decode_video_bytes(b"clip", media_io)
 
     decode.assert_not_called()
     assert result is media_io.result  # software path (an error on stripped images)
-    assert media_io.calls == [data]
+    assert media_io.calls == [b"clip"]
 
 
 @pytest.mark.asyncio
-async def test_omni_vp9_profile1_misprobed_as_h264_never_reaches_nvdec(monkeypatch):
-    """A stray ``avc1`` in the payload makes the byte probe say H.264."""
+async def test_omni_vp9_in_mp4_never_reaches_nvdec(monkeypatch):
     decode, frames, _ = _nvdec_mock(monkeypatch)
-    monkeypatch.setattr(video_loader_module, "should_use_nvdec", lambda c: c == "h264")
-    loader = VideoLoader(nvdec_royalty_free_codecs=True)
-    data = _webm(b"V_VP9", _VP9_KEYFRAME[1], extra_frame=b"avc1")
-    assert video_loader_module.probe_video_codec(data) == "h264"
+    monkeypatch.setattr(video_loader_module, "probe_video_codec", lambda b: "vp9")
+    _fake_demuxer(monkeypatch, "VP9", container="mov,mp4,m4a,3gp,3g2,mj2")
 
-    await loader._decode_video_bytes(data, _RecordingMediaIO(frames))
+    await VideoLoader(nvdec_royalty_free_codecs=True)._decode_video_bytes(
+        b"clip", _RecordingMediaIO(frames)
+    )
 
     decode.assert_not_called()
 
@@ -438,11 +459,12 @@ async def test_omni_vp9_profile1_misprobed_as_h264_never_reaches_nvdec(monkeypat
 @pytest.mark.parametrize("profile", [0, 2])
 async def test_omni_vp9_420_profile_still_uses_nvdec(monkeypatch, profile):
     decode, frames, meta = _nvdec_mock(monkeypatch)
-    loader = VideoLoader(nvdec_royalty_free_codecs=True)
+    monkeypatch.setattr(video_loader_module, "probe_video_codec", lambda b: "vp9")
+    _fake_demuxer(monkeypatch, "VP9", packets=[bytes([_VP9_KEYFRAME[profile]]) * 8])
     media_io = _RecordingMediaIO(frames)
 
-    _, got_meta = await loader._decode_video_bytes(
-        _webm(b"V_VP9", _VP9_KEYFRAME[profile]), media_io
+    _, got_meta = await VideoLoader(nvdec_royalty_free_codecs=True)._decode_video_bytes(
+        b"clip", media_io
     )
 
     assert got_meta == meta
@@ -451,14 +473,17 @@ async def test_omni_vp9_420_profile_still_uses_nvdec(monkeypatch, profile):
 
 
 @pytest.mark.asyncio
-async def test_omni_h264_with_stray_av1_marker_still_uses_nvdec(monkeypatch):
+@pytest.mark.parametrize("hint", ["av1", "h264", "vp9"])
+async def test_omni_real_h264_keeps_nvdec_whatever_the_hint(monkeypatch, hint):
+    """A stray ``av01``/``vp09`` marker in an H.264 file must not cost NVDEC."""
     decode, frames, meta = _nvdec_mock(monkeypatch)
+    monkeypatch.setattr(video_loader_module, "probe_video_codec", lambda b: hint)
     monkeypatch.setattr(video_loader_module, "should_use_nvdec", lambda c: c == "h264")
-    loader = VideoLoader(nvdec_royalty_free_codecs=True)
-    data = _webm(b"V_MPEG4/ISO/AVC", 0x00, extra_frame=b"V_AV1")
-    assert video_loader_module.probe_video_codec(data) == "av1"
+    _fake_demuxer(monkeypatch, "H264", container="avi")
 
-    _, got_meta = await loader._decode_video_bytes(data, _RecordingMediaIO(frames))
+    _, got_meta = await VideoLoader(nvdec_royalty_free_codecs=True)._decode_video_bytes(
+        b"clip", _RecordingMediaIO(frames)
+    )
 
     assert got_meta == meta
     decode.assert_called_once()
@@ -503,13 +528,11 @@ def test_default_loader_never_imports_the_omni_check():
             def load_bytes(self, content):
                 return ("software", content)
 
-        webm = bytes.fromhex(%r)
-        for data in (webm, b"avc1" + bytes(64), b"vp09" + bytes(64)):
+        for data in (b"V_VP9" + bytes(64), b"avc1" + bytes(64), b"vp09" + bytes(64)):
             asyncio.run(vl.VideoLoader()._decode_video_bytes(data, MediaIO()))
         assert "dynamo.common.multimodal.nvdec_stream_caps" not in sys.modules
         print("ok")
         """
-        % _webm(b"V_VP9", _VP9_KEYFRAME[1]).hex()
     )
     out = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
